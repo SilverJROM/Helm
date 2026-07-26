@@ -1,0 +1,46 @@
+node_modules/
+dist/
+data/*.db*
+*.log
+.env*
+.env.*.local
+.DS_Store
+*.tsbuildinfo
+coverage/
+.vscode/
+.idea/
+batch-*/
+test-results/
+
+# C3 Landlock write-fence (generated binary; the .c source is committed)
+tools/helm-sandbox
+dist/tools/helm-sandbox
+tmp/
+
+# overmind run-state (written to cwd)
+.overmind-state.json
+**/.overmind-state.json
+
+# stray root test db (real one is data/helm.db)
+/helm.db
+data/dogfood.db*
+# model-swap runtime digests — transient, written by the app/validator during a run (like data/*.db*)
+data/swaps/
+
+# internal planning artifacts (projcore/lead run state — do not leak).
+# NOTE: plan-cache/ is product data (referenced by src/), keep it tracked.
+plan/
+/north-star.md
+
+# [north] 2026-07-26 — pre-git backup litter. These 229 sibling copies existed ONLY because
+# the tree had no git; they stay on disk, they just aren't tracked. Superseded by real history.
+*.bak-*
+.pre-cyclebuilddir-backup/
+
+# [north] 2026-07-26 — two pattern gaps found while taking the first baseline:
+#   `node_modules/` (trailing slash) cannot match node_modules when it is a SYMLINK, which it is
+#   here (-> TGBOTS/Helm-ovm-run/node_modules). A committed symlink breaks any fresh clone.
+node_modules
+#   `data/*.db*` only matches DIRECT children of data/, so data/backups/*.db* was slipping through.
+data/backups/
+data/**/*.db*

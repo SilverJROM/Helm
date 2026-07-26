@@ -1,0 +1,31 @@
+{
+  "ts": "2026-07-02T09:45:09.154Z",
+  "probeRunId": 83,
+  "results": [
+    {
+      "check": "a-picker-coordinator-pinned",
+      "ok": true,
+      "detail": "first option=\"⭐ projcore — coordinator\" total options=12"
+    },
+    {
+      "check": "b-fenced-spawn-in-project-dir",
+      "ok": true,
+      "detail": "session=helm-chat-p1-projcore-30bc65 paneCwd=/home/agjrom/websites/cards launchLine=\"/home/agjrom/TGBOTS/Helm/dist/tools/helm-sandbox /home/agjrom/websites/cards cod\""
+    },
+    {
+      "check": "c-reply-bubble-renders",
+      "ok": true,
+      "detail": "reply=\"projcoreReady in Helm test-chat mode.\r\n\r\n  To start Phase 0, send the requirements source or answer these intake items:\r\n\r\n  1. Scope: what project/feature/bug list should this run\""
+    },
+    {
+      "check": "d-chat-creates-no-run",
+      "ok": true,
+      "detail": "runs before=82 after=82"
+    },
+    {
+      "check": "e-post-runs-immediate",
+      "ok": true,
+      "detail": "elapsed=9ms status=200 body={\"runId\":83,\"status\":\"started\"}"
+    }
+  ]
+}

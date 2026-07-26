@@ -1,0 +1,8 @@
+STOP BUTTON VISIBLE: yes
+RUN PHASE BEFORE: interview
+RUN STATUS BEFORE: active
+CONFIRM DIALOG: Stop run #86? The orchestrator loop aborts within one cycle and its worker sessions are reaped. This cannot be
+UI STOP ROUND-TRIP MS: 458
+RUN PHASE AFTER: failed
+STOP BUTTON AFTER (0 = hidden on terminal run): 0
+OK

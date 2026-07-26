@@ -1,0 +1,35 @@
+• Explored
+  └ Read projcore-brief-template.md
+
+────────────────────────────────────────────────────────────────────────────────
+
+• ⟦HELM_REPLY⟧
+  Projcore loaded in test-chat mode. I will treat requirements coverage as the
+  acceptance bar and will not accept implementer self-report as verification.
+
+  Phase 0 intake needed before any run:
+
+  1. Which og-requirements.md and implementation-plan.md should govern this run?
+  2. Scope target: full project, one feature area, or a specific issue list?
+  3. Test authority: what commands/envs may be used for build, unit,
+     integration, UI, and deploy validation?
+
+  4. Branch/commit policy: may workers create commits/branches, or leave
+     working-tree diffs only?
+
+  5. Lifecycle: pre-live, post-live, or demo-crunch?
+  6. Worker policy: use project defaults, or set per-task model/effort overrides
+     in the plan?
+
+  7. Any pre-approved red-team or deliberation candidates?
+
+  Once those are supplied, I can build the north-star, requirements matrix,
+  queue, and atomic batch plan.
+  ⟦/HELM_REPLY⟧
+
+────────────────────────────────────────────────────────────────────────────────
+
+
+› Improve documentation in @filename
+
+  gpt-5.5 high fast · ~/websites/cards

@@ -1,0 +1,23 @@
+[
+  {
+    "id": 231,
+    "run_id": "master:1",
+    "role": "owner",
+    "batch_id": "chat-1",
+    "session": "helm-pm-cards:0.0",
+    "type": "message",
+    "state": null,
+    "source": "post",
+    "correlation_id": "chat:1:1782988626185",
+    "body": {
+      "text": "CC-CHAT-2 SMOKE ANSWER: proceed with the closest defaults, minimal scope, no extra features. commonjs + node test runner is fine.",
+      "sources": [
+        "post"
+      ],
+      "delivered": true,
+      "session": "helm-pm-cards"
+    },
+    "seq": 2,
+    "ts": "2026-07-02T10:37:06.185Z"
+  }
+]

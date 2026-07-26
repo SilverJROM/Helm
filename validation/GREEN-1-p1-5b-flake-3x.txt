@@ -1,0 +1,74 @@
+=== 3x p1-5b FLAKE RUNS (must all deterministic PASS) ===
+=== FLAKE RUN 1 ===
+
+ RUN  v2.1.9 /home/agjrom/TGBOTS/Helm
+
+ ↓ src/p1-6b.test.ts (35 tests | 35 skipped)
+ ↓ src/p2-1.test.ts (31 tests | 31 skipped)
+ ↓ src/p1-4.test.ts (17 tests | 17 skipped)
+ ↓ src/project-service.test.ts (17 tests | 17 skipped)
+ ✓ src/p1-5b.test.ts (8 tests | 7 skipped) 301ms
+   ✓ P1-5b Master supervise + park primitive + provider fields + launching state (reminders 1-6) > single-flight respawn (reminder 3) + launching state written then transitioned (reminder 5) 300ms
+ ↓ src/p1-5a.test.ts (5 tests | 5 skipped)
+ ↓ src/services/plumbing-watcher.test.ts (9 tests | 9 skipped)
+ ↓ src/c3-writefence.test.ts (6 tests | 6 skipped)
+ ↓ src/p1-6a.test.ts (6 tests | 6 skipped)
+ ↓ src/model-service.test.ts (8 tests | 8 skipped)
+ ↓ src/p1-3.test.ts (5 tests | 5 skipped)
+ ↓ src/memory-service.test.ts (5 tests | 5 skipped)
+ ↓ src/services/substrate.test.ts (5 tests | 5 skipped)
+ ↓ src/smoke.test.ts (2 tests | 2 skipped)
+
+ Test Files  1 passed | 13 skipped (14)
+      Tests  1 passed | 158 skipped (159)
+   Start at  12:51:24
+   Duration  2.15s (transform 259ms, setup 0ms, collect 657ms, tests 301ms, environment 1ms, prepare 405ms)
+
+=== FLAKE RUN 2 ===
+
+ RUN  v2.1.9 /home/agjrom/TGBOTS/Helm
+
+ ↓ src/p1-6b.test.ts (35 tests | 35 skipped)
+ ↓ src/p2-1.test.ts (31 tests | 31 skipped)
+ ↓ src/p1-4.test.ts (17 tests | 17 skipped)
+ ↓ src/project-service.test.ts (17 tests | 17 skipped)
+ ✓ src/p1-5b.test.ts (8 tests | 7 skipped) 299ms
+ ↓ src/p1-5a.test.ts (5 tests | 5 skipped)
+ ↓ src/services/plumbing-watcher.test.ts (9 tests | 9 skipped)
+ ↓ src/c3-writefence.test.ts (6 tests | 6 skipped)
+ ↓ src/p1-6a.test.ts (6 tests | 6 skipped)
+ ↓ src/model-service.test.ts (8 tests | 8 skipped)
+ ↓ src/p1-3.test.ts (5 tests | 5 skipped)
+ ↓ src/memory-service.test.ts (5 tests | 5 skipped)
+ ↓ src/services/substrate.test.ts (5 tests | 5 skipped)
+ ↓ src/smoke.test.ts (2 tests | 2 skipped)
+
+ Test Files  1 passed | 13 skipped (14)
+      Tests  1 passed | 158 skipped (159)
+   Start at  12:51:27
+   Duration  2.12s (transform 238ms, setup 0ms, collect 627ms, tests 299ms, environment 1ms, prepare 398ms)
+
+=== FLAKE RUN 3 ===
+
+ RUN  v2.1.9 /home/agjrom/TGBOTS/Helm
+
+ ↓ src/p1-6b.test.ts (35 tests | 35 skipped)
+ ↓ src/p2-1.test.ts (31 tests | 31 skipped)
+ ↓ src/p1-4.test.ts (17 tests | 17 skipped)
+ ↓ src/project-service.test.ts (17 tests | 17 skipped)
+ ✓ src/p1-5b.test.ts (8 tests | 7 skipped) 300ms
+ ↓ src/p1-5a.test.ts (5 tests | 5 skipped)
+ ↓ src/services/plumbing-watcher.test.ts (9 tests | 9 skipped)
+ ↓ src/c3-writefence.test.ts (6 tests | 6 skipped)
+ ↓ src/p1-6a.test.ts (6 tests | 6 skipped)
+ ↓ src/model-service.test.ts (8 tests | 8 skipped)
+ ↓ src/p1-3.test.ts (5 tests | 5 skipped)
+ ↓ src/memory-service.test.ts (5 tests | 5 skipped)
+ ↓ src/services/substrate.test.ts (5 tests | 5 skipped)
+ ↓ src/smoke.test.ts (2 tests | 2 skipped)
+
+ Test Files  1 passed | 13 skipped (14)
+      Tests  1 passed | 158 skipped (159)
+   Start at  12:51:29
+   Duration  2.11s (transform 241ms, setup 0ms, collect 631ms, tests 300ms, environment 1ms, prepare 396ms)
+

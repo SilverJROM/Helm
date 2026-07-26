@@ -1,0 +1,3 @@
+session=helm-chat-p1-projcore-30bc65
+pane_current_path=/home/agjrom/websites/cards
+launch_line=/home/agjrom/TGBOTS/Helm/dist/tools/helm-sandbox /home/agjrom/websites/cards cod

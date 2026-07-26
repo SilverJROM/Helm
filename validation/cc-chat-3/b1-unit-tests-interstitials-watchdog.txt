@@ -1,0 +1,15 @@
+
+ RUN  v2.1.9 /home/agjrom/TGBOTS/Helm
+
+ ✓ src/services/cli-interstitials.test.ts (12 tests) 4ms
+ ✓ src/services/composer-watchdog.test.ts (9 tests) 307ms
+   ✓ CC-CHAT-3 R8 RealTransport.resubmitIfComposerHeld (stubbed tmux) > codex "Create a plan?" nudge (swallows C-m) → Esc-dismiss FIRST, then Enter 301ms
+stderr | src/services/composer-watchdog.test.ts > CC-CHAT-3 R8 RealTransport.resubmitIfComposerHeld (stubbed tmux) > capture failure (session gone) → best-effort false, never throws
+[tmux] composerHoldsText probe failed { target: 'helm-t1-implementer:0.0', err: 'Error: no such session' }
+
+
+ Test Files  2 passed (2)
+      Tests  21 passed (21)
+   Start at  11:28:51
+   Duration  591ms (transform 74ms, setup 14ms, collect 85ms, tests 311ms, environment 0ms, prepare 56ms)
+

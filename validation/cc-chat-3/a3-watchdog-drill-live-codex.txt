@@ -1,0 +1,21 @@
+=== PANE BEFORE (brief held un-submitted in composer) ===
+  queue, and atomic batch plan.
+  ⟦/HELM_REPLY⟧
+────────────────────────────────────────────────────────────────────────────────
+› HELM WATCHDOG DRILL (CC-CHAT-3 R8): reply with the single word ACK and
+  nothing else.
+  gpt-5.5 high fast · ~/websites/cards
+[orchestrator-loop] submit-watchdog target=helm-chat-p1-projcore-db7518:0.0 composer still holds the implementer brief → re-pressed Enter (1/10)
+[orchestrator-loop] submit-watchdog target=helm-chat-p1-projcore-db7518:0.0 composer clear after 1 re-press(es) — implementer brief submitted
+(waitForCallback ended as expected — no DONE callback in this drill: waitForCallback wall-timeout for implementer (wanted DONE))
+=== PANE AFTER (composer cleared / brief submitted) ===
+  7. Any pre-approved red-team or deliberation candidates?
+  Once those are supplied, I can build the north-star, requirements matrix,
+  queue, and atomic batch plan.
+  ⟦/HELM_REPLY⟧
+────────────────────────────────────────────────────────────────────────────────
+› HELM WATCHDOG DRILL (CC-CHAT-3 R8): reply with the single word ACK and
+  nothing else.
+• ACK
+› Improve documentation in @filename
+  gpt-5.5 high fast · ~/websites/cards

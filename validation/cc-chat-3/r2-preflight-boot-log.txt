@@ -1,0 +1,7 @@
+0|helm     | Helm listening on 127.0.0.1:3110
+0|helm     | Helm listening on 127.0.0.1:3110
+0|helm     | [cli-preflight] codex update (best-effort): Updating Codex via `npm install -g @openai/codex`... | changed 2 packages in 2s | 🎉 Update ran successfully! Please restart Codex.
+0|helm     | [cli-preflight] codex version: codex-cli 0.142.5
+codex-cli 0.142.5
+--- skip guard ---
+[cli-preflight] skipped (HELM_SKIP_CLI_PREFLIGHT=1)

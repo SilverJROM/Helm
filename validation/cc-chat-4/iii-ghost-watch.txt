@@ -1,0 +1,14 @@
+# EHR ghost non-return watch (CC-CHAT-4)
+# Spawner identified deterministically: vitest suite (see evidence.md §C).
+# Pre-fix repro: killed 11:43:44Z -> 'vitest run src/p1-6a.test.ts' -> reappeared 11:43:53Z (suite start second).
+# Killed again ~11:47Z. Post-fix spawner-cadence cycles (a "cadence" = one vitest run of the spawning suites):
+#   cycle 1: 11:54:57-11:56:57Z p1-5b+p1-6a+p1-6b (48 passed) -> no ghost, no leaked test sessions
+#   cycle 2: full suite (post-all-fixes) -> see v-final-vitest.txt tail below watch
+# Wall-clock samples (>=10 min after last kill):
+12:10:24Z tmux: 0 helm-projcore-EHR sessions
+12:12:31Z tmux: 0 helm-projcore-EHR sessions
+12:15:00Z tmux: 0 helm-projcore-EHR sessions
+12:17:30Z tmux: 0 helm-projcore-EHR sessions
+12:20:00Z tmux: 0 helm-projcore-EHR sessions
+12:20:04Z FINAL: 0 helm-projcore-EHR sessions — >=25min since last kill + 2 spawner cycles, ghost did NOT return
+12:22:30Z tmux: 0 helm-projcore-EHR sessions

@@ -1,0 +1,15 @@
+
+ RUN  v2.1.9 /home/agjrom/TGBOTS/Helm
+
+ ✓ src/p2-1.test.ts > P2-1 Worker spawn through the app (ephemeral; spawn/reap/cap/reaper/migration/routes) > E1: v15→v16 migration on COPY of live data/helm.db preserves rows + adds memories table + idx + version=16 + supports proposed/app/project inserts + query filters
+ ✓ src/memory-service.test.ts > E1 MemoryService (M1 + M2-backend): app + project scopes; propose→approve; JIT query; cross write-silo / read-allow > fresh DB yields SCHEMA_VERSION=16 + memories table + idx (two-track)
+ ✓ src/memory-service.test.ts > E1 MemoryService (M1 + M2-backend): app + project scopes; propose→approve; JIT query; cross write-silo / read-allow > AGENT-proposed app memory starts status=proposed; owner approve flips to approved; queryMemory returns ONLY approved (proposals excluded)
+ ✓ src/memory-service.test.ts > E1 MemoryService (M1 + M2-backend): app + project scopes; propose→approve; JIT query; cross write-silo / read-allow > queryMemory returns ONLY approved app + this-project (other project excluded; proposals never served)
+ ✓ src/memory-service.test.ts > E1 MemoryService (M1 + M2-backend): app + project scopes; propose→approve; JIT query; cross write-silo / read-allow > cross-project WRITE rejected (token claim only / enforceProjectId); cross-project READ allowed (owner list other pid)
+ ✓ src/memory-service.test.ts > E1 MemoryService (M1 + M2-backend): app + project scopes; propose→approve; JIT query; cross write-silo / read-allow > CRUD + approve/reject + list filters + project scope always approved
+
+ Test Files  2 passed | 12 skipped (14)
+      Tests  6 passed | 153 skipped (159)
+   Start at  12:06:14
+   Duration  1.96s (transform 243ms, setup 0ms, collect 636ms, tests 130ms, environment 1ms, prepare 395ms)
+

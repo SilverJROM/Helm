@@ -1,0 +1,17 @@
+=== RUN 86 (post-stop):
+86|failed|failed|2026-07-02 12:03:27|2026-07-02 12:06:30
+=== agent_events stop row:
+status|STOPPED|run-stop:86:1782993990840|{"text":"run 86 stopped by operator","kind":"run-stop","stop_reason":"stopped from CC run panel","sources":["post"]}
+=== worker_runtimes run 86 (should be none/terminal):
+=== tmux AFTER (helm-pm-cards should be GONE):
+(no run sessions — reaped)
+=== pm2 logs (abort/stop lines):
+[run-orchestrator] aborted: run terminal in DB (run=86 boundary=post-interview stop requested via registry (stopped from CC run panel))
+[run-orchestrator] run 86 orchestration stopped cleanly: run 86 aborted: post-interview: stop requested via registry (stopped from CC run panel)
+[run-orchestrator] run 86 STOP requested (stopped from CC run panel); marked terminal + abort flag set (reaped 0 worker rows)
+[run-orchestrator] aborted: run terminal in DB (run=86 boundary=post-interview stop requested via registry (stopped from CC run panel))
+[run-orchestrator] run 86 orchestration stopped cleanly: run 86 aborted: post-interview: stop requested via registry (stopped from CC run panel)
+[run-orchestrator] run 86 STOP requested (stopped from CC run panel); marked terminal + abort flag set (reaped 0 worker rows)
+[run-orchestrator] run 87 STOP requested (direct curl stop proof); marked terminal + abort flag set (reaped 0 worker rows)
+[run-orchestrator] aborted: run terminal in DB (run=87 boundary=post-interview stop requested via registry (direct curl stop proof))
+[run-orchestrator] run 87 orchestration stopped cleanly: run 87 aborted: post-interview: stop requested via registry (direct curl stop proof)

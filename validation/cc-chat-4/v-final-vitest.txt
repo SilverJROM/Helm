@@ -1,0 +1,8 @@
+
+ Test Files  44 passed (44)
+      Tests  549 passed | 3 skipped (552)
+   Start at  12:07:41
+   Duration  287.22s (transform 696ms, setup 91ms, collect 1.88s, tests 281.38s, environment 4ms, prepare 1.23s)
+
+=== tmux after cycle-2:
+(no ghost, no leaked test sessions)

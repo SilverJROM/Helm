@@ -1,0 +1,675 @@
+import { execFile } from "node:child_process";
+import { setTimeout as setTimeoutPromise } from "node:timers/promises";
+import { promisify } from "node:util";
+import { seatReadySignal } from "../config/providers.js";
+
+const execFileAsync = promisify(execFile);
+
+// CC-CHAT-1 fix: capturePane uses `tmux capture-pane -e` (ANSI escapes kept for xterm.js) — any
+// submission-detection regex/string match MUST run on ANSI-stripped text (colour codes split words:
+// e.g. the codex nudge renders "esc\x1b[0m dismiss", which silently defeated the plain-text match).
+// eslint-disable-next-line no-control-regex
+const TMUX_ANSI_RE = /[\u001b\u009b][[\]()#;?]*(?:(?:[a-zA-Z\d]*(?:;[a-zA-Z\d]*)*)?\u0007|(?:\d{1,4}(?:;\d{0,4})*)?[\dA-PR-TZcf-ntqry=><~])/g;
+function stripAnsiForMatch(s: string): string {
+  return (s ?? "").replace(TMUX_ANSI_RE, "");
+}
+
+export interface TmuxPane {
+  target: string;
+  session: string;
+  window: string;
+  pane: string;
+  command: string;
+  title: string;
+}
+
+export interface SendCommandResult {
+  message: string;
+  safetyCheck?: any;
+  blocked: boolean;
+}
+
+export type TextSubmissionState = "held" | "submitted" | "indeterminate";
+
+// SL-R1: optional registry hook injected into TmuxService. A pair of best-effort callbacks fired
+// at the single createSession/terminateSession choke point so every Helm session is captured
+// centrally. Defaults to a no-op — existing tests, FakeTmuxService, and any construction WITHOUT a
+// registry keep working, and TmuxService never hard-depends on the DB.
+export interface TmuxSessionRegistryHook {
+  onCreate(name: string): void;
+  onTerminate(name: string): void;
+  // SL-R2/R4: fired on ACTIVE INPUT to a session (sendKeys). Refreshes last_used_at so the janitor's
+  // TTL means "idle for TTL" not "alive for TTL" — keeps actively-used standalone sessions alive.
+  onUse(name: string): void;
+}
+
+const NOOP_REGISTRY_HOOK: TmuxSessionRegistryHook = {
+  onCreate() {},
+  onTerminate() {},
+  onUse() {}
+};
+
+export class TmuxService {
+  // safetyService removed for clean lift into Helm (guardrails.checkCommand used at higher layer for external dispatches if needed)
+  // sendCommand accepts skipSafetyCheck (4th arg) for trusted bare CLI launches (master)
+
+  // SL-R1: no-op by default; the real registry is injected in src/index.ts on the shared instance.
+  private registryHook: TmuxSessionRegistryHook;
+
+  constructor(registryHook?: TmuxSessionRegistryHook) {
+    this.registryHook = registryHook ?? NOOP_REGISTRY_HOOK;
+  }
+
+  /** SL-R1: wire the registry after construction (lets index.ts build the registry with the same db, then attach). */
+  setRegistryHook(hook: TmuxSessionRegistryHook): void {
+    this.registryHook = hook ?? NOOP_REGISTRY_HOOK;
+  }
+
+  // SL-R2/R4: active-input signal. Fired from EVERY method by which Helm actively drives a session
+  // (sendAndSubmit — the chat/message path, sendCommand, sendEnter, sendKeys) so last_used_at is
+  // refreshed and the janitor's TTL means "idle for TTL", not "alive for TTL". NOT fired from
+  // capturePane (that's high-freq polling — an idle-but-monitored session must still be reapable).
+  // Bare session name (target may be session:window.pane). Best-effort — never break a send.
+  private touchSession(target: string): void {
+    try { this.registryHook.onUse((target ?? "").split(":")[0]); } catch (err) { console.warn('[tmux] registry onUse failed', { target, err: String(err) }); }
+  }
+
+  async listPanes(): Promise<TmuxPane[]> {
+    try {
+      const format = "#{session_name}|#{window_index}|#{pane_index}|#{pane_current_command}|#{pane_title}";
+      const { stdout } = await execFileAsync("tmux", ["list-panes", "-a", "-F", format]);
+
+      return stdout
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .map((line) => {
+          const [session, window, pane, command, title] = line.split("|");
+          return {
+            target: `${session}:${window}.${pane}`,
+            session,
+            window,
+            pane,
+            command,
+            title
+          };
+        });
+    } catch (err) {
+      console.warn('[tmux] listPanes failed', { err: String(err) });
+      return [];
+    }
+  }
+
+  async listJobsSummary(): Promise<string> {
+    const panes = await this.listPanes();
+    if (!panes.length) {
+      return "No tmux panes found.";
+    }
+
+    return panes
+      .map((p) => `- ${p.target} | cmd=${p.command} | title=${p.title || "n/a"}`)
+      .join("\n");
+  }
+
+  async peekPane(target: string, lines = 200): Promise<string> {
+    this.ensureValidTarget(target);
+    const safeLines = Math.max(20, Math.min(lines, 1000));
+    const { stdout } = await execFileAsync("tmux", [
+      "capture-pane",
+      "-p",
+      "-t",
+      target,
+      "-S",
+      `-${safeLines}`
+    ]);
+    return stdout.trim() || "<empty pane output>";
+  }
+
+  async sessionExists(target: string): Promise<boolean> {
+    this.ensureValidTarget(target);
+    const sessionName = target.split(":")[0];
+    try {
+      await execFileAsync("tmux", ["has-session", "-t", sessionName]);
+      return true;
+    } catch (err) {
+      console.warn('[tmux] sessionExists/sendAndSubmit failed', { target, err: String(err) });
+      return false;
+    }
+  }
+
+  async sendCommand(
+    target: string,
+    command: string,
+    pressEnter = true,
+    skipSafetyCheck = false
+  ): Promise<SendCommandResult> {
+    this.ensureValidTarget(target);
+    const trimmed = command.trim();
+    if (!trimmed) {
+      throw new Error("Command is required");
+    }
+    if (/[\u0000-\u001f\u007f]/.test(trimmed)) {
+      throw new Error("Command contains unsupported control characters");
+    }
+
+    // Safety omitted in this lift (trusted paths for master launch use skipSafetyCheck=true; higher layers use guardrails.checkCommand)
+    // if (!skipSafetyCheck && this.safetyService) { ... }
+
+    await execFileAsync("tmux", ["send-keys", "-l", "-t", target, "--", trimmed]);
+    if (pressEnter) {
+      await execFileAsync("tmux", ["send-keys", "-t", target, "C-m"]);
+    }
+    this.touchSession(target); // SL-R2/R4: active input → refresh last_used_at
+    return {
+      message: `Sent command to ${target}${pressEnter ? " and pressed Enter" : ""}: ${trimmed}`,
+      blocked: false
+    };
+  }
+
+  // Type literal (non-interpreted) text into the composer. Extracted so the submit-verify path can be
+  // driven by tests independently of capturePane (StubTmux overrides this + sendEnter + sendKeys).
+  async sendLiteralText(target: string, text: string): Promise<void> {
+    await execFileAsync("tmux", ["send-keys", "-l", "-t", target, "--", text]);
+  }
+
+  // Send text literally then verify submission by a per-seat composer TRANSITION. Returns true only when
+  // the post-send pane positively proves submission; blank/boot/auth/capture-failure frames stay
+  // indeterminate and fail closed. Best-effort: never throws.
+  //
+  // F2 (opt-in, per-seat, master-safe): when `opts.readySignal` is supplied (the caller's provider
+  // readyProbe glyph, e.g. '❯' / '›'), the seat must PRESENT that signal before we type — a send attempted
+  // before the composer accepts input (empty first paint, codex launch echo, claude/grok auth/update/
+  // startup) lacks it → NOT delivered instead of typing into the void (BUG-1 does not recur). Callers that
+  // omit it (the master runtime feed, whose TUI does not surface ❯/› at feed time; legacy callers) keep the
+  // exact original behavior. This carries per-seat composer-ready state into verification without shared
+  // global state and without a heuristic that a different-TUI seat would fail.
+  //
+  // F1: the "still held?" check is `composerRegionHoldsText` — the composer region + OUR specific text only,
+  // never free-form response wording — so a reply merely ending in "Not now" cannot be misread as un-submitted.
+  async sendAndSubmit(target: string, text: string, opts?: { readySignal?: string; generationCountsAsSubmitted?: boolean }): Promise<boolean> {
+    try {
+      this.ensureValidTarget(target);
+      const trimmed = text.trim();
+      if (!trimmed) return false;
+
+      // Distinctive chunks used to detect our message in the composer region.
+      // head chunk: matches short messages on the composer line; tail chunk: matches LONG messages
+      // whose head scrolled out of the visible composer block (codex multi-line composer).
+      const chunk = trimmed.replace(/\s+/g, "").slice(0, 40);
+      const tailChunk = trimmed.replace(/\s+/g, "").slice(-40);
+
+      const fast = process.env.HELM_TEST_FAST_WD === '1';
+
+      // F2 opt-in per-seat readiness gate. Uses the SAME signal the caller's readyProbe uses, so it never
+      // misjudges a seat whose composer we don't otherwise model.
+      const readySignal = opts?.readySignal;
+      if (readySignal) {
+        const READY_BACKOFF_MS = fast ? [1, 1, 1, 1] : [100, 250, 500, 1000, 1500];
+        let ready = false;
+        for (const waitMs of READY_BACKOFF_MS) {
+          const pane = stripAnsiForMatch(await this.capturePane(target));
+          if (pane.includes(readySignal)) { ready = true; break; }
+          await setTimeoutPromise(waitMs);
+        }
+        if (!ready) return false; // composer never presented its ready signal → seat not accepting input
+      }
+
+      // Initial send: literal text, allow the TUI paste/composer to settle, then press Enter. These remain
+      // separate overridable calls so tests can reproduce the real send-keys paste/submit race exactly.
+      await this.sendLiteralText(target, trimmed);
+      this.touchSession(target); // SL-R2/R4: chat/message submission → refresh last_used_at (THE active-use path)
+      await setTimeoutPromise(fast ? 1 : 300);
+      await this.sendEnter(target);
+
+      // TRANSITION — our text must LEAVE the composer region. ROBUSTFIX v2 (live runs 76+78): codex can DROP
+      // Enter on a pasted composer for a post-boot window (>6s), so retry Enter-only (never a re-paste —
+      // single-clean-send preserved) on a BACKOFF totalling ~55s, stopping the moment the composer clears.
+      // A codex/spark seat can echo the submitted turn under a ›/❯ transcript line while it generates.
+      // isTextSubmitted accepts generation only when it is footer-scoped BELOW that payload-bearing line,
+      // which proves it belongs to this turn; stale generation above a held composer remains held.
+      const SUBMIT_BACKOFF_MS = fast ? [1, 1, 1, 1] : [1000, 2000, 4000, 8000, 15000, 25000];
+      for (const waitMs of SUBMIT_BACKOFF_MS) {
+        await setTimeoutPromise(waitMs);
+        const pane = stripAnsiForMatch(await this.capturePane(target));
+        const state = this.isTextSubmitted(pane, chunk, tailChunk);
+        if (state === "submitted") return true;
+        // Backward-compatible master/feed carve-out: ungated legacy callers historically accept an active
+        // no-composer generation frame. Interactive seats always pass readySignal and therefore stay on the
+        // fail-closed tri-state path above.
+        if (state === "indeterminate" && !readySignal
+          && /esc to interrupt|esc to cancel|⏹|Responding…|Generating…|Thinking…|Working…|thinking (?:with|·)/i.test(pane)) {
+          return true;
+        }
+        // An indeterminate boot/capture frame gives us no safe target for Enter. Keep polling, but never
+        // re-paste. Only a positively HELD composer receives a bounded Enter-only retry.
+        if (state !== "held") continue;
+        // The codex "Create a plan?" nudge SWALLOWS C-m; dismiss it with Esc (harmless) before re-pressing.
+        if (/Create a plan\?[\s\S]{0,120}esc dismiss/i.test(pane)) {
+          try { await this.sendKeys(target, 'Escape'); } catch {}
+          await setTimeoutPromise(fast ? 1 : 300);
+        }
+        await this.sendEnter(target);
+      }
+
+      await setTimeoutPromise(fast ? 1 : 1500);
+      const pane = stripAnsiForMatch(await this.capturePane(target));
+      const state = this.isTextSubmitted(pane, chunk, tailChunk);
+      if (state === "submitted") return true;
+      return state === "indeterminate" && !readySignal
+        && /esc to interrupt|esc to cancel|⏹|Responding…|Generating…|Thinking…|Working…|thinking (?:with|·)/i.test(pane);
+    } catch (err) {
+      console.warn('[tmux] sessionExists/sendAndSubmit failed', { target, err: String(err) });
+      return false;
+    }
+  }
+
+  // R8 (submit watchdog) — pure check: does this (already captured) pane show `text` still sitting
+  // UN-submitted in the composer? Extracted around isTextSubmitted so the watchdog probes
+  // (orchestrator-loop waitForCallback / planning first-callback wait) and unit tests share the
+  // exact same heuristic as sendAndSubmit's own verification (head chunk + tail chunk +
+  // paste/plan-nudge indicators, ANSI-stripped).
+  paneHoldsUnsubmittedText(rawPane: string, text: string): boolean {
+    const trimmed = (text ?? "").trim();
+    if (!trimmed) return false;
+    const chunk = trimmed.replace(/\s+/g, "").slice(0, 40);
+    const tailChunk = trimmed.replace(/\s+/g, "").slice(-40);
+    return this.isTextSubmitted(rawPane, chunk, tailChunk) === "held";
+  }
+
+  // R8 (submit watchdog) — live probe: capture the session's pane and report whether `text` is
+  // still visible un-submitted in its composer. Best-effort: any error (session gone etc) → false.
+  async composerHoldsText(target: string, text: string): Promise<boolean> {
+    try {
+      this.ensureValidTarget(target);
+      const pane = await this.capturePane(target);
+      return this.paneHoldsUnsubmittedText(pane, text);
+    } catch (err) {
+      console.warn('[tmux] composerHoldsText probe failed', { target, err: String(err) });
+      return false;
+    }
+  }
+
+  // MECHANISM-based, per-seat submit detection (F1/F2 redesign). The ONLY reliable signal is whether the
+  // COMPOSER REGION — the ❯/› input line plus its multi-line input block — still holds OUR specific text.
+  // It never inspects free-form RESPONSE text, so a reply that merely ENDS in "Not now" / "Press Enter to
+  // confirm" cannot be misread as un-submitted (F1), and "no composer region present" means our text is
+  // simply not held there (delivery is decided by a real held→cleared TRANSITION in sendAndSubmit, not by
+  // guessing boot-vs-submitted from a single frame — F2). Returns true iff OUR text is still in the composer.
+  composerRegionHoldsText(rawPane: string, chunk: string, tailChunk?: string): boolean {
+    if (!chunk && !tailChunk) return false;
+    const pane = stripAnsiForMatch(rawPane); // idempotent; defends direct callers passing -e output
+    // A pasted blob is text held in the composer (not yet submitted).
+    if (/\[Pasted Content|tab to queue/i.test(pane)) return true;
+    // CC-CHAT-1 (codex 5.5): the "Create a plan?  …  esc dismiss" nudge only shows while the composer
+    // HOLDS un-submitted multi-line text (below a bare ›, invisible to the composer-line scan). Held.
+    if (/Create a plan\?[\s\S]{0,120}esc dismiss/i.test(pane)) return true;
+    const lines = pane.replace(/\r\n/g, "\n").split("\n");
+    let composerIdx = -1;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (/^[❯›]/u.test(lines[i].trimStart())) {
+        composerIdx = i;
+        break;
+      }
+    }
+    if (composerIdx < 0) return false; // no composer region ⇒ our text is not held there
+    const composerChunk = lines[composerIdx].replace(/\s+/g, "");
+    if (chunk && composerChunk.includes(chunk)) return true;
+    // Multi-line composer (codex): content renders on the lines BELOW a bare ❯/› marker. A long message
+    // scrolls its head out of view — match the message TAIL against that below-marker block.
+    if (tailChunk) {
+      const below = lines.slice(composerIdx + 1).join("").replace(/\s+/g, "");
+      if (below.includes(tailChunk)) return true;
+    }
+    return false;
+  }
+
+  // worker-dispatch-feed submit-proof (P1 FOOTER-SCOPED). A generation indicator only proves OUR brief was
+  // submitted when it belongs to THIS turn — i.e. it renders in the live footer region STRICTLY BELOW the last
+  // ›/❯ composer/transcript line. Callers gate this behind `composerRegionHoldsText` being TRUE, so that last
+  // ›/❯ line is the one holding our just-typed brief (codex/spark echo the submitted turn back under a › line
+  // the composer check misreads as "still held"); a generation marker BELOW it is this turn's active work.
+  // A generation token sitting in STALE SCROLLBACK ABOVE a composer that STILL HOLDS our un-submitted brief is
+  // an EARLIER completed turn and is NOT below the composer line ⇒ NOT counted — else a not-submitted brief is
+  // falsely reported delivered (the P1 false-positive). Mirrors how the chat relay (paneIsGenerating) and the
+  // master-feed footer-scope their generation check. Keys on the SAME indicators those two already trust — NOT
+  // the composer glyph. Best-effort, pure over an already-captured pane (idempotent ANSI strip defends callers).
+  submittedByGeneration(rawPane: string): boolean {
+    const pane = stripAnsiForMatch(rawPane);
+    const lines = pane.replace(/\r\n/g, "\n").split("\n");
+    let composerIdx = -1;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (/^[❯›]/u.test(lines[i].trimStart())) { composerIdx = i; break; }
+    }
+    if (composerIdx < 0) return false; // no composer/transcript anchor → the composer-region check decides
+    // Only the region STRICTLY BELOW the payload-bearing composer line is THIS turn's active footer. A stale
+    // generation line ABOVE the held composer (composerIdx) is excluded by construction.
+    const footer = lines.slice(composerIdx + 1).join("\n");
+    return /esc to interrupt|esc to cancel|⏹|Responding…|Generating…|Thinking…|Working…|thinking (?:with|·)/i.test(footer);
+  }
+
+  // Tri-state submit proof. Absence of our text is not enough: a genuinely-cleared composer still renders
+  // a ❯/› line, whereas blank/boot/update/auth/capture-failure frames render no composer and are therefore
+  // indeterminate. A payload-bearing line followed by footer-scoped generation is positive proof that this
+  // turn submitted even though the TUI still echoes our text under the composer glyph.
+  private isTextSubmitted(rawPane: string, chunk: string, tailChunk?: string): TextSubmissionState {
+    const pane = stripAnsiForMatch(rawPane);
+    if (!pane.trim()) return "indeterminate";
+
+    if (this.composerRegionHoldsText(pane, chunk, tailChunk)) {
+      return this.submittedByGeneration(pane) ? "submitted" : "held";
+    }
+
+    const hasRenderedComposer = pane.replace(/\r\n/g, "\n").split("\n")
+      .some((line) => /^[❯›]/u.test(line.trimStart()));
+    return hasRenderedComposer ? "submitted" : "indeterminate";
+  }
+
+  async sendEnter(target: string): Promise<SendCommandResult> {
+    this.ensureValidTarget(target);
+    await execFileAsync("tmux", ["send-keys", "-t", target, "C-m"]);
+    this.touchSession(target); // SL-R2/R4: active input → refresh last_used_at
+    return {
+      message: `Sent Enter to ${target}`,
+      blocked: false
+    };
+  }
+
+  /**
+   * F3/R8 submit-watchdog primitive (G1: hoisted to TmuxService for reuse by chat-session-service
+   * and real-transport without duplication). If `text` is still visibly held in the composer
+   * (per the exact isTextSubmitted heuristic), dismiss any codex "Create a plan?" nudge then
+   * press Enter once. Returns true iff a re-press action was performed. Best-effort, never throws.
+   */
+  async resubmitIfComposerHeld(target: string, text: string): Promise<boolean> {
+    try {
+      this.ensureValidTarget(target);
+      const held = await this.composerHoldsText(target, text);
+      if (!held) return false;
+      const pane = stripAnsiForMatch(await this.capturePane(target, 60));
+      if (/Create a plan\?[\s\S]{0,120}esc dismiss/i.test(pane)) {
+        try { await this.sendKeys(target, 'Escape'); } catch {}
+        await setTimeoutPromise(300);
+      }
+      await this.sendEnter(target);
+      return true;
+    } catch (err) {
+      console.warn('[tmux] resubmitIfComposerHeld failed', { target, err: String(err) });
+      return false;
+    }
+  }
+
+  async createSession(name: string, cwd?: string): Promise<string> {
+    this.ensureValidSessionName(name);
+    // POCFIX4: idempotent for fixed per-project session names (e.g. 'helm_cards' leftover from prior run).
+    // Best-effort kill-if-exists (has-session then kill-session) before new-session so duplicate never throws.
+    try {
+      await execFileAsync("tmux", ["has-session", "-t", name]);
+      // exists -> kill (ignore errors, best-effort)
+      await execFileAsync("tmux", ["kill-session", "-t", name]).catch(() => {});
+    } catch {
+      // does not exist: proceed to create
+    }
+    const args = ["new-session", "-d", "-s", name];
+    if (cwd) {
+      args.push("-c", cwd);
+    }
+    await execFileAsync("tmux", args);
+    // ST-R1: positive, name-independent Helm ownership tag. Set a tmux session user-option `@helm_child 1`
+    // on EVERY session Helm creates (single choke point). This is the marker the janitor (ST-R2) REQUIRES
+    // before it will ever terminate a session — nothing untagged is ever killed. Best-effort: a set-option
+    // failure must never break/throw the create (swallowed + logged, exactly like the registry hook below).
+    await execFileAsync('tmux', ['set-option', '-t', name, '@helm_child', '1'])
+      .catch((err) => { console.warn('[tmux] set @helm_child failed (best-effort)', { name, err: String(err) }); });
+    // SL-R1: register EVERY created session centrally (single choke point). Best-effort — a registry
+    // failure must never break session creation.
+    try { this.registryHook.onCreate(name); } catch (err) { console.warn('[tmux] registry onCreate failed', { name, err: String(err) }); }
+    return `${name}:0.0`;
+  }
+
+  // ST-R2: positive Helm-ownership probe. Returns true ONLY if the live session carries the
+  // `@helm_child` user-option set to '1' (the marker createSession applies). On ANY error — session
+  // gone, tmux failure, option absent — returns FALSE (fail-safe: unknown ownership = NOT ours = never
+  // kill). The janitor gates its terminate on this so a non-Helm (or untagged) session can never be reaped.
+  async sessionHasHelmChildTag(name: string): Promise<boolean> {
+    try {
+      this.ensureValidSessionName(name);
+      const { stdout } = await execFileAsync('tmux', ['show-options', '-t', name, '-v', '@helm_child']);
+      return stdout.trim() === '1';
+    } catch (err) {
+      console.warn('[tmux] sessionHasHelmChildTag probe failed → treating as NOT-Helm (fail-safe)', { name, err: String(err) });
+      return false;
+    }
+  }
+
+  async createPane(sessionTarget: string, cwd?: string): Promise<string> {
+    // sessionTarget can be "session:window" or "session:window.pane"
+    const args = ["split-window", "-t", sessionTarget];
+    if (cwd) {
+      args.push("-c", cwd);
+    }
+    await execFileAsync("tmux", args);
+
+    // Get the new pane target
+    const panes = await this.listPanes();
+    const sessionName = sessionTarget.split(":")[0];
+    const sessionPanes = panes.filter((p) => p.session === sessionName);
+    const last = sessionPanes[sessionPanes.length - 1];
+    return last?.target || sessionTarget;
+  }
+
+  async terminateSession(sessionName: string): Promise<void> {
+    this.ensureValidSessionName(sessionName);
+    await execFileAsync("tmux", ["kill-session", "-t", sessionName]);
+    // SL-R1/R2: mark reaped centrally on terminate. Best-effort — never mask a real kill.
+    try { this.registryHook.onTerminate(sessionName); } catch (err) { console.warn('[tmux] registry onTerminate failed', { sessionName, err: String(err) }); }
+  }
+
+  async terminatePane(target: string): Promise<void> {
+    this.ensureValidTarget(target);
+    await execFileAsync("tmux", ["kill-pane", "-t", target]);
+  }
+
+  async capturePane(target: string, lines = 200): Promise<string> {
+    this.ensureValidTarget(target);
+    const safeLines = Math.max(20, Math.min(lines, 5000));
+    try {
+      const { stdout } = await execFileAsync("tmux", [
+        "capture-pane",
+        "-p",
+        "-e",
+        "-t",
+        target,
+        "-S",
+        `-${safeLines}`
+      ]);
+      // Convert \n to \r\n for xterm.js
+      return stdout.replace(/\n/g, "\r\n");
+    } catch (err) {
+      console.warn('[tmux] capturePane failed', { err: String(err) });
+      return "";
+    }
+  }
+
+  // Current working directory of a session's active pane. Used to resolve a coordinator's
+  // relative run_dir (registered relative to ITS cwd, not ours). Returns null if unknown.
+  async paneCurrentPath(session: string): Promise<string | null> {
+    this.ensureValidTarget(session);
+    try {
+      const { stdout } = await execFileAsync("tmux", [
+        "display-message",
+        "-p",
+        "-t",
+        session,
+        "#{pane_current_path}"
+      ]);
+      const dir = stdout.trim();
+      return dir || null;
+    } catch (err) {
+      console.warn('[tmux] paneCurrentPath failed', { session, err: String(err) });
+      return null;
+    }
+  }
+
+  ensureValidTarget(target: string): void {
+    const bareSession = /^[a-zA-Z0-9_.-]+$/.test(target);
+    const paneTarget = /^[a-zA-Z0-9_.-]+:[0-9]+\.[0-9]+$/.test(target);
+    if (!bareSession && !paneTarget) {
+      throw new Error("Invalid tmux target. Use format session or session:window.pane");
+    }
+  }
+
+  private ensureValidSessionName(name: string): void {
+    if (!/^[a-zA-Z0-9_.-]+$/.test(name)) {
+      throw new Error("Invalid session name. Use alphanumeric, underscore, dot, or dash only.");
+    }
+  }
+
+  // Added for P1-5b: pid-verify (list-panes -F #{pane_pid}) and exitSequence support
+  async getPanePid(target: string): Promise<string | null> {
+    this.ensureValidTarget(target);
+    try {
+      const { stdout } = await execFileAsync("tmux", ["list-panes", "-t", target, "-F", "#{pane_pid}"]);
+      return stdout.trim() || null;
+    } catch (err) {
+      console.warn('[tmux] getPanePid failed', { target, err: String(err) });
+      return null;
+    }
+  }
+
+  async sendKeys(target: string, keys: string): Promise<SendCommandResult> {
+    this.ensureValidTarget(target);
+    await execFileAsync("tmux", ["send-keys", "-t", target, keys]);
+    this.touchSession(target); // SL-R2/R4: active input → refresh last_used_at
+    return {
+      message: `Sent keys ${keys} to ${target}`,
+      blocked: false
+    };
+  }
+
+  async forceKillPane(target: string): Promise<void> {
+    this.ensureValidTarget(target);
+    await execFileAsync("tmux", ["respawn-pane", "-k", "-t", target]);
+  }
+
+  // B4 DSP1 helpers (small, surgical): ready probe + marker verify with exact bash fidelity (-J join + full ws-strip).
+  // Used by DispatchService for ensure/reuse + 3-call hand-off confirmation. Defaults match worker + sh.
+  async waitForReady(target: string, signal = '❯', timeoutMs = 30000): Promise<boolean> {
+    this.ensureValidTarget(target);
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const pane = await this.capturePane(target, 150);
+      if (pane.includes(signal)) return true;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    return false;
+  }
+
+  async capturePaneForVerify(target: string, lines = 200): Promise<string> {
+    this.ensureValidTarget(target);
+    const safeLines = Math.max(20, Math.min(lines, 5000));
+    try {
+      const { stdout } = await execFileAsync("tmux", [
+        "capture-pane",
+        "-p",
+        "-J", // join wrapped lines (bash -J) so marker not split
+        "-e",
+        "-t",
+        target,
+        "-S",
+        `-${safeLines}`
+      ]);
+      return stdout;
+    } catch (err) {
+      console.warn('[tmux] capturePaneForVerify failed', { target, err: String(err) });
+      return "";
+    }
+  }
+
+  async verifyMarkerPresent(target: string, marker: string, linesBack = 200): Promise<boolean> {
+    this.ensureValidTarget(target);
+    const pane = await this.capturePaneForVerify(target, linesBack);
+    // exact port of sh marker verify: full whitespace delete on both, then substring
+    const paneNW = pane.replace(/\s+/g, "");
+    const markNW = marker.replace(/\s+/g, "");
+    return paneNW.includes(markNW);
+  }
+
+  async sendDispatchInstruction(target: string, payload: string, readySignal?: string): Promise<boolean> {
+    this.ensureValidTarget(target);
+    // delegate to robust submit (handles composer paste issues like sendAndSubmit).
+    // F2: interactive worker SEAT — forward the provider ready glyph the dispatcher already readyProbed with,
+    // so a seat that never reached its composer is not falsely marked delivered.
+    // worker-dispatch-feed (2026-07-16): ALSO accept a live GENERATION indicator as submit-proof. DispatchService.start
+    // has already waitForReady'd this SAME glyph immediately before this call, so the seat IS ready; once it accepts the
+    // brief it starts GENERATING, and codex/spark echo the submitted brief back under a ›-prefixed transcript line that
+    // composerRegionHoldsText misreads as "still held" → the false "feed-failed" that stalled the live cards2 loop.
+    // Generation ⇒ delivered; a genuinely dead / never-accepting seat never generates → still returns false.
+    return this.sendAndSubmit(target, payload, { readySignal, generationCountsAsSubmitted: true });
+  }
+
+  // B7 DSP7: /clear primitive (provider-specific). MUST VERIFY reset actually happened (capture prompt / confirm clean state).
+  // codex/grok: TUI /clear (or fresh session equiv). claude: clear+rehydrate sequence.
+  // Returns issued + verified (clean prompt present, no prior task residue). Used by loop between tasks.
+  // Best-effort on send; verification is the guard (test both success and non-reset detection).
+  async clearContext(target: string, provider: string = 'codex'): Promise<{ issued: boolean; verified: boolean; postCapture: string }> {
+    this.ensureValidTarget(target);
+    let issued = false;
+    try {
+      let cmd = '/clear';
+      if (provider === 'claude') {
+        // claude clear+rehydrate (per brief)
+        cmd = 'clear';
+      } else if (provider === 'grok' || provider === 'codex') {
+        cmd = '/clear';
+      }
+      // F2: SEAT control command — gate on this provider's composer ready glyph so /clear is not falsely
+      // marked issued into a not-ready seat.
+      const submitOk = await this.sendAndSubmit(target, cmd, { readySignal: seatReadySignal(provider) });
+      if (submitOk) issued = true;
+      await new Promise((r) => setTimeout(r, 300));
+    } catch (err) {
+      console.warn('[tmux] clearContext send failed (best effort)', { target, provider, err: String(err) });
+    }
+    const postCapture = await this.capturePane(target, 80);
+    // VERIFY clean: ready prompt signal present AND no obvious prior context/task residue
+    const hasReady = /❯|ready|Human:|^\s*>|^\s*❯/i.test(postCapture);
+    const hasResidue = /batch-|thinking|previous|context|task|REPRO|working on/i.test(postCapture.slice(0, 300));
+    const verified = issued && hasReady && !hasResidue;
+    return { issued, verified, postCapture };
+  }
+
+  // A1: /compact primitive (provider-specific). Mirrors clearContext (B7 DSP7) but summarize-then-continue
+  // instead of a hard reset. claude + codex + grok CLIs all ship a native /compact; only a genuinely
+  // unknown/other provider gets a generic plain-language fallback instruction. Verify only that the pane
+  // returned to a ready prompt — compact INTENTIONALLY keeps the summarized conversation, so residual
+  // context/task words are EXPECTED (do NOT apply clearContext's !hasResidue term here). Longer settle
+  // wait than /clear — real summarization is slower than a plain reset.
+  async compactContext(target: string, provider: string = 'codex'): Promise<{ issued: boolean; verified: boolean; postCapture: string }> {
+    this.ensureValidTarget(target);
+    let issued = false;
+    try {
+      let cmd = '/compact';
+      if (provider === 'claude' || provider === 'codex' || provider === 'grok') {
+        // native /compact in all three CLIs (claude/codex/grok).
+        cmd = '/compact';
+      } else {
+        // genuinely unknown/other provider — generic plain-language fallback instruction line.
+        cmd = 'summarize the conversation so far into a compact form and continue';
+      }
+      // F2: SEAT control command — gate on this provider's composer ready glyph (undefined for an unknown
+      // provider → ungated, original behavior).
+      const submitOk = await this.sendAndSubmit(target, cmd, { readySignal: seatReadySignal(provider) });
+      if (submitOk) issued = true;
+      // Compaction does real summarization work — give the pane more time to settle than /clear before capture.
+      await new Promise((r) => setTimeout(r, 1500));
+    } catch (err) {
+      console.warn('[tmux] compactContext send failed (best effort)', { target, provider, err: String(err) });
+    }
+    const postCapture = await this.capturePane(target, 80);
+    // VERIFY: ready prompt signal present after compaction. NO residue check — compact keeps the
+    // (summarized) conversation, so prior context/task words remaining is expected, not a failure.
+    const hasReady = /❯|ready|Human:|^\s*>|^\s*❯/i.test(postCapture);
+    const verified = issued && hasReady;
+    return { issued, verified, postCapture };
+  }
+}

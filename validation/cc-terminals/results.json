@@ -1,0 +1,86 @@
+[
+  {
+    "name": "Terminals tab content renders",
+    "ok": true
+  },
+  {
+    "name": "Terminals tab button exists",
+    "ok": true
+  },
+  {
+    "name": "Run summary bar renders",
+    "ok": true
+  },
+  {
+    "name": "Summary working metric present",
+    "ok": true
+  },
+  {
+    "name": "Roster shows workers (>4 for overflow)",
+    "ok": true
+  },
+  {
+    "name": "2x2 grid renders 4 panes",
+    "ok": true
+  },
+  {
+    "name": "Pane status badges rendered",
+    "ok": true
+  },
+  {
+    "name": "Pane header has role title",
+    "ok": true
+  },
+  {
+    "name": "Live tmux capture visible in a pane (npm test line)",
+    "ok": true
+  },
+  {
+    "name": "Overflow grid tabs appear (>4 workers)",
+    "ok": true
+  },
+  {
+    "name": "Grid 2 overflow tab becomes active",
+    "ok": true
+  },
+  {
+    "name": "1x2 toggle -> button active",
+    "ok": true
+  },
+  {
+    "name": "1x2 grid renders 2 panes",
+    "ok": true
+  },
+  {
+    "name": "1x2 grid uses two-column layout",
+    "ok": true
+  },
+  {
+    "name": "2x2 toggle -> button active",
+    "ok": true
+  },
+  {
+    "name": "2x2 grid renders 4 panes again",
+    "ok": true
+  },
+  {
+    "name": "Clear empties the grid (selected 0)",
+    "ok": true
+  },
+  {
+    "name": "Add to grid places a worker (selected 1)",
+    "ok": true
+  },
+  {
+    "name": "Slot button places worker (>=1 selected)",
+    "ok": true
+  },
+  {
+    "name": "Timeline tab still renders (no regression)",
+    "ok": true
+  },
+  {
+    "name": "Chat tab still renders (no regression)",
+    "ok": true
+  }
+]

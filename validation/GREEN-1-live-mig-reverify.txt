@@ -1,0 +1,88 @@
+
+ RUN  v2.1.9 /home/agjrom/TGBOTS/Helm
+
+ ✓ src/p1-6b.test.ts > P1-6b Manual model hot-swap (master_switches v5 + switchModel 14-seq + digest fence + RESUME_ACK + UI + REAL cross proof; per APPROVED-PLAN + consensus §4/§5) > RTF-H5 double-launch guard: 2nd launchMaster while state=launching + alive session THROWS (no 2nd sendCommand) + supervisor ticks dont overlap
+ ✓ src/p2-1.test.ts > P2-1 Worker spawn through the app (ephemeral; spawn/reap/cap/reaper/migration/routes) > D1-fix1: v13→v14 migration on COPY of live data/helm.db allows source=chat, preserves rows + indexes + version=14
+ ✓ src/p2-1.test.ts > P2-1 Worker spawn through the app (ephemeral; spawn/reap/cap/reaper/migration/routes) > D3: v14→v15 migration on COPY of live data/helm.db preserves rows + adds tasks table + version=15
+ ✓ src/p2-1.test.ts > P2-1 Worker spawn through the app (ephemeral; spawn/reap/cap/reaper/migration/routes) > E1: v15→v16 migration on COPY of live data/helm.db preserves rows + adds memories table + idx + version=16 + supports proposed/app/project inserts + query filters
+ ✓ src/p2-1.test.ts > P2-1 Worker spawn through the app (ephemeral; spawn/reap/cap/reaper/migration/routes) > routes (Fastify inject — auth + loopback + seam + validation outcomes) > D3 TaskService CRUD + status grouping + upsert by task_key (idempotent)
+ ✓ src/p2-1.test.ts > P2-1 Worker spawn through the app (ephemeral; spawn/reap/cap/reaper/migration/routes) > routes (Fastify inject — auth + loopback + seam + validation outcomes) > D3 /ingest/task-update security: token-Y + body project_id=X records under Y NEVER X; bad/missing token → 401
+ ✓ src/p2-1.test.ts > P2-1 Worker spawn through the app (ephemeral; spawn/reap/cap/reaper/migration/routes) > routes (Fastify inject — auth + loopback + seam + validation outcomes) > D3 roster derivation (working/idle/not-spawned from master+worker runtimes state)
+ ✓ src/p2-1.test.ts > P2-1 Worker spawn through the app (ephemeral; spawn/reap/cap/reaper/migration/routes) > SSE /activity (P2-2 live board; real listen + http client; hijack + master-<id> filter + leak-safe teardown + auth + cap) > delivers snapshot then live events for chat-<id>; cross-project event filtered OUT (real listen + stream read) 763ms
+ ✓ src/p2-1.test.ts > P2-1 Worker spawn through the app (ephemeral; spawn/reap/cap/reaper/migration/routes) > SSE /activity (P2-2 live board; real listen + http client; hijack + master-<id> filter + leak-safe teardown + auth + cap) > disconnect calls unsubscribe (listener count drops — no leak) 4119ms
+ ✓ src/p2-1.test.ts > P2-1 Worker spawn through the app (ephemeral; spawn/reap/cap/reaper/migration/routes) > SSE /activity (P2-2 live board; real listen + http client; hijack + master-<id> filter + leak-safe teardown + auth + cap) > auth + OVM errors (viewer 403, unknown 400) + createSseAuthMiddleware accepts Bearer then ?access_token
+ ✓ src/project-service.test.ts > C1 ProjectService (A0/P1): CRUD + promote + autodetect mismatch + v12 mig on live copy > fresh DB yields SCHEMA_VERSION=13 + projects + project_agents tables exist (no rows)
+ ✓ src/project-service.test.ts > C1 ProjectService (A0/P1): CRUD + promote + autodetect mismatch + v12 mig on live copy > promote requires name+directory; UNIQUE name → 409-mappable error; stores primary_driver + tmux_session
+ ✓ src/project-service.test.ts > C1 ProjectService (A0/P1): CRUD + promote + autodetect mismatch + v12 mig on live copy > get/delete: 404-mappable on unknown; delete removes
+ ✓ src/project-service.test.ts > C1 ProjectService (A0/P1): CRUD + promote + autodetect mismatch + v12 mig on live copy > autodetect mismatch (fake session running grok while driver is claude → mismatch true w/ expected+detected; matching → ok)
+ ✓ src/project-service.test.ts > C1 ProjectService (A0/P1): CRUD + promote + autodetect mismatch + v12 mig on live copy > v8→v12 on a COPY of the live db preserves data (agents/models counts, adds projects table, version=12)
+ ✓ src/project-service.test.ts > C1 ProjectService (A0/P1): CRUD + promote + autodetect mismatch + v12 mig on live copy > listOpenTmuxSessions + listWithStatus basic (empty panes → [])
+ ✓ src/project-service.test.ts > C2 ProjectAgentService (P2): CRUD + one-primary invariant + dynamic GLOBAL pool + add-all idempotent + set-to-default + v8->v13 on live copy > add/list/remove + 404/409 on unknown/dup
+ ✓ src/project-service.test.ts > C2 ProjectAgentService (P2): CRUD + one-primary invariant + dynamic GLOBAL pool + add-all idempotent + set-to-default + v8->v13 on live copy > one-primary-driver invariant: setting new primary clears the old → exactly one flag=1
+ ✓ src/project-service.test.ts > C2 ProjectAgentService (P2): CRUD + one-primary invariant + dynamic GLOBAL pool + add-all idempotent + set-to-default + v8->v13 on live copy > model resolution: dynamic picks from GLOBAL pool; override; default (agent default_model_id)
+ ✓ src/project-service.test.ts > C2 ProjectAgentService (P2): CRUD + one-primary invariant + dynamic GLOBAL pool + add-all idempotent + set-to-default + v8->v13 on live copy > set-to-default resets overrides (model_id null + use_dynamic=0)
+ ✓ src/project-service.test.ts > C2 ProjectAgentService (P2): CRUD + one-primary invariant + dynamic GLOBAL pool + add-all idempotent + set-to-default + v8->v13 on live copy > add-all is idempotent (adds missing only; re-call no dups)
+ ✓ src/project-service.test.ts > C2 ProjectAgentService (P2): CRUD + one-primary invariant + dynamic GLOBAL pool + add-all idempotent + set-to-default + v8->v13 on live copy > v8→v13 on a COPY of the live db preserves data (agents/models/projects counts, adds project_agents table, version=13)
+stderr | src/p1-5a.test.ts > P1-5a Master launch (launchMaster + readyProbe + master-launched gate + master_runtimes v4) > REAL grok launch proof for real OVM project (seed grok-build chain, live tmux session + real readyProbe passed + master-launched event with shas + master_runtimes row running, THEN cleanup)
+[tmux] sessionExists/sendAndSubmit failed {
+  target: 'helm-EHR',
+  err: 'Error: Command failed: tmux has-session -t helm-EHR\n' +
+    "can't find session: helm-EHR\n"
+}
+
+stdout | src/p1-5a.test.ts > P1-5a Master launch (launchMaster + readyProbe + master-launched gate + master_runtimes v4) > REAL grok launch proof for real OVM project (seed grok-build chain, live tmux session + real readyProbe passed + master-launched event with shas + master_runtimes row running, THEN cleanup)
+P1-5a REAL PROOF — SESSION LIST (pre-cleanup): - AGJ-51:0.0 | cmd=claude | title=✳ Review AGJAssist upgrade plan and project structure
+- MNSVR:0.0 | cmd=claude | title=✳ Claude Code
+- cards-1031:0.0 | cmd=claude | title=✳ Build quick card dealing app with shuffle
+- derma-88:0.0 | cmd=claude | title=✳ Review app requirements and scope planning
+- helm-EHR:0.0 | cmd=grok | title=grok
+- helm-grok:0.0 | cmd=grok | title=⠹ - Running: cd /home/agjrom/TGBOTS/Helm &&… - GREEN-1: Make Full Vitest Suite Green - grok
+- hris-d-22:0.0 | cmd=claude | title=✳ Review HRIS project notes and improvements
+- hris-d-22-codex55:0.0 | cmd=node | title=HRIS
+- hris-d-22-grok:0.0 | cmd=grok | title=Implement Batch B12 Attendance Snappy Pa… - grok
+- lkcamp-12:0.0 | cmd=claude | title=✳ Fix image and comment pull issues on todo list
+- lkvc:0.0 | cmd=claude | title=✳ Claude Code
+- rsp:0.0 | cmd=claude | title=✳ Claude Code
+- wflow-18:0.0 | cmd=claude | title=✳ Review red team documentation for projcore integration
+P1-5a REAL PROOF — master-launched EVENT BODY: {
+  core_sha: 'c5d001c4b4de5b086614ad42f6e33a4da755d91e6659a6155676ce9254560bfb',
+  overlay_sha: '46c85496fcdc33782c73a445efa1de830b4581f12f11874ced436625c791341b',
+  preamble_sha: '56197baf8f872717725339f019ab5956310019430162eca92dc82b8665ac5aaa',
+  provider: 'grok',
+  model: 'grok-build',
+  session: 'helm-EHR:0.0',
+  sources: [ 'post' ]
+}
+P1-5a REAL PROOF — master_runtimes ROW state: running project_id: 1
+
+ ✓ src/p1-5a.test.ts > P1-5a Master launch (launchMaster + readyProbe + master-launched gate + master_runtimes v4) > REAL grok launch proof for real OVM project (seed grok-build chain, live tmux session + real readyProbe passed + master-launched event with shas + master_runtimes row running, THEN cleanup) 2145ms
+ ✓ src/p1-5a.test.ts > P1-5a Master launch (launchMaster + readyProbe + master-launched gate + master_runtimes v4) > re-launch guard negative path (deterministic, no real launch): second launchMaster when running row exists + tmux session alive → throws "master already running"
+ ✓ src/services/plumbing-watcher.test.ts > PlumbingWatcherService (B3a per consensus) > watch_reason: hash-stale + pane-alive (no dead) → progress_stall or checkin (hash wins)
+ ✓ src/services/plumbing-watcher.test.ts > PlumbingWatcherService (B3a per consensus) > v8->v11 (and any prior) migration on COPY of live data/helm.db preserves all existing rows + adds 3 tables (no loss)
+stderr | src/p1-6a.test.ts > P1-6a Command Center chat (setup list + send + history + UI; per APPROVED-PLAN reminders) > REAL round-trip proof (reminder 1): record as agent_event + ensure running (launch if needed) + prove sendAndSubmit delivered (real capture) + history from events ordered; cleanup
+[tmux] sessionExists/sendAndSubmit failed {
+  target: 'helm-EHR',
+  err: 'Error: Command failed: tmux has-session -t helm-EHR\n' +
+    "can't find session: helm-EHR\n"
+}
+
+stderr | src/p1-6a.test.ts > P1-6a Command Center chat (setup list + send + history + UI; per APPROVED-PLAN reminders) > REAL round-trip proof (reminder 1): record as agent_event + ensure running (launch if needed) + prove sendAndSubmit delivered (real capture) + history from events ordered; cleanup
+[tmux] sessionExists/sendAndSubmit failed {
+  target: 'helm-EHR',
+  err: 'Error: Command failed: tmux has-session -t helm-EHR\n' +
+    "can't find session: helm-EHR\n"
+}
+
+ ✓ src/p1-6a.test.ts > P1-6a Command Center chat (setup list + send + history + UI; per APPROVED-PLAN reminders) > REAL round-trip proof (reminder 1): record as agent_event + ensure running (launch if needed) + prove sendAndSubmit delivered (real capture) + history from events ordered; cleanup 2837ms
+ ✓ src/model-service.test.ts > B1 ModelService (S1) + B2 agent bindings + delete ref-guard + v10 mig (S2) > v9→v10 migration safe on COPY of live db (preserves agents + names, backfills default_model_id for name matches grok-build/codex-5.5/claude-sonnet per gate 1, cols, version=10)
+ ✓ src/memory-service.test.ts > E1 MemoryService (M1 + M2-backend): app + project scopes; propose→approve; JIT query; cross write-silo / read-allow > fresh DB yields SCHEMA_VERSION=16 + memories table + idx (two-track)
+ ✓ src/memory-service.test.ts > E1 MemoryService (M1 + M2-backend): app + project scopes; propose→approve; JIT query; cross write-silo / read-allow > AGENT-proposed app memory starts status=proposed; owner approve flips to approved; queryMemory returns ONLY approved (proposals excluded)
+ ✓ src/memory-service.test.ts > E1 MemoryService (M1 + M2-backend): app + project scopes; propose→approve; JIT query; cross write-silo / read-allow > queryMemory returns ONLY approved app + this-project (other project excluded; proposals never served)
+ ✓ src/memory-service.test.ts > E1 MemoryService (M1 + M2-backend): app + project scopes; propose→approve; JIT query; cross write-silo / read-allow > cross-project WRITE rejected (token claim only / enforceProjectId); cross-project READ allowed (owner list other pid)
+ ✓ src/memory-service.test.ts > E1 MemoryService (M1 + M2-backend): app + project scopes; propose→approve; JIT query; cross write-silo / read-allow > CRUD + approve/reject + list filters + project scope always approved
+
+ Test Files  8 passed | 6 skipped (14)
+      Tests  33 passed | 126 skipped (159)
+   Start at  12:51:24
+   Duration  12.43s (transform 284ms, setup 0ms, collect 694ms, tests 10.53s, environment 1ms, prepare 400ms)
+

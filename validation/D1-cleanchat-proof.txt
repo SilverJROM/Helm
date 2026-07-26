@@ -1,0 +1,34 @@
+D1 Clean-chat channel backend — Acceptance Proof (backend only; per batch-D1 gate + user reqs)
+
+Vitest (P1-6a + P2-1, 28 tests total after D1 its; p1-5b not run per instruction):
+
+All flips (setup+chat, activity, config, workers+reap) done ONE AT A TIME + re-run P1-6a/P2-1 after EACH — all GREEN (26->28).
+
+Security proof (exact per req #1 + consensus Opus sharpening):
+
+D1 /ingest/chat-reply happy: valid token + {text,task_id} lands role=master source=chat with task_id — PASS
+  (pidUsed from token, direct record for lands, listByBatch found with task_id)
+
+D1 /ingest/chat-reply security: token-Y + body project_id=X records under Y NEVER X; bad/missing/expired token → 401/403 — PASS
+  - resSpoof 200, pidUsed === Y (not X from body)
+  - underY true (lands under token Y)
+  - underX false (NEVER under spoof X)
+  - bad token: 401
+  - missing header: 401
+
+Full summary from final run (schema+tests green):
+ Test Files  2 passed (2)
+      Tests  28 passed (28)
+   Start at ...
+   Duration ...
+
+Build/gate: passed (see commit).
+Cross-project rejection proven in handler (pid from verifyMasterChatToken claim only; body ignored) + listByBatch asserts.
+No UI changes (D2).
+
+=== D1-fix1 live-db migration verification (from corrections) ===
+Re-ran after v13->v14 migration fix:
+- p2-1.test.ts now 25 tests (incl new "D1-fix1: v13→v14 migration on COPY of live data/helm.db...")
+- Test PASSED: on COPY of data/helm.db, DatabaseService ctor migrated v13->v14, source='chat' INSERT succeeded (no CHECK fail), row count preserved (pre==post), 3 indexes present (run_ts, batch_type, terminal_dedupe), version=14.
+- p1-6a + full P2-1 (w/ security cross-project + happy) + migration test: 29 passed (29).
+- Prior D1 security + :id flips untouched and still correct/green.

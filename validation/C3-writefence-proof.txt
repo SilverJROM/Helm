@@ -1,0 +1,27 @@
+BIN=/home/agjrom/TGBOTS/Helm/dist/tools/helm-sandbox
+proj=/tmp/c3-proj-SXif33
+sibling=/home/agjrom/c3-sibling-huMNwp
+fence=active Landlock ABI v4 (project-bound master/worker launches only)
+inside: status=0 stderr=
+outside-sibling: status=1 stderr=bash: line 1: /home/agjrom/c3-sibling-huMNwp/escape-bad.txt: Permission denied
+
+cross-read: status=0 stdout=CROSS-READ-SECRET
+outside-deeper: status=1
+KERNEL PROOF COMPLETE: EPERM on all outside writes (checked from host), success inside + cross-read.
+
+W1: proj=/tmp/c3-w1-proj-7C0DQo victim=/home/agjrom/c3-w1-victim-WjmpPk/fd_escape.txt fd=19
+status=1 stderr=bash: line 1: 19: Bad file descriptor
+ content_present=false
+W1 BLOCKED (fd scrubbed, write failed)
+
+W2: proj=/tmp/c3-w2-proj-GTLj7C badHome=/home/agjrom/c3-w2-badhome-ymlzBD
+status=1 created_in_bad=false stderr=mkdir: cannot create directory ‘/home/agjrom/c3-w2-badhome-ymlzBD/.config’: Permission denied
+
+W2 BLOCKED (real getpwuid home used; injected HOME ignored for exceptions)
+
+W3: cwd=/home/agjrom arg=. victim=/home/agjrom/c3-w3-victim-hhotdp/relative_escape.txt
+relative status=1 created=false stderr=helm-sandbox: project_dir must be an absolute path (got '.')
+
+W3 relative '.' BLOCKED (non-absolute project_dir rejected before rules)
+abs status=0 inside_created=true
+W3 absolute path still works (inside write OK)

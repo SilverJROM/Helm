@@ -1,0 +1,5 @@
+=== RUN 86 state (pre-stop):
+{"runId":86,"phase":"interview","status":"active","tasks":[],"current":null}
+=== tmux (run session spawned):
+helm-pm-cards: 1 windows (created Thu Jul  2 12:03:27 2026)
+=== worker_runtimes for run 86:

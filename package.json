@@ -1,0 +1,32 @@
+{
+  "name": "helm",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "check:webjs": "node --check src/web/public/app.js",
+    "build": "node --check src/web/public/app.js && tsc -p tsconfig.json && mkdir -p tools dist/tools && cc tools/helm-sandbox.c -o tools/helm-sandbox -Wall -Wextra && cp tools/helm-sandbox dist/tools/helm-sandbox && cp -r src/web dist/",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@fastify/cors": "^11.2.0",
+    "@fastify/static": "^9.0.0",
+    "@fastify/websocket": "^11.2.0",
+    "better-sqlite3": "^12.6.2",
+    "dotenv": "^16.4.5",
+    "fastify": "^5.8.1",
+    "jsonwebtoken": "^9.0.3"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.44.0",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/node": "^22.13.10",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3",
+    "vitest": "^2.1.8"
+  }
+}

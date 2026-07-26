@@ -1,0 +1,20 @@
+=== START RUN (curl):
+{"runId":87,"status":"started"}
+=== pre-stop state:
+{"runId":87,"phase":"interview","status":"active","tasks":[],"current":null}
+=== tmux run session:
+helm-pm-cards: 1 windows (created Thu Jul  2 12:08:13 2026)
+=== POST /api/runs/87/stop:
+{"runId":87,"ok":true,"phase":"failed","status":"failed","reapedWorkers":0}
+real	0m1.332s
+user	0m0.003s
+sys	0m0.002s
+
+=== post-stop state:
+{"runId":87,"phase":"failed","status":"failed","tasks":[],"current":null}
+=== idempotent second stop:
+{"runId":87,"ok":true,"alreadyTerminal":true,"phase":"failed","status":"failed","reapedWorkers":0}
+=== 404 unknown run:
+404
+=== tmux after (session reaped):
+(helm-pm-cards gone)
