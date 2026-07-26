@@ -30,7 +30,9 @@ data/swaps/
 # internal planning artifacts (projcore/lead run state — do not leak).
 # NOTE: plan-cache/ is product data (referenced by src/), keep it tracked.
 plan/
-/north-star.md
+# north-star.md is now TRACKED (JROM 2026-07-26). It is the PROJECT constitution, not run state:
+# no secrets, and it is what a future contributor — or JROM on another machine — needs. `plan/`
+# stays ignored because that IS per-run scaffolding.
 
 # [north] 2026-07-26 — pre-git backup litter. These 229 sibling copies existed ONLY because
 # the tree had no git; they stay on disk, they just aren't tracked. Superseded by real history.
