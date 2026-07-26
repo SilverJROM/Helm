@@ -155,6 +155,19 @@ Recorded because each one *misleads* someone who doesn't know it. Not a work que
 - **The adaptive planner is built and dark.** Stages 1-4 done and validated; **stage 5 (tests, telemetry,
   deploy) never executed**; default-OFF flag, no telemetry baseline ever taken, and its own status line
   is itself stale (`docs/adaptive-planner-plan.md:90-95`).
+- **The notification protocol documents a DEAD port.** `~/.config/agent-protocols/notifications.md`
+  §Transport says `POST 127.0.0.1:8701/notify`. **Nothing listens on 8701** — verified 2026-07-26. Every
+  page sent there is silently discarded, which is the *identical* failure the guardian's own code warns
+  about from 2026-07-09 (*"the escalation endpoint had never been implemented, so every page the old
+  daemon raised was dropped into a closed port"*). **The working route is
+  `POST 127.0.0.1:3101/api/guardian/escalate`** (AGJAssist, loopback-only, `x-overmind-token` or
+  `x-guardian-token`, body `{run_id, severity, title, lines[], action}`, 10-min in-memory dedupe).
+  **Two limits of that route:** `severity` accepts **only `BLOCKED`/`URGENT`** — there is no `DONE`; and
+  the real `buildDoneNotification` fires only from the Overmind lifecycle endpoint for a *registered
+  workflow*. **JROM has ruled Overmind OUT (2026-07-26: "skip overmind")**, and this run's registration
+  was refused anyway (`no-project-for-run-dir`). So **completion is sent as `URGENT` with a
+  completion-shaped title** — see the effort decision `D9`. Anyone testing the wire must test 3101, not
+  8701, and must not trust the protocol doc on this point until it is corrected.
 
 ## 9. Open questions — do NOT assume an answer
 
