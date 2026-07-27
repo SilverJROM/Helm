@@ -1418,6 +1418,23 @@ async function main(): Promise<void> {
     }
   });
 
+  // A6b / R3.14: POST /api/cycles/:id/finish-planning — production finishPlanning without requiring
+  // a live plancore seat cold-spawn. Same CycleService.finishPlanning the orchestrator calls at
+  // planning-done (A5): gate-mode → awaiting_approval=1 (phase stays planning); autonomous →
+  // implementation. Owner-only. Enables reliable post-approve proof and operator "plan is ready"
+  // without burning 80–120s on first-callback seat boot (flaky under live 180s caps).
+  app.post('/api/cycles/:id/finish-planning', { preHandler: [authMiddleware, requireOwnerPre] }, async (request: any, reply: any) => {
+    const id = Number(request.params.id);
+    try {
+      const c = cycleService.finishPlanning(id);
+      return { cycle: c };
+    } catch (e: any) {
+      if (e.code === 'NOT_FOUND') return reply.code(404).send({ error: e.message });
+      if (e.code === 'CONFLICT') return reply.code(409).send({ error: e.message });
+      return reply.code(400).send({ error: e.message });
+    }
+  });
+
   // B6-T03: POST /api/cycles/:id/approve — gate-mode awaiting-approval → implementation (R-E3).
   // B10b: service-layer FORBIDDEN (jkage L0) → 403.
   // A6 / R3.14: the run-orchestrator parks a gate-mode cycle's planning run without dispatching

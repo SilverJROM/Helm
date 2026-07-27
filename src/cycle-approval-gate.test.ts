@@ -163,4 +163,45 @@ describe.sequential('B6-T03 cycle approval gate (R-E3)', () => {
       await app.close();
     }
   });
+
+  it('POST /api/cycles/:id/finish-planning parks gate-mode at awaiting_approval (A6b setup path)', async () => {
+    // Mirrors production index.ts finish-planning route — same CycleService.finishPlanning as
+    // orchestrator planning-done. No plancore seat required.
+    const app = Fastify({ logger: false });
+    const requireOwnerPre = createRequireOwner();
+    app.post('/api/cycles/:id/finish-planning', { preHandler: [ownerAuth, requireOwnerPre] }, async (request: any, reply: any) => {
+      try {
+        const c = cycleService.finishPlanning(Number(request.params.id));
+        return { cycle: c };
+      } catch (e: any) {
+        if (e.code === 'NOT_FOUND') return reply.code(404).send({ error: e.message });
+        if (e.code === 'CONFLICT') return reply.code(409).send({ error: e.message });
+        return reply.code(400).send({ error: e.message });
+      }
+    });
+    await app.ready();
+    try {
+      const res = await app.inject({
+        method: 'POST',
+        url: `/api/cycles/${gateCycleId}/finish-planning`,
+        remoteAddress: '127.0.0.1',
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.cycle.phase).toBe('planning');
+      expect(body.cycle.awaiting_approval).toBe(true);
+      expect(isAwaitingApproval(body.cycle)).toBe(true);
+
+      // Not in planning → CONFLICT
+      const badId = insertCycle(dbs, projectId, 'Bad', 'bad_0703', 'pause_after_planning', 'discovery');
+      const badRes = await app.inject({
+        method: 'POST',
+        url: `/api/cycles/${badId}/finish-planning`,
+        remoteAddress: '127.0.0.1',
+      });
+      expect(badRes.statusCode).toBe(409);
+    } finally {
+      await app.close();
+    }
+  });
 });
