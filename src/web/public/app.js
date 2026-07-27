@@ -5715,7 +5715,12 @@ function App() {
         if (seatsPayload === 'absent' || seatsList.length === 0) {
           return html`<div class="text-sec" data-testid="ws-plan-panes-empty" style="font-size:11px;padding:6px">No seat panes for this cycle yet. Start Planning to record co-planner seats.</div>`;
         }
-        return html`<div class="cc-plan-panes" data-testid="ws-plan-panes" data-pane-count=${seatsList.length}>
+        // B4 send-back: data-pane-count = all seats (honest roster); data-live-pane-count = live only
+        // so e2e can fail if only historical rows satisfy a count contract (HIGH-2).
+        const livePaneCount = seatsList.filter((s) => s && s.live).length;
+        return html`<div class="cc-plan-panes" data-testid="ws-plan-panes"
+            data-pane-count=${seatsList.length}
+            data-live-pane-count=${livePaneCount}>
           ${seatsList.map((s) => {
             const rid = Number(s.id);
             const key = `${cycleId}::${rid}`;
@@ -5725,7 +5730,8 @@ function App() {
             const liveChip = s.live
               ? html`<span class="chip chip-green" data-testid=${`ws-plan-pane-live-${rid}`}>live</span>`
               : html`<span class="chip chip-orange" data-testid=${`ws-plan-pane-historical-${rid}`}>historical</span>`;
-            return html`<div class=${SESSION_PANE_CLASSES.pane} data-testid=${`ws-plan-pane-${rid}`} data-runtime-id=${rid} data-role=${s.role || ''}>
+            return html`<div class=${SESSION_PANE_CLASSES.pane} data-testid=${`ws-plan-pane-${rid}`}
+                data-runtime-id=${rid} data-role=${s.role || ''} data-live=${s.live ? '1' : '0'}>
               <div class=${SESSION_PANE_CLASSES.header}>
                 <span class="sp-pane-title" data-testid=${`ws-plan-pane-title-${rid}`}>${title}</span>
                 ${liveChip}
