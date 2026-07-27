@@ -2546,12 +2546,18 @@ async function main(): Promise<void> {
   // Lists the per-worker terminals for a project's active run so the UI can show N tmux panes at once.
   // Source of truth = master_runtimes (coordinator pseudo-worker) + worker_runtimes rows. Owner-guarded, :id validated.
   // Runtime state → status badge mapping mirrors the mockup vocabulary (WORKING/DONE/FAIL/idle).
+  // A15: WORKING only when state is launching|running AND tmux target still exists; self-heal
+  // finalize session-gone so stuck running/ended_at NULL never paints live.
   app.get('/api/projects/:id/terminals', { preHandler: [authMiddleware, requireOwnerPre] }, async (request: any, reply: any) => {
     const projectId = Number(request.params.id);
     const exists = db.prepare("SELECT 1 FROM projects WHERE id = ?").get(projectId);
     if (!exists) return reply.code(400).send({ error: 'unknown project' });
-    const mapState = (state: string, kind: 'master' | 'worker'): string => {
-      if (state === 'running' || state === 'launching') return 'WORKING';
+    const mapState = (state: string, kind: 'master' | 'worker', tmuxAlive?: boolean): string => {
+      if (state === 'running' || state === 'launching') {
+        // A15: truthful live — dead tmux is historical/idle, not WORKING.
+        if (kind === 'worker' && tmuxAlive === false) return 'idle';
+        return 'WORKING';
+      }
       if (state === 'done') return 'DONE';
       if (state === 'failed') return 'FAIL';
       if (state === 'parked') return 'idle';
@@ -2575,7 +2581,30 @@ async function main(): Promise<void> {
       });
     }
     const ws: any[] = db.prepare("SELECT id, role, provider, model, session, state, task_brief, correlation_id, started_at, ended_at FROM worker_runtimes WHERE project_id = ? ORDER BY id DESC").all(projectId);
+    const { finalizeWorkerRuntimeRow } = await import('./services/worker-runtime-finalize.js');
     for (const w of ws) {
+      let state = String(w.state || '');
+      let endedAt = w.ended_at || null;
+      let tmuxAlive: boolean | undefined;
+      const stateLive = state === 'launching' || state === 'running';
+      if (stateLive && w.session) {
+        try {
+          tmuxAlive = await tmuxService.sessionExists(String(w.session));
+        } catch {
+          tmuxAlive = false;
+        }
+        if (!tmuxAlive) {
+          // Self-heal: session gone but row still running → terminalize so next read is consistent.
+          finalizeWorkerRuntimeRow(db, Number(w.id), 'reaped', 'session-gone');
+          state = 'reaped';
+          endedAt = new Date().toISOString().replace('T', ' ').slice(0, 19);
+        }
+      } else if (stateLive && !w.session) {
+        tmuxAlive = false;
+        finalizeWorkerRuntimeRow(db, Number(w.id), 'reaped', 'session-gone');
+        state = 'reaped';
+        endedAt = new Date().toISOString().replace('T', ' ').slice(0, 19);
+      }
       out.push({
         id: String(w.id),
         kind: 'worker',
@@ -2583,12 +2612,13 @@ async function main(): Promise<void> {
         provider: w.provider,
         model: w.model,
         session: w.session || null,
-        state: w.state,
-        status: mapState(w.state, 'worker'),
+        state,
+        status: mapState(state, 'worker', tmuxAlive),
+        live: !!(stateLive && tmuxAlive && state !== 'reaped'),
         task: w.task_brief || null,
         batchId: w.correlation_id || null,
         startedAt: w.started_at || null,
-        endedAt: w.ended_at || null
+        endedAt
       });
     }
     return { workers: out };

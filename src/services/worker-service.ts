@@ -12,6 +12,7 @@ import { startGovernedDocGuard, type GovernedDocGuardHandle } from './doc-path-g
 import { applyEnvelopeIsolation } from './envelope-isolation.js';
 import type { SessionRegistryService } from './session-registry-service.js';
 import { HelmIdentityService } from './helm-identity-service.js';
+import { finalizeWorkerRuntimeRow, finalizeSessionGoneWorkers } from './worker-runtime-finalize.js';
 
 export class WorkerService {
   private reaperInterval: NodeJS.Timeout | null = null;
@@ -272,8 +273,9 @@ VALUES (?,?,?,?,?,?,?,?,datetime('now'), ?)
       this.governedDocGuards.delete(session);
     }
     // State machine: timeout is a FAILURE terminal; explicit/shutdown reap is 'reaped'.
+    // A15: shared finalize writer (idempotent if already terminal).
     const terminalState = reason === 'timeout' ? 'failed' : 'reaped';
-    this.db.prepare("UPDATE worker_runtimes SET state=?, exit_reason=?, ended_at=datetime('now') WHERE id=?").run(terminalState, reason, id);
+    finalizeWorkerRuntimeRow(this.db.raw, id, terminalState as 'failed' | 'reaped', reason);
     this.events.recordEvent({
       run_id: `worker-${id}`,
       role: 'system',
@@ -323,6 +325,13 @@ VALUES (?,?,?,?,?,?,?,?,datetime('now'), ?)
     if (this.reaperInFlight) return;
     this.reaperInFlight = true;
     try {
+      // A15 / R4: session-gone choke — launching|running whose tmux target is gone leave
+      // running/ended_at NULL without waiting for WORKER_TIMEOUT (~30min). Explicit finalize,
+      // not "hope the generic age janitor".
+      try {
+        await finalizeSessionGoneWorkers(this.db.raw, (name) => this.tmux.sessionExists(name));
+      } catch { /* best-effort */ }
+
       // H1: compare in a SINGLE time format. started_at is SQLite datetime('now') ("YYYY-MM-DD
       // HH:MM:SS", space). A JS toISOString() cutoff (with 'T') would sort lexicographically
       // wrong (space < 'T'), false-reaping fresh same-day workers. Use SQLite datetime arithmetic.

@@ -1,0 +1,37 @@
+- text: Helm Agent Platform
+- button "«"
+- text: Agent Studio Project Setup Command Center Memory Tracking TEAMS deliberation-team red-team silverjrom admin
+- button "Dark"
+- text: Agent Studio
+- button "⟨"
+- text: Select an agent Agents Models Tiers Teams Telemetry Plumbing / Watchers Routing
+- button "⟩"
+- text: Agent Context AGENTS (10)
+- button "Agents actions": ⋮
+- searchbox "Filter agents…"
+- text: ACTIVE No active sessions PROJECT AGENTS discovery project solo grok grok-4.5 ibrain project solo grok grok-4.5 implementer project tiered codex gpt-5.3-codex-spark panelist project solo claude claude-sonnet-4-6 plancore project solo grok grok-4.5 planner project team codex gpt-5.5 validator project tiered grok grok-4.5 HOUSE AGENTS agent-master house solo claude claude-sonnet-4-6 jkage house solo L0 · learner claude claude-sonnet-4-6 overseer house solo claude claude-haiku-4-5 TEAMS deliberation-team deliberation red-team red-team
+- button "+ New Agent"
+- text: "Project:"
+- combobox:
+  - option "— select / follows chat tab —" [selected]
+  - option "a15-validation-1785135809676"
+  - option "memory_mcp"
+  - option "imgedt"
+  - option "cards2"
+- text: ● live capture tmux mirror
+- button "Refresh"
+- text: 0 working now 0 passed / done 0 idle 0 fail / blocked Visible grid
+- group "Grid size":
+  - button "1x2"
+  - button "2x2"
+- text: Overflow tabs 0 ≤ 4 — all fit in one grid Selected 0/4 panes
+- article: Empty pane 1 choose a worker from the roster →
+- article: Empty pane 2 choose a worker from the roster →
+- article: Empty pane 3 choose a worker from the roster →
+- article: Empty pane 4 choose a worker from the roster →
+- complementary "Worker picker":
+  - text: Workers 0 total
+  - button "Fill from active tab"
+  - button "Clear"
+  - text: "No workers for this project's run yet. Panes show idle until a run spawns worker tmux sessions. Real source: /api/projects/:id/terminals (master_runtimes + worker_runtimes)."
+- text: "CC-MT: live per-worker tmux tails via /api/projects/:id/terminals/:wid (capture-pane, poll 1.5s). Grid density + roster slot placement persist per project. Degrades to idle/empty panes when no live sessions. Select an agent to see its context"

@@ -264,6 +264,8 @@ export class RunOrchestratorService {
       // missing deploy/final-test config) is recoverable — leave cycles.phase alone.
       if (kind === 'failure') {
         this.terminalizeCycleAtRunEnd({ runId });
+        // A15: seat ledger — finalize non-terminal worker_runtimes for this run.
+        void this.finalizeRunWorkerRuntimes(runId, 'run-blocked-failure');
       }
     } catch { /* terminal transition and operator alert are best-effort */ }
   }
@@ -310,6 +312,8 @@ export class RunOrchestratorService {
       } catch {}
       // A7 / R3.15: detached failure is a true terminal — advance cycle board if linked.
       this.terminalizeCycleAtRunEnd({ runId, cycleId: input.cycleId ?? null });
+      // A15: seat ledger on detached failure.
+      void this.finalizeRunWorkerRuntimes(runId, 'detached-start-failed');
     });
     return { runId, batchId };
   }
@@ -335,6 +339,25 @@ export class RunOrchestratorService {
       console.warn(
         `[RunOrchestrator] finishPlanning(${cycleId}) non-fatal at planning-done: ${e?.message || e}`
       );
+    }
+  }
+
+  /**
+   * A15 / R4: finalize every non-terminal worker_runtimes row for a run (seat ledger).
+   * Best-effort reaps the tmux session then shared finalizeWriter → reaped + ended_at.
+   * Used at true run terminals and planning-done-yield so seats never stick as running.
+   */
+  private async finalizeRunWorkerRuntimes(runId: number, reason: string): Promise<number> {
+    try {
+      const { finalizeRunWorkerRuntimes: finalizeRun } = await import('./worker-runtime-finalize.js');
+      const db = this.deps.artifacts['db'].raw;
+      return await finalizeRun(db, runId, reason, async (session) => {
+        try {
+          await this.deps.transport.reap(`${session}:0.0`, reason);
+        } catch { /* best-effort */ }
+      });
+    } catch {
+      return 0;
     }
   }
 
@@ -1017,6 +1040,8 @@ export class RunOrchestratorService {
         try { await this.deps.artifacts.persistState(runDir, ['interview', 'planning', 'failed'], 'failed', runId); } catch {}
         // A7 / R3.15: early true terminal (often still cycles.phase=planning — the JROM symptom).
         this.terminalizeCycleAtRunEnd({ runId, cycleId: input.cycleId ?? null });
+        // A15: seat ledger on early pre-exec fail (plancore/partner may still be "running").
+        await this.finalizeRunWorkerRuntimes(runId, 'pre-execution-failed');
         return runId;
       }
     }
@@ -1057,6 +1082,9 @@ export class RunOrchestratorService {
     // helm-algo owns execution from here — reap the planning-brain session so it CANNOT keep working past
     // PLAN-READY (runaway / token-burn guard; the brain is re-spawned on demand for decisions only).
     try { await this.deps.transport.reap(`${planningSessionName}:0.0`, 'planning-done-yield-to-algo'); } catch {}
+    // A15: tmux reap alone left worker_runtimes state=running/ended_at NULL (A1 insert, never finalize).
+    // Finalize ALL non-terminal seats for this run at planning-done yield (plancore + partner).
+    await this.finalizeRunWorkerRuntimes(runId, 'planning-done-yield-to-algo');
 
     // A5 / R3.13: production finishPlanning at planning-done. Only on the real planning path
     // (not cyclePlan / seedPlan skip paths — those never ran planning). Resolves cycle id from
@@ -1336,6 +1364,8 @@ export class RunOrchestratorService {
     } catch {}
     // A7 / R3.15: success or task-failed completion advances the cycle board to terminal `complete`.
     this.terminalizeCycleAtRunEnd({ runId });
+    // A15: seat ledger clean on run terminal (success or task-failed).
+    await this.finalizeRunWorkerRuntimes(runId, hadFailed ? 'run-failed' : 'run-complete');
 
     // D-a3: do NOT reap on completion (was silent reap). Instead set the close-confirm state
     // (an ibrain master_runtimes row with no closed_reason yet).
@@ -1622,19 +1652,8 @@ export class RunOrchestratorService {
         body: { text: `run ${runId} stopped by operator`, kind: 'run-stop', stop_reason: stopReason }
       });
     } catch { /* stop-reason note is best-effort */ }
-    let reapedWorkers = 0;
-    try {
-      const rows: any[] = db.prepare(
-        `SELECT id, session FROM worker_runtimes WHERE run_id = ? AND state NOT IN ('done','failed','reaped')`
-      ).all(runId);
-      for (const r of rows) {
-        if (r.session) { try { await this.deps.transport.reap(`${r.session}:0.0`, 'run-stopped'); } catch {} }
-        try {
-          db.prepare(`UPDATE worker_runtimes SET state='reaped', exit_reason='run-stopped', ended_at=datetime('now') WHERE id = ?`).run(r.id);
-          reapedWorkers += 1;
-        } catch {}
-      }
-    } catch { /* best-effort */ }
+    // A15: shared finalizeRunWorkerRuntimes (was inline UPDATE; now shared writer + reap).
+    const reapedWorkers = await this.finalizeRunWorkerRuntimes(runId, 'run-stopped');
     // Pre-executing phases (starting/interview/planning): the active party is the phase-brain
     // session, not a worker_runtimes row — reap it too so a stopped
     // interview doesn't leave a live TUI burning tokens. (In 'executing' the normal flow already

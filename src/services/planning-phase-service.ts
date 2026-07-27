@@ -10,6 +10,7 @@ import { parseCallbackLine } from './agent-event-ingest.js';
 import { classifySeatPane } from './seat-pane-state.js';
 import { CANONICAL_CYCLE_ARTIFACTS, materializeCanonicalArtifactSet } from './cycle-artifact-paths.js';
 import { validateExecutionPlan } from './execution-plan-parser.js';
+import { finalizeWorkerRuntimeRow } from './worker-runtime-finalize.js';
 
 /**
  * B9 PLN1: Planning-phase orchestration (projcore-brain + co-planner).
@@ -131,15 +132,13 @@ export class PlanningPhaseService {
     }
   }
 
-  // A1: transition a planning seat's worker_runtimes row to a terminal state on reap/retry.
+  // A1/A15: transition a planning seat's worker_runtimes row to a terminal state (shared finalizeWriter).
   private finalizeWorkerRuntime(id: number | null, state: 'done' | 'failed' | 'reaped', reason: string): void {
     if (id == null) return;
     try {
       const db = (this.artifacts as any)['db']?.raw;
       if (!db) return;
-      db.prepare(
-        `UPDATE worker_runtimes SET state=?, exit_reason=?, ended_at=datetime('now') WHERE id=? AND state NOT IN ('done','failed','reaped')`
-      ).run(state, reason, id);
+      finalizeWorkerRuntimeRow(db, id, state, reason);
     } catch {
       /* best-effort bookkeeping */
     }
@@ -230,6 +229,10 @@ export class PlanningPhaseService {
       canonicalArtifactRoot,
     });
 
+    // A15: hoist seat runtime ids so phase exit can finalize both (A1 only finalized plancore on retry).
+    let plancoreRuntimeId: number | null = null;
+    let partnerRuntimeId: number | null = null;
+
     // POCFIX20: projcore spawn-retry. Helm's claude spawn is intermittently flaky (empty pane / brief never
     // lands → no plan → dead run), while grok's is reliable; root cause is a hard-to-pin spawn timing/race.
     // Cause-agnostic robustness: if projcore emits NO callback within a window, reap + respawn (up to 3x).
@@ -240,7 +243,6 @@ export class PlanningPhaseService {
       const firstCbWindowMs = isFakeP ? 0 : clampedPlanningMs('HELM_CB_FIRST_CALLBACK_MS', 120_000, 5_000, 5 * 60_000);
       const cbPath = path.join(runDir, 'callbacks.md');
       let lastDispatchBrief = planningBrief;
-      let plancoreRuntimeId: number | null = null;
       for (let attempt = 1; attempt <= maxSpawnAttempts; attempt++) {
         let dispatchOffset = 0;
         try { dispatchOffset = (await fs.stat(cbPath)).size; } catch {}
@@ -292,7 +294,7 @@ export class PlanningPhaseService {
       await this.artifacts.writeBrief(runDir, partner, partnerBrief);
       const partnerSpawned = await this.transport.spawn({ role: partner, brief: partnerBrief, runDir, batchId: `${batchId}-partner`, model: inputs.partnerModel, provider: inputs.partnerProvider, attemptId: 0, projectDir: effectiveProjectDir, projectId: inputs.projectId, runId: inputs.runId, ...(inputs.strictReadAllow ? { strictReadAllow: inputs.strictReadAllow } : {}) });  // B-ISO1 + A2: projectId/runId → helm_sessions via createSession
       // A1 (R4.16): record the partner seat so it is DB-observable with run+cycle linkage.
-      this.registerWorkerRuntime(inputs.projectId, inputs.runId, partner, `${batchId}-partner`, partnerSpawned.handle, inputs.partnerProvider, inputs.partnerModel);
+      partnerRuntimeId = this.registerWorkerRuntime(inputs.projectId, inputs.runId, partner, `${batchId}-partner`, partnerSpawned.handle, inputs.partnerProvider, inputs.partnerModel);
     }
 
     // Fixture drive: simulate the exchange + agreement (tests append real [helm callback] lines + sleep).
@@ -392,6 +394,9 @@ export class PlanningPhaseService {
 
     if (!agreed) {
       // Gate blocked — do not ingest or hand off.
+      // A15: finalize planning seats so they do not stick as running after a failed gate.
+      this.finalizeWorkerRuntime(plancoreRuntimeId, 'reaped', 'planning-not-agreed');
+      this.finalizeWorkerRuntime(partnerRuntimeId, 'reaped', 'planning-not-agreed');
       return {
         agreed: false,
         coPlannerUsed: partner,
@@ -411,6 +416,11 @@ export class PlanningPhaseService {
     await materializeCanonicalArtifactSet(canonicalArtifactRoot, runDir);
     const rid = inputs.runId ?? this.artifacts.createRun(inputs.projectId ?? null, batchId, nsPath);
     const { createdTaskIds, keyToId } = await this.parser.ingestExecutionPlan(rid, planMarkdown, this.queue, runDir);
+
+    // A15: planning phase exit (success) — mark seats done. Orchestrator also finalizes at
+    // planning-done-yield (idempotent). Partner no longer depends on the generic janitor alone.
+    this.finalizeWorkerRuntime(plancoreRuntimeId, 'done', 'planning-phase-complete');
+    this.finalizeWorkerRuntime(partnerRuntimeId, 'done', 'planning-phase-complete');
 
     return {
       agreed: true,
