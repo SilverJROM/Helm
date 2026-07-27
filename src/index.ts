@@ -2264,7 +2264,31 @@ async function main(): Promise<void> {
           const promptEv: any = messages.find((m: any) => m?.body?.kind === 'run-prompt' && m?.body?.run_pk === runSel.id);
           if (promptEv && tsToMs(promptEv.ts) >= tsToMs(startedIso)) startedIso = new Date(tsToMs(promptEv.ts) + 1).toISOString();
           const tsArr = runCbTsCache.assign(`${projectId}:${runSel.batch_id}`, parsed.length, startedIso);
-          const cbMsgs = toRunChatMessages(parsed, { projectId, runPk: runSel.id, batchId: runSel.batch_id, ts: tsArr });
+          // A14 (D8/R4.31): helm_pm is a shared face for BOTH plancore and ibrain — resolve which
+          // one actually emitted a given line via this run's own worker_runtimes dispatch windows
+          // (same class of fix as agent-event-ingest.ts's roleMatches(run.role, parsed.role)).
+          let brainDispatches: { role: 'plancore' | 'ibrain'; startedAtMs: number; endedAtMs: number | null; model?: string | null; provider?: string | null }[] = [];
+          try {
+            const wrRows: any[] = db.prepare(
+              `SELECT role, model, provider, started_at, ended_at FROM worker_runtimes
+               WHERE run_id = ? AND role IN ('plancore','ibrain') AND started_at IS NOT NULL
+               ORDER BY started_at ASC`
+            ).all(runSel.id);
+            brainDispatches = wrRows.map((row, idx) => {
+              const startedAtMs = tsToMs(row.started_at);
+              const nextStart = wrRows[idx + 1] ? tsToMs(wrRows[idx + 1].started_at) : null;
+              // worker_runtimes.started_at/ended_at are SQLite datetime('now') — SECOND granularity —
+              // while a callback line's own ts (CallbackTsCache) is millisecond-precision. A line
+              // genuinely emitted just before a new dispatch can still land in the SAME reported second
+              // as that dispatch's (truncated-down) started_at. When a window's end is only IMPLICIT
+              // (the next dispatch's start, not this row's own recorded ended_at), pad it by just under
+              // a full second so a same-second line still resolves to the OLDER, already-active window
+              // rather than being prematurely handed to a dispatch that may not truly have started yet.
+              const endedAtMs = row.ended_at ? tsToMs(row.ended_at) : (nextStart != null ? nextStart + 999 : null);
+              return { role: row.role, startedAtMs, endedAtMs, model: row.model, provider: row.provider };
+            });
+          } catch { /* best-effort — falls back to the honest helm_pm label, never a guess */ }
+          const cbMsgs = toRunChatMessages(parsed, { projectId, runPk: runSel.id, batchId: runSel.batch_id, ts: tsArr, brainDispatches });
           messages = mergeChatMessages(messages, cbMsgs);
         }
       }

@@ -6510,9 +6510,13 @@ function App() {
               ${chatOnly.length ? chatOnly.map(m => {
                 const isO = m.role === 'owner';
                 const txt = (m.body && m.body.text) || m.text || '';
-                // CC-CHAT-2 R3: implementer/validator/panelist callback lines render as COMPACT
-                // muted status bubbles with a role chip (distinct from the agent bubbles).
-                if (m.run_cb && m.role !== 'helm-pm') {
+                // A14 (D8/R4.31): the server now sends the TRUE resolved role (plancore/ibrain/
+                // discovery/coord, or the honest 'helm_pm' fallback when dispatch context can't
+                // disambiguate) — never a literal internal-role/model mask. Phase-brain roles still
+                // render as the full agent bubble below; everything else (implementer/validator/
+                // panelist/reviewer/...) renders as a COMPACT muted status bubble with a role chip.
+                const isBrainRole = ['plancore', 'ibrain', 'discovery', 'coord', 'helm_pm'].includes(m.role);
+                if (m.run_cb && !isBrainRole) {
                   const stCls = /DONE|PASS|READY/i.test(m.state||'') ? 'success' : /FAIL|BLOCKED/i.test(m.state||'') ? 'warning' : 'info';
                   return html`<div class="cc-bubble" data-testid="chat-status-message" style="opacity:.72;padding:3px 8px;font-size:10px;max-width:92%;">
                     <span class="chip" style="font-size:8px;padding:0 4px;margin-right:3px;">${m.role}</span>
@@ -6520,7 +6524,10 @@ function App() {
                     <span style="margin-left:4px;color:var(--text-sec);">${String(txt).slice(0,180)}</span>
                   </div>`;
                 }
-                const who = isO ? 'JROM' : (m.role || 'master');
+                // Human-facing label: true role, plus the actual model when the dispatch window
+                // resolved one (A14 — "true internal role + actual model", never a bare face mask).
+                const brainModel = m.run_cb && m.body && m.body.model;
+                const who = isO ? 'JROM' : (brainModel ? `${m.role || 'master'} (${brainModel})` : (m.role || 'master'));
                 const sm = txt.match(/(STATUS:\s*\w+|✓\s*APPROVED-PLAN|●\s*gate pending|APPROVED-PLAN|DONE|BLOCKED)/i);
                 // Run coordinator bubbles carry a real state — chip it; else fall back to text sniff.
                 const stateChip = m.run_cb && m.state ? html`<span class="chip ${/DONE|READY|PASS/i.test(m.state)?'success':/WORKING|PLANNING|DECIDING/i.test(m.state)?'info':'warning'}" style="font-size:8px;padding:0 3px;">${m.state}</span>` : (sm ? html`<span class="chip ${/DONE|APPROVED/i.test(sm[0])?'success':/WORKING|PROPOSED/i.test(sm[0])?'info':'warning'}" style="font-size:8px;padding:0 3px;">${sm[0]}</span>` : null);
