@@ -431,6 +431,53 @@ describe('planning-phase-service (B9 PLN1) + gate + auto pick', () => {
       const res = await p;
       expect(res.agreed).toBe(false);
       expect(res.createdTaskIds).toEqual([]);
+      // A11 (R1.6): a mechanism-level reason naming the missing partner batch id — never a silent pass.
+      expect(res.blockedReason).toBeTruthy();
+      expect(res.blockedReason).toContain('batch-A8-stall-partner');
+      expect(res.blockedReason).toMatch(/ROUND-CAP-EXHAUSTED/);
+    } finally {
+      if (origPlanTo === undefined) delete (process.env as any).HELM_PLANNING_TIMEOUT_MS; else process.env.HELM_PLANNING_TIMEOUT_MS = origPlanTo;
+    }
+  }, 15000);
+
+  // A11 (D7/R1.30): the round cap is project config, not a constant — proven end to end by observing
+  // that the bounded-exit wait actually SCALES with roundCap (same per-round window, more rounds
+  // granted before giving up), not just that a reason string mentions "rounds".
+  it('A11: round cap scales the bounded-exit wait — roundCap=3 (default) waits ~3x longer than roundCap=1 before BLOCKED', async () => {
+    const origPlanTo = process.env.HELM_PLANNING_TIMEOUT_MS;
+    process.env.HELM_PLANNING_TIMEOUT_MS = '120'; // small per-round window, deterministic
+    try {
+      const t1Start = Date.now();
+      const res1 = await phase.runPlanningPhase({
+        runDir,
+        batchId: 'batch-A11-cap1',
+        northStar: 'Add a small utility function to format dates.',
+        conversationLog: 'clear scope',
+        mode: 'auto',
+        roundCap: 1,
+      });
+      const elapsed1 = Date.now() - t1Start;
+      expect(res1.agreed).toBe(false);
+      expect(res1.blockedReason).toContain('1 round(s)');
+
+      const t3Start = Date.now();
+      const res3 = await phase.runPlanningPhase({
+        runDir,
+        batchId: 'batch-A11-cap3',
+        northStar: 'Add a small utility function to format dates.',
+        conversationLog: 'clear scope',
+        mode: 'auto',
+        roundCap: 3,
+      });
+      const elapsed3 = Date.now() - t3Start;
+      expect(res3.agreed).toBe(false);
+      expect(res3.blockedReason).toContain('3 round(s)');
+      expect(res3.createdTaskIds).toEqual([]);
+
+      // roundCap=3 must wait meaningfully longer (same ~120ms per-round window, 3 rounds granted)
+      // than roundCap=1 — proving the cap actually governs the bound, not just labels it. 1.5x (not
+      // the full nominal 3x) keeps this robust against scheduler/poll-interval jitter on slower CI.
+      expect(elapsed3).toBeGreaterThan(elapsed1 * 1.5);
     } finally {
       if (origPlanTo === undefined) delete (process.env as any).HELM_PLANNING_TIMEOUT_MS; else process.env.HELM_PLANNING_TIMEOUT_MS = origPlanTo;
     }

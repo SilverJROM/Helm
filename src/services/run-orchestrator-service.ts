@@ -213,6 +213,22 @@ export class RunOrchestratorService {
     }
   }
 
+  // A11 (R1.6 + D7): read the project's co-planner agreement round cap — default 3 (fail-safe on any
+  // read error) — threaded into runPlanningPhase so the bounded-exit budget is config-driven, not a
+  // constant. Same fail-safe pattern as resolvePlanningPanelSize.
+  private resolvePlanningRoundCap(projectId?: number): number {
+    if (projectId == null) return 3;
+    try {
+      const row: any = this.deps.artifacts['db'].raw
+        .prepare('SELECT planning_round_cap FROM projects WHERE id = ?')
+        .get(projectId);
+      const n = Number(row?.planning_round_cap ?? 3);
+      return Number.isFinite(n) && n >= 1 ? Math.trunc(n) : 3;
+    } catch {
+      return 3;
+    }
+  }
+
   /**
    * v93: when adaptive_planning is ON, build PlannerPanel from project config (members/lead/backups).
    * Applies seat-binary availability for backup fallback when masterRuntime is present.
@@ -919,6 +935,7 @@ export class RunOrchestratorService {
         strictReadAllow: runStrictAllow,  // B-ISO1: run-scoped strict read fence for the planning seats
         adaptivePlanning: this.isAdaptivePlanning(projectId),  // v92: opt-in adaptive tiered planner
         panelSize: this.resolvePlanningPanelSize(projectId),  // A10: core-path planning panel size (total seats)
+        roundCap: this.resolvePlanningRoundCap(projectId),  // A11: co-planner agreement round cap
         runId: input.precreatedRunId,  // CC-CHAT-1 B2: reuse the detached-precreated run row (no duplicate)
         canonicalArtifactRoot,
         ...(adaptivePanel?.panel ? { panel: adaptivePanel.panel } : {}),
@@ -1011,6 +1028,7 @@ export class RunOrchestratorService {
         strictReadAllow: runStrictAllow,  // B-ISO1: run-scoped strict read fence for the planning seats
         adaptivePlanning: this.isAdaptivePlanning(projectId),  // v92: opt-in adaptive tiered planner
         panelSize: this.resolvePlanningPanelSize(projectId),  // A10: core-path planning panel size (total seats)
+        roundCap: this.resolvePlanningRoundCap(projectId),  // A11: co-planner agreement round cap
         runId,  // D-b1: reuse the interview-created run (prevents duplicate run row); phase already advanced to planning
         ...(adaptivePanel?.panel ? { panel: adaptivePanel.panel } : {}),
         ...(adaptivePanel?.isModelAvailable ? { isModelAvailable: adaptivePanel.isModelAvailable } : {}),
@@ -1051,16 +1069,19 @@ export class RunOrchestratorService {
       } catch {}
       const notAgreed = !!(planningRes && planningRes.agreed === false);
       if (notAgreed || (!isFakeEnv && zeroTasks)) {
+        // A11 (R1.6 + D7): a bounded planning exit (wall-clock timeout / round-cap exhaustion, the SAME
+        // mechanism under D7) must be a VISIBLE BLOCKED state that escalates to JROM, never silently
+        // recorded as a plain 'failed' run indistinguishable from any other crash. transitionRunToBlocked
+        // sets phase='blocked' (kind='failure' keeps status='failed' — this is genuinely a failure, not
+        // an operator-recoverable pause) and fires the same notifyBlockedRun alert other blocked paths use.
         const reason = notAgreed
-          ? 'PLANNING-NOT-AGREED: co-planner verdict never arrived (gate blocked); plan not ingested'
+          ? (planningRes?.blockedReason || 'PLANNING-NOT-AGREED: co-planner verdict never arrived (gate blocked); plan not ingested')
           : 'ZERO-TASKS-INGESTED: no run_tasks after planning; refusing vacuous complete';
-        console.warn(`[RunOrchestrator] run ${runId} FAILED pre-execution: ${reason}`);
-        try { this.deps.artifacts['db'].raw.prepare(`UPDATE runs SET phase = 'failed', status = 'failed', ended_at = datetime('now') WHERE id = ?`).run(runId); } catch {}
-        try { await this.deps.artifacts.persistState(runDir, ['interview', 'planning', 'failed'], 'failed', runId); } catch {}
-        // A7 / R3.15: early true terminal (often still cycles.phase=planning — the JROM symptom).
-        this.terminalizeCycleAtRunEnd({ runId, cycleId: input.cycleId ?? null });
-        // A15: seat ledger on early pre-exec fail (plancore/partner may still be "running").
-        await this.finalizeRunWorkerRuntimes(runId, 'pre-execution-failed');
+        console.warn(`[RunOrchestrator] run ${runId} BLOCKED pre-execution: ${reason}`);
+        try { await this.deps.artifacts.persistState(runDir, ['interview', 'planning', 'blocked'], 'blocked', runId); } catch {}
+        // transitionRunToBlocked also terminalizes the cycle board + finalizes worker_runtimes seat
+        // ledger (kind='failure' path) — no need to duplicate those calls here.
+        this.transitionRunToBlocked(runId, reason, project);
         return runId;
       }
     }

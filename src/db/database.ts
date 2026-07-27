@@ -3282,6 +3282,23 @@ ALTER TABLE runs_new RENAME TO runs;
         }
         this.db.prepare('UPDATE schema_version SET version = 99').run();
       }
+
+      // v100 / A11 (R1.6 + D7/R1.30): per-project agreement round cap for the co-planner planning gate
+      // — default 3, mirroring (not reusing) the unenforced topology.yaml deliberation_panel.max_rounds
+      // convention so an operator learns one rule. Exhausting the cap is the SAME bounded-exit mechanism
+      // as the R1.6 wall-clock timeout (D7: "shares R1.6's mechanism and owning row"), never a silent
+      // pass — see PlanningPhaseService.runPlanningPhase's effectiveTimeoutMs (perRoundMs * roundCap).
+      if (current && current.version < 100) {
+        if (hasTable('projects')) {
+          const cols = this.db.prepare('PRAGMA table_info(projects)').all() as any[];
+          if (!cols.some((c) => c.name === 'planning_round_cap')) {
+            this.db.exec(
+              "ALTER TABLE projects ADD COLUMN planning_round_cap INTEGER NOT NULL DEFAULT 3 CHECK(planning_round_cap >= 1)"
+            );
+          }
+        }
+        this.db.prepare('UPDATE schema_version SET version = 100').run();
+      }
     }
   }
 

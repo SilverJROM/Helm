@@ -86,6 +86,10 @@ export interface PlanningInputs {
   panel?: import('./adaptive-planning-phase.js').PlannerPanel;
   /** v93: optional availability probe for backup fallback (seat-binary). */
   isModelAvailable?: (provider: string, model: string) => boolean | Promise<boolean>;
+  /** A11 (R1.6 + D7): co-planner agreement round cap, from project.planning_round_cap. Default/undefined
+   *  => 3. The bounded-exit wall-clock budget is PLANNING_TIMEOUT_MS * roundCap (see effectiveTimeoutMs) —
+   *  exhausting it is D7's "round cap exhausted", the SAME mechanism as R1.6's timeout, never a silent pass. */
+  roundCap?: number;
 }
 
 export interface PlanningResult {
@@ -99,6 +103,9 @@ export interface PlanningResult {
   createdTaskIds: number[];
   keyToId: Record<string, number>;
   runId: number;               // A2: the DB run created (now supports projectId)
+  /** A11 (R1.6 + D7): set only when agreed===false — a mechanism-level reason naming the missing
+   *  partner batch id(s) and the round-cap budget exhausted, for the caller's visible BLOCKED state. */
+  blockedReason?: string;
 }
 
 export function selectCoPlannerMode(
@@ -287,6 +294,13 @@ export class PlanningPhaseService {
     // fake/fixture: keep 4000ms for fast tests. This + post-wait poll for BOTH signals/file fixes real projcore planning (minutes) always blocking on 4s.
     const isFake = process.env.USE_FAKE_TMUX === '1' && process.env.NODE_ENV !== 'production';
     const PLANNING_TIMEOUT_MS = parseInt(process.env.HELM_PLANNING_TIMEOUT_MS || (isFake ? '4000' : '600000'), 10);
+    // A11 (R1.6 + D7): the agreement gate's bounded-exit budget is now expressed in project-configurable
+    // "rounds" of the existing per-round window (default roundCap=3, so the effective budget is 3x the
+    // window above) — exhausting it is D7's "round cap exhausted", the SAME mechanism as R1.6's timeout.
+    // Only the whole-plan agreement wait (waitForAgreement) is scaled; the canonical-doc-write poll
+    // below is a separate wait (plancore finishing its write after agreement) and is untouched.
+    const roundCap = Math.max(1, Math.trunc(inputs.roundCap ?? 3) || 3);
+    const effectiveTimeoutMs = PLANNING_TIMEOUT_MS * roundCap;
 
     await this.ensureDir('prompts', runDir);
     await this.ensureDir('', runDir);
@@ -435,7 +449,7 @@ export class PlanningPhaseService {
     // A8 (R1.2): waitForAgreement requires BOTH the partner agreement signal AND projcore PLAN-READY in
     // every mode — 'planner' no longer fast-paths on PLAN-READY alone. real path adds explicit file poll
     // below for BOTH before ingest.
-    const agreed = await this.waitForAgreement(cbPath, batchId, partner, brainRole, PLANNING_TIMEOUT_MS, agreementFenceOffset, partnerBatchIds);
+    const agreed = await this.waitForAgreement(cbPath, batchId, partner, brainRole, effectiveTimeoutMs, agreementFenceOffset, partnerBatchIds);
 
     // Short grace for plancore to flush canonical documents before the PLAN-READY callback is consumed.
     await new Promise((r) => setTimeout(r, 120));
@@ -527,6 +541,10 @@ export class PlanningPhaseService {
       this.finalizeWorkerRuntime(plancoreRuntimeId, 'reaped', 'planning-not-agreed');
       for (const id of partnerRuntimeIds) this.finalizeWorkerRuntime(id, 'reaped', 'planning-not-agreed');
       await this.advanceAgreementFence(runDir, batchId, path.join(runDir, 'callbacks.md'));
+      // A11 (R1.6 + D7): a mechanism-level reason naming the missing partner batch id(s) and the
+      // round-cap budget exhausted — never a generic/silent message. Bounded exit, visible BLOCKED
+      // (the caller, RunOrchestratorService, turns this into phase='blocked' + operator notification).
+      const blockedReason = `ROUND-CAP-EXHAUSTED (R1.6/D7): no unanimous CLEAN verdict within ${roundCap} round(s) (~${effectiveTimeoutMs}ms budget); partner batch(es) [${partnerBatchIds.join(', ') || 'none configured'}] never confirmed agreement — bounded exit, never a silent pass.`;
       return {
         agreed: false,
         coPlannerUsed: partner,
@@ -537,7 +555,8 @@ export class PlanningPhaseService {
         plan,
         createdTaskIds: [],
         keyToId: {},
-        runId: 0
+        runId: 0,
+        blockedReason
       };
     }
 

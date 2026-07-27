@@ -2,7 +2,7 @@ import type Database from "better-sqlite3";
 import { assertAllRoleTiersInvariants } from "./role-tier-invariants.js";
 import { PROVIDERS } from "../config/providers.js";
 
-export const SCHEMA_VERSION = 99;
+export const SCHEMA_VERSION = 100;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -130,6 +130,8 @@ CREATE TABLE IF NOT EXISTS projects (
   -- v99 / A10 (R1.3): core (non-adaptive) planning panel size — total seats (plancore + partners).
   -- Default 2 preserves today's plancore+1-partner behavior; config replaces the removed north-star guess.
   planning_panel_size INTEGER NOT NULL DEFAULT 2 CHECK(planning_panel_size >= 1),
+  -- v100 / A11 (R1.6 + D7): per-project agreement round cap for the co-planner gate, default 3.
+  planning_round_cap INTEGER NOT NULL DEFAULT 3 CHECK(planning_round_cap >= 1),
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
