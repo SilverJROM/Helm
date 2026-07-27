@@ -15,6 +15,7 @@ import { RunOrchestratorService } from './services/run-orchestrator-service.js';
 import { EscalationService } from './services/escalation-service.js';
 import { PanelService } from './services/panel-service.js';
 import { CycleService, isAwaitingApproval } from './services/cycle-service.js';
+import { requestRunAbort, getRunAbort, clearRunAbort } from './services/run-abort-registry.js';
 
 /**
  * A6 / R3.14 — pause_after_planning actually gates the implementation queue.
@@ -266,5 +267,77 @@ describe.sequential('A6 R3.14 pause_after_planning gate', () => {
       .prepare('SELECT COUNT(*) AS c FROM task_attempts ta JOIN run_tasks rt ON ta.task_id = rt.id WHERE rt.run_id = ?')
       .get(implRunId);
     expect(Number(implAttemptsRow.c)).toBeGreaterThan(0);
+  });
+
+  it('A6b: recycled runs.id does not inherit a stale abort — cyclePlan still dispatches', async () => {
+    // Mechanism: INTEGER PRIMARY KEY without AUTOINCREMENT reuses free rowids after DELETE.
+    // A prior stop left requestRunAbort(id) in the process-local registry; createRun must clear it
+    // so a fresh cyclePlan run is not aborted at pre-execution with zero attempts.
+    const proj = projectSvc.createProject({ name: 'a6b-abort-recycle', directory: projDir });
+    const cycle = await cycleSvc.createCycle(proj.id, 'A6b abort recycle', 'pause_after_planning');
+    cycleSvc.setCyclePhase(cycle.id, 'planning');
+
+    // Author cycle plan.md (cyclePlan seed reads cycle folder, not runDir plan.json).
+    const cycleDir = cycleSvc.getCycleDocDir(cycle.id);
+    await fs.mkdir(cycleDir, { recursive: true });
+    const planMd =
+      '# Plan\n\n```json\n' +
+      JSON.stringify([
+        {
+          id: 'T1',
+          batch: 'A6b',
+          title: 'A6b abort-recycle proof',
+          req_refs: ['R3.14'],
+          assignee: 'grok-4.5',
+          validator_lane: 'L2',
+          effort: 'low',
+          type: 'feature',
+        },
+      ]) +
+      '\n```\n';
+    await fs.writeFile(path.join(cycleDir, 'plan.md'), planMd, 'utf8');
+    await fs.writeFile(path.join(cycleDir, 'og-requirements.md'), '# R3.14\n', 'utf8');
+    await fs.writeFile(path.join(cycleDir, 'north-star.md'), '# ns\n', 'utf8');
+
+    // Poison a run id that SQLite will reuse after delete (max free rowid).
+    const poisonId = artifacts.createRun(proj.id, 'a6b-poison', null, cycle.id);
+    requestRunAbort(poisonId, 'A6 live evidence capture complete');
+    expect(getRunAbort(poisonId)?.reason).toContain('A6 live evidence');
+    db.raw.prepare('DELETE FROM runs WHERE id = ?').run(poisonId);
+
+    // createRun must clear the recycled id's abort (product contract).
+    const implBatchId = `a6b-impl-${Date.now().toString(36)}`;
+    await seedImplementationCallbacks(proj.id, implBatchId);
+    const freshId = artifacts.createRun(proj.id, implBatchId, null, cycle.id);
+    expect(freshId).toBe(poisonId); // recycled rowid — the condition under test
+    expect(getRunAbort(freshId)).toBeNull();
+
+    // Gate-mode cycle was never planning-driven in this unit — seed awaiting_approval so
+    // approveCycle is valid. Park half is A6's ownership; this row owns post-approve dispatch.
+    db.raw
+      .prepare("UPDATE cycles SET phase = 'planning', awaiting_approval = 1, autonomy = 'pause_after_planning' WHERE id = ?")
+      .run(cycle.id);
+    const approved = cycleSvc.approveCycle(cycle.id);
+    expect(approved.phase).toBe('implementation');
+
+    const implRunId = await orch.startRun({
+      projectId: proj.id,
+      cycleId: cycle.id,
+      prompt: `implement cycle ${cycle.id} from plan.md`,
+      batchId: implBatchId,
+      cyclePlan: true,
+      precreatedRunId: freshId,
+    });
+    expect(implRunId).toBe(freshId);
+
+    const implTasks = db.raw.prepare('SELECT id, status FROM run_tasks WHERE run_id = ?').all(implRunId) as any[];
+    expect(implTasks.length).toBeGreaterThan(0);
+    expect(implTasks.some((t: any) => t.status !== 'pending')).toBe(true);
+    const attemptsRow: any = db.raw
+      .prepare('SELECT COUNT(*) AS c FROM task_attempts ta JOIN run_tasks rt ON ta.task_id = rt.id WHERE rt.run_id = ?')
+      .get(implRunId);
+    expect(Number(attemptsRow.c)).toBeGreaterThan(0);
+
+    clearRunAbort(freshId);
   });
 });

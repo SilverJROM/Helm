@@ -6,7 +6,8 @@ export default defineConfig({
   // A1 (F5, plan §1.8a): widened once so a newly added `<row-id>.live.spec.ts` is collected
   // alongside the pre-existing batch-cap-projects.spec.ts — previously only the latter matched,
   // so a new live spec silently ran nothing against :3110.
-  testMatch: /(batch-cap-projects\.spec|[AB]\d+\.live\.spec)\.ts$/,
+  // Optional trailing letter allows split rows (A6b, A15-style still uses digits only).
+  testMatch: /(batch-cap-projects\.spec|[AB]\d+[a-z]?\.live\.spec)\.ts$/,
   timeout: 180 * 1000,
   expect: { timeout: 30 * 1000 },
   fullyParallel: false,

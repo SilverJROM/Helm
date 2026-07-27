@@ -413,6 +413,13 @@ export class RunOrchestratorService {
     let project = this.deps.projectService.getProject(projectId);
     if (!project) throw new Error('unknown project');
 
+    // A6b belt-and-braces: createRun already clearRunAborts the new id, but a caller that reuses a
+    // precreatedRunId after an external stop (or a recycled-id race before createRun was fixed)
+    // must not inherit a stale abort at pre-execution / task-boundary.
+    if (input.precreatedRunId != null && Number.isFinite(Number(input.precreatedRunId))) {
+      clearRunAbort(Number(input.precreatedRunId));
+    }
+
     // B-ISO1 (sol wiring review fix #4): resolve the RUN-SCOPED strict read policy ONCE, at run start,
     // and thread it to every seat this run spawns (interview + planning + execution loop + panels).
     // Validate fail-fast here (same fail-closed rules the sandbox enforces) so a bad run policy refuses

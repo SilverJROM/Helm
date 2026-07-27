@@ -1,6 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { DatabaseService } from '../db/database.js';
+import { clearRunAbort } from './run-abort-registry.js';
 
 export class ValidatorProtocolDefectError extends Error {
   readonly code = 'VALIDATOR_PROTOCOL_DEFECT';
@@ -196,7 +197,14 @@ export class RunArtifactService {
     const info = this.db.raw
       .prepare(`INSERT INTO runs (project_id, cycle_id, batch_id, north_star_ref, status) VALUES (?,?,?,?, 'active')`)
       .run(projectId, cycleId, batchId, northStarRef);
-    return info.lastInsertRowid as number;
+    const runId = Number(info.lastInsertRowid);
+    // A6b: runs.id is INTEGER PRIMARY KEY without AUTOINCREMENT, so SQLite reuses free rowids after
+    // CASCADE delete (e.g. project teardown). The process-local abort registry is keyed by runId and
+    // survives that delete — a stale POST /stop from a prior test/run would abort the NEW run at
+    // pre-execution with zero attempts (live A6: "implementation queue never dispatched after
+    // approveCycle"). Clear on every new row so a recycled id never inherits a previous stop.
+    clearRunAbort(runId);
+    return runId;
   }
 
   /** Append a durable orchestration metric/event without exposing the private DB handle. */
