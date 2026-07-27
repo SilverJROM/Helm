@@ -17,6 +17,8 @@ import { TmuxService } from '../tmux/tmux-service.js';
 import { EscalationService } from './escalation-service.js';
 import { PanelService } from './panel-service.js';
 import { DispatchService } from './dispatch-service.js';
+import { CycleService } from './cycle-service.js';
+import { CANONICAL_CYCLE_ARTIFACTS } from './cycle-artifact-paths.js';
 
 describe('RunOrchestratorService (A2 wiring)', () => {
   let db: DatabaseService;
@@ -2102,5 +2104,152 @@ describe('E-phase (E1 mid-run inject/redirect at boundary; E2 checkin+stale->run
       await fs.rm(rDir, { recursive: true, force: true }).catch(() => {});
       await fs.rm(tmpDb, { force: true }).catch(() => {});
     });
+  });
+});
+
+// === B1 (SEAM-2/N10/R2.8): canonicalArtifactRoot resolves from the cycle for EVERY cycle-linked
+// entry path, independent of cyclePlan — and non-cyclePlan build/fence semantics stay byte-identical ===
+describe('B1: SEAM-2 canonicalArtifactRoot for cycle-linked non-cyclePlan runs', () => {
+  it('a cycle-linked (non-cyclePlan) run materializes the CYCLE-authored north-star.md into runDir — not the raw prompt', async () => {
+    process.env.USE_FAKE_TMUX = '1';
+    process.env.NODE_ENV = 'test';
+    const tmpDb = path.join(os.tmpdir(), `helm-b1-seam2-${Date.now()}.db`);
+    const dbs = new DatabaseService(tmpDb);
+    const arts = new RunArtifactService(dbs);
+    const parserS = new PlanParserService(arts);
+    const q = new TaskQueueService(arts);
+    const fT = new FakeTransport();
+    const pSvc = new ProjectService(dbs);
+    const aSvc = new AgentAssignmentService(dbs);
+    const planningS = new PlanningPhaseService(fT, arts, q);
+    const escS = new EscalationService(dbs);
+    const panelS = new PanelService(fT, arts, 'b1seam2');
+    const cycleSvc = new CycleService(dbs, pSvc);
+
+    const tmpProjDir = path.join(os.tmpdir(), `helm-b1-seam2-proj-${Date.now()}`);
+    await fs.mkdir(tmpProjDir, { recursive: true });
+    const proj = pSvc.createProject({ name: 'b1-seam2', directory: tmpProjDir });
+    const pid = proj.id;
+    const cycle = await cycleSvc.createCycle(pid, 'B1 SEAM-2 cycle');
+    const cycleDir = cycleSvc.getCycleDocDir(cycle.id);
+    await fs.mkdir(cycleDir, { recursive: true });
+    const CYCLE_NORTH_STAR = 'CYCLE-AUTHORED NORTH STAR — SEAM-2 PROOF\n';
+    await fs.writeFile(path.join(cycleDir, 'north-star.md'), CYCLE_NORTH_STAR, 'utf8');
+
+    const orch = new RunOrchestratorService({
+      artifacts: arts, planning: planningS, parser: parserS, queue: q, transport: fT,
+      projectService: pSvc, assignmentService: aSvc, escalationService: escS, panelService: panelS,
+      cycleService: cycleSvc,
+      deployRunner: { async runDeploy() { return { success: true, note: 'fake' }; } } as any,
+      finalTestRunner: { async runTest() { return { success: true, note: 'fake' }; } } as any,
+    });
+
+    const fixedBatch = 'b1seam2batch';
+    const expectedRunDir = path.join(os.tmpdir(), `helm-run-${pid}-${fixedBatch}`);
+    await fs.rm(expectedRunDir, { recursive: true, force: true });
+    await fs.mkdir(expectedRunDir, { recursive: true });
+    const plan = { tasks: [{ task_key: 'T1', atomic_work: 'noop', complexity: 'low', model: 'gpt-5.5', effort: 'low', needs_more_info: false, task_type: 'feature', validation_criteria: 'ok', deps: [] }], meta: { source: 'b1-seam2' } };
+    await fs.writeFile(path.join(expectedRunDir, 'plan.json'), JSON.stringify(plan, null, 2), 'utf8');
+    const cbPath = path.join(expectedRunDir, 'callbacks.md');
+    await fs.writeFile(cbPath, `[helm callback] plancore ${fixedBatch} STATUS: PLAN-READY — plan agreed with planner; see plan.json\n[helm callback] planner ${fixedBatch}-partner STATUS: REVIEW-READY\n`, 'utf8');
+    await fs.appendFile(cbPath, `
+[helm callback] implementer ${fixedBatch} STATUS: DONE — wired
+[helm callback] validator ${fixedBatch} STATUS: PASS — verified
+[helm callback] panelist ${fixedBatch} STATUS: VERDICT-READY — CLEAN: all gates pass (seat red-b1:0)
+[helm callback] panelist ${fixedBatch} STATUS: VERDICT-READY — CLEAN: regressions hold (seat red-b1:1)
+`, 'utf8');
+
+    try {
+      // Mirrors startRunDetached's real production recipe: the run row is PRE-CREATED cycle-linked
+      // (createRun(..., cycleId)), then startRun reuses it via precreatedRunId — exactly how every real
+      // route (start-planning/start-implementation/the POST /runs project route) reaches this code.
+      const precreatedRunId = arts.createRun(pid, fixedBatch, path.join(expectedRunDir, CANONICAL_CYCLE_ARTIFACTS.northStar), cycle.id);
+      const runId = await orch.startRun({ projectId: pid, cycleId: cycle.id, prompt: 'raw prompt text — must NOT end up as north-star.md', batchId: fixedBatch, precreatedRunId });
+      expect(runId).toBeGreaterThan(0);
+
+      // SEAM-2: canonicalArtifactRoot resolved to the cycle folder -> materializeCanonicalArtifactSet
+      // copied the CYCLE's real north-star.md into runDir, so the "prompt-as-north-star" fallback
+      // (canonicalArtifactRoot === runDir) never fires.
+      const materialized = await fs.readFile(path.join(expectedRunDir, 'north-star.md'), 'utf8');
+      expect(materialized).toBe(CYCLE_NORTH_STAR);
+      expect(materialized).not.toContain('raw prompt text');
+
+      // Byte-identical non-cyclePlan build/fence: the implementer is still fenced to the RAW registered
+      // project directory, never a cycle build subdirectory (that substitution is cyclePlan-only).
+      const implSpawn = fT.spawnCalls.find((c) => c.role === 'implementer');
+      expect(implSpawn?.projectDir).toBe(tmpProjDir);
+
+      const row: any = dbs.raw.prepare('SELECT cycle_id FROM runs WHERE id = ?').get(runId);
+      expect(Number(row.cycle_id)).toBe(cycle.id);
+    } finally {
+      try { dbs.close(); } catch {}
+      await fs.rm(tmpProjDir, { recursive: true, force: true }).catch(() => {});
+      await fs.rm(expectedRunDir, { recursive: true, force: true }).catch(() => {});
+      await fs.rm(tmpDb, { force: true }).catch(() => {});
+    }
+  });
+
+  it('a cycle-linked run whose cycle cannot be resolved degrades to the runDir scratch root (soft — never blocks the run)', async () => {
+    process.env.USE_FAKE_TMUX = '1';
+    process.env.NODE_ENV = 'test';
+    const tmpDb = path.join(os.tmpdir(), `helm-b1-seam2-soft-${Date.now()}.db`);
+    const dbs = new DatabaseService(tmpDb);
+    const arts = new RunArtifactService(dbs);
+    const parserS = new PlanParserService(arts);
+    const q = new TaskQueueService(arts);
+    const fT = new FakeTransport();
+    const pSvc = new ProjectService(dbs);
+    const aSvc = new AgentAssignmentService(dbs);
+    const planningS = new PlanningPhaseService(fT, arts, q);
+    const escS = new EscalationService(dbs);
+    const panelS = new PanelService(fT, arts, 'b1seam2soft');
+    const cycleSvc = new CycleService(dbs, pSvc);
+
+    const tmpProjDir = path.join(os.tmpdir(), `helm-b1-seam2-soft-proj-${Date.now()}`);
+    await fs.mkdir(tmpProjDir, { recursive: true });
+    const proj = pSvc.createProject({ name: 'b1-seam2-soft', directory: tmpProjDir });
+    const pid = proj.id;
+    // A REAL cycle row (satisfies the runs.cycle_id FK) whose on-disk folder is then removed, so
+    // getCycleDocDir resolves a path but fs.realpath/stat on it throws — the "cannot resolve" branch
+    // of the soft-degrade contract, not "cycle doesn't exist" (which createRun's FK would refuse anyway).
+    const cycle = await cycleSvc.createCycle(pid, 'Unresolvable cycle');
+    await fs.rm(cycleSvc.getCycleDocDir(cycle.id), { recursive: true, force: true });
+
+    const orch = new RunOrchestratorService({
+      artifacts: arts, planning: planningS, parser: parserS, queue: q, transport: fT,
+      projectService: pSvc, assignmentService: aSvc, escalationService: escS, panelService: panelS,
+      cycleService: cycleSvc,
+      deployRunner: { async runDeploy() { return { success: true, note: 'fake' }; } } as any,
+      finalTestRunner: { async runTest() { return { success: true, note: 'fake' }; } } as any,
+    });
+
+    const fixedBatch = 'b1seam2softbatch';
+    const expectedRunDir = path.join(os.tmpdir(), `helm-run-${pid}-${fixedBatch}`);
+    await fs.rm(expectedRunDir, { recursive: true, force: true });
+    await fs.mkdir(expectedRunDir, { recursive: true });
+    const plan = { tasks: [{ task_key: 'T1', atomic_work: 'noop', complexity: 'low', model: 'gpt-5.5', effort: 'low', needs_more_info: false, task_type: 'feature', validation_criteria: 'ok', deps: [] }], meta: { source: 'b1-seam2-soft' } };
+    await fs.writeFile(path.join(expectedRunDir, 'plan.json'), JSON.stringify(plan, null, 2), 'utf8');
+    const cbPath = path.join(expectedRunDir, 'callbacks.md');
+    await fs.writeFile(cbPath, `[helm callback] plancore ${fixedBatch} STATUS: PLAN-READY — plan agreed with planner; see plan.json\n[helm callback] planner ${fixedBatch}-partner STATUS: REVIEW-READY\n`, 'utf8');
+    await fs.appendFile(cbPath, `
+[helm callback] implementer ${fixedBatch} STATUS: DONE — wired
+[helm callback] validator ${fixedBatch} STATUS: PASS — verified
+[helm callback] panelist ${fixedBatch} STATUS: VERDICT-READY — CLEAN: all gates pass (seat red-b1:0)
+[helm callback] panelist ${fixedBatch} STATUS: VERDICT-READY — CLEAN: regressions hold (seat red-b1:1)
+`, 'utf8');
+
+    try {
+      const precreatedRunId = arts.createRun(pid, fixedBatch, path.join(expectedRunDir, CANONICAL_CYCLE_ARTIFACTS.northStar), cycle.id);
+      const runId = await orch.startRun({ projectId: pid, cycleId: cycle.id, prompt: 'raw prompt text — DOES end up as north-star.md here', batchId: fixedBatch, precreatedRunId });
+      expect(runId).toBeGreaterThan(0);
+      // Degrades to the runDir scratch root: the pre-existing prompt-as-north-star fallback still fires.
+      const materialized = await fs.readFile(path.join(expectedRunDir, 'north-star.md'), 'utf8');
+      expect(materialized).toContain('raw prompt text');
+    } finally {
+      try { dbs.close(); } catch {}
+      await fs.rm(tmpProjDir, { recursive: true, force: true }).catch(() => {});
+      await fs.rm(expectedRunDir, { recursive: true, force: true }).catch(() => {});
+      await fs.rm(tmpDb, { force: true }).catch(() => {});
+    }
   });
 });

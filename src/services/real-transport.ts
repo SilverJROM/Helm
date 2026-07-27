@@ -4,7 +4,7 @@ import type { ITransport } from './fake-transport.js';
 import { TmuxService } from '../tmux/tmux-service.js';
 import { DispatchService, type DispatchStartParams } from './dispatch-service.js';
 import { ProviderResolverService } from './provider-resolver-service.js';
-import { resolveHelmSandboxBin, makeStrictReadProfileEnv } from '../security/landlock-sandbox.js';
+import { resolveHelmSandboxBin, makeStrictReadProfileEnv, makeRunRootWriteAllowEnv } from '../security/landlock-sandbox.js';
 import { startGovernedDocGuard, type GovernedDocGuardHandle } from './doc-path-guard.js';
 import { PROVIDERS, seatReadySignal } from '../config/providers.js';
 import { matchInterstitial, InterstitialBlockedError } from './cli-interstitials.js';
@@ -122,7 +122,10 @@ export class RealTransport implements ITransport {
     // B-ISO1: compose (+ fail-closed validate) the OPT-IN strict read env BEFORE the createSession
     // side effect below, so a bad allowlist refuses the spawn cleanly. Absent → '' (byte-identical).
     const strictEnv = params.strictReadAllow !== undefined ? makeStrictReadProfileEnv(params.strictReadAllow) : '';
-    const fencedLaunch = `${strictEnv}${envPrefix}${sandboxBin} ${fenceDir} ${launchCmd}`;
+    // B1 (R2.12/F6): opt-in extra write-fence grant for a durable HELM_RUN_ROOT outside /tmp — '' when
+    // unset (byte-identical to every existing caller).
+    const runRootWriteEnv = makeRunRootWriteAllowEnv();
+    const fencedLaunch = `${strictEnv}${runRootWriteEnv}${envPrefix}${sandboxBin} ${fenceDir} ${launchCmd}`;
 
     // POCFIX7: for claude, pre-ensure trust in launch dir (fenceDir / project cwd) so no interactive dialog blocks boot.
     // Best-effort (never abort launch). Only claude (grok/codex have no such).

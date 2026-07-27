@@ -17,6 +17,13 @@
  *   write-side tooling exceptions are IDENTICAL in both profiles. Fail-closed on a missing/empty
  *   allowlist and on any relative/nonexistent/unrulable entry (never skipped silently).
  *   Policy (which paths a given run may read) stays caller-side; this mechanism is generic.
+ *
+ * B1 (2026-07-27, R2.12/F6): opt-in extra WRITE-fence exception.
+ *   HELM_SANDBOX_WRITE_ALLOW=<abs1>:<abs2>:... (colon-separated absolute paths) grants the SAME
+ *   write-side bits as the hardcoded /tmp + $HOME dot-dir tooling exceptions below (documented,
+ *   narrow, additive — NOT project-write). Exists so a durable HELM_RUN_ROOT outside /tmp still
+ *   lets a worker append to <run>/callbacks.md under the fence. Absent/empty -> no-op, byte-identical
+ *   to every existing deployment/test. Set but malformed (relative path, empty entry) -> fail-closed.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -445,6 +452,46 @@ static void add_strict_allow_rules(int rs, const char *list, uint64_t ro_dir, co
   }
 }
 
+/* B1 (R2.12/F6): HELM_SANDBOX_WRITE_ALLOW=<abs1>:<abs2>:... — extra write-fence exceptions, same
+ * documented tooling-exception class as /tmp and the $HOME dot-dirs (NOT a project-write hole).
+ * Mirrors add_strict_allow_rules' fail-closed empty-entry detection (leading/trailing/repeated ':'
+ * never silently collapsed by strtok_r). Each entry is ensure_dir()'d (a run root may not exist yet
+ * at first boot, same as the /tmp/home-dot-dir exceptions) then granted via the shared add_rule()
+ * helper with the caller-supplied access mask (the SAME `exc` bits used for /tmp — full rw in the
+ * default profile, write-only in strict, per the strict-mode audit on the /tmp grant in main()). */
+static void add_write_allow_rules(int rs, const char *list, uint64_t access, const char *proj) {
+  size_t n = strlen(list);
+  bool has_empty_entry = (n == 0) || (list[0] == ':') || (list[n - 1] == ':') || (strstr(list, "::") != NULL);
+  if (has_empty_entry) {
+    char eb[PATH_MAX + 96];
+    snprintf(eb, sizeof(eb),
+             "HELM_SANDBOX_WRITE_ALLOW contains an empty entry (leading/trailing/repeated ':'): '%s'",
+             list);
+    fail(eb, proj, 0);
+  }
+
+  char *copy = strdup(list);
+  if (copy == NULL) {
+    fail("strdup(HELM_SANDBOX_WRITE_ALLOW)", proj, errno);
+  }
+  int granted = 0;
+  char *saveptr = NULL;
+  char op[PATH_MAX + 96];
+  for (char *tok = strtok_r(copy, ":", &saveptr); tok != NULL; tok = strtok_r(NULL, ":", &saveptr)) {
+    if (tok[0] != '/') {
+      snprintf(op, sizeof(op), "HELM_SANDBOX_WRITE_ALLOW entry must be an absolute path: '%s'", tok);
+      fail(op, proj, 0);
+    }
+    ensure_dir(tok);
+    add_rule(rs, tok, access, proj, "write-allow");
+    granted++;
+  }
+  free(copy);
+  if (granted == 0) {
+    fail("HELM_SANDBOX_WRITE_ALLOW has zero entries (contains only separators)", proj, 0);
+  }
+}
+
 int main(int argc, char **argv) {
   if (argc < 3) {
     fprintf(stderr, "usage: %s <project_dir> <cmd> [args...]\n", argv[0]);
@@ -562,6 +609,13 @@ int main(int argc, char **argv) {
   uint64_t exc_write = rw & ~ro; /* WRITE_FILE|TRUNCATE|MAKE_REG|MAKE_DIR|REMOVE_FILE|REMOVE_DIR|MAKE_SYM|REFER */
   uint64_t exc = strict ? exc_write : rw;
   add_rule(rs, "/tmp", exc, resolved, "tmp");
+
+  /* B1 (R2.12/F6): opt-in extra write-fence exception for a durable run root outside /tmp — see the
+   * file-header doc comment. Absent/empty is a no-op (byte-identical to every existing caller). */
+  const char *write_allow = getenv("HELM_SANDBOX_WRITE_ALLOW");
+  if (write_allow != NULL && write_allow[0] != '\0') {
+    add_write_allow_rules(rs, write_allow, exc, resolved);
+  }
   /* W2 HIGH: use real home from getpwuid(getuid()), NEVER the caller's getenv("HOME") (injectable) */
   struct passwd *pw = getpwuid(getuid());
   const char *real_home = (pw && pw->pw_dir && *pw->pw_dir) ? pw->pw_dir : NULL;

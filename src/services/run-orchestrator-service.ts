@@ -612,6 +612,27 @@ export class RunOrchestratorService {
       // One canonical handoff replaces FIX #42b's partial og-requirements/decisions copy. Snapshot the
       // complete hyphen-canonical document set for runDir-relative implementation consumers.
       await materializeCanonicalArtifactSet(canonicalArtifactRoot, runDir);
+    } else if (input.cycleId != null && this.deps.cycleService) {
+      // B1 (SEAM-2/N10/R2.8): canonicalArtifactRoot must resolve from the cycle for EVERY cycle-linked
+      // entry path, not just cyclePlan — otherwise a cycle-linked run reached via start-planning (or a
+      // future cycleId-carrying /api/projects/:id/runs call) leaves canonicalArtifactRoot at the tmp
+      // scratch runDir and R2.8 is unmet for that path. This branch is deliberately SOFT: unlike the
+      // cyclePlan block above (which is a build/fence contract and must fail closed), a bad lookup here
+      // only degrades the document view (D2 §Required outcome 2 — a missing file/cycle never blocks the
+      // execution view). effectiveProjectDir/resolvedCycleWorkspace/the build subdir/Landlock fence are
+      // NOT touched here — they stay exactly project.directory, byte-identical to a non-cycle run.
+      try {
+        const ws = this.deps.cycleService.getCycleDocDir(input.cycleId);
+        const canonRoot = await fs.realpath(project.directory);
+        const canonWs = await fs.realpath(ws);
+        const st = await fs.stat(canonWs);
+        const rel = path.relative(canonRoot, canonWs);
+        const contained = st.isDirectory() && canonWs !== canonRoot && rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
+        if (contained) {
+          canonicalArtifactRoot = canonWs;
+          await materializeCanonicalArtifactSet(canonicalArtifactRoot, runDir);
+        }
+      } catch { /* degrade to the runDir scratch root — never blocks the run */ }
     }
 
     // A1a (seat-binary pre-flight): BEFORE this run dispatches any agents, verify every model it could

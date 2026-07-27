@@ -46,3 +46,6 @@ node_modules
 #   `data/*.db*` only matches DIRECT children of data/, so data/backups/*.db* was slipping through.
 data/backups/
 data/**/*.db*
+# B1 (R2.12/F6): durable HELM_RUN_ROOT — per-run scaffolding (briefs, callbacks.md, evidence), same
+# runtime-artifact class as data/*.db* above; never tracked.
+data/runs/

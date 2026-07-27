@@ -7,7 +7,7 @@ import { ToolkitService } from './toolkit-service.js';
 import { AGENT_ROLES } from '../guardrails.js';
 import { loadConfig } from '../config/config.js';
 import { PROVIDERS } from '../config/providers.js';
-import { resolveHelmSandboxBin, makeWriteFencePolicy, makeStrictReadProfileEnv } from '../security/landlock-sandbox.js';
+import { resolveHelmSandboxBin, makeWriteFencePolicy, makeStrictReadProfileEnv, makeRunRootWriteAllowEnv } from '../security/landlock-sandbox.js';
 import { startGovernedDocGuard, type GovernedDocGuardHandle } from './doc-path-guard.js';
 import { applyEnvelopeIsolation } from './envelope-isolation.js';
 import type { SessionRegistryService } from './session-registry-service.js';
@@ -194,7 +194,10 @@ VALUES (?,?,?,?,?,?,?,?,datetime('now'), ?)
         const { envPrefix, launchCmd } = applyEnvelopeIsolation(launch.provider, launchSpec.launch_cmd);
         // B-ISO1: strictEnv (composed fail-closed above) prefixes the sandbox bin so the kernel fence
         // enforces the strict read profile on the worker seat; '' when the opt-in is absent (byte-identical).
-        const fencedCmd = `${strictEnv}${envPrefix}${sandboxBin} ${projectDir} ${launchCmd}`;
+        // B1 (R2.12/F6): opt-in extra write-fence grant for a durable HELM_RUN_ROOT outside /tmp — '' when
+        // unset (byte-identical to every existing caller).
+        const runRootWriteEnv = makeRunRootWriteAllowEnv();
+        const fencedCmd = `${strictEnv}${runRootWriteEnv}${envPrefix}${sandboxBin} ${projectDir} ${launchCmd}`;
         await this.tmux.sendCommand(target, fencedCmd, true, true);
         // R7.26/B22b: start the userspace guard as soon as the fenced process exists (not
         // gated on ready-probe success) - a tampering attempt shouldn't get a free window

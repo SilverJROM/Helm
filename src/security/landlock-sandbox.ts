@@ -155,6 +155,28 @@ ${readLine}
 }
 
 /**
+ * B1 (R2.12/F6): compose the env prefix that grants the sandbox binary's extra WRITE-fence exception
+ * for a durable HELM_RUN_ROOT outside /tmp — worker seats append to <run>/callbacks.md under the
+ * fence (the Helm-native callback contract), and /tmp is the only run-root location covered by a
+ * hardcoded write exception today (tools/helm-sandbox.c). Absent/empty HELM_RUN_ROOT -> '' (byte-
+ * identical to every existing caller/test — the default os.tmpdir() root is already covered by /tmp).
+ * SET but non-absolute -> THROWS (fail-closed; mirrors the "ABSOLUTE HELM_RUN_ROOT" contract) rather
+ * than silently granting nothing while HELM_RUN_ROOT is honoured code-side (the exact false-PASS F6
+ * warns about). The returned string ends with a trailing space so callers prepend it directly.
+ */
+export function makeRunRootWriteAllowEnv(runRootOverride: string | undefined = process.env.HELM_RUN_ROOT): string {
+  const value = (runRootOverride || "").trim();
+  if (!value) return ""; // unset/empty -> default os.tmpdir() root, already covered by the /tmp exception
+  if (!path.isAbsolute(value)) {
+    throw new Error(`HELM_RUN_ROOT must be an absolute path (got '${value}')`);
+  }
+  if (value.includes(":")) {
+    throw new Error(`HELM_RUN_ROOT must not contain ':' (the HELM_SANDBOX_WRITE_ALLOW separator): '${value}'`);
+  }
+  return `HELM_SANDBOX_WRITE_ALLOW='${value.replace(/'/g, `'\\''`)}' `;
+}
+
+/**
  * Startup self-check (honest): verifies the binary exists + is executable, then runs a quick landlock probe
  * (temp project dir + /bin/true). Returns 'active' only on full success. Never lies about enforcement.
  */

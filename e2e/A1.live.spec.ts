@@ -22,12 +22,11 @@ const PROJECT_DIR = '/home/agjrom/websites/a1-validation';
 const PROJECT_NAME = `a1-validation-${Date.now()}`;
 const BATCH_ID = `a1-live-${Date.now()}`;
 
-// resolveRunDir (run-paths.ts): os.tmpdir()/helm-run-<projectId>-<batchId>. HELM_RUN_ROOT is unset in
-// ecosystem.config.cjs, but the live process's .env sets TMPDIR=/tmp/helm-harness (confirmed via a
-// temporary diagnostic log, reverted after use), so os.tmpdir() for the pm2 process is NOT plain
-// /tmp — a naive prediction against plain /tmp silently misses the file (ENOENT), which is why the
-// planPreexists skip-interview path looked broken before this was found.
-const HELM_TMPDIR = process.env.HELM_TMPDIR_OVERRIDE || '/tmp/helm-harness';
+// resolveRunDir (run-paths.ts): <HELM_RUN_ROOT or os.tmpdir()>/helm-run-<projectId>-<batchId>.
+// B1 (R2.12/F6): ecosystem.config.cjs now sets HELM_RUN_ROOT=/home/agjrom/websites/Helm/data/runs
+// (ABSOLUTE, durable), which run-paths.ts's runRoot() prefers over os.tmpdir() unconditionally once
+// the pm2 process picks it up — override via HELM_RUN_ROOT_OVERRIDE if a deployment differs.
+const HELM_TMPDIR = process.env.HELM_RUN_ROOT_OVERRIDE || '/home/agjrom/websites/Helm/data/runs';
 function predictRunDir(projectId: number): string {
   return path.join(HELM_TMPDIR, `helm-run-${projectId}-${BATCH_ID}`);
 }
@@ -46,6 +45,7 @@ async function login(): Promise<string> {
 test.describe('A1 live: plancore + partner recorded as worker_runtimes, visible on :3110', () => {
   let token: string;
   let projectId: number;
+  let cycleId: number;
   let runId: number | null = null;
 
   test.beforeAll(async () => {
@@ -67,6 +67,18 @@ test.describe('A1 live: plancore + partner recorded as worker_runtimes, visible 
     const projData = await projResp.json();
     if (!projResp.ok) throw new Error(`project create failed: ${JSON.stringify(projData)}`);
     projectId = projData.project.id;
+
+    // B1 (N10): POST /api/projects/:id/runs now REQUIRES an explicit cycleId (refuses an unlinked
+    // run) — this throwaway project's own throwaway cycle satisfies that without changing what A1
+    // proves (worker_runtimes linkage was already asserted via runs.cycle_id resolution, unaffected).
+    const cycleResp = await fetch(`${BASE}/api/projects/${projectId}/cycles`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: `A1 live ${Date.now()}` }),
+    });
+    const cycleData = await cycleResp.json();
+    if (!cycleResp.ok) throw new Error(`cycle create failed: ${JSON.stringify(cycleData)}`);
+    cycleId = cycleData.cycle.id;
 
     // Pre-seed plan.json in the run's OWN tmp dir so `planPreexists` is true and startRunInner takes
     // the direct-to-planning branch (real plancore + partner spawns) immediately — no interview round.
@@ -120,6 +132,7 @@ test.describe('A1 live: plancore + partner recorded as worker_runtimes, visible 
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         batchId: BATCH_ID,
+        cycleId,
         prompt: 'Architecture note: A1 live evidence run — cross-module, high-risk security refactor ' +
           'requiring two independent reviewers to agree before any implementation proceeds (throwaway).',
       }),

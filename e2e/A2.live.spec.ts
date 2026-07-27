@@ -15,7 +15,9 @@ const PROJECT_DIR = '/home/agjrom/websites/a2-validation';
 const PROJECT_NAME = `a2-validation-${Date.now()}`;
 const BATCH_ID = `a2-live-${Date.now()}`;
 
-const HELM_TMPDIR = process.env.HELM_TMPDIR_OVERRIDE || '/tmp/helm-harness';
+// B1 (R2.12/F6): ecosystem.config.cjs now sets HELM_RUN_ROOT=/home/agjrom/websites/Helm/data/runs
+// (ABSOLUTE, durable), which run-paths.ts's runRoot() prefers over os.tmpdir() unconditionally.
+const HELM_TMPDIR = process.env.HELM_RUN_ROOT_OVERRIDE || '/home/agjrom/websites/Helm/data/runs';
 function predictRunDir(projectId: number): string {
   return path.join(HELM_TMPDIR, `helm-run-${projectId}-${BATCH_ID}`);
 }
@@ -34,6 +36,7 @@ async function login(): Promise<string> {
 test.describe('A2 live: helm_sessions project_id/run_id for planning seats on :3110', () => {
   let token: string;
   let projectId: number;
+  let cycleId: number;
   let runId: number | null = null;
 
   test.beforeAll(async () => {
@@ -49,6 +52,16 @@ test.describe('A2 live: helm_sessions project_id/run_id for planning seats on :3
     const projData = await projResp.json();
     if (!projResp.ok) throw new Error(`project create failed: ${JSON.stringify(projData)}`);
     projectId = projData.project.id;
+
+    // B1 (N10): POST /api/projects/:id/runs now REQUIRES an explicit cycleId.
+    const cycleResp = await fetch(`${BASE}/api/projects/${projectId}/cycles`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: `A2 live ${Date.now()}` }),
+    });
+    const cycleData = await cycleResp.json();
+    if (!cycleResp.ok) throw new Error(`cycle create failed: ${JSON.stringify(cycleData)}`);
+    cycleId = cycleData.cycle.id;
 
     const runDir = predictRunDir(projectId);
     fs.mkdirSync(runDir, { recursive: true });
@@ -99,6 +112,7 @@ test.describe('A2 live: helm_sessions project_id/run_id for planning seats on :3
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         batchId: BATCH_ID,
+        cycleId,
         prompt: 'Architecture note: A2 live evidence run — cross-module, high-risk security refactor ' +
           'requiring two independent reviewers to agree before any implementation proceeds (throwaway).',
       }),

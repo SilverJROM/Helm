@@ -21,6 +21,13 @@ module.exports = {
         HELM_ALLOW_LAN_LAUNCH: "1",         // allow mutating/launch ops from private-LAN clients (not just loopback), so the UI works over the LAN IP. Still owner-cred gated; public IPs always rejected.
         HELM_PORT: "3110",
         HELM_DB_PATH: "/home/agjrom/websites/Helm/data/cards2-ibrain.db",
+        // B1 (R2.12/F6): durable run root — src/services/run-paths.ts defaults to os.tmpdir() (wiped on
+        // reboot) unless overridden. MUST be absolute (run-orchestrator-service tests + reboot-class
+        // proof assert this), and its exact path must be routed through the Landlock write-fence grant
+        // (src/security/landlock-sandbox.ts:makeRunRootWriteAllowEnv -> HELM_SANDBOX_WRITE_ALLOW) so a
+        // worker seat can still append to <run>/callbacks.md under the fence — set together, never one
+        // without the other (a code-only HELM_RUN_ROOT here would be a false PASS on R2.12).
+        HELM_RUN_ROOT: "/home/agjrom/websites/Helm/data/runs",
         HELM_OWNER_CRED: "cards2-harness-563f750bebc23bba", // front-door login; rotate — see report
         HELM_DISABLE_MASTER_SUPERVISOR: "0", // ghost supervisor contaminates repos mid-cycle
         HELM_SKIP_BATCH_DEPLOY: "1",

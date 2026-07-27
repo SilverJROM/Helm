@@ -2628,10 +2628,20 @@ async function main(): Promise<void> {
   // A3 gate fix: NO masterService.isSetUp / old master-chain gate on /runs path (unlike /chat /terminal paths). Keep only owner + local-launch auth + project exists. Directory-registered projects (no old master chain) MUST be able to start a real run from the CC chat send.
   // GET status for phase/tasks/current (A3 will poll + timeline from agent_events + runs).
   // D-b1: POST /runs for a CC task list starts in interview with the discovery brain; autonomous execution begins only after NORTH-STAR-READY + planning.
+  // B1 (N10): body.cycleId is now REQUIRED and validated against :id — this was the one starter that
+  // could create an unlinked run (no UI control calls it; start-planning/start-implementation already
+  // derive cycleId server-side from the URL and are unaffected).
   app.post('/api/projects/:id/runs', { preHandler: [authMiddleware, requireOwnerPre, requireLocalLaunchPre] }, async (request: any, reply: any) => {
     const pid = Number(request.params.id);
     if (!projectService.getProject(pid)) return reply.code(404).send({ error: 'unknown project' });
     const body = request.body || {};
+    // B1 (N10): every created run must be cycle-linked (R2.8) — this was the one starter that could
+    // create a run with NO cycleId at all. Validate + refuse BEFORE any run row exists; never silently
+    // pick a cycle. start-planning/start-implementation already derive cycleId server-side from the URL.
+    const cid = Number(body.cycleId);
+    if (!Number.isFinite(cid)) return reply.code(400).send({ error: 'cycleId required' });
+    const cycle: any = db.prepare('SELECT id, project_id FROM cycles WHERE id = ?').get(cid);
+    if (!cycle || Number(cycle.project_id) !== pid) return reply.code(400).send({ error: 'unknown cycle for this project' });
     const seedPlan = typeof body.seedPlan === 'string' && body.seedPlan.trim() ? body.seedPlan.trim() : undefined;
     // PLAN-CACHE Phase-2 replay uses the cached north-star, so a prompt is not required when seedPlan is set.
     const prompt = (body.prompt || (seedPlan ? `[plan-cache replay: ${seedPlan}]` : '')).trim();
@@ -2640,7 +2650,7 @@ async function main(): Promise<void> {
       // CC-CHAT-1 B2: return IMMEDIATELY (Cloudflare-524 class fix). startRun runs in the background
       // (fire-and-forget with error logging inside startRunDetached; failures mark the run failed).
       // Callers poll GET /api/projects/:id/runs — the CC already does.
-      const { runId } = runOrchestratorService.startRunDetached({ projectId: pid, prompt, roleBindings: body.roleBindings, batchId: body.batchId, seedPlan });
+      const { runId } = runOrchestratorService.startRunDetached({ projectId: pid, cycleId: cid, prompt, roleBindings: body.roleBindings, batchId: body.batchId, seedPlan });
       return { runId, status: 'started' };
     } catch (e: any) {
       return reply.code(400).send({ error: e.message || 'startRun failed' });
