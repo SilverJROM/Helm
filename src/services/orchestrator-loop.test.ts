@@ -5,15 +5,23 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { FakeTransport } from './fake-transport.js';
-import { OrchestratorLoop } from './orchestrator-loop.js';
+import {
+  CallbackWaitError,
+  OrchestratorLoop,
+  RunAbortedError,
+  SeatAuthTerminalError,
+  inferKlooRoute,
+} from './orchestrator-loop.js';
+import { requestRunAbort } from './run-abort-registry.js';
 import { RunArtifactService } from './run-artifact-service.js';
+import { ProjectService } from './project-service.js';
 import { TaskQueueService } from './task-queue-service.js';
 import { DatabaseService } from '../db/database.js';
 import { SCHEMA_VERSION } from '../db/schema.js';
 import { EscalationService } from './escalation-service.js';
 import { PanelService } from './panel-service.js';
 import { resolveAgentLaunchSpec, ProviderResolverService } from './provider-resolver-service.js';
-import { inferKlooRoute } from './orchestrator-loop.js';
+import * as WorkerRuntimeFinalize from './worker-runtime-finalize.js';
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -2235,6 +2243,150 @@ describe('POCFIX22 regression: byte-offset sinceOffset must use Buffer (not char
     const goodWindow: string = await (loop as any).readCallbacksWindow(sinceOffset);
     expect(goodWindow.includes(unique)).toBe(true);
   }, 15000);
+});
+
+describe('S01 finalizeWorkerRuntime chokepoint: all terminal paths use finalizeWorkerRuntimeRow', () => {
+  let runDir: string;
+  let transport: FakeTransport;
+  let loop: OrchestratorLoop;
+  let dbs: DatabaseService;
+  let svc: RunArtifactService;
+  let tmpDbPath: string;
+  let projectId: number;
+  let runId: number;
+  let attemptId: number;
+
+  const setupActiveAttempt = async (batchId: string) => {
+    runDir = await fs.mkdtemp(path.join(os.tmpdir(), 'helm-s01-finalize-'));
+    await fs.writeFile(path.join(runDir, 'callbacks.md'), '# S01 callbacks\n', 'utf8');
+
+    tmpDbPath = path.join(os.tmpdir(), `helm-s01-finalize-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+    dbs = new DatabaseService(tmpDbPath);
+    svc = new RunArtifactService(dbs);
+
+    const projects = new ProjectService(dbs);
+    const project = projects.createProject({
+      name: `s01-finalize-${Date.now()}`,
+      directory: path.join(os.tmpdir(), 'helm-s01-finalize-project'),
+    });
+    projectId = project.id;
+    runId = svc.createRun(projectId, batchId);
+
+    const taskId = svc.recordTask(runId, 'S01-001', 'S01 terminal finalize writer');
+    attemptId = svc.recordAttempt(taskId, 1);
+
+    transport = new FakeTransport();
+    loop = new OrchestratorLoop(transport, {
+      runDir,
+      batchId,
+      artifactService: svc,
+    });
+
+    (loop as any).projectId = projectId;
+    (loop as any).runId = runId;
+    (loop as any).taskId = taskId;
+    (loop as any).currentAttemptId = attemptId;
+  };
+
+  const workerRuntimeRow = () =>
+    dbs.raw
+      .prepare('SELECT id, state, exit_reason, ended_at FROM worker_runtimes WHERE run_id=? ORDER BY id DESC LIMIT 1')
+      .get(runId) as any;
+
+  const cleanup = async () => {
+    if (runDir) {
+      await fs.rm(runDir, { recursive: true, force: true }).catch(() => {});
+    }
+    if (dbs) dbs.close();
+    if (tmpDbPath) {
+      await fs.rm(tmpDbPath).catch(() => {});
+    }
+  };
+
+  beforeEach(async () => {
+    await setupActiveAttempt('batch-S01');
+  });
+
+  afterEach(async () => {
+    await cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it('DONE terminal path writes via finalizeWorkerRuntimeRow', async () => {
+    const finalizeSpy = vi.spyOn(WorkerRuntimeFinalize, 'finalizeWorkerRuntimeRow');
+    const callbacks = path.join(runDir, 'callbacks.md');
+
+    const p = (loop as any).performRolePhase('implementer', 'S01 done terminal path', ['DONE']);
+    await sleep(20);
+    await fs.appendFile(callbacks, '[helm callback] implementer batch-S01 STATUS: DONE — all clear\n');
+    const result = await p;
+
+    expect(result.state).toBe('DONE');
+    const row = workerRuntimeRow();
+    expect(row.state).toBe('done');
+    expect(row.exit_reason).toBe('reaped-DONE');
+    expect(row.ended_at).toBeTruthy();
+    expect(finalizeSpy).toHaveBeenCalledWith(expect.anything(), row.id, 'done', 'reaped-DONE');
+  });
+
+  it('auth fault path writes via finalizeWorkerRuntimeRow', async () => {
+    const finalizeSpy = vi.spyOn(WorkerRuntimeFinalize, 'finalizeWorkerRuntimeRow');
+    const brief = 'S01 auth fault terminal path';
+    transport.queueSeatScript([
+      {
+        sessionAlive: true,
+        pane: `${brief}\nAuthentication required — your session has expired`,
+        composerHoldsBrief: false,
+      },
+    ]);
+
+    const p = (loop as any).performRolePhase('implementer', brief, ['DONE']);
+    await expect(p).rejects.toBeInstanceOf(SeatAuthTerminalError);
+
+    const row = workerRuntimeRow();
+    expect(row.state).toBe('reaped');
+    expect(row.exit_reason).toBe('implementer-seat-auth-paused');
+    expect(finalizeSpy).toHaveBeenCalledWith(expect.anything(), row.id, 'reaped', 'implementer-seat-auth-paused');
+  });
+
+  it('failed terminal path writes via finalizeWorkerRuntimeRow', async () => {
+    const finalizeSpy = vi.spyOn(WorkerRuntimeFinalize, 'finalizeWorkerRuntimeRow');
+    const previousWall = process.env.HELM_CB_WALL_MS;
+    const previousFirst = process.env.HELM_CB_FIRST_CALLBACK_MS;
+    process.env.HELM_CB_WALL_MS = '120';
+    process.env.HELM_CB_FIRST_CALLBACK_MS = '120';
+
+    try {
+      const p = (loop as any).performRolePhase('implementer', 'S01 failed terminal path', ['DONE']);
+      await expect(p).rejects.toBeInstanceOf(CallbackWaitError);
+
+      const row = workerRuntimeRow();
+      expect(row.state).toBe('failed');
+      expect(row.exit_reason.startsWith('implementer-')).toBe(true);
+      expect(row.exit_reason).toBe('implementer-wall-timeout');
+      expect(finalizeSpy).toHaveBeenCalledWith(expect.anything(), row.id, 'failed', 'implementer-wall-timeout');
+    } finally {
+      if (previousWall === undefined) delete process.env.HELM_CB_WALL_MS;
+      else process.env.HELM_CB_WALL_MS = previousWall;
+      if (previousFirst === undefined) delete process.env.HELM_CB_FIRST_CALLBACK_MS;
+      else process.env.HELM_CB_FIRST_CALLBACK_MS = previousFirst;
+    }
+  });
+
+  it('run-abort path writes via finalizeWorkerRuntimeRow', async () => {
+    const finalizeSpy = vi.spyOn(WorkerRuntimeFinalize, 'finalizeWorkerRuntimeRow');
+
+    const p = (loop as any).performRolePhase('implementer', 'S01 abort terminal path', ['DONE']);
+    await sleep(10);
+    requestRunAbort(runId, 'operator stop');
+
+    await expect(p).rejects.toBeInstanceOf(RunAbortedError);
+
+    const row = workerRuntimeRow();
+    expect(row.state).toBe('reaped');
+    expect(row.exit_reason).toBe('run-aborted');
+    expect(finalizeSpy).toHaveBeenCalledWith(expect.anything(), row.id, 'reaped', 'run-aborted');
+  });
 });
 
 // C0: thread the kloo `route` (models.route, B1) from a bound model through to spawn, so

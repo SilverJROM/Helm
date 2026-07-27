@@ -25,6 +25,7 @@ import { PhaseStaffingService } from './phase-staffing.js';
 import { matchSeatAuthError, authRemedyFor } from './seat-auth.js';
 import { parsePlanContradiction } from './plan-contradiction.js';
 import { classifyGateFault, authFault } from './fault-class.js';
+import { finalizeWorkerRuntimeRow } from './worker-runtime-finalize.js';
 
 export type Transition = string;
 
@@ -1217,9 +1218,7 @@ export class OrchestratorLoop {
     try {
       const db = (this.artifactService as any)['db']?.raw;
       if (!db) return;
-      db.prepare(
-        `UPDATE worker_runtimes SET state=?, exit_reason=?, ended_at=datetime('now') WHERE id=? AND state NOT IN ('done','failed','reaped')`
-      ).run(state, reason, id);
+      finalizeWorkerRuntimeRow(db, id, state, reason);
     } catch {
       /* best-effort bookkeeping */
     }

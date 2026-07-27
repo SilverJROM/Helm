@@ -116,6 +116,23 @@ describe.sequential('A15 worker_runtimes finalize-to-reaped', () => {
     expect(!!(sl && false)).toBe(false); // tmux gone → not live
   });
 
+  it('(c) finalizeWorkerRuntimeRow is no-op when row already terminal', () => {
+    const id = insertRunning('helm-a15-terminal-already');
+    db.raw
+      .prepare(`UPDATE worker_runtimes SET state='done', exit_reason='prior-done', ended_at='2000-01-01T00:00:00.000Z' WHERE id=?`)
+      .run(id);
+    const before = db.raw.prepare('SELECT state, exit_reason, ended_at FROM worker_runtimes WHERE id = ?').get(id) as any;
+    expect(before.state).toBe('done');
+
+    const changed = finalizeWorkerRuntimeRow(db.raw, id, 'failed', 'should-not-overwrite');
+    expect(changed).toBe(false);
+
+    const after = db.raw.prepare('SELECT state, exit_reason, ended_at FROM worker_runtimes WHERE id = ?').get(id) as any;
+    expect(after.state).toBe('done');
+    expect(after.exit_reason).toBe('prior-done');
+    expect(after.ended_at).toBe(before.ended_at);
+  });
+
   it('session still alive is not finalized by session-gone pass', async () => {
     const id = insertRunning('helm-a15-alive');
     const n = await finalizeSessionGoneWorkers(db.raw, async () => true);
