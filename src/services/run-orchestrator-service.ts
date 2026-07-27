@@ -116,7 +116,11 @@ export class RunOrchestratorService {
     // IS-R1 (impl-start): resolves the cycle folder for the cycle-plan implementation-only path
     // (getCycleDocDir → <cycle folder>/plan.md). Only needed for cyclePlan runs; absent
     // for legacy/project-level runs. Typed structurally to avoid a service import cycle.
-    cycleService?: { getCycleDocDir(cycleId: number): string };
+    // A5 / R3.13: finishPlanning is called from production at planning-done (idempotent-safe N7).
+    cycleService?: {
+      getCycleDocDir(cycleId: number): string;
+      finishPlanning?(cycleId: number): unknown;
+    };
     // A1a (seat-binary pre-flight): when provided, the run refuses to start if any rostered model's
     // launch CLI is not on the seat's PATH (the "binary vanished" bug) — instead of discovering it as a
     // per-seat generic timeout mid-run. Optional (like the other injected runners): absent => skipped.
@@ -293,6 +297,30 @@ export class RunOrchestratorService {
       } catch {}
     });
     return { runId, batchId };
+  }
+
+  /**
+   * A5 / R3.13: call CycleService.finishPlanning from production at planning-done.
+   * Docstring on finishPlanning promised B10 would call it; only tests did until this wire.
+   * Idempotent-safe (N7): CONFLICT (phase ≠ 'planning') is swallowed so a second call never
+   * fails the run. Other errors are logged and non-fatal (board cosmetic; run must continue).
+   * No-op when cycleService is unwired, finishPlanning is missing, or cycleId is absent.
+   */
+  private finishPlanningAtPlanningDone(cycleId: number | null): void {
+    if (cycleId == null || !Number.isFinite(cycleId)) return;
+    const fin = this.deps.cycleService?.finishPlanning;
+    if (typeof fin !== 'function') return;
+    try {
+      fin.call(this.deps.cycleService, cycleId);
+    } catch (e: any) {
+      if (e?.code === 'CONFLICT') {
+        // N7: already past planning (double-call / start-implementation race) — board already advanced.
+        return;
+      }
+      console.warn(
+        `[RunOrchestrator] finishPlanning(${cycleId}) non-fatal at planning-done: ${e?.message || e}`
+      );
+    }
   }
 
   // R5a (CC-CHAT-4): phase-boundary terminal gate for the run-orchestrator's own steps —
@@ -926,6 +954,24 @@ export class RunOrchestratorService {
     // helm-algo owns execution from here — reap the planning-brain session so it CANNOT keep working past
     // PLAN-READY (runaway / token-burn guard; the brain is re-spawned on demand for decisions only).
     try { await this.deps.transport.reap(`${planningSessionName}:0.0`, 'planning-done-yield-to-algo'); } catch {}
+
+    // A5 / R3.13: production finishPlanning at planning-done. Only on the real planning path
+    // (not cyclePlan / seedPlan skip paths — those never ran planning). Resolves cycle id from
+    // input or the run row. N7: CONFLICT is swallowed so a second call cannot fail the run.
+    // A6 owns honouring pause_after_planning as a queue gate; this row only flips the cycle board.
+    if (!input.cyclePlan && !input.seedPlan) {
+      let planningDoneCycleId: number | null =
+        input.cycleId != null && Number.isFinite(Number(input.cycleId)) ? Number(input.cycleId) : null;
+      if (planningDoneCycleId == null && runId != null) {
+        try {
+          const r = this.deps.artifacts['db'].raw
+            .prepare('SELECT cycle_id FROM runs WHERE id = ?')
+            .get(runId) as any;
+          if (r?.cycle_id != null) planningDoneCycleId = Number(r.cycle_id);
+        } catch { /* leave null */ }
+      }
+      this.finishPlanningAtPlanningDone(planningDoneCycleId);
+    }
 
     // R5a: phase boundary (planning → executing). Never start the dispatch loop for a run
     // that went terminal during planning.
