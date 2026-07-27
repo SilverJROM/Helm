@@ -344,6 +344,7 @@ export class PlanningPhaseService {
     // This fixes the live POST /runs 400 BRIEF-CONTRACT-MISSING for the planning (projcore) brief under real dispatch/RealTransport.
     const briefWriter = new BriefWriterService();
     const effectiveProjectDir = inputs.projectDir || process.cwd();
+    // A12 / R1.7: pass D7 config-sourced planning_round_cap into the brief (no open-ended "iterate").
     let planningBrief = briefWriter.generatePlanningBrief({
       batchId,
       northStar: effectiveNorthStar,
@@ -353,7 +354,13 @@ export class PlanningPhaseService {
       callbacksFile: path.join(runDir, 'callbacks.md'),
       runDir,
       canonicalArtifactRoot,
+      planningRoundCap: roundCap,
     });
+    // A12: persist the planning brief immediately so the contract is on disk before plancore cold-spawn
+    // (which can take minutes). Dispatch-nonce rebind rewrites the same path after spawn.
+    try {
+      await this.artifacts.writeBrief(runDir, 'plancore', planningBrief);
+    } catch { /* best-effort early write; post-spawn write remains below */ }
 
     // A15: hoist seat runtime ids so phase exit can finalize both (A1 only finalized plancore on retry).
     // A10: partner seats are now N (>= 0), one runtime id per spawned partner.
