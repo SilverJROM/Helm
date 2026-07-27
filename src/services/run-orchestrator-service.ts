@@ -118,9 +118,11 @@ export class RunOrchestratorService {
     // (getCycleDocDir → <cycle folder>/plan.md). Only needed for cyclePlan runs; absent
     // for legacy/project-level runs. Typed structurally to avoid a service import cycle.
     // A5 / R3.13: finishPlanning is called from production at planning-done (idempotent-safe N7).
+    // A7 / R3.15: setCyclePhase('complete') at true run terminals (terminalizeCycleAtRunEnd).
     cycleService?: {
       getCycleDocDir(cycleId: number): string;
       finishPlanning?(cycleId: number): unknown;
+      setCyclePhase?(cycleId: number, phase: string): unknown;
     };
     // A1a (seat-binary pre-flight): when provided, the run refuses to start if any rostered model's
     // launch CLI is not on the seat's PATH (the "binary vanished" bug) — instead of discovering it as a
@@ -258,6 +260,11 @@ export class RunOrchestratorService {
         project: project?.name || run?.project_name,
         message,
       });
+      // A7 / R3.15: true blocked-failure terminalizes the cycle board. Operator-pause (A6 park,
+      // missing deploy/final-test config) is recoverable — leave cycles.phase alone.
+      if (kind === 'failure') {
+        this.terminalizeCycleAtRunEnd({ runId });
+      }
     } catch { /* terminal transition and operator alert are best-effort */ }
   }
 
@@ -301,6 +308,8 @@ export class RunOrchestratorService {
           .prepare(`UPDATE runs SET phase = 'failed', status = 'failed', ended_at = datetime('now') WHERE id = ? AND phase NOT IN ('complete','failed','blocked')`)
           .run(runId);
       } catch {}
+      // A7 / R3.15: detached failure is a true terminal — advance cycle board if linked.
+      this.terminalizeCycleAtRunEnd({ runId, cycleId: input.cycleId ?? null });
     });
     return { runId, batchId };
   }
@@ -325,6 +334,35 @@ export class RunOrchestratorService {
       }
       console.warn(
         `[RunOrchestrator] finishPlanning(${cycleId}) non-fatal at planning-done: ${e?.message || e}`
+      );
+    }
+  }
+
+  /**
+   * A7 / R3.15: on true run completion (success / failed / blocked-failure), advance the linked
+   * cycle board to the sole terminal cycle phase `complete`. Does NOT call completeCycle (no
+   * folder archive). Operator-pause paths must never call this (A6 park stays non-terminal).
+   * Resolves cycle_id from the run row when only runId is known. N7: board write is non-fatal.
+   */
+  private terminalizeCycleAtRunEnd(opts: { runId?: number | null; cycleId?: number | null }): void {
+    let cycleId =
+      opts.cycleId != null && Number.isFinite(Number(opts.cycleId)) ? Number(opts.cycleId) : null;
+    if (cycleId == null && opts.runId != null && Number.isFinite(Number(opts.runId))) {
+      try {
+        const r = this.deps.artifacts['db'].raw
+          .prepare('SELECT cycle_id FROM runs WHERE id = ?')
+          .get(Number(opts.runId)) as any;
+        if (r?.cycle_id != null) cycleId = Number(r.cycle_id);
+      } catch { /* leave null */ }
+    }
+    if (cycleId == null || !Number.isFinite(cycleId)) return;
+    const setPhase = this.deps.cycleService?.setCyclePhase;
+    if (typeof setPhase !== 'function') return;
+    try {
+      setPhase.call(this.deps.cycleService, cycleId, 'complete');
+    } catch (e: any) {
+      console.warn(
+        `[RunOrchestrator] terminalizeCycleAtRunEnd(${cycleId}) non-fatal: ${e?.message || e}`
       );
     }
   }
@@ -977,6 +1015,8 @@ export class RunOrchestratorService {
         console.warn(`[RunOrchestrator] run ${runId} FAILED pre-execution: ${reason}`);
         try { this.deps.artifacts['db'].raw.prepare(`UPDATE runs SET phase = 'failed', status = 'failed', ended_at = datetime('now') WHERE id = ?`).run(runId); } catch {}
         try { await this.deps.artifacts.persistState(runDir, ['interview', 'planning', 'failed'], 'failed', runId); } catch {}
+        // A7 / R3.15: early true terminal (often still cycles.phase=planning — the JROM symptom).
+        this.terminalizeCycleAtRunEnd({ runId, cycleId: input.cycleId ?? null });
         return runId;
       }
     }
@@ -1294,6 +1334,8 @@ export class RunOrchestratorService {
     try {
       await this.deps.artifacts.persistState(runDir, ['interview', 'planning', 'executing', finalPhase], finalRunStatus, runId);
     } catch {}
+    // A7 / R3.15: success or task-failed completion advances the cycle board to terminal `complete`.
+    this.terminalizeCycleAtRunEnd({ runId });
 
     // D-a3: do NOT reap on completion (was silent reap). Instead set the close-confirm state
     // (an ibrain master_runtimes row with no closed_reason yet).
@@ -1565,6 +1607,8 @@ export class RunOrchestratorService {
     // slot. TaskQueueService's runEpoch/taskEpoch guard on mark* is the remaining defense-in-depth for a
     // stale write that still lands after a claim-time clear.
     db.prepare(`UPDATE runs SET phase = 'failed', status = 'failed', ended_at = datetime('now') WHERE id = ? AND phase NOT IN ('complete','failed','blocked')`).run(runId);
+    // A7 / R3.15: operator stop is a true terminal — board must not stay planning/implementation.
+    this.terminalizeCycleAtRunEnd({ runId });
     try {
       this.deps.events?.recordEvent({
         run_id: String(runId),
