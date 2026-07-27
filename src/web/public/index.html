@@ -18,6 +18,9 @@
   --terminal-text:#9ba9c0;
   --radius:8px;--radius-card:6px;
   --phase-brain:#58a6ff;--grok-45:#a371f7;--codex:#2dd4bf;--sonnet:#3fb950;
+  /* B3 / R5.19 R6.23 R6.25 foundation — shared session-pane flex/viewport tokens (B5 applies layout strip) */
+  --sp-pane-min-body:0;
+  --sp-stick-threshold:24px;
 }
 .theme-light{
   --bg:#ffffff;--surface:#f6f8fa;--surface-2:#eaeef2;--border:#d0d7de;
@@ -293,6 +296,59 @@ select option{background:var(--surface)}
 .cc-ws-switcher-item.sel { border-color: var(--accent); background: var(--accent-surface); }
 .cc-ws-body { margin-top: 14px; padding: 16px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-2); color: var(--text-sec); font-size: 12px; }
 .cc-ws-body-disc { padding: 0; background: transparent; border: none; }
+
+/* B3 / R5.19 R6.23 R6.25 foundation — shared session-pane shell + flex utilities.
+   B4 consumes for planning panes; B5 applies viewport strip; B6 wires bottom-stick.
+   Does NOT redesign Discovery content (still uses .cc-disc-* below). */
+.sp-pane {
+  flex: 1;
+  min-width: 0;
+  min-height: var(--sp-pane-min-body, 0);
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: var(--surface);
+}
+.sp-pane-header {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-2);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+.sp-pane-body {
+  flex: 1;
+  min-height: var(--sp-pane-min-body, 0);
+  overflow: auto;
+  padding: 4px 6px;
+}
+.sp-pane-footer {
+  flex: 0 0 auto;
+  padding: 6px 8px;
+  border-top: 1px solid var(--border);
+  background: var(--surface-2);
+}
+.sp-pane-payload {
+  margin: 0;
+  font-family: ui-monospace, 'JetBrains Mono', monospace;
+  font-size: 10px;
+  white-space: pre-wrap;
+  color: var(--terminal-text);
+  background: var(--terminal-bg);
+  padding: 4px;
+  border: 0;
+}
+.sp-pane-empty { font-size: 11px; color: var(--text-sec); padding: 8px 4px; }
+.sp-flex-fill { flex: 1; min-height: 0; min-width: 0; }
+.sp-scroll-owner { overflow: auto; min-height: 0; }
 
 /* B7-T01: Discovery tab split — chat (reuses .cc-bubble/.cc-composer) | living docs, either pane
    minimizable to a rail (.cc-disc-rail). Scoped to cc-disc-*. Parity ref: v2.1-02-discovery.png. */
