@@ -5040,9 +5040,54 @@ function App() {
       setCcDiscImageUrl(p => ({ ...p, [key]: url }));
     } catch (e) { /* thumbnail stays blank; doesn't block the rest of the pane */ }
   };
-  // B7-T03: attach an image from the Discovery composer (R-C3). Reads the file via FileReader,
-  // uploads via the existing B3-T02 endpoint, then reloads the artifact listing so the saved
-  // image shows up in the gallery (real persisted path, not a fake/local-only preview).
+  // B8 / R6.27: safe basename for chat-file upload (no path segments; keep extension).
+  const ccSafeChatFilename = (name, fallbackBase = 'paste') => {
+    const raw = String(name || '').trim() || fallbackBase;
+    const base = raw.split(/[/\\]/).pop() || fallbackBase;
+    const cleaned = base.replace(/[^\w.\-()+@ ]+/g, '_').replace(/^\.+/, '').slice(0, 120);
+    return cleaned || fallbackBase;
+  };
+  // Deterministic safe .txt name for pasted plain text (collision → caller retries with salt).
+  const ccPasteTextFilename = (salt = '') => {
+    const d = new Date();
+    const utc = d.toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
+    const s = salt ? `-${String(salt).replace(/[^\w]/g, '').slice(0, 8)}` : '';
+    return `paste-${utc}${s}.txt`;
+  };
+  // Insert project-relative path into Discovery composer without discarding draft.
+  const ccInsertComposerRef = (refPath) => {
+    const ref = String(refPath || '').trim();
+    if (!ref) return;
+    setCcComposer((prev) => {
+      const cur = String(prev || '');
+      if (!cur) return ref;
+      if (cur.endsWith(' ') || cur.endsWith('\n')) return cur + ref;
+      return cur + ' ' + ref;
+    });
+  };
+  // B8: upload to B7 chat-file writer (POST /api/cycles/:id/chat-files). Returns path or null.
+  // Never clears composer draft on error.
+  const ccUploadChatFile = async (cycleId, filename, opts = {}) => {
+    if (!cycleId || !filename) return null;
+    const body = { filename };
+    if (opts.contentBase64 != null) body.contentBase64 = opts.contentBase64;
+    else if (opts.content != null) body.content = opts.content;
+    else return null;
+    const r = await authedFetch(`/api/cycles/${cycleId}/chat-files`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+      allowStatuses: [400, 404, 409, 413],
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      const err = new Error(d.error || `Upload failed (${r.status})`);
+      err.status = r.status;
+      err.code = r.status === 409 ? 'CONFLICT' : r.status === 413 ? 'TOO_LARGE' : 'UPLOAD';
+      throw err;
+    }
+    return d.path || null;
+  };
+  // B8 / R6.27: attach image via chat-files (same contract as paste), then insert path into composer.
   const ccAttachImage = async (cycleId, file) => {
     if (!cycleId || !file) return;
     setCcDiscAttachErr('');
@@ -5059,19 +5104,98 @@ function App() {
         reader.readAsDataURL(file);
       });
       const contentBase64 = String(dataUrl).split(',').pop();
-      const r = await authedFetch(`/api/cycles/${cycleId}/attachments`, {
-        method: 'POST',
-        body: JSON.stringify({ filename: file.name, contentBase64 }),
-        allowStatuses: [400, 404, 409]
-      });
-      const d = await r.json().catch(() => ({}));
-      if (!r.ok) {
-        setCcDiscAttachErr(d.error || `Attach failed (${r.status})`);
-        return;
+      let filename = ccSafeChatFilename(file.name || 'paste.png', 'paste.png');
+      if (!/\.(png|jpe?g|webp|gif)$/i.test(filename)) filename = `${filename}.png`;
+      let pathRef = null;
+      for (let attempt = 0; attempt < 4 && !pathRef; attempt++) {
+        const tryName = attempt === 0 ? filename : ccSafeChatFilename(
+          filename.replace(/(\.[^.]+)?$/, `-${Date.now()}-${attempt}$1` || '.png'),
+          'paste.png'
+        );
+        try {
+          pathRef = await ccUploadChatFile(cycleId, tryName, { contentBase64 });
+        } catch (e) {
+          if (e && e.code === 'CONFLICT' && attempt < 3) continue;
+          throw e;
+        }
       }
-      await loadDiscArtifacts(cycleId);
+      if (pathRef) {
+        ccInsertComposerRef(pathRef);
+        setCcDiscAttachErr('');
+      }
     } catch (e) {
       setCcDiscAttachErr(e.message || 'Attach failed');
+    } finally {
+      setCcDiscAttaching(false);
+    }
+  };
+  // B8 / R6.27: Discovery composer paste — files/images keep safe name; text → deterministic .txt.
+  // Upload first, then insert project-relative ref. Errors do not discard draft.
+  const ccDiscComposerPaste = async (cycleId, e) => {
+    if (!cycleId || !e) return;
+    const cd = e.clipboardData;
+    if (!cd) return;
+
+    // Prefer file items (image/file paste)
+    const files = cd.files && cd.files.length ? Array.from(cd.files) : [];
+    if (files.length) {
+      e.preventDefault();
+      const file = files[0];
+      setCcDiscAttachErr('');
+      setCcDiscAttaching(true);
+      try {
+        const isImage = file.type && file.type.startsWith('image/');
+        if (isImage || file.type) {
+          const buf = await file.arrayBuffer();
+          const bytes = new Uint8Array(buf);
+          let binary = '';
+          for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+          const contentBase64 = btoa(binary);
+          let filename = ccSafeChatFilename(file.name || (isImage ? 'paste.png' : 'paste.bin'), isImage ? 'paste.png' : 'paste.bin');
+          let pathRef = null;
+          for (let attempt = 0; attempt < 4 && !pathRef; attempt++) {
+            const tryName = attempt === 0 ? filename : ccSafeChatFilename(
+              `${filename.replace(/(\.[^.]+)$/, '')}-${Date.now()}-${attempt}${filename.match(/(\.[^.]+)$/) ? filename.match(/(\.[^.]+)$/)[1] : ''}`,
+              filename
+            );
+            try {
+              pathRef = await ccUploadChatFile(cycleId, tryName, { contentBase64 });
+            } catch (err) {
+              if (err && err.code === 'CONFLICT' && attempt < 3) continue;
+              throw err;
+            }
+          }
+          if (pathRef) ccInsertComposerRef(pathRef);
+        }
+      } catch (err) {
+        setCcDiscAttachErr(err.message || 'Paste upload failed');
+      } finally {
+        setCcDiscAttaching(false);
+      }
+      return;
+    }
+
+    // Plain-text paste → deterministic .txt under project tmp (R6.27); ref inserted into composer.
+    const text = cd.getData('text/plain');
+    if (text == null || text === '') return;
+
+    e.preventDefault();
+    setCcDiscAttachErr('');
+    setCcDiscAttaching(true);
+    try {
+      let pathRef = null;
+      for (let attempt = 0; attempt < 4 && !pathRef; attempt++) {
+        const filename = ccPasteTextFilename(attempt ? `${Date.now()}${attempt}` : '');
+        try {
+          pathRef = await ccUploadChatFile(cycleId, filename, { content: text });
+        } catch (err) {
+          if (err && err.code === 'CONFLICT' && attempt < 3) continue;
+          throw err;
+        }
+      }
+      if (pathRef) ccInsertComposerRef(pathRef);
+    } catch (err) {
+      setCcDiscAttachErr(err.message || 'Paste upload failed');
     } finally {
       setCcDiscAttaching(false);
     }
@@ -5534,16 +5658,18 @@ function App() {
             </div>
             <div class="cc-disc-pane-footer cc-composer" data-testid="ws-disc-composer">
               <textarea data-testid="ws-disc-chat-composer" disabled=${!canChat}
-                placeholder=${canChat ? 'talk to discovery…' : 'Assign an agent to chat…'}
+                placeholder=${canChat ? 'talk to discovery… (paste text/image → project tmp ref)' : 'Assign an agent to chat…'}
                 value=${ccComposer} oninput=${e=>setCcComposer(e.target.value)}
                 onkeydown=${e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();ccWsSendChat(pid, discAgentId);}}}
+                onpaste=${(e) => ccDiscComposerPaste(cycleId, e)}
                 style="width:100%;height:56px;font-size:12px;border:1px solid var(--border);border-radius:4px;padding:4px;background:var(--surface-2);"></textarea>
               ${ccDiscAttachErr ? html`<div data-testid="ws-disc-attach-err" style="color:#f85149;font-size:11px;padding:2px 0">${ccDiscAttachErr}</div>` : null}
+              ${ccDiscAttaching ? html`<div data-testid="ws-disc-chat-file-uploading" class="text-sec" style="font-size:10px;padding:2px 0">Uploading paste/file…</div>` : null}
               <div style="display:flex;justify-content:space-between;align-items:center;margin-top:2px">
                 <input ref=${ccDiscAttachInputRef} type="file" accept="image/*" data-testid="ws-disc-attach-input"
                   style="display:none" onchange=${e => { const f = e.target.files && e.target.files[0]; e.target.value = ''; if (f) ccAttachImage(cycleId, f); }} />
                 <button data-testid="ws-disc-chat-attach" class="btn btn-sm" disabled=${ccDiscAttaching}
-                  onclick=${() => ccDiscAttachInputRef.current && ccDiscAttachInputRef.current.click()}>${ccDiscAttaching ? 'Attaching…' : 'Attach image'}</button>
+                  onclick=${() => ccDiscAttachInputRef.current && ccDiscAttachInputRef.current.click()}>${ccDiscAttaching ? 'Uploading…' : 'Attach image'}</button>
                 <button data-testid="ws-disc-chat-send" class="btn btn-primary btn-sm" disabled=${!canChat} onclick=${() => ccWsSendChat(pid, discAgentId)}>Send</button>
               </div>
             </div>

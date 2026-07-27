@@ -58,6 +58,7 @@ import { ProjectStatusService } from "./services/project-status-service.js";
 import { TaskService } from "./services/task-service.js";
 import { CycleService } from "./services/cycle-service.js";
 import { CycleDocsService } from "./services/cycle-docs-service.js";
+import { CycleChatFileService } from "./services/cycle-chat-file-service.js";
 import { CANONICAL_CYCLE_ARTIFACTS } from "./services/cycle-artifact-paths.js";
 import { maybeAutoStartCycleImplementation, startCycleImplementationAfterApproval } from "./services/cycle-auto-start.js";
 import { MemoryService } from "./services/memory-service.js";
@@ -364,6 +365,8 @@ async function main(): Promise<void> {
   // B2-T01: CycleService (create only for this slice). Folder creation fenced to project.directory.
   const cycleService = new CycleService(db, projectService);
   const cycleDocsService = new CycleDocsService(cycleService);
+  // B8 / R6.27: thin HTTP over B7 CycleChatFileService (project tmp/<cycle-folder>/ chat-files).
+  const cycleChatFileService = new CycleChatFileService(cycleService);
 
   // D3: TaskService (C3r). list/upsert for per-project tasks + roster derivation from runtimes.
   // Coordinator updates exclusively via the sanctioned /ingest/task-update (project_id from token claim).
@@ -1572,6 +1575,41 @@ async function main(): Promise<void> {
       if (e.code === 'CONFLICT') return reply.code(409).send({ error: e.message });
       const isTraversal = e.code === 'TRAVERSAL' || /traversal|only image|symlink/i.test(String(e.message));
       return reply.code(isTraversal ? 400 : 400).send({ error: e.message || 'attachment save failed' });
+    }
+  });
+
+  // B8 / R6.27: POST /api/cycles/:id/chat-files — paste/upload into project tmp/<cycle-folder>/<filename>
+  // via B7 CycleChatFileService. Returns project-relative path for Discovery composer insertion.
+  // Accepts content (utf8 text) OR contentBase64 (binary/image). Exclusive create; never OS /tmp.
+  app.post('/api/cycles/:id/chat-files', { preHandler: [authMiddleware, requireOwnerPre] }, async (request: any, reply: any) => {
+    const id = Number(request.params.id);
+    if (!Number.isInteger(id) || id <= 0) return reply.code(400).send({ error: 'invalid cycle id' });
+    try {
+      const body = request.body || {};
+      if (typeof body.filename !== 'string' || !body.filename.trim()) {
+        return reply.code(400).send({ error: 'filename required' });
+      }
+      let payload: string | Buffer;
+      if (typeof body.contentBase64 === 'string' && body.contentBase64.trim()) {
+        const b64 = body.contentBase64.trim();
+        if (!/^[A-Za-z0-9+/]+={0,2}$/.test(b64) || b64.length % 4 !== 0) {
+          return reply.code(400).send({ error: 'invalid base64' });
+        }
+        payload = Buffer.from(b64, 'base64');
+      } else if (typeof body.content === 'string') {
+        payload = body.content;
+      } else {
+        return reply.code(400).send({ error: 'content or contentBase64 required' });
+      }
+      const result = await cycleChatFileService.saveCycleChatFile(id, body.filename.trim(), payload);
+      return result;
+    } catch (e: any) {
+      if (e?.code === 'INVALID') return reply.code(400).send({ error: e.message });
+      if (e?.code === 'TOO_LARGE') return reply.code(413).send({ error: e.message });
+      if (e?.code === 'NOT_FOUND') return reply.code(404).send({ error: e.message });
+      if (e?.code === 'CONFLICT') return reply.code(409).send({ error: e.message });
+      const isTraversal = e?.code === 'TRAVERSAL' || /traversal|symlink/i.test(String(e?.message || ''));
+      return reply.code(isTraversal ? 400 : 400).send({ error: e?.message || 'chat-file save failed' });
     }
   });
 
