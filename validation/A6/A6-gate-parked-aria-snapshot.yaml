@@ -1,5 +1,5 @@
 - button "← Back"
-- text: a6-validation-1785126891598 / A6 gate 1785126891598
+- text: a6-validation-1785127901155 / A6 gate 1785127901155
 - button "gate-after-planning"
 - button "Cycle switcher"
 - text: Discovery Planning Implementation Final Tests History Planning docs ready — awaiting approval
@@ -45,6 +45,9 @@
   - listitem: CALLBACK_WAIT_RESULT2026-07-27 04:27:59role=plancore · outcome=callback · reason=callback · provider=grok
   - listitem: CALLBACK_WAIT_RESULT2026-07-27 04:30:47role=plancore · outcome=callback · reason=callback · provider=grok
   - listitem: CALLBACK_WAIT_RESULT2026-07-27 04:35:14role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 04:38:34role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 04:46:12role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 04:52:03role=plancore · outcome=callback · reason=callback · provider=grok
   - listitem: REGISTERED2076-07-14 00:58:42role=system · reason=a4-live-seed
   - listitem: CALLBACK_WAIT_RESULT2076-07-14 00:58:43role=plancore · outcome=callback · provider=grok
   - listitem: TERMINAL2076-07-14 00:58:44outcome=complete · reason=a4-live
@@ -64,6 +67,13 @@
 - button "Approve"
 - text: og-requirements.md rendered
 - button "Full screen"
-- text: "# Requirements - **R3.14** — pause_after_planning actually gates the implementation queue. plan.md schema valid"
+- heading "Requirements" [level=1]
+- list:
+  - listitem:
+    - strong: R3.14
+    - text: — pause_after_planning actually gates the implementation queue.
+- text: plan.md schema valid
 - button "Full screen"
-- text: "# Plan ```json [{\"id\":\"T1\",\"batch\":\"A6\",\"title\":\"A6 gate proof task\",\"req_refs\":[\"R3.14\"],\"assignee\":\"grok-4.5\",\"validator_lane\":\"L2\",\"effort\":\"low\",\"type\":\"feature\"}] ``` Per-task planning view Loading task rows…"
+- heading "Plan" [level=1]
+- code: "[{\"id\":\"T1\",\"batch\":\"A6\",\"title\":\"A6 gate proof task\",\"req_refs\":[\"R3.14\"],\"assignee\":\"grok-4.5\",\"validator_lane\":\"L2\",\"effort\":\"low\",\"type\":\"feature\"}]"
+- text: Per-task planning view Loading task rows…

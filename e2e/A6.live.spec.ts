@@ -183,7 +183,7 @@ test.describe('A6 live: pause_after_planning gates the implementation queue on :
     // SEND-BACK (validator, attempt=2): the outer live-run contract hard-caps the whole process at
     // 180s (`timeout ... 180s npx playwright test ...`) — every internal deadline below must sum to
     // comfortably less than that in the realistic (not worst-every-loop-simultaneously) case.
-    test.setTimeout(170000);
+    test.setTimeout(175000);
     const t0 = Date.now();
     const mark = (label: string) => console.log(`[A6.live timing] ${label} at +${Date.now() - t0}ms`);
 
@@ -239,13 +239,11 @@ test.describe('A6 live: pause_after_planning gates the implementation queue on :
     // Poll until the GATE fires: awaiting_approval=1, phase stays 'planning' (never auto-advances
     // to implementation the way an autonomous cycle would — that's the A5 contract, not this one).
     let awaitingApproval = false;
-    // SEND-BACK attempt=2 retry: 45s was too tight — a real plancore cold-spawn under load can take
-    // close to that alone. 80s held reliably across every earlier untimed run; keep it.
-    // SEND-BACK attempt=2, 3rd retry: 80s wasn't enough either — server logs confirmed the gate
-    // DOES flip correctly, just past the deadline (real plancore cold-spawn latency under shared-box
-    // contention, not a mechanism bug). Give this the lion's share of the 180s budget; proceedDeadline
-    // below is trimmed to compensate. `mark()` timing logged either way to calibrate further if needed.
-    const gateDeadline = Date.now() + 115000;
+    // SEND-BACK history: 45s too tight; 115s measured a real ~80s plancore cold-spawn with margin
+    // to spare. attempt=3 needs headroom for the POST-approve implementer spawn too (see
+    // proceedDeadline below), so this comes down slightly — still comfortably above the observed
+    // ~80-82s ceiling.
+    const gateDeadline = Date.now() + 95000;
     while (Date.now() < gateDeadline) {
       const row = readCycle(cycleId);
       if (row && Number(row.awaiting_approval) === 1) {
@@ -401,10 +399,17 @@ test.describe('A6 live: pause_after_planning gates the implementation queue on :
     // Poll for the PROCEEDING signal: the queue actually dispatched (run_tasks left 'pending', or a
     // real attempt was recorded) — the direct opposite of test one's "queue never starts" invariant.
     let proceeded = false;
-    // SEND-BACK (attempt=2): tightened to fit the 180s outer contract. A real implementer spawn on
-    // a CLEAN harness (no orphaned prior-attempt tmux sessions) lands well inside this; the caller
-    // is responsible for that precondition (see the pre-flight cleanup this batch's callback notes).
-    const proceedDeadline = Date.now() + 30000;
+    // SEND-BACK attempt=3: attempt=2's 30s was measured against ONE run where this phase took
+    // ~6.5s — too optimistic. The validator's re-run at the same commit showed the real implementer
+    // cold-spawn can cost as much as the plancore one (gateDeadline). Widened to match; gateDeadline
+    // above came down to keep both inside the 180s outer contract.
+    const proceedDeadline = Date.now() + 65000;
+    // SEND-BACK attempt=3 diagnostic: log the FIRST moment run_tasks shows up for the fresh run —
+    // startRunDetached's ingestion (seedFromCyclePlan) is itself fire-and-forget background work,
+    // not guaranteed done the instant the run row exists. If this stays false for a while, the
+    // bottleneck is ingestion, not the real implementer spawn; if it flips fast but `proceeded`
+    // still times out, the bottleneck is squarely the real spawn — same as gateDeadline's cost.
+    let loggedIngested = false;
     while (Date.now() < proceedDeadline) {
       const db = new Database(DB_PATH, { readonly: true });
       const tasks = db.prepare('SELECT status FROM run_tasks WHERE run_id = ?').all(implRunId) as any[];
@@ -412,6 +417,10 @@ test.describe('A6 live: pause_after_planning gates the implementation queue on :
         .prepare('SELECT COUNT(*) AS c FROM task_attempts ta JOIN run_tasks rt ON ta.task_id = rt.id WHERE rt.run_id = ?')
         .get(implRunId) as any;
       db.close();
+      if (!loggedIngested && tasks.length > 0) {
+        loggedIngested = true;
+        mark('cyclePlan run_tasks ingested');
+      }
       if (tasks.length > 0 && (tasks.some((t) => t.status !== 'pending') || Number(attempts.c) > 0)) {
         proceeded = true;
         break;
