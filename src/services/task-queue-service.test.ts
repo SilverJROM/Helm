@@ -247,3 +247,44 @@ describe('Leg D: dynamic-task batch resolution', () => {
     expect(q.newBatchAfterLast(runId)).toBe(DEFAULT_BATCH);
   });
 });
+
+describe('A6b-L3: clearRun generation guard (recycled runId/taskId poisoning a new occupant)', () => {
+  it('a mark* call for a taskId enqueued under a PRIOR generation of runId is ignored, not applied to the current occupant', () => {
+    // SQLite reuses a freed runs.id/run_tasks.id after CASCADE delete. A run's own background dispatch
+    // (still awaiting a real callback) can settle AFTER that run was stopped+deleted and call
+    // mark*(taskId, runId) against a runId/taskId pair a brand-new run has since reused — this must not
+    // silently mark the NEW occupant's live task terminal.
+    const q = new TaskQueueService();
+    const runId = 30;
+    const taskId = 475; // same numeric id reused across "occupants" of runId 30, exactly as SQLite does
+
+    q.enqueue(runId, taskId, [], false, 'A6b'); // occupant #1 (e.g. a prior, now-deleted run)
+    q.clearRun(runId); // simulates stop()+cascade-delete: occupant #1's slot is torn down
+
+    q.enqueue(runId, taskId, [], false, 'A6b'); // occupant #2 (the new run, id recycled)
+    expect(q.getNextReady(runId)).toBe(taskId); // occupant #2's task is legitimately in flight
+
+    // Occupant #1's orphaned background chain finally settles and calls markFailed with its OWN
+    // (now-stale) taskId/runId — this must be rejected, not corrupt occupant #2's in-flight task.
+    q.markFailed(taskId, runId);
+
+    expect(q.isBlockedByFailure(taskId)).toBe(false);
+    expect(q.classifyDrainState(runId).kind).not.toBe('unknown-pending-stall');
+    // occupant #2's task is still genuinely in flight and can still be completed normally.
+    q.markComplete(taskId, runId);
+    expect(q.classifyDrainState(runId).kind).toBe('all-complete');
+  });
+
+  it('a mark* call for the CURRENT generation still applies normally (guard does not over-reject)', () => {
+    const q = new TaskQueueService();
+    const runId = 31;
+    // Belt-and-braces pre-ingest clear (the normal startRunDetached/seedFromCyclePlan pattern) before the
+    // real enqueue — same generation throughout, so the guard must NOT reject this run's own writes.
+    q.clearRun(runId);
+    q.enqueue(runId, 1, [], false, 'A6b');
+    q.enqueue(runId, 2, [1], false, 'A6b'); // depends on 1
+    q.markFailed(1, runId);
+    expect(q.isBlockedByFailure(2)).toBe(true); // the mark applied — 2 is blocked by failed prereq 1
+    expect(q.classifyDrainState(runId).kind).toBe('failed-block');
+  });
+});

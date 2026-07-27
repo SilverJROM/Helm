@@ -1550,8 +1550,20 @@ export class RunOrchestratorService {
     const stopReason = (reason && String(reason).trim()) || 'operator stop via POST /api/runs/:id/stop';
     const { requestRunAbort } = await import('./run-abort-registry.js');
     requestRunAbort(runId, stopReason);
-    // Drop process-local queue claim so a later recycled runId does not inherit stuck inFlight.
-    try { this.deps.queue.clearRun(runId); } catch { /* stop must not fail on bookkeeping */ }
+    // A6b-L3 (send-back): do NOT clearRun(runId) here. This run's own background dispatch (drainDispatch
+    // awaiting a real implementer/validator callback, real wallMs up to 30min) is typically still in
+    // flight when stop is requested — it only unwinds on its next abort-registry poll. A clearRun called
+    // HERE, at stop-time, has no way to know whether THIS SAME runId has already been recycled by a brand
+    // new run by the time it runs (SQLite reuses a freed runs.id after CASCADE delete) — proven live: it
+    // can wipe a NEWER occupant's already-ingested queue out from under it (getNextReady sees an empty
+    // queue despite genuinely-pending durable run_tasks — classifyDrainState's queue/DB-divergence
+    // fail-safe reports `unknown-pending-stall` with zero attempts even though the new run never
+    // dispatched). The three CLAIM-TIME clears (startRunDetached, startRunInner's precreatedRunId
+    // belt-and-braces, seedFromCyclePlan) already fully cover "a recycled runId must not inherit a prior
+    // occupant's stuck inFlight/failed/allTasks" — they fire at the one safe moment: right before the NEW
+    // occupant starts using the id, never racing a stop that targets a still-live but soon-to-be-recycled
+    // slot. TaskQueueService's runEpoch/taskEpoch guard on mark* is the remaining defense-in-depth for a
+    // stale write that still lands after a claim-time clear.
     db.prepare(`UPDATE runs SET phase = 'failed', status = 'failed', ended_at = datetime('now') WHERE id = ? AND phase NOT IN ('complete','failed','blocked')`).run(runId);
     try {
       this.deps.events?.recordEvent({

@@ -49,8 +49,23 @@ export class TaskQueueService {
   // deferred / complete tasks that markComplete/markDeferred remove from the live `queues` array.
   private batchOf: Record<number, string> = {}; // taskId -> resolved batch label
   private allTasks: Record<number, number[]> = {}; // runId -> every enqueued task id (append-only)
+  // A6b-L3 (send-back): SQLite reuses a freed `runs.id`/`run_tasks.id` after CASCADE delete. A run's own
+  // background dispatch (drainDispatch awaiting a real implementer/validator callback, real wallMs up to
+  // 30min) can still be in flight when that run is stopped+deleted; when it finally settles it calls
+  // mark*(taskId, runId) with STALE ids that may by then belong to a brand-new occupant of the same
+  // (runId, taskId) pair. runEpoch/taskEpoch let mark* detect and reject a write from a prior occupant
+  // instead of silently corrupting the current one's in-flight task as failed/complete/deferred (which
+  // manifests as getNextReady/classifyDrainState seeing a task wrongly terminal — a queue/DB divergence
+  // reported as `unknown-pending-stall` with zero attempts, even though the current occupant never ran).
+  private runEpoch: Record<number, number> = {}; // runId -> generation, bumped every clearRun
+  private taskEpoch: Record<number, number> = {}; // taskId -> the runEpoch it was enqueued under
 
   constructor(private readonly artifacts?: RunArtifactService) {}
+
+  /** True when taskId was enqueued under a since-superseded generation of runId (a stale/prior occupant). */
+  private isStaleWrite(runId: number, taskId: number): boolean {
+    return (this.taskEpoch[taskId] ?? 0) !== (this.runEpoch[runId] || 0);
+  }
 
   /** Rebuild one durable run on this shared service without disturbing other active runs. */
   clearRun(runId: number): void {
@@ -58,6 +73,7 @@ export class TaskQueueService {
     for (const taskId of taskIds) {
       delete this.deps[taskId];
       delete this.batchOf[taskId];
+      delete this.taskEpoch[taskId];
       this.failedTasks.delete(taskId);
       this.deferredTasks.delete(taskId);
       this.completedTasks.delete(taskId);
@@ -65,6 +81,8 @@ export class TaskQueueService {
     delete this.queues[runId];
     delete this.allTasks[runId];
     delete this.inFlight[runId];
+    // Bump LAST: any write still in flight for the pre-bump generation is now provably stale.
+    this.runEpoch[runId] = (this.runEpoch[runId] || 0) + 1;
   }
 
   private normBatch(batch: string | null | undefined): string {
@@ -75,6 +93,7 @@ export class TaskQueueService {
   enqueue(runId: number, taskId: number, depTaskIds: number[] = [], urgent = false, batch: string = DEFAULT_BATCH): void {
     if (!this.queues[runId]) this.queues[runId] = [];
     if (!this.allTasks[runId]) this.allTasks[runId] = [];
+    this.taskEpoch[taskId] = this.runEpoch[runId] || 0;
     this.deps[taskId] = [...(depTaskIds || [])];
     this.batchOf[taskId] = this.normBatch(batch);
     if (!this.allTasks[runId].includes(taskId)) this.allTasks[runId].push(taskId);
@@ -165,6 +184,10 @@ export class TaskQueueService {
   }
 
   markComplete(taskId: number, runId?: number): void {
+    if (runId != null && this.isStaleWrite(runId, taskId)) {
+      console.warn(`[TaskQueueService] stale markComplete(${taskId}, ${runId}) ignored — runId was recycled since this task's generation (a prior occupant's late write)`);
+      return;
+    }
     this.completedTasks.add(taskId);
     if (runId && this.inFlight[runId] === taskId) {
       this.inFlight[runId] = null;
@@ -183,6 +206,10 @@ export class TaskQueueService {
   }
 
   markFailed(taskId: number, runId?: number): void {
+    if (runId != null && this.isStaleWrite(runId, taskId)) {
+      console.warn(`[TaskQueueService] stale markFailed(${taskId}, ${runId}) ignored — runId was recycled since this task's generation (a prior occupant's late write)`);
+      return;
+    }
     this.failedTasks.add(taskId);
     if (runId && this.inFlight[runId] === taskId) {
       this.inFlight[runId] = null;
@@ -197,6 +224,10 @@ export class TaskQueueService {
   }
 
   markDeferred(taskId: number, runId?: number): void {
+    if (runId != null && this.isStaleWrite(runId, taskId)) {
+      console.warn(`[TaskQueueService] stale markDeferred(${taskId}, ${runId}) ignored — runId was recycled since this task's generation (a prior occupant's late write)`);
+      return;
+    }
     this.deferredTasks.add(taskId);
     if (runId && this.inFlight[runId] === taskId) {
       this.inFlight[runId] = null;

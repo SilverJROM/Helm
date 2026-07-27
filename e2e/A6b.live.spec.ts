@@ -311,7 +311,13 @@ test.describe('A6b live: post-approve implementation dispatch on :3110', () => {
     // PROCEEDING: queue dispatched (status left pending and/or attempts exist).
     let proceeded = false;
     let loggedIngested = false;
-    const proceedDeadline = Date.now() + 55000;
+    // L3 send-back: 55s was narrower than this codebase's own measured real-implementer
+    // cold-spawn cost for the IDENTICAL mechanism. A6.live.spec.ts (send-back attempt=3) already
+    // proved this can run up to ~65s on the real (non-fake) transport and widened its own
+    // proceedDeadline to 65000 to match. A6b skips A6's plancore cold-spawn (finish-planning
+    // shortcut) so it has more of the 170s/180s budget to spend here — widen with margin above
+    // A6's proven ceiling rather than re-measuring from scratch.
+    const proceedDeadline = Date.now() + 95000;
     while (Date.now() < proceedDeadline) {
       const db = new Database(DB_PATH, { readonly: true });
       const tasks = db.prepare('SELECT status FROM run_tasks WHERE run_id = ?').all(implRunId) as any[];

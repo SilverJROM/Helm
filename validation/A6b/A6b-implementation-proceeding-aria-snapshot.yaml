@@ -1,18 +1,19 @@
 - button "← Back"
-- text: a6b-validation-1785129777159 / A6b dispatch 1785129777159
+- text: a6b-validation-1785133727997 / A6b dispatch 1785133727997
 - button "gate-after-planning"
 - button "Graceful Stop"
 - button "Cycle switcher"
-- text: Implementation running. Additive changes still enter through Discovery chat; graceful stop is available for replan. Discovery Planning Implementation Final Tests History Implementation running Run in progress 0/1 done 1 working 0 pending 0 failed 0 parked Deploy target not set Workers
+- text: Implementation running. Additive changes still enter through Discovery chat; graceful stop is available for replan. Discovery Planning Implementation Final Tests History Implementation running Run in progress 0/1 done 0 working 1 pending 0 failed 0 parked Deploy target not set Workers
 - 'button "Auto-focus: On" [pressed]'
 - button "Show both"
-- text: implementer - T1
+- text: implementer
 - button "–"
 - text: No live terminal for this task yet. validator
 - button "–"
-- text: No live terminal for this task yet. Active task · 0/1 done
+- text: No live terminal for this task yet. No task currently working · 0/1 done
 - button "Show all 1"
-- text: RUN T1 A6b post-approve dispatch proof batch A6b · working working — —
-- button "Docs collapsed tasks/T1 Expand":
-  - text: Docs collapsed tasks/T1
+- text: No task is currently working.
+- button "Show all 1"
+- button "Docs collapsed Expand":
+  - text: Docs collapsed
   - button "Expand"
