@@ -716,22 +716,6 @@ select option{background:var(--surface)}
 .cc-bubble.user { margin-left: auto; background: rgba(88,166,255,0.12); border-color: var(--accent); border-radius: 10px 10px 3px 10px; }
 .cc-bubble .who { font-size: 9px; color: var(--text-sec); display: block; margin-bottom: 1px; font-weight: 500; }
 .cc-bubble .meta { font-size: 9px; color: var(--text-sec); margin-top: 2px; }
-.cc-live-reply {
-  width: 100%;
-  margin: 6px 0 4px;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-.cc-live-prompt {
-  align-self: flex-end;
-  width: fit-content;
-  max-width: 92%;
-  border: 1px solid var(--accent);
-  border-radius: 10px 10px 3px 10px;
-  background: rgba(88,166,255,.12);
-  padding: 6px 9px;
-}
 .cc-live-label {
   padding: 0;
   font-size: 9px;
@@ -740,14 +724,63 @@ select option{background:var(--surface)}
   text-transform: uppercase;
   color: var(--text-sec);
 }
-.cc-live-prompt .cc-live-label { padding: 0 0 3px; }
-.cc-live-prompt-text {
+/* B6 / R6.24: sticky last-reply-only strip (replaces sticky last-prompt). Distinct surface; 2-line clamp. */
+.cc-last-reply-strip {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  width: 100%;
+  margin: 0 0 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  background: var(--accent-surface, rgba(88,166,255,.10));
+  box-shadow: 0 2px 10px rgba(0,0,0,.18);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.cc-last-reply-strip-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: nowrap;
+}
+.cc-last-reply-strip-controls {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+  flex-wrap: nowrap;
+}
+.cc-last-reply-body {
   color: var(--text);
   font-size: 12px;
-  line-height: 1.35;
+  line-height: 1.4;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+.cc-last-reply-body.is-collapsed {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
+  max-height: calc(1.4em * 2);
+}
+.cc-last-reply-body.is-expanded {
+  display: block;
+  max-height: none;
+  overflow: visible;
+}
+.cc-last-reply-restore-wrap {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  margin: 0 0 6px;
+}
+/* Legacy live-stream class retained for any residual callers; B6 strip owns last reply (no nested scroll). */
 .cc-live-stream {
   width: 100%;
   margin: 0;
@@ -761,17 +794,9 @@ select option{background:var(--surface)}
   line-height: 1.45;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+  max-height: none;
+  overflow: visible;
 }
-.cc-disc-pane-body .cc-live-reply {
-  margin-top: 8px;
-}
-.cc-disc-pane-body .cc-live-prompt {
-  position: sticky;
-  top: 4px;
-  z-index: 2;
-  box-shadow: 0 2px 8px rgba(0,0,0,.16);
-}
-/* B5 / R6.25: remove nested 340px log cap — stream grows with pane-body (single scrollbar owner) */
 .cc-disc-pane-body .cc-live-stream {
   max-height: none;
   overflow: visible;

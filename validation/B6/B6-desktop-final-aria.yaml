@@ -1,0 +1,54 @@
+- text: Helm Agent Platform
+- button "«"
+- text: Agent Studio Project Setup Command Center Memory Tracking TEAMS deliberation-team red-team silverjrom admin
+- button "Dark"
+- text: Agent Studio
+- button "⟨"
+- text: Select an agent Agents Models Tiers Teams Telemetry Plumbing / Watchers Routing
+- button "⟩"
+- text: Agent Context AGENTS (10)
+- button "Agents actions": ⋮
+- searchbox "Filter agents…"
+- text: ACTIVE No active sessions PROJECT AGENTS discovery project solo grok grok-4.5 ibrain project solo grok grok-4.5 implementer project tiered codex gpt-5.3-codex-spark panelist project solo claude claude-sonnet-4-6 plancore project solo grok grok-4.5 planner project team codex gpt-5.5 validator project tiered grok grok-4.5 HOUSE AGENTS agent-master house solo claude claude-sonnet-4-6 jkage house solo L0 · learner claude claude-sonnet-4-6 overseer house solo claude claude-haiku-4-5 TEAMS deliberation-team deliberation red-team red-team
+- button "+ New Agent"
+- text: New agent solo tmux Identity Models Skills Memory Name
+- textbox
+- text: Classification
+- combobox:
+  - option "solo" [selected]
+  - option "tiered"
+  - option "team"
+- text: Required. Controls Models layout (solo / L1–L4 ladder / team note). Kind (house|project) is separate — default project. Provider — — L1 model
+- combobox:
+  - option "— pick a default model —" [selected]
+  - option "claude-fable (claude)"
+  - option "codex-5.5 (codex)"
+  - option "Codex 5.4 Mini (codex)"
+  - option "Codex 5.6 Luna (codex)"
+  - option "Codex 5.6 Sol (codex)"
+  - option "Codex 5.6 Terra (codex)"
+  - option "grok-4.5 (grok)"
+  - option "Haiku (claude)"
+  - option "Opus 5 (claude)"
+  - option "Sonnet 5 (claude)"
+  - option "Spark (codex)"
+- text: Backup
+- combobox:
+  - option "— none —" [selected]
+  - option "claude-fable (claude)"
+  - option "codex-5.5 (codex)"
+  - option "Codex 5.4 Mini (codex)"
+  - option "Codex 5.6 Luna (codex)"
+  - option "Codex 5.6 Sol (codex)"
+  - option "Codex 5.6 Terra (codex)"
+  - option "grok-4.5 (grok)"
+  - option "Haiku (claude)"
+  - option "Opus 5 (claude)"
+  - option "Sonnet 5 (claude)"
+  - option "Spark (codex)"
+- text: Description No description available Identity prompt agent.md
+- button "render >"
+- text: filename-first; render or edit body (JROM reviews) PROPOSALS No pending proposals for this agent.
+- button "Save"
+- button "Cancel / New"
+- text: Select an agent to see its context

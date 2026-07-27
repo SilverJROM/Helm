@@ -1145,13 +1145,58 @@ function App() {
   const [ccThread,setCcThread]=useState({});            // pid -> [{id, role:'user'|'agent', text, thinking, fallback, ts}]
   const [ccDeliveryGap,setCcDeliveryGap]=useState({});  // F2: pid -> true when the SSE signalled a delivery-failure GAP (some failures evicted / epoch degraded)
   const [ccGlobalLossWarn,setCcGlobalLossWarn]=useState(false); // F2 round-6: app-wide sticky warning when a hard-cap loss (lossGeneration) occurred; stays until the owner acks
-  const [ccLivePane,setCcLivePane]=useState({});        // pid -> latest agent-chat pane from SSE, rendered directly under pinned prompt
+  const [ccLivePane,setCcLivePane]=useState({});        // pid -> latest agent-chat pane from SSE (B6: feeds last-reply strip)
+  // B6 / R6.24: last-reply strip mode per project — collapsed (2-line) | expanded | hidden
+  const [ccLastReplyStrip, setCcLastReplyStrip] = useState({}); // pid -> 'collapsed'|'expanded'|'hidden'
   const [ccFavAgents,setCcFavAgents]=useState(() => { try { return JSON.parse(localStorage.getItem('helm_cc_fav_agents') || '[]'); } catch { return []; } });
   const ccChatEsRef = useRef(null);                     // one live SSE stream for the current pid's session
   const ccPendingUserRef = useRef({});                  // pid -> last user text (reply-extraction scope)
   const ccSessionRef = useRef({});                      // state mirror for cleanup paths
   const ccThreadRef = useRef({});                       // F2 round-7 (finding #5): LIVE mirror of ccThread (pid -> bubbles) so the SSE closure reads current thread state, not a stale attachment snapshot
   const ccEnsureInFlightRef = useRef({});               // F3: pid -> { tail } in-flight ensure+send lease chain
+  // B6 / R6.23: bottom-stick refs — capture intent on scroll / before mutation; never unconditional scrollTop
+  const discChatBodyRef = useRef(null);
+  const discChatStickRef = useRef({ shouldStick: true });
+  const chatThreadStickRef = useRef({ shouldStick: true });
+  const implTermBodyRefs = useRef({}); // role -> element
+  const implTermStickRefs = useRef({}); // role -> last intent
+
+  // B6 e2e seed (sessionStorage HELM_E2E_B6=1 only): force live strip + stick paths without a real agent.
+  useEffect(() => {
+    try {
+      if (typeof sessionStorage === 'undefined' || sessionStorage.getItem('HELM_E2E_B6') !== '1') return undefined;
+    } catch {
+      return undefined;
+    }
+    const onSeed = (ev) => {
+      const d = (ev && ev.detail) || {};
+      const pid = Number(d.projectId || d.pid);
+      if (!pid) return;
+      if (d.prompt != null) ccPendingUserRef.current[pid] = String(d.prompt);
+      if (d.session) {
+        setCcSession((p) => {
+          const n = { ...p, [pid]: d.session };
+          ccSessionRef.current = n;
+          return n;
+        });
+      }
+      if (d.liveReply != null) {
+        const bodyEl = discChatBodyRef.current;
+        const intent = captureStickIntent(bodyEl);
+        discChatStickRef.current = intent;
+        setCcLivePane((p) => ({ ...p, [pid]: String(d.liveReply) }));
+        requestAnimationFrame(() => applyStick(discChatBodyRef.current, intent));
+      }
+      if (Array.isArray(d.thread)) setCcThread((p) => ({ ...p, [pid]: d.thread }));
+      if (d.stripMode) setCcLastReplyStrip((p) => ({ ...p, [pid]: d.stripMode }));
+    };
+    window.addEventListener('helm:e2e-b6-seed', onSeed);
+    window.__helmE2eB6Seed = (detail) => onSeed({ detail });
+    return () => {
+      window.removeEventListener('helm:e2e-b6-seed', onSeed);
+      try { delete window.__helmE2eB6Seed; } catch { /* ignore */ }
+    };
+  }, []);
   const ccChannelCursorRef = useRef({});                // F2 round-6: CHANNEL -> highest delivery-failure seq seen (a cursor on one channel must never suppress another)
   const ccDeliveryEpochRef = useRef(null);              // F2 round-5: last-seen server delivery epoch; a change (restart) resets the per-channel cursors + shows a gap
   const ccLossGenAckedRef = useRef(0);                  // F2 round-6: highest process-wide lossGeneration the owner has acknowledged
@@ -1560,6 +1605,7 @@ function App() {
   };
   const ccLiveReplyText = (pid, fallbackPane) => stripAnsiForDisplay(ccLivePane[pid] || fallbackPane || '');
   const ccHasLiveTurn = (pid, fallbackPane) => !!(ccLastUserPrompt(pid) || ccLiveReplyText(pid, fallbackPane));
+  // B6 / R6.24 de-dupe: keep last user bubble in the list; drop trailing agent bubbles (shown only in strip).
   const ccThreadWithoutLiveTurn = (pid, thread, liveActive) => {
     const arr = thread || [];
     if (!liveActive || !arr.length) return arr;
@@ -1568,23 +1614,46 @@ function App() {
       if (arr[i] && arr[i].role === 'user') { lastUserIndex = i; break; }
     }
     if (lastUserIndex < 0) return arr;
-    return arr.filter((m, i) => i < lastUserIndex);
+    return arr.filter((m, i) => i <= lastUserIndex);
   };
+  const ccLastReplyMode = (pid) => ccLastReplyStrip[pid] || 'collapsed';
+  const setCcLastReplyMode = (pid, mode) => setCcLastReplyStrip((p) => ({ ...p, [pid]: mode }));
+  // B6 / R6.24: sticky last-reply-only strip (not last-prompt). Distinct surface; collapse / expand / hide.
+  // De-dupe: strip owns the live agent text — no second copy in .cc-live-stream below.
   const renderCcLiveReply = (pid, agentLabel, fallbackPane) => {
-    const prompt = ccLastUserPrompt(pid);
     const raw = ccLiveReplyText(pid, fallbackPane);
-    if (!prompt && !raw) return null;
-    return html`<div class="cc-live-reply" data-testid="cc-live-reply">
-      ${prompt ? html`<div class="cc-live-prompt" data-testid="cc-live-prompt">
-        <div class="cc-live-label">Last prompt</div>
-        <div class="cc-live-prompt-text">${prompt}</div>
-      </div>` : null}
-      <div class="cc-live-label">${agentLabel || 'Agent'} reply</div>
-      <div class="cc-live-stream" data-testid="cc-live-stream"
-        ref=${(el) => { if (el) el.scrollTop = el.scrollHeight; }}>${raw || 'Waiting for live output…'}</div>
+    const mode = ccLastReplyMode(pid);
+    if (mode === 'hidden') {
+      return html`<div class="cc-last-reply-restore-wrap" data-testid="cc-last-reply-hidden">
+        <button type="button" class="btn btn-sm" data-testid="cc-last-reply-show"
+          onclick=${() => setCcLastReplyMode(pid, 'collapsed')}>Show last reply</button>
+      </div>`;
+    }
+    const body = raw || 'Waiting for live output…';
+    const expanded = mode === 'expanded';
+    return html`<div class="cc-last-reply-strip" data-testid="cc-last-reply-strip" data-mode=${mode}>
+      <div class="cc-last-reply-strip-header">
+        <span class="cc-live-label" data-testid="cc-last-reply-label">${agentLabel || 'Agent'} · last reply</span>
+        <div class="cc-last-reply-strip-controls" data-testid="cc-last-reply-controls">
+          ${expanded
+            ? html`<button type="button" class="btn btn-sm" data-testid="cc-last-reply-collapse"
+                onclick=${() => setCcLastReplyMode(pid, 'collapsed')}>Collapse</button>`
+            : html`<button type="button" class="btn btn-sm" data-testid="cc-last-reply-expand"
+                onclick=${() => setCcLastReplyMode(pid, 'expanded')} title="Expand last reply">…</button>`}
+          <button type="button" class="btn btn-sm" data-testid="cc-last-reply-hide"
+            onclick=${() => setCcLastReplyMode(pid, 'hidden')}>Hide</button>
+        </div>
+      </div>
+      <div class=${`cc-last-reply-body ${expanded ? 'is-expanded' : 'is-collapsed'}`}
+        data-testid="cc-last-reply-body"
+        data-expanded=${expanded ? '1' : '0'}>${body}</div>
     </div>`;
   };
   const ccIngestPane = (pid, pane) => {
+    // B6 site-1/3: capture Discovery scroll intent BEFORE content mutation (was unconditional stream stick).
+    const bodyEl = discChatBodyRef.current;
+    const intent = captureStickIntent(bodyEl);
+    discChatStickRef.current = intent;
     setCcLivePane(p => ({...p, [pid]: pane || ''}));
     // Marker-based, idempotent recompute of the current turn's agent bubble (thinking → reply) —
     // the SAME extractHelmReply pipeline the Studio chat uses.
@@ -1599,7 +1668,10 @@ function App() {
     // When idle and the extractor yielded no text, fall back to the plain-prose segmenter so a
     // completed reply still renders (rather than an empty / stuck-thinking bubble).
     if (!thinking && !text) text = extractAgentPaneSegment('', pane, pending) || '';
-    if (!thinking && !text) return;
+    if (!thinking && !text) {
+      requestAnimationFrame(() => applyStick(discChatBodyRef.current, intent));
+      return;
+    }
     setCcThread(prev => {
       const arr = prev[pid] || [];
       const last = arr[arr.length - 1];
@@ -1607,6 +1679,7 @@ function App() {
       if (last && last.role === 'agent') return {...prev, [pid]: [...arr.slice(0, -1), { ...last, ...bubble }]};
       return {...prev, [pid]: [...arr, { id: 'cc' + (ccMsgIdRef.current++), ts: Date.now(), ...bubble }]};
     });
+    requestAnimationFrame(() => applyStick(discChatBodyRef.current, intent));
     // iter3: do NOT clear pending on reply/fallback — keep as persistent current-turn anchor until next send (fixes wrapped-prompt scope loss)
   };
   const ccDetachStream = () => { if (ccChatEsRef.current) { try { ccChatEsRef.current.close(); } catch {} ccChatEsRef.current = null; } };
@@ -2128,9 +2201,11 @@ function App() {
     chatThreadMessagesRef.current = chatThreadMessages;
   }, [chatThreadMessages]);
 
+  // B6 site-2 / R6.23: Studio chat — stick only when reader was near bottom (B3 applyStick).
   useEffect(() => {
     const el = chatThreadScrollRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
+    if (!el) return;
+    requestAnimationFrame(() => applyStick(el, chatThreadStickRef.current));
   }, [chatThreadMessages, chatPaneContent]);
 
   // B1 + B06: load models + CLI facet when Models tab active
@@ -5119,13 +5194,18 @@ function App() {
   };
   // LV-R3: fetch a role's live terminal pane (server-derives the running worker). Failure keeps the
   // last snapshot (no crash, no flicker to empty); empty text / null session → placeholder in render.
+  // B6 site-4 / R6.23: capture stick intent before content write; apply after paint (no unconditional ref stick).
   const loadTaskTerminal = async (cycleId, role) => {
     if (!cycleId || !token) return;
+    const bodyEl = implTermBodyRefs.current[role];
+    const intent = captureStickIntent(bodyEl);
+    implTermStickRefs.current[role] = intent;
     try {
       const r = await authedFetch(`/api/cycles/${cycleId}/task-terminal?role=${role}`, { allowStatuses: [400, 404] });
       if (!r.ok) return;
       const d = await r.json();
       setCcImplTerm(p => ({ ...p, [`${cycleId}::${role}`]: { session: d.session ?? null, text: d.text || '' } }));
+      requestAnimationFrame(() => applyStick(implTermBodyRefs.current[role], intent));
     } catch (e) { /* keep last snapshot */ }
   };
   // B9-T02: lazy per-task docs fetch (R-F6) — tasks/<id>/changes.md + independent-validation.md.
@@ -5429,11 +5509,19 @@ function App() {
               </div>
             </div>
             <div class="cc-disc-pane-body cc-chat-scroll" data-testid="ws-disc-chat-body"
-              ref=${(el) => { if (el && discLiveActive) el.scrollTop = el.scrollHeight; }}>
+              ref=${(el) => {
+                discChatBodyRef.current = el;
+                if (el) discChatStickRef.current = captureStickIntent(el);
+              }}
+              onscroll=${() => {
+                if (discChatBodyRef.current) discChatStickRef.current = captureStickIntent(discChatBodyRef.current);
+              }}>
+              ${discLiveActive ? renderCcLiveReply(pid, brainName) : null}
               ${ccDeliveryGap[pid] ? html`<div data-testid="ws-disc-delivery-gap" style="color:#d29922;font-size:10px;padding:3px 6px;">⚠ some delivery statuses may be incomplete — reload to re-sync.</div>` : null}
               ${ccGlobalLossWarn ? html`<div data-testid="ws-disc-loss-warn" style="color:#f85149;font-size:10px;padding:3px 6px;">⚠ delivery-status notifications were dropped under load — some sent messages' status is uncertain. <button class="btn btn-sm" style="padding:0 4px;font-size:9px" onclick=${ccAckGlobalLoss}>Dismiss</button></div>` : null}
               ${visibleThread.length ? visibleThread.map(m => {
                 const isU = m.role === 'user';
+                // Live agent text lives only in the sticky strip (ccThreadWithoutLiveTurn drops trailing agents).
                 return html`<div class=${`cc-bubble ${isU ? 'user' : ''}`} data-testid=${isU ? 'ws-disc-chat-message' : 'ws-disc-chat-bubble-agent'} key=${m.id}>
                   <span class="who">${isU ? 'JROM' : brainName}</span>
                   ${m.thinking
@@ -5443,7 +5531,6 @@ function App() {
                   ${isU && m.delivered === false ? html`<span style="color:#f85149;font-size:8px;">⚠ not delivered</span>` : null}
                 </div>`;
               }) : (discLiveActive ? null : html`<div class="text-sec" data-testid="ws-disc-chat-empty" style="padding:6px;font-size:11px">No messages yet. ${canChat ? `Type a message to start chatting with ${brainName}.` : 'Assign an agent to this project to chat.'}</div>`)}
-              ${discLiveActive ? renderCcLiveReply(pid, brainName) : null}
             </div>
             <div class="cc-disc-pane-footer cc-composer" data-testid="ws-disc-composer">
               <textarea data-testid="ws-disc-chat-composer" disabled=${!canChat}
@@ -5988,7 +6075,14 @@ function App() {
             title=${`Minimize ${role} pane fully to a rail (manual)`} onclick=${() => setCcImplCollapsedPane(role)}>–</button>
         </div>
         <div class="cmt-term-body" data-testid=${`ws-impl-term-${role}-body`}
-          ref=${(el) => { if (el && p.content) el.scrollTop = el.scrollHeight; }}>
+          ref=${(el) => {
+            implTermBodyRefs.current[role] = el;
+            if (el) implTermStickRefs.current[role] = captureStickIntent(el);
+          }}
+          onscroll=${() => {
+            const el = implTermBodyRefs.current[role];
+            if (el) implTermStickRefs.current[role] = captureStickIntent(el);
+          }}>
           ${p.content
             ? p.content.split(/\r?\n/).map((line, i) => html`<div key=${i} class="cmt-line">${line || ' '}</div>`)
             : html`<div class="text-sec" data-testid=${`ws-impl-term-${role}-empty`}>No live terminal for this task yet.</div>`}
@@ -7912,7 +8006,14 @@ function App() {
         ${(() => {
           const logsPre = html`<pre data-testid="as-chat-logs" class="as-chat-logs">${chatLogs || (chatSid ? 'Loading session logs…' : 'No live session — turn the session On to view its tmux logs.')}</pre>`;
           const chatThread = html`
-            <div data-testid="as-chat-thread" class="as-chat-thread" ref=${chatThreadScrollRef} style="flex:1;min-height:200px;overflow-y:auto;margin-bottom:8px">
+            <div data-testid="as-chat-thread" class="as-chat-thread" ref=${(el) => {
+              chatThreadScrollRef.current = el;
+              if (el) chatThreadStickRef.current = captureStickIntent(el);
+            }}
+              onscroll=${() => {
+                if (chatThreadScrollRef.current) chatThreadStickRef.current = captureStickIntent(chatThreadScrollRef.current);
+              }}
+              style="flex:1;min-height:200px;overflow-y:auto;margin-bottom:8px">
               ${chatDeliveryGap ? html`<div data-testid="chat-delivery-gap" style="color:#d29922;font-size:10px;padding:3px 6px;">⚠ some delivery statuses may be incomplete — reload to re-sync.</div>` : null}
               ${ccGlobalLossWarn ? html`<div data-testid="chat-loss-warn" style="color:#f85149;font-size:10px;padding:3px 6px;">⚠ delivery-status notifications were dropped under load — some sent messages' status is uncertain. <button class="btn btn-sm" style="padding:0 4px;font-size:9px" onclick=${ccAckGlobalLoss}>Dismiss</button></div>` : null}
               ${chatThreadMessages.length
