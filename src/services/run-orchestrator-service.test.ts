@@ -965,10 +965,10 @@ describe('RunOrchestratorService (A2 wiring)', () => {
     const tmux = new TmuxService();
     const name = `pocfix4-dup-sess-${Date.now().toString(36)}`;
     try {
-      const t1 = await tmux.createSession(name);
+      const t1 = await tmux.createSession(name, undefined, { owner: 'helm' });
       expect(t1).toBe(`${name}:0.0`);
       // duplicate: must not throw; old killed; same target returned
-      const t2 = await tmux.createSession(name);
+      const t2 = await tmux.createSession(name, undefined, { owner: 'helm' });
       expect(t2).toBe(`${name}:0.0`);
     } finally {
       await tmux.terminateSession(name).catch(() => {});

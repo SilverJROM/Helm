@@ -1,30 +1,37 @@
-# S04 changes — helm_sessions.owner column (AC1)
+# S05 changes — pre-spawn owner refuse + 6 create paths (AC2, AC3)
 
 ## Root cause / objective
-Binary decision authority is not stored on the session registry. Without `owner`, the reconciler cannot structurally exclude human/legacy seats. S04 adds the column and threads types; S05 refuses create without owner; S07 backfills legacy rows.
+S04 stored `owner` but every product create path still omitted it. Refusal inside `register()`/`onCreate` is too late: `createSession` already ran `has-session`/`kill`/`new-session`, and `onCreate` is try/caught — yielding live untracked sessions (F2). S05 refuses **before any tmux mutation** and threads explicit `owner` on all six create paths in the same slice.
 
 ## Mechanism
-1. **`SessionOwner`** = `helm` | `human` | `legacy:unknown`
-2. **Two-track DDL** `SCHEMA_VERSION` 100→101:
-   - Fresh: `schema.ts` `helm_sessions.owner` with CHECK `(owner IS NULL OR owner IN (...))`
-   - Upgrade: `database.ts` v101 guarded `ALTER TABLE … ADD COLUMN` same CHECK
-3. **Types**: `RegisterOpts.owner?`, `TmuxSessionCreateOpts.owner?`, `HelmSessionRow.owner: SessionOwner | null`
-4. **UPSERT**: `owner = COALESCE(excluded.owner, helm_sessions.owner)` so recreated names never silently drop authority
-5. Existing rows may stay **null** until S07; janitor stays off
+1. **`assertValidSessionOwner`** at top of `TmuxService.createSession` after `ensureValidSessionName` — throw if missing/invalid **before** any `execFile`/tmux command.
+2. **Defensive `SessionRegistryService.register()`** — throws if owner missing/invalid (belt for direct callers).
+3. **Six product call sites** pass owner:
+   - `worker-service` workers → `helm`
+   - `real-transport` brains → `helm`
+   - `master-runtime` preflight (`helm-preflight-*`) → `helm`
+   - `master-runtime` launchMaster brains → `helm`
+   - `model-validation` probes → `helm`
+   - `chat-session-service` discovery/chat → `human`
+4. **`index.ts` onCreate** forwards `owner` into `register`.
+5. **`EnrichOpts`** separated from `RegisterOpts` so late enrich does not require owner.
 
 ## Code changes
-- `src/db/schema.ts` — SCHEMA_VERSION 101 + owner column
-- `src/db/database.ts` — v101 migration
-- `src/services/session-registry-service.ts` — SessionOwner, RegisterOpts, INSERT/UPSERT
-- `src/tmux/tmux-service.ts` — TmuxSessionCreateOpts.owner
-- `src/services/session-registry-service.test.ts` — S04 synthetic suite
+- `src/tmux/tmux-service.ts` — required owner + pre-spawn guard
+- `src/services/session-registry-service.ts` — register refuse; EnrichOpts
+- `src/services/worker-service.ts` — owner helm
+- `src/services/real-transport.ts` — owner helm
+- `src/services/master-runtime-service.ts` — preflight + brain owner helm
+- `src/services/model-validation-service.ts` — probe owner helm
+- `src/services/chat-session-service.ts` — human owner
+- `src/index.ts` — onCreate owner forward
+- Tests: `tmux-helm-child-tag.test.ts` (fake-exec pre-spawn), `session-registry-service.test.ts`, `s05-owner-create-paths.test.ts`, a15/orchestrator-loop/run-orchestrator register/createSession owners
 
 ## Guardrails
 - `HELM_SESSION_JANITOR=0` unchanged (`.env` + `ecosystem.config.cjs`)
-- Synthetic DB only; live `data/helm.db` mtime asserted untouched in tests
-- No create-path refusal (S05); no backfill (S07)
+- Fake exec / synthetic DB only; no live reap
+- Out of scope: S06 preflight kind, S07 backfill
 
 ## Test status
-`npx vitest run src/services/session-registry-service.test.ts --poolOptions.forks.maxForks=2` → **30 passed**  
-`npx tsc --noEmit -p .` → **exit 0**  
-Live `data/helm.db` mtime asserted untouched by S04 suite.
+`HELM_SESSION_JANITOR=0 npx vitest run src/tmux/tmux-helm-child-tag.test.ts src/services/session-registry-service.test.ts src/s05-owner-create-paths.test.ts src/a15-worker-finalize.test.ts --poolOptions.forks.maxForks=2` → **61 passed**  
+`npx tsc --noEmit -p .` → **exit 0**

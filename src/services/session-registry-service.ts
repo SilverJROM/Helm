@@ -27,11 +27,31 @@ export interface HelmSessionRow {
 }
 
 export interface RegisterOpts {
-  /** S04: threaded storage contract. S05 makes create-path required + refuse. */
-  owner?: SessionOwner;
+  /**
+   * S04: storage contract. S05: required for direct register() — throw if missing/invalid.
+   * Create paths already refuse pre-spawn in TmuxService.createSession (F2).
+   */
+  owner: SessionOwner;
   kind?: string;
   projectId?: number | null;
   runId?: number | null;
+}
+
+/** Late context fill — owner is set at register/create, not via enrich. */
+export interface EnrichOpts {
+  kind?: string;
+  projectId?: number | null;
+  runId?: number | null;
+}
+
+const VALID_OWNERS = new Set<SessionOwner>(['helm', 'human', 'legacy:unknown']);
+
+function assertRegisterOwner(owner: unknown): asserts owner is SessionOwner {
+  if (typeof owner !== 'string' || !VALID_OWNERS.has(owner as SessionOwner)) {
+    throw new Error(
+      `session owner required (helm|human|legacy:unknown); got ${owner === undefined || owner === null ? String(owner) : JSON.stringify(owner)}`
+    );
+  }
 }
 
 /**
@@ -61,12 +81,15 @@ export class SessionRegistryService {
   constructor(private readonly db: DatabaseService) {}
 
   /** SL-R1: upsert an active row for a session on create (last-wins on name). */
-  register(name: string, opts: RegisterOpts = {}): void {
+  register(name: string, opts: RegisterOpts): void {
     if (!name) return;
+    // S05: defensive refuse — direct callers without owner throw. Create-path refusal is pre-spawn
+    // in TmuxService.createSession (onCreate after new-session is try/caught and too late — F2).
+    assertRegisterOwner(opts?.owner);
     const kind = opts.kind ?? deriveSessionKind(name);
     const projectId = opts.projectId ?? null;
     const runId = opts.runId ?? null;
-    const owner = opts.owner ?? null;
+    const owner = opts.owner;
     // Upsert: a re-created session name resets to active + refreshes context/created_at.
     // S04: owner uses COALESCE so recreated names never silently drop decision authority.
     this.db.prepare(`
@@ -119,7 +142,7 @@ WHERE name = ?
   }
 
   /** SL-R2: enrich a row with late-known context (run_id/project_id/kind). Only fills nulls / overrides given. */
-  enrich(name: string, opts: RegisterOpts = {}): void {
+  enrich(name: string, opts: EnrichOpts = {}): void {
     if (!name) return;
     this.db.prepare(`
 UPDATE helm_sessions SET

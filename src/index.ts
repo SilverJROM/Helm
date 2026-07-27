@@ -279,10 +279,11 @@ async function main(): Promise<void> {
   const sessionRegistry = new SessionRegistryService(db);
   if (typeof (tmuxService as any).setRegistryHook === 'function') {
     (tmuxService as any).setRegistryHook({
-      // A2 (R4.16): forward optional projectId/runId/kind from createSession so helm_sessions
-      // rows land linked at the choke point (planning seats no longer NULL).
-      onCreate: (name: string, opts?: { projectId?: number | null; runId?: number | null; kind?: string }) => {
-        try { sessionRegistry.register(name, opts ?? {}); } catch {}
+      // A2 + S05: forward projectId/runId/kind/owner from createSession so helm_sessions
+      // rows land linked with decision authority at the choke point. Owner is required pre-spawn
+      // in createSession; register() also refuses missing owner (defensive).
+      onCreate: (name: string, opts?: { projectId?: number | null; runId?: number | null; kind?: string; owner?: 'helm' | 'human' | 'legacy:unknown' }) => {
+        try { sessionRegistry.register(name, opts as any); } catch {}
       },
       onTerminate: (name: string) => { try { sessionRegistry.markReaped(name); } catch {} },
       // SL-R2/R4: active-input refreshes last_used_at so the TTL means "idle for TTL" (in-use sessions kept).

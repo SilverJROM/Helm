@@ -34,7 +34,7 @@ describe('SL-R1/R2 SessionRegistryService', () => {
   afterEach(() => cleanup());
 
   it('register-on-create sets status active + derives kind + list/get', () => {
-    reg.register('helm-batch-A1-implementer-abc123');
+    reg.register('helm-batch-A1-implementer-abc123', { owner: 'helm' });
     const row = reg.get('helm-batch-A1-implementer-abc123');
     expect(row).toBeTruthy();
     expect(row!.status).toBe('active');
@@ -58,7 +58,7 @@ describe('SL-R1/R2 SessionRegistryService', () => {
   });
 
   it('markIdle then markReaped transition (idle → reaped, ended_at set)', () => {
-    reg.register('helm-w-cards-7');
+    reg.register('helm-w-cards-7', { owner: 'helm' });
     reg.markIdle('helm-w-cards-7', 'run-terminal');
     expect(reg.get('helm-w-cards-7')!.status).toBe('idle');
     reg.markReaped('helm-w-cards-7', 'janitor-ttl');
@@ -69,10 +69,10 @@ describe('SL-R1/R2 SessionRegistryService', () => {
   });
 
   it('register is last-wins (re-create resets a reaped row to active)', () => {
-    reg.register('helm-w-cards-9');
+    reg.register('helm-w-cards-9', { owner: 'helm' });
     reg.markReaped('helm-w-cards-9');
     expect(reg.get('helm-w-cards-9')!.status).toBe('reaped');
-    reg.register('helm-w-cards-9');
+    reg.register('helm-w-cards-9', { owner: 'helm' });
     const row = reg.get('helm-w-cards-9')!;
     expect(row.status).toBe('active');
     expect(row.ended_at).toBeNull();
@@ -81,7 +81,7 @@ describe('SL-R1/R2 SessionRegistryService', () => {
   });
 
   it('enrich fills run_id / project_id / kind', () => {
-    reg.register('helm-batch-A1-implementer-z');
+    reg.register('helm-batch-A1-implementer-z', { owner: 'helm' });
     reg.enrich('helm-batch-A1-implementer-z', { runId: 55, projectId: 3 });
     const row = reg.get('helm-batch-A1-implementer-z')!;
     expect(row.run_id).toBe(55);
@@ -91,8 +91,8 @@ describe('SL-R1/R2 SessionRegistryService', () => {
   // A2 (R4.16): planning seats must land in helm_sessions with both ids at register time
   // (the createSession choke point calls register with opts — this is the DB half of that contract).
   it('A2: register of a planning seat with projectId+runId stores both ids (not NULL)', () => {
-    reg.register('helm-batch-A2-plancore-abc12', { projectId: 42, runId: 99, kind: 'plancore' });
-    reg.register('helm-batch-A2-partner-def34', { projectId: 42, runId: 99, kind: 'deliberation' });
+    reg.register('helm-batch-A2-plancore-abc12', { owner: 'helm', projectId: 42, runId: 99, kind: 'plancore' });
+    reg.register('helm-batch-A2-partner-def34', { owner: 'helm', projectId: 42, runId: 99, kind: 'deliberation' });
     const plancore = reg.get('helm-batch-A2-plancore-abc12')!;
     const partner = reg.get('helm-batch-A2-partner-def34')!;
     expect(plancore.project_id).toBe(42);
@@ -131,14 +131,22 @@ describe('S04 helm_sessions.owner (AC1)', () => {
     }
   });
 
-  it('fresh DB: owner column present, SCHEMA_VERSION ≥ 101, null allowed until S07', () => {
+  it('fresh DB: owner column present, SCHEMA_VERSION ≥ 101', () => {
     expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(101);
     const ver = (db.raw.prepare('SELECT version FROM schema_version').get() as any).version;
     expect(ver).toBe(SCHEMA_VERSION);
     const cols = db.raw.prepare('PRAGMA table_info(helm_sessions)').all().map((c: any) => c.name);
     expect(cols).toContain('owner');
-    reg.register('helm-w-owner-null-ok');
-    expect(reg.get('helm-w-owner-null-ok')!.owner).toBeNull();
+    reg.register('helm-w-owner-ok', { owner: 'helm' });
+    expect(reg.get('helm-w-owner-ok')!.owner).toBe('helm');
+  });
+
+  // S05: direct register without owner refuses (defensive; create-path is pre-spawn).
+  it('S05: register() without owner throws', () => {
+    expect(() => reg.register('helm-w-no-owner' as any, {} as any)).toThrow(/owner required/);
+    expect(() => reg.register('helm-w-no-owner2', { owner: undefined as any })).toThrow(/owner required/);
+    expect(() => reg.register('helm-w-bad-owner', { owner: 'robot' as any })).toThrow(/owner required/);
+    expect(reg.get('helm-w-no-owner')).toBeFalsy();
   });
 
   it('owner round-trip: helm | human | legacy:unknown', () => {
@@ -158,12 +166,14 @@ describe('S04 helm_sessions.owner (AC1)', () => {
     }).toThrow();
   });
 
-  it('recreated-name upsert does not silently drop authority (COALESCE owner)', () => {
+  it('recreated-name upsert keeps authority when owner re-asserted; omit throws (S05)', () => {
     reg.register('helm-w-cards-auth', { owner: 'helm', projectId: 1, runId: 10 });
     expect(reg.get('helm-w-cards-auth')!.owner).toBe('helm');
     reg.markReaped('helm-w-cards-auth', 'test-reap');
-    // Re-register same name WITHOUT owner — must preserve prior authority, not null it.
-    reg.register('helm-w-cards-auth', { projectId: 1, runId: 11 });
+    // S05: re-register without owner refuses (no silent null authority).
+    expect(() => reg.register('helm-w-cards-auth', { projectId: 1, runId: 11 } as any)).toThrow(/owner required/);
+    // Re-register with explicit owner resets to active + keeps/sets authority.
+    reg.register('helm-w-cards-auth', { owner: 'helm', projectId: 1, runId: 11 });
     const row = reg.get('helm-w-cards-auth')!;
     expect(row.status).toBe('active');
     expect(row.owner).toBe('helm');
@@ -401,7 +411,7 @@ describe('SL-R3/R4 session janitor (WorkerService.sessionJanitorTick)', () => {
     const { TmuxService } = await import('../tmux/tmux-service.js');
     const tmux = new (TmuxService as any)();
     tmux.setRegistryHook({
-      onCreate: (n: string) => reg.register(n),
+      onCreate: (n: string) => reg.register(n, { owner: 'helm' }),
       onTerminate: (n: string) => reg.markReaped(n),
       onUse: (n: string) => reg.touch(n),
     });

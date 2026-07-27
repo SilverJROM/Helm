@@ -37,13 +37,27 @@ export type TextSubmissionState = "held" | "submitted" | "indeterminate";
 // registry keep working, and TmuxService never hard-depends on the DB.
 // A2 (R4.16): onCreate may carry projectId/runId/kind so helm_sessions rows land linked at create
 // time (planning seats via RealTransport; workers may still enrich later for late-known context).
-// S04 / AC1: owner (helm|human|legacy:unknown) threaded here; S05 makes it required + refuses create.
+// S04 / AC1: owner (helm|human|legacy:unknown) threaded here.
+// S05 / AC2: owner REQUIRED pre-spawn — createSession refuses missing/invalid before any tmux mutation.
+export type TmuxSessionOwner = 'helm' | 'human' | 'legacy:unknown';
+
 export interface TmuxSessionCreateOpts {
   projectId?: number | null;
   runId?: number | null;
   kind?: string;
-  /** Decision authority. Optional until S05 pre-spawn refusal. */
-  owner?: 'helm' | 'human' | 'legacy:unknown';
+  /** Decision authority. Required at create (S05 pre-spawn refusal). */
+  owner: TmuxSessionOwner;
+}
+
+const VALID_SESSION_OWNERS = new Set<string>(['helm', 'human', 'legacy:unknown']);
+
+/** S05: fail-closed owner check shared by createSession (pre-spawn) and register (defensive). */
+export function assertValidSessionOwner(owner: unknown): asserts owner is TmuxSessionOwner {
+  if (typeof owner !== 'string' || !VALID_SESSION_OWNERS.has(owner)) {
+    throw new Error(
+      `session owner required (helm|human|legacy:unknown); got ${owner === undefined || owner === null ? String(owner) : JSON.stringify(owner)}`
+    );
+  }
 }
 
 export interface TmuxSessionRegistryHook {
@@ -411,6 +425,9 @@ export class TmuxService {
 
   async createSession(name: string, cwd?: string, opts?: TmuxSessionCreateOpts): Promise<string> {
     this.ensureValidSessionName(name);
+    // S05 / AC2 (F2): owner refusal MUST be pre-spawn. register()/onCreate runs AFTER new-session and is
+    // try/caught — refusing there would leave a live untracked unreapable session. Check before ANY tmux cmd.
+    assertValidSessionOwner(opts?.owner);
     // POCFIX4: idempotent for fixed per-project session names (e.g. 'helm_cards' leftover from prior run).
     // Best-effort kill-if-exists (has-session then kill-session) before new-session so duplicate never throws.
     try {
@@ -431,9 +448,9 @@ export class TmuxService {
     // failure must never break/throw the create (swallowed + logged, exactly like the registry hook below).
     await execFileAsync('tmux', ['set-option', '-t', name, '@helm_child', '1'])
       .catch((err) => { console.warn('[tmux] set @helm_child failed (best-effort)', { name, err: String(err) }); });
-    // SL-R1 / A2: register EVERY created session centrally (single choke point), carrying optional
-    // projectId/runId/kind so helm_sessions rows are linked at create time. Best-effort — a registry
-    // failure must never break session creation.
+    // SL-R1 / A2 / S05: register EVERY created session centrally (single choke point), carrying owner +
+    // optional projectId/runId/kind so helm_sessions rows are linked at create time. Best-effort — a
+    // registry failure must never break session creation (owner already validated pre-spawn).
     try { this.registryHook.onCreate(name, opts); } catch (err) { console.warn('[tmux] registry onCreate failed', { name, err: String(err) }); }
     return `${name}:0.0`;
   }

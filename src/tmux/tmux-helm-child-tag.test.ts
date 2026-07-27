@@ -52,7 +52,7 @@ describe('ST-R1/R2 @helm_child tmux ownership tag', () => {
       return { stdout: '', stderr: '' };
     };
     const tmux: any = new TmuxService();
-    const ret = await tmux.createSession('helm-w-tagtest');
+    const ret = await tmux.createSession('helm-w-tagtest', undefined, { owner: 'helm' });
     expect(ret).toBe('helm-w-tagtest:0.0');
 
     const newSessionIdx = cpMock.calls.findIndex((c) => c.args[0] === 'new-session');
@@ -74,11 +74,11 @@ describe('ST-R1/R2 @helm_child tmux ownership tag', () => {
       return { stdout: '', stderr: '' };
     };
     const tmux: any = new TmuxService();
-    await expect(tmux.createSession('helm-w-tagfail')).resolves.toBe('helm-w-tagfail:0.0');
+    await expect(tmux.createSession('helm-w-tagfail', undefined, { owner: 'helm' })).resolves.toBe('helm-w-tagfail:0.0');
   });
 
-  // A2 (R4.16): createSession forwards projectId/runId into the registry onCreate choke point.
-  it('A2: createSession passes projectId+runId to registry onCreate', async () => {
+  // A2 (R4.16) + S05: createSession forwards projectId/runId/owner into the registry onCreate choke point.
+  it('A2: createSession passes projectId+runId+owner to registry onCreate', async () => {
     cpMock.impl = async (_cmd: string, args: string[]) => {
       if (args[0] === 'has-session') throw new Error('no such session');
       return { stdout: '', stderr: '' };
@@ -89,8 +89,48 @@ describe('ST-R1/R2 @helm_child tmux ownership tag', () => {
       onTerminate: () => {},
       onUse: () => {},
     });
-    await tmux.createSession('helm-batch-A2-plancore-x1', '/tmp/proj', { projectId: 7, runId: 88 });
-    expect(seen).toEqual([{ name: 'helm-batch-A2-plancore-x1', opts: { projectId: 7, runId: 88 } }]);
+    await tmux.createSession('helm-batch-A2-plancore-x1', '/tmp/proj', { projectId: 7, runId: 88, owner: 'helm' });
+    expect(seen).toEqual([{ name: 'helm-batch-A2-plancore-x1', opts: { projectId: 7, runId: 88, owner: 'helm' } }]);
+  });
+
+  // S05 / AC2: pre-spawn owner refuse — zero tmux mutations when owner missing/invalid.
+  it('S05: missing owner rejects before any tmux command', async () => {
+    const tmux: any = new TmuxService();
+    await expect(tmux.createSession('helm-w-no-owner')).rejects.toThrow(/owner required/);
+    await expect(tmux.createSession('helm-w-no-owner2', '/tmp', {} as any)).rejects.toThrow(/owner required/);
+    expect(cpMock.calls).toEqual([]);
+  });
+
+  it('S05: invalid owner rejects before any tmux command', async () => {
+    const tmux: any = new TmuxService();
+    await expect(tmux.createSession('helm-w-bad', undefined, { owner: 'robot' as any })).rejects.toThrow(/owner required/);
+    expect(cpMock.calls).toEqual([]);
+  });
+
+  it('S05: valid helm owner reaches new-session (register still receives owner)', async () => {
+    cpMock.impl = async (_cmd: string, args: string[]) => {
+      if (args[0] === 'has-session') throw new Error('no such session');
+      return { stdout: '', stderr: '' };
+    };
+    const seen: any[] = [];
+    const tmux: any = new TmuxService({
+      onCreate: (name: string, opts?: any) => { seen.push({ name, opts }); },
+      onTerminate: () => {},
+      onUse: () => {},
+    });
+    await tmux.createSession('helm-w-ok', '/tmp', { owner: 'helm', kind: 'worker' });
+    expect(cpMock.calls.some((c) => c.args[0] === 'new-session')).toBe(true);
+    expect(seen[0]).toEqual({ name: 'helm-w-ok', opts: { owner: 'helm', kind: 'worker' } });
+  });
+
+  it('S05: valid human owner reaches new-session', async () => {
+    cpMock.impl = async (_cmd: string, args: string[]) => {
+      if (args[0] === 'has-session') throw new Error('no such session');
+      return { stdout: '', stderr: '' };
+    };
+    const tmux: any = new TmuxService();
+    await expect(tmux.createSession('helm-chat-ok', undefined, { owner: 'human' })).resolves.toBe('helm-chat-ok:0.0');
+    expect(cpMock.calls.some((c) => c.args[0] === 'new-session')).toBe(true);
   });
 
   it('ST-R2: sessionHasHelmChildTag returns true ONLY when the option is exactly "1"', async () => {

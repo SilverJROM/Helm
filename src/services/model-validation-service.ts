@@ -303,7 +303,8 @@ export class ModelValidationService {
     const prompt = `Reply with exactly ${marker} and no other text.`;
 
     try {
-      await this.tmux!.createSession(sessionName);
+      // S05: validation probe seats are Helm-owned.
+      await this.tmux!.createSession(sessionName, undefined, { owner: 'helm', kind: 'test' });
       const baseCmd = `codex -m ${model.model_id} --dangerously-bypass-approvals-and-sandbox`;
       const { envPrefix: _envPrefix, launchCmd } = applyEnvelopeIsolation('codex', baseCmd);
       // envPrefix is '' for codex; launchCmd carries -c project_doc_max_bytes=0

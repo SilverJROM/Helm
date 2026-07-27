@@ -657,7 +657,8 @@ export class ChatSessionService {
     // B-ISO1: compose (+ fail-closed validate) the OPT-IN strict read env BEFORE createSession, so a
     // bad allowlist refuses the spawn cleanly. Absent → '' (fencedLaunch byte-identical to read-all).
     const strictEnv = opts?.strictReadAllow !== undefined ? makeStrictReadProfileEnv(opts.strictReadAllow) : '';
-    const target = await this.deps.tmux.createSession(sessionName, fenceDir);
+    // S05 / AC3: discovery/chat is human-owned decision authority (never auto-reap candidate).
+    const target = await this.deps.tmux.createSession(sessionName, fenceDir, { owner: 'human' });
 
     try {
       const sandboxBin = resolveHelmSandboxBin();

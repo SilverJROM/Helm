@@ -2446,7 +2446,7 @@ describe('S02 reapLiveRunWorkers routes through finalizeWorkerRuntimeRow + regis
 
   it('(5) reapLiveRunWorkers finalizes via chokepoint and marks active registry idle', async () => {
     const session = 'helm-w-s02-boundary-sweep';
-    reg.register(session, { projectId, runId, kind: 'worker' });
+    reg.register(session, { owner: 'helm',  projectId, runId, kind: 'worker' });
     expect(reg.get(session)!.status).toBe('active');
 
     const info = dbs.raw
@@ -2477,7 +2477,7 @@ describe('S02 reapLiveRunWorkers routes through finalizeWorkerRuntimeRow + regis
 
   it('(5b) reapLiveRunWorkers leaves already-reaped registry reaped', async () => {
     const session = 'helm-w-s02-boundary-reaped';
-    reg.register(session, { projectId, runId, kind: 'worker' });
+    reg.register(session, { owner: 'helm',  projectId, runId, kind: 'worker' });
     reg.markReaped(session, 'prior-terminate');
 
     dbs.raw

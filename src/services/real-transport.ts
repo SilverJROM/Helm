@@ -137,10 +137,11 @@ export class RealTransport implements ITransport {
     // Dedicated fresh session per dispatch (clean context; reuse would require explicit /clear before next)
     // Honor explicit sessionName for per-project projcore (from projects.projcore_session or default <slug>-projcore)
     const sessionName = params.sessionName || `helm-${batchId}-${role}-${Date.now().toString(36).slice(-8)}`;
-    // A2: pass projectId/runId at the createSession choke point so helm_sessions lands linked.
+    // A2 + S05: projectId/runId + owner=helm (brains/workers via transport) at createSession choke point.
     const target = await this.tmux.createSession(sessionName, fenceDir, {
       projectId: params.projectId ?? null,
       runId: params.runId ?? null,
+      owner: 'helm',
     });
 
     try {

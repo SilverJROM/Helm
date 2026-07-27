@@ -191,7 +191,8 @@ export class MasterRuntimeService {
     const probeSession = `helm-preflight-${randomUUID().slice(0, 8)}`;
     let created = false;
     try {
-      await this.tmux.createSession(probeSession, cwd);
+      // S05: preflight probe seats are Helm-owned.
+      await this.tmux.createSession(probeSession, cwd, { owner: 'helm', kind: 'preflight' });
       created = true;
       const target = `${probeSession}:0.0`;
       for (const bin of bins) {
@@ -447,7 +448,8 @@ export class MasterRuntimeService {
     let createdThisTime = false;
     const exists = await this.tmux.sessionExists(sessionName);
     if (!exists) {
-      await this.tmux.createSession(sessionName, projectDir); // C3 cwd lock
+      // S05: phase-brain seats (plancore/ibrain) are Helm-owned.
+      await this.tmux.createSession(sessionName, projectDir, { owner: 'helm' }); // C3 cwd lock
       createdThisTime = true;
     }
     this.activeMasterSessions.add(sessionName); // RTF-M5: track on EVERY launch (reused sessions too for shutdown)

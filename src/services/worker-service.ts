@@ -184,7 +184,7 @@ VALUES (?,?,?,?,?,?,?,?,datetime('now'), ?)
       const sessionName = `helm-w-${slug}-${id}`;
       const target = `${sessionName}:0.0`;
       try {
-        await this.tmux.createSession(sessionName, projectDir); // C3 cwd lock (project-bound only)
+        await this.tmux.createSession(sessionName, projectDir, { owner: 'helm', kind: 'worker', projectId, runId: runId ?? null }); // C3 cwd lock; S05 owner=helm
         this.activeWorkerSessions.add(sessionName);
         this.db.prepare("UPDATE worker_runtimes SET session=? WHERE id=?").run(sessionName, id);
         // SL-R2: the registry hook fired on createSession registered this session 'active'; enrich the
