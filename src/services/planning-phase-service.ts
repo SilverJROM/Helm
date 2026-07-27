@@ -78,6 +78,10 @@ export interface PlanningInputs {
   runId?: number;              // D-b1: if provided (interview path pre-created the run), reuse for ingest instead of createRun
   strictReadAllow?: string[];  // B-ISO1 (sol wiring review fix #4): run-scoped opt-in strict read allowlist, threaded from RunOrchestrator to the projcore + partner planning seats. undefined => read-all (unchanged).
   adaptivePlanning?: boolean;  // v92: project.adaptive_planning — when true, runPlanningPhase delegates to the adaptive tiered planner module. Default/undefined => existing single-author path.
+  /** A10 (R1.3): core (non-adaptive) planning panel size — total seats (plancore + partners), from
+   *  project.planning_panel_size. Default/undefined => 2 (today's plancore+1-partner behavior).
+   *  Distinct from the adaptive planner's own `panel.size` (only consulted when adaptivePlanning is on). */
+  panelSize?: number;
   /** v93: per-project adaptive planner panel (size / lead / members / backups / default effort). */
   panel?: import('./adaptive-planning-phase.js').PlannerPanel;
   /** v93: optional availability probe for backup fallback (seat-binary). */
@@ -103,7 +107,10 @@ export function selectCoPlannerMode(
 ): 'planner' | 'deliberation' {
   if (signals.isCrossCutting || signals.isAmbiguous || signals.isHighRisk) return 'deliberation';
   const t = (northStar || '').toLowerCase();
-  if (/cross.?module|schema|arch|ambiguous|multiple (viable|approach)|security|high.?risk/.test(t)) {
+  // A10 (R1.3): the bare `arch` alternative false-positived on any north-star mentioning "search"
+  // (se-ARCH matches an unanchored substring) — replaced with `architect` (architecture/architect),
+  // the actual cross-cutting signal this clause was meant to catch; "search" does not contain it.
+  if (/cross.?module|schema|architect|ambiguous|multiple (viable|approach)|security|high.?risk/.test(t)) {
     return 'deliberation';
   }
   return 'planner';
@@ -335,8 +342,9 @@ export class PlanningPhaseService {
     });
 
     // A15: hoist seat runtime ids so phase exit can finalize both (A1 only finalized plancore on retry).
+    // A10: partner seats are now N (>= 0), one runtime id per spawned partner.
     let plancoreRuntimeId: number | null = null;
-    let partnerRuntimeId: number | null = null;
+    const partnerRuntimeIds: (number | null)[] = [];
 
     // POCFIX20: projcore spawn-retry. Helm's claude spawn is intermittently flaky (empty pane / brief never
     // lands → no plan → dead run), while grok's is reliable; root cause is a hard-to-pin spawn timing/race.
@@ -385,22 +393,37 @@ export class PlanningPhaseService {
     // deliberation paths.
     await this.artifacts.writeBrief(runDir, 'plancore', planningBrief);
 
-    // A8 (R1.2): a planning run always convenes a partner — 'planner' selects a single co-reviewer,
-    // 'deliberation' a cross-cutting review, but neither mode skips the partner (D1). Default-config
-    // planning therefore always spawns exactly 2 seats (plancore + partner).
-    const partnerBrief = briefWriter.generatePanelBrief({
-      role: partner,
-      batchId: `${batchId}-partner`,
-      seat: 'partner',
-      lens: 'plan atomicity, deps, fields, complexity/recommended_model, validation_criteria',
-      requirement: 'Review canonical plan.md and north-star.md. Pressure-test atomicity, deps, fields, complexity/recommended_model. Return agreement or concrete gaps.',
-      projectDir: effectiveProjectDir,
-      callbacksFile: path.join(runDir, 'callbacks.md'),
-    });
-    await this.artifacts.writeBrief(runDir, partner, partnerBrief);
-    const partnerSpawned = await this.transport.spawn({ role: partner, brief: partnerBrief, runDir, batchId: `${batchId}-partner`, model: inputs.partnerModel, provider: inputs.partnerProvider, attemptId: 0, projectDir: effectiveProjectDir, projectId: inputs.projectId, runId: inputs.runId, ...(inputs.strictReadAllow ? { strictReadAllow: inputs.strictReadAllow } : {}) });  // B-ISO1 + A2: projectId/runId → helm_sessions via createSession
-    // A1 (R4.16): record the partner seat so it is DB-observable with run+cycle linkage.
-    partnerRuntimeId = this.registerWorkerRuntime(inputs.projectId, inputs.runId, partner, `${batchId}-partner`, partnerSpawned.handle, inputs.partnerProvider, inputs.partnerModel);
+    // A8 (R1.2): a planning run always convenes at least one partner — 'planner' selects a single
+    // co-reviewer, 'deliberation' a cross-cutting review, but neither mode skips the partner (D1).
+    // A10 (R1.3): the NUMBER of partners is per-project config (project.planning_panel_size, total
+    // seats including plancore), not a guess from selectCoPlannerMode's north-star regex — that
+    // function only ever chose the partner's review *lens* (planner vs deliberation), never seat count.
+    // Default/undefined panelSize => 2 total seats (plancore + 1 partner), byte-identical to pre-A10
+    // behavior and correlation-id-compatible with every existing fixture hardcoding `${batchId}-partner`.
+    const panelSize = Math.max(1, Math.trunc(inputs.panelSize ?? 2) || 2);
+    const partnerCount = Math.max(0, panelSize - 1);
+    const partnerBatchIds: string[] = [];
+    for (let i = 0; i < partnerCount; i++) {
+      // Seat 0 keeps the EXACT legacy correlation id (`${batchId}-partner`, no numeric suffix) so the
+      // default 2-seat case never changes wire format for any existing consumer/fixture. Additional
+      // seats (panelSize >= 3) are numbered from 2.
+      const partnerBatchId = i === 0 ? `${batchId}-partner` : `${batchId}-partner-${i + 1}`;
+      const seatLabel = i === 0 ? 'partner' : `partner-${i + 1}`;
+      partnerBatchIds.push(partnerBatchId);
+      const partnerBrief = briefWriter.generatePanelBrief({
+        role: partner,
+        batchId: partnerBatchId,
+        seat: seatLabel,
+        lens: 'plan atomicity, deps, fields, complexity/recommended_model, validation_criteria',
+        requirement: 'Review canonical plan.md and north-star.md. Pressure-test atomicity, deps, fields, complexity/recommended_model. Return agreement or concrete gaps.',
+        projectDir: effectiveProjectDir,
+        callbacksFile: path.join(runDir, 'callbacks.md'),
+      });
+      await this.artifacts.writeBrief(runDir, i === 0 ? partner : `${partner}-${i + 1}`, partnerBrief);
+      const partnerSpawned = await this.transport.spawn({ role: partner, brief: partnerBrief, runDir, batchId: partnerBatchId, model: inputs.partnerModel, provider: inputs.partnerProvider, attemptId: 0, projectDir: effectiveProjectDir, projectId: inputs.projectId, runId: inputs.runId, ...(inputs.strictReadAllow ? { strictReadAllow: inputs.strictReadAllow } : {}) });  // B-ISO1 + A2: projectId/runId → helm_sessions via createSession
+      // A1 (R4.16): record each partner seat so it is DB-observable with run+cycle linkage.
+      partnerRuntimeIds.push(this.registerWorkerRuntime(inputs.projectId, inputs.runId, partner, partnerBatchId, partnerSpawned.handle, inputs.partnerProvider, inputs.partnerModel));
+    }
 
     // Fixture drive: simulate the exchange + agreement (tests append real [helm callback] lines + sleep).
     // The phase "blocks" here in real waits; in fixture the caller (test) drives the callbacks.md to PLAN-READY.
@@ -412,7 +435,7 @@ export class PlanningPhaseService {
     // A8 (R1.2): waitForAgreement requires BOTH the partner agreement signal AND projcore PLAN-READY in
     // every mode — 'planner' no longer fast-paths on PLAN-READY alone. real path adds explicit file poll
     // below for BOTH before ingest.
-    const agreed = await this.waitForAgreement(cbPath, batchId, partner, brainRole, PLANNING_TIMEOUT_MS, agreementFenceOffset);
+    const agreed = await this.waitForAgreement(cbPath, batchId, partner, brainRole, PLANNING_TIMEOUT_MS, agreementFenceOffset, partnerBatchIds);
 
     // Short grace for plancore to flush canonical documents before the PLAN-READY callback is consumed.
     await new Promise((r) => setTimeout(r, 120));
@@ -502,7 +525,7 @@ export class PlanningPhaseService {
       // Gate blocked — do not ingest or hand off.
       // A15: finalize planning seats so they do not stick as running after a failed gate.
       this.finalizeWorkerRuntime(plancoreRuntimeId, 'reaped', 'planning-not-agreed');
-      this.finalizeWorkerRuntime(partnerRuntimeId, 'reaped', 'planning-not-agreed');
+      for (const id of partnerRuntimeIds) this.finalizeWorkerRuntime(id, 'reaped', 'planning-not-agreed');
       await this.advanceAgreementFence(runDir, batchId, path.join(runDir, 'callbacks.md'));
       return {
         agreed: false,
@@ -527,7 +550,7 @@ export class PlanningPhaseService {
     // A15: planning phase exit (success) — mark seats done. Orchestrator also finalizes at
     // planning-done-yield (idempotent). Partner no longer depends on the generic janitor alone.
     this.finalizeWorkerRuntime(plancoreRuntimeId, 'done', 'planning-phase-complete');
-    this.finalizeWorkerRuntime(partnerRuntimeId, 'done', 'planning-phase-complete');
+    for (const id of partnerRuntimeIds) this.finalizeWorkerRuntime(id, 'done', 'planning-phase-complete');
     await this.advanceAgreementFence(runDir, batchId, path.join(runDir, 'callbacks.md'));
 
     return {
@@ -674,37 +697,47 @@ export class PlanningPhaseService {
 
   /**
    * Whole-plan agreement gate (D6/R1.29 scope half — exactly ONE gate per planning run; the per-task
-   * reconvene-on-conflict half is A13's, not built here). Requires BOTH signals in the SAME poll pass:
+   * reconvene-on-conflict half is A13's, not built here). Requires PLAN-READY plus a CLEAN verdict from
+   * EVERY partner batch id in `partnerBatchIds` (N11 unanimous — a project configured for panelSize=3
+   * spawns 2 partners, and BOTH must agree, not just one) in the SAME poll pass:
    * - projcore's PLAN-READY for this run's own batchId (brainRole).
-   * - the partner's own VERDICT-READY for `${batchId}-partner` (R1.5/N3 — the partner is spawned under
-   *   its own namespaced batch; a bare `batchId` equality matches nothing, dead-locking every run, and an
-   *   unscoped match would accept a stale/foreign partner line from a different run).
-   * R1.4/N2: VERDICT-READY is the literal STATUS token for BOTH verdicts — the actual CLEAN/BROKEN
-   * verdict lives in the note payload after the em-dash, never the token. Only a note that resolves to
-   * CLEAN satisfies the gate; a confirmed BROKEN verdict fails it FAST (returns false as soon as it's
-   * seen — it must not wait out the full timeout, which is 600_000ms/10min in production: the verdict
-   * has already arrived and is negative, there is nothing left to wait for under this row's scope).
+   * - EACH partner's own VERDICT-READY for its namespaced batch id (R1.5/N3 — every partner is spawned
+   *   under its own `${batchId}-partner[-N]` batch; a bare `batchId` equality matches nothing, dead-
+   *   locking every run, and an unscoped match would accept a stale/foreign partner line from a
+   *   different run). `partnerBatchIds` may be empty (A10: panelSize=1, solo planning) — PLAN-READY
+   *   alone then satisfies the gate, since there is no partner to convene.
+   * R1.4/N2: VERDICT-READY is the literal STATUS token for every verdict — the actual CLEAN/BROKEN
+   * verdict lives in the note payload after the em-dash, never the token. A confirmed BROKEN from ANY
+   * partner fails the gate FAST (returns false as soon as it's seen — dispositive on its own, it must
+   * not wait out the full timeout, which is 600_000ms/10min in production).
    * A missing/unparseable verdict body is treated as "no verdict yet" (keeps waiting, fail-closed by
    * omission) rather than an immediate BROKEN, in case the payload is still being written mid-line.
-   * Each poll re-derives the LATEST matching line for each signal (reversed scan) rather than latching a
+   * Each poll re-derives the LATEST matching line per partner (reversed scan) rather than latching a
    * boolean forever, so a later BROKEN can never be shadowed by an earlier accidental CLEAN.
-   * A9 send-back (attempt=2/3): `sinceOffset` fences BOTH signals to lines appended after the PRIOR
+   * A9 send-back (attempt=2/3): `sinceOffset` fences every signal to lines appended after the PRIOR
    * runPlanningPhase call's own end for this (runDir, batchId) key (see the durable agreementFencePath
    * sidecar file / a first-ever call for a key is never fenced). runDir is deterministic per (projectId, batchId) and
    * callbacks.md is never truncated between attempts, so a restart/rerun reusing the same batchId can
-   * otherwise leave an OLD VERDICT-READY CLEAN for the same `${batchId}-partner` (or an old PLAN-READY)
+   * otherwise leave an OLD VERDICT-READY CLEAN for the same partner batch id (or an old PLAN-READY)
    * sitting in the file — same-batch stale, not the different-batch/foreign case R1.5 alone closes. A
    * prior attempt's agreement must never satisfy a later one just because the batch id was reused.
    */
-  private async waitForAgreement(cbPath: string, batchId: string, partnerRole: string, brainRole: string, timeoutMs: number, sinceOffset = 0): Promise<boolean> {
+  private async waitForAgreement(
+    cbPath: string,
+    batchId: string,
+    partnerRole: string,
+    brainRole: string,
+    timeoutMs: number,
+    sinceOffset = 0,
+    partnerBatchIds: string[] = [`${batchId}-partner`]
+  ): Promise<boolean> {
     const start = Date.now();
-    const partnerBatchId = `${batchId}-partner`;
     while (Date.now() - start < timeoutMs) {
       try {
         const raw = await this.readCallbacksWindow(cbPath, sinceOffset);
         const lines = raw.split(/\r?\n/).reverse(); // newest first
         let sawPlanReady = false;
-        let partnerVerdict: 'CLEAN' | 'BROKEN' | null = null;
+        const verdicts = new Map<string, 'CLEAN' | 'BROKEN'>(); // partnerBatchId -> latest parsed verdict
         for (const line of lines) {
           const parsed = this.parseAgreementCallbackLine(line);
           if (!parsed) continue;
@@ -712,26 +745,27 @@ export class PlanningPhaseService {
             sawPlanReady = true;
           }
           if (
-            partnerVerdict === null &&
-            parsed.batchId === partnerBatchId &&
+            !verdicts.has(parsed.batchId) &&
+            partnerBatchIds.includes(parsed.batchId) &&
             parsed.state === 'VERDICT-READY' &&
             roleMatches(partnerRole, parsed.role)
           ) {
             const verdictMatch = /^\s*(CLEAN|BROKEN)\b/i.exec(parsed.note || '');
-            partnerVerdict = verdictMatch ? (verdictMatch[1].toUpperCase() as 'CLEAN' | 'BROKEN') : null;
+            if (verdictMatch) verdicts.set(parsed.batchId, verdictMatch[1].toUpperCase() as 'CLEAN' | 'BROKEN');
           }
-          if (sawPlanReady && partnerVerdict !== null) break; // latest of each already locked in (reversed scan)
+          if (sawPlanReady && verdicts.size === partnerBatchIds.length) break; // every seat's latest already locked in (reversed scan)
         }
-        if (sawPlanReady && partnerVerdict === 'CLEAN') return true;
-        // R1.4: a confirmed BROKEN verdict fails the gate immediately — dispositive on its own, whether
-        // or not PLAN-READY has arrived yet. It has already arrived and is negative, so there is nothing
-        // left to wait for (never byte-identical to a silent CLEAN pass, and never forced to burn the
-        // full 10min production timeout to reach the same conclusion).
-        if (partnerVerdict === 'BROKEN') return false;
+        // R1.4/N11 (unanimous): a confirmed BROKEN from ANY partner fails the gate immediately —
+        // dispositive on its own, whether or not PLAN-READY or the other seats' verdicts have arrived
+        // yet. It has already arrived and is negative, so there is nothing left to wait for (never
+        // byte-identical to a silent CLEAN pass, and never forced to burn the full 10min production
+        // timeout to reach the same conclusion).
+        if ([...verdicts.values()].some((v) => v === 'BROKEN')) return false;
+        if (sawPlanReady && partnerBatchIds.every((id) => verdicts.get(id) === 'CLEAN')) return true;
       } catch {}
       await new Promise((r) => setTimeout(r, 20));
     }
-    // A8 (R1.2) still holds: a timeout with no confirmed CLEAN partner agreement is a bounded stall,
+    // A8 (R1.2) still holds: a timeout with no confirmed unanimous CLEAN agreement is a bounded stall,
     // never a silent pass — return false so the caller's existing agreed:false path (reap seats, no
     // ingest) takes over instead of proceeding on PLAN-READY alone.
     return false;

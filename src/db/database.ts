@@ -3265,6 +3265,23 @@ ALTER TABLE runs_new RENAME TO runs;
         applyB11PanelistRetirement(this.db);
         this.db.prepare('UPDATE schema_version SET version = 98').run();
       }
+
+      // v99 / A10 (R1.3): per-project planning panel size (1/2/3/N, default 2) for the CORE (non-adaptive)
+      // planning path — replaces guessing seat count from selectCoPlannerMode's north-star regex (that
+      // function only ever chose planner/deliberation *lens*, not seat count). Distinct from the
+      // opt-in adaptive planner's own PlannerPanel.size (project_planner_panel table, v93) and from
+      // topology.yaml's deliberation_panel — this row changes seat count only for the default path.
+      if (current && current.version < 99) {
+        if (hasTable('projects')) {
+          const cols = this.db.prepare('PRAGMA table_info(projects)').all() as any[];
+          if (!cols.some((c) => c.name === 'planning_panel_size')) {
+            this.db.exec(
+              "ALTER TABLE projects ADD COLUMN planning_panel_size INTEGER NOT NULL DEFAULT 2 CHECK(planning_panel_size >= 1)"
+            );
+          }
+        }
+        this.db.prepare('UPDATE schema_version SET version = 99').run();
+      }
     }
   }
 

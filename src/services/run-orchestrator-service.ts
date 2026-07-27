@@ -196,6 +196,23 @@ export class RunOrchestratorService {
     }
   }
 
+  // A10 (R1.3): read the project's core (non-adaptive) planning panel size — total seats including
+  // plancore, default 2 (fail-safe on any read error) — threaded into runPlanningPhase so it spawns
+  // exactly that many seats instead of the removed north-star-regex guess. Independent of
+  // isAdaptivePlanning: this config only applies on the default/OFF path.
+  private resolvePlanningPanelSize(projectId?: number): number {
+    if (projectId == null) return 2;
+    try {
+      const row: any = this.deps.artifacts['db'].raw
+        .prepare('SELECT planning_panel_size FROM projects WHERE id = ?')
+        .get(projectId);
+      const n = Number(row?.planning_panel_size ?? 2);
+      return Number.isFinite(n) && n >= 1 ? Math.trunc(n) : 2;
+    } catch {
+      return 2;
+    }
+  }
+
   /**
    * v93: when adaptive_planning is ON, build PlannerPanel from project config (members/lead/backups).
    * Applies seat-binary availability for backup fallback when masterRuntime is present.
@@ -901,6 +918,7 @@ export class RunOrchestratorService {
         partnerProvider,
         strictReadAllow: runStrictAllow,  // B-ISO1: run-scoped strict read fence for the planning seats
         adaptivePlanning: this.isAdaptivePlanning(projectId),  // v92: opt-in adaptive tiered planner
+        panelSize: this.resolvePlanningPanelSize(projectId),  // A10: core-path planning panel size (total seats)
         runId: input.precreatedRunId,  // CC-CHAT-1 B2: reuse the detached-precreated run row (no duplicate)
         canonicalArtifactRoot,
         ...(adaptivePanel?.panel ? { panel: adaptivePanel.panel } : {}),
@@ -992,6 +1010,7 @@ export class RunOrchestratorService {
         partnerProvider,
         strictReadAllow: runStrictAllow,  // B-ISO1: run-scoped strict read fence for the planning seats
         adaptivePlanning: this.isAdaptivePlanning(projectId),  // v92: opt-in adaptive tiered planner
+        panelSize: this.resolvePlanningPanelSize(projectId),  // A10: core-path planning panel size (total seats)
         runId,  // D-b1: reuse the interview-created run (prevents duplicate run row); phase already advanced to planning
         ...(adaptivePanel?.panel ? { panel: adaptivePanel.panel } : {}),
         ...(adaptivePanel?.isModelAvailable ? { isModelAvailable: adaptivePanel.isModelAvailable } : {}),

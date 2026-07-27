@@ -50,6 +50,7 @@ export interface Project {
   final_tests_default: boolean;
   adaptive_planning: boolean; // v92: opt-in adaptive tiered planner
   planner_default_effort: string | null; // v93: panel default effort (low|med|high|xhigh)
+  planning_panel_size: number; // v99: core (non-adaptive) planning panel size, total seats, default 2
   created_at: string;
   updated_at: string;
 }
@@ -106,6 +107,7 @@ function rowToProject(row: any): Project {
     final_tests_default: normalizeFinalTestsDefault(row.final_tests_default),
     adaptive_planning: Number(row.adaptive_planning ?? 0) === 1,
     planner_default_effort: row.planner_default_effort == null ? 'med' : String(row.planner_default_effort),
+    planning_panel_size: Math.max(1, Number(row.planning_panel_size ?? 2) || 2),
     created_at: String(row.created_at),
     updated_at: String(row.updated_at)
   };

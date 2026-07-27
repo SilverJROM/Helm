@@ -28,7 +28,7 @@ export interface ITransport {
 export class FakeTransport implements ITransport {
   private spawned = new Map<string, { role: string; brief: string; runDir: string; at: number; rung?: number; model?: string; effort?: string; sessionName?: string; provider?: string; route?: string; attemptId?: number; strictReadAllow?: string[] }>();
   public readonly reapCalls: Array<{ handle: string; reason: string; at: number }> = [];
-  public readonly spawnCalls: Array<{ role: string; brief: string; at: number; rung?: number; model?: string; effort?: string; sessionName?: string; provider?: string; route?: string; attemptId?: number; projectDir?: string; strictReadAllow?: string[]; projectId?: number; runId?: number }> = [];
+  public readonly spawnCalls: Array<{ role: string; brief: string; at: number; batchId?: string; rung?: number; model?: string; effort?: string; sessionName?: string; provider?: string; route?: string; attemptId?: number; projectDir?: string; strictReadAllow?: string[]; projectId?: number; runId?: number }> = [];
   public readonly nudgeCalls: Array<{ handle: string; provider?: string; at: number }> = [];
   public readonly inspectCalls: Array<{ handle: string; provider?: string; at: number }> = [];
   // B0 legacy (kept for test call sites); callback decisions still come only from genuine callbacks.md lines.
@@ -50,7 +50,7 @@ export class FakeTransport implements ITransport {
     this.spawned.set(handle, { role: params.role, brief: params.brief, runDir: params.runDir, at: Date.now(), rung: params.rung, model: params.model, sessionName: params.sessionName, provider: params.provider, route: params.route, attemptId: params.attemptId, strictReadAllow: params.strictReadAllow });
     const pendingScript = this.pendingSeatScripts.shift();
     if (pendingScript) this.seatScripts.set(handle, pendingScript.map((frame) => ({ ...frame })));
-    this.spawnCalls.push({ role: params.role, brief: params.brief, at: Date.now(), rung: params.rung, model: params.model, sessionName: params.sessionName, provider: params.provider, route: params.route, attemptId: params.attemptId, effort: params.effort, projectDir: params.projectDir, strictReadAllow: params.strictReadAllow, projectId: params.projectId, runId: params.runId });
+    this.spawnCalls.push({ role: params.role, brief: params.brief, at: Date.now(), batchId: params.batchId, rung: params.rung, model: params.model, sessionName: params.sessionName, provider: params.provider, route: params.route, attemptId: params.attemptId, effort: params.effort, projectDir: params.projectDir, strictReadAllow: params.strictReadAllow, projectId: params.projectId, runId: params.runId });
     return { handle, role: params.role };
   }
 

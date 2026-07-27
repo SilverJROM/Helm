@@ -54,6 +54,15 @@ describe('planning-phase-service (B9 PLN1) + gate + auto pick', () => {
     expect(selectCoPlannerMode('architecture pivot for security model', { isAmbiguous: true })).toBe('deliberation');
   });
 
+  // A10 (R1.3): the old regex's bare `arch` alternative was unanchored — it matched "se-ARCH" as a
+  // substring, false-positiving any north-star that merely mentions a search feature into 'deliberation'.
+  // Replaced with `architect` (architecture/architect), which "search" does not contain, while a
+  // genuine architecture-scoped north-star (with no other trigger word) still resolves to 'deliberation'.
+  it('A10: "search" no longer false-positives into deliberation; "architecture" alone still does', () => {
+    expect(selectCoPlannerMode('Add a search endpoint that queries the users table by name')).toBe('planner');
+    expect(selectCoPlannerMode('Redesign the service architecture end to end')).toBe('deliberation');
+  });
+
   it('gate BLOCKS handoff until agreement; planner mode always convenes + waits for the partner (A8/R1.2)', async () => {
     const north = 'Simple single-module feature: add a plan parser that reads json and creates run_tasks.';
     const conv = 'Interview notes: clear scope, no cross module risk.';
@@ -123,6 +132,58 @@ describe('planning-phase-service (B9 PLN1) + gate + auto pick', () => {
     expect(res.agreed).toBe(true);
     expect(transport.spawnCalls.length).toBe(2);
     expect(transport.spawnCalls.some((s) => s.role === 'planner')).toBe(true);
+  });
+
+  // A10 (R1.3): panel size is per-project config (total seats incl. plancore), not a north-star guess.
+  it('A10: panelSize=3 spawns exactly 3 seats (plancore + 2 partners), unanimous CLEAN from BOTH required', async () => {
+    const batchId = 'batch-A10-three-seats';
+    const cbp = path.join(runDir, 'callbacks.md');
+    const p = phase.runPlanningPhase({
+      runDir,
+      batchId,
+      northStar: 'Add a small utility function to format dates.',
+      conversationLog: 'clear scope, no cross module risk.',
+      mode: 'auto',
+      panelSize: 3,
+    });
+    await fs.appendFile(cbp, `[helm callback] plancore ${batchId} STATUS: PLAN-READY — plan.json written\n`);
+    await sleep(30);
+    // Only the FIRST (legacy-named) partner agrees so far — the gate must not pass on a partial verdict.
+    await fs.appendFile(cbp, `[helm callback] planner ${batchId}-partner STATUS: VERDICT-READY — CLEAN: clean\n`);
+    await sleep(60);
+    expect(transport.spawnCalls.length).toBe(3); // plancore + 2 partners spawned up front, regardless of verdict timing
+    expect(transport.spawnCalls.filter((s) => s.role === 'planner').length).toBe(2);
+    expect(transport.spawnCalls.some((s) => s.batchId === `${batchId}-partner`)).toBe(true);
+    expect(transport.spawnCalls.some((s) => s.batchId === `${batchId}-partner-2`)).toBe(true);
+    // Second partner now agrees too — unanimous, gate passes.
+    await fs.appendFile(cbp, `[helm callback] planner ${batchId}-partner-2 STATUS: VERDICT-READY — CLEAN: clean\n`);
+
+    const res = await p;
+    expect(res.agreed).toBe(true);
+  });
+
+  it('A10: panelSize=3 — a BROKEN from either partner fails the gate (unanimous, not majority)', async () => {
+    const batchId = 'batch-A10-broken-one-of-two';
+    const cbp = path.join(runDir, 'callbacks.md');
+    process.env.HELM_PLANNING_TIMEOUT_MS = '300';
+    try {
+      const p = phase.runPlanningPhase({
+        runDir,
+        batchId,
+        northStar: 'Add a small utility function to format dates.',
+        conversationLog: 'clear scope, no cross module risk.',
+        mode: 'auto',
+        panelSize: 3,
+      });
+      await fs.appendFile(cbp, `[helm callback] plancore ${batchId} STATUS: PLAN-READY — plan.json written\n`);
+      await fs.appendFile(cbp, `[helm callback] planner ${batchId}-partner STATUS: VERDICT-READY — CLEAN: clean\n`);
+      await fs.appendFile(cbp, `[helm callback] planner ${batchId}-partner-2 STATUS: VERDICT-READY — BROKEN: gap found\n`);
+      const res = await p;
+      expect(res.agreed).toBe(false);
+      expect(res.createdTaskIds).toEqual([]);
+    } finally {
+      delete process.env.HELM_PLANNING_TIMEOUT_MS;
+    }
   });
 
   it('hands Discovery cycle artifacts through Planning into implementation as one canonical set', async () => {

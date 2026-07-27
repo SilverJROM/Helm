@@ -2,7 +2,7 @@ import type Database from "better-sqlite3";
 import { assertAllRoleTiersInvariants } from "./role-tier-invariants.js";
 import { PROVIDERS } from "../config/providers.js";
 
-export const SCHEMA_VERSION = 98;
+export const SCHEMA_VERSION = 99;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -127,6 +127,9 @@ CREATE TABLE IF NOT EXISTS projects (
   adaptive_planning INTEGER NOT NULL DEFAULT 0 CHECK(adaptive_planning IN (0, 1)),
   -- v93: default effort for adaptive planner panel slots that omit a per-slot effort override.
   planner_default_effort TEXT DEFAULT 'med' CHECK(planner_default_effort IS NULL OR planner_default_effort IN ('low','med','high','xhigh')),
+  -- v99 / A10 (R1.3): core (non-adaptive) planning panel size — total seats (plancore + partners).
+  -- Default 2 preserves today's plancore+1-partner behavior; config replaces the removed north-star guess.
+  planning_panel_size INTEGER NOT NULL DEFAULT 2 CHECK(planning_panel_size >= 1),
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
