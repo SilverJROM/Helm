@@ -98,7 +98,7 @@ function getAfterLastUserPrompt(pane) {
 }
 
 function paneLooksGenerating(pane) {
-  return /esc to interrupt|esc to cancel|Responding…|Thinking…|Working…|Baked for|Cogitat|Generating…|⏹/i.test(pane || '');
+  return /esc to interrupt|esc to cancel|Responding…|Thinking…|Working…|Cogitat|Generating…|⏹/i.test(pane || '');
 }
 
 function looksLikeChrome(text) {
@@ -212,6 +212,15 @@ function extractHelmReply(pane, afterUserText) {
     return { state: 'thinking', text: '' };
   }
 
+  const scopeHasMarkers = HELM_REPLY_OPEN_RE.test(scope) || HELM_REPLY_CLOSE_RE.test(scope);
+  HELM_REPLY_OPEN_RE.lastIndex = 0;
+  const paneHasMarkers = pane.includes('⟦HELM_REPLY⟧') || pane.includes('[[HELM_REPLY]]') ||
+    pane.includes('⟦/HELM_REPLY⟧') || pane.includes('[[/HELM_REPLY]]');
+  if (!afterUserText && !scopeHasMarkers && paneHasMarkers) {
+    const footerOnly = stripChrome(scope.replace(/─/g, '')).trim();
+    if (!footerOnly) scope = pane;
+  }
+
   // within bounded scope only
   const opens = [...scope.matchAll(HELM_REPLY_OPEN_RE)];
   if (opens.length) {
@@ -233,6 +242,22 @@ function extractHelmReply(pane, afterUserText) {
     if (openText) return { state: 'reply', text: openText };
     const fb = extractAgentPaneSegment('', pane, afterUserText);
     return fb ? { state: 'fallback', text: fb } : { state: 'empty', text: '' };
+  }
+
+  let closeScope = scope;
+  let closeOnly = closeScope.match(HELM_REPLY_CLOSE_RE);
+  if (!closeOnly && ![...pane.matchAll(HELM_REPLY_OPEN_RE)].length) {
+    closeScope = pane;
+    closeOnly = closeScope.match(HELM_REPLY_CLOSE_RE);
+  }
+  if (closeOnly) {
+    const beforeClose = closeScope
+      .slice(0, closeOnly.index)
+      .split('\n')
+      .map(l => l.replace(/^[●•]\s*/, '').trim())
+      .join('\n');
+    const closeText = stripChrome(beforeClose);
+    if (closeText) return { state: 'reply', text: closeText };
   }
 
   // plain-prose within scope: strip specified TUI noise + tool noise (to keep existing tests)

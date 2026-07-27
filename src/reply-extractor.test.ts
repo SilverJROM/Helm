@@ -7,6 +7,7 @@
 // .js ESM module (no .d.ts). @ts-nocheck at top makes tsc skip for this test file.
 // Runtime import works under vitest. Tests the exact 4 cases required by brief.
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
 import {
   extractHelmReply,
   extractAgentPaneSegment,
@@ -321,6 +322,42 @@ The batch is done and all tests pass. Ready to merge.
   });
 
   it('DC-R1: open marker, no close, pane STILL GENERATING (esc to interrupt present) → thinking', () => {
+    const pane = `❯ tell me the status
+⟦HELM_REPLY⟧
+Working on it, gathering the test resul
+  esc to interrupt`;
+    expect(paneLooksGenerating(pane)).toBe(true);
+    const r = extractHelmReply(pane, 'tell me the status');
+    expect(r.state).toBe('thinking');
+    expect(r.text || '').toBe('');
+  });
+
+  it('E4: real finished Discovery pane is idle, not generating', () => {
+    const realFinishedPane = readFileSync(
+      new URL('./test-fixtures/panes/discovery-finished-turn-20260727.txt', import.meta.url),
+      'utf8'
+    );
+    expect(paneLooksGenerating(realFinishedPane)).toBe(false);
+  });
+
+  it('E4: real finished Discovery pane extracts the completed reply', () => {
+    const realFinishedPane = readFileSync(
+      new URL('./test-fixtures/panes/discovery-finished-turn-20260727.txt', import.meta.url),
+      'utf8'
+    );
+    expect(extractHelmReply(realFinishedPane, '').state).toBe('reply');
+  });
+
+  it('E4: truncated finished pane with close marker but no open marker extracts reply', () => {
+    const realFinishedPane = readFileSync(
+      new URL('./test-fixtures/panes/discovery-finished-turn-20260727.txt', import.meta.url),
+      'utf8'
+    );
+    const last80Lines = realFinishedPane.trimEnd().split('\n').slice(-80).join('\n');
+    expect(extractHelmReply(last80Lines, '').state).toBe('reply');
+  });
+
+  it('E4: genuinely generating pane still returns thinking', () => {
     const pane = `❯ tell me the status
 ⟦HELM_REPLY⟧
 Working on it, gathering the test resul
