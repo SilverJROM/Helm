@@ -1729,6 +1729,81 @@ async function main(): Promise<void> {
     }
   });
 
+  // A3 SEAM-1 (R4.17): GET /api/cycles/:id/seats — every worker_runtimes seat for runs of this cycle,
+  // live OR historical (reaped/done/failed kept). Pane key = persisted worker_runtimes.id.
+  // live = state launching|running AND tmux target still exists. No schema migration; join via runs.
+  app.get('/api/cycles/:id/seats', { preHandler: [authMiddleware, requireOwnerPre] }, async (request: any, reply: any) => {
+    const id = Number(request.params.id);
+    if (!Number.isInteger(id) || id <= 0) return reply.code(400).send({ error: 'invalid cycle id' });
+    const cycle: any = db.prepare('SELECT id FROM cycles WHERE id = ?').get(id);
+    if (!cycle) return reply.code(404).send({ error: 'unknown cycle' });
+    const rows: any[] = db.prepare(
+      `SELECT wr.id, wr.role, wr.provider, wr.model, wr.session, wr.state,
+              wr.run_id AS runId, wr.correlation_id AS batchId,
+              wr.started_at AS startedAt, wr.ended_at AS endedAt
+       FROM worker_runtimes wr
+       JOIN runs ON runs.id = wr.run_id
+       WHERE runs.cycle_id = ?
+       ORDER BY wr.id ASC`
+    ).all(id);
+    const seats = [];
+    for (const r of rows) {
+      const stateLive = r.state === 'launching' || r.state === 'running';
+      let tmuxAlive = false;
+      if (stateLive && r.session) {
+        try {
+          tmuxAlive = await tmuxService.sessionExists(r.session);
+        } catch {
+          tmuxAlive = false;
+        }
+      }
+      seats.push({
+        id: r.id,
+        role: r.role,
+        provider: r.provider,
+        model: r.model,
+        session: r.session || null,
+        state: r.state,
+        runId: r.runId,
+        cycleId: id,
+        batchId: r.batchId || null,
+        startedAt: r.startedAt || null,
+        endedAt: r.endedAt || null,
+        live: !!(stateLive && tmuxAlive)
+      });
+    }
+    return { seats };
+  });
+
+  // A3 SEAM-1 path-safe capture: session resolved ONLY from (cycleId, runtimeId) in DB.
+  // NEVER accepts a client-supplied session name (query/body session|sessionName ignored).
+  // Foreign-cycle runtime id → 404. Mirrors /api/projects/:id/terminals/:wid security contract.
+  app.get('/api/cycles/:id/seats/:runtimeId', { preHandler: [authMiddleware, requireOwnerPre] }, async (request: any, reply: any) => {
+    const id = Number(request.params.id);
+    const runtimeId = Number(request.params.runtimeId);
+    if (!Number.isInteger(id) || id <= 0) return reply.code(400).send({ error: 'invalid cycle id' });
+    if (!Number.isInteger(runtimeId) || runtimeId <= 0) return reply.code(400).send({ error: 'invalid runtime id' });
+    const cycle: any = db.prepare('SELECT id FROM cycles WHERE id = ?').get(id);
+    if (!cycle) return reply.code(404).send({ error: 'unknown cycle' });
+    // Deliberately ignore request.query.session / request.body — session comes from the join only.
+    const row: any = db.prepare(
+      `SELECT wr.id, wr.session
+       FROM worker_runtimes wr
+       JOIN runs ON runs.id = wr.run_id
+       WHERE wr.id = ? AND runs.cycle_id = ?`
+    ).get(runtimeId, id);
+    if (!row) return reply.code(404).send({ error: 'unknown seat for cycle' });
+    if (!row.session) return { session: null, content: '(no session recorded for this seat)' };
+    const target = `${row.session}:0.0`;
+    try {
+      const content = await tmuxService.capturePane(target, 200);
+      return { session: row.session, content: content || '' };
+    } catch (e: any) {
+      console.warn('[seats] capture failed for cycle', id, 'runtime', runtimeId, e?.message);
+      return { session: row.session, content: '' };
+    }
+  });
+
   // B2-T04: POST /api/cycles/:id/complete — move folder from cycle/<name> to cycle/completed/<name> + status='completed' (R-B2, R-G3).
   // Move first, status update after; 409 on collision; paths fenced under project.directory.
   app.post('/api/cycles/:id/complete', { preHandler: [authMiddleware, requireOwnerPre] }, async (request: any, reply: any) => {

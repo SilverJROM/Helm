@@ -810,10 +810,11 @@ function App() {
   // B8-T02: per-task planning table (R-D2/D4) — id of the row selected for the detail strip.
   // Non-keyed by cycle (single workspace open at a time); reset on cycle switch below.
   const [ccPlanSelectedTaskId, setCcPlanSelectedTaskId] = useState(null);
-  // B8-T03: "watch live" pane toggle (R-D1/D3/H4) — quiet by default. worker_runtimes has no
-  // cycle_id link (schema.ts), so there is no way to identify a per-cycle planner pane today;
-  // this stays a graceful placeholder until B10 wires the real planner session.
+  // B8-T03: "watch live" pane toggle (R-D1/D3/H4) — quiet by default. A3 closes R4.17 with a
+  // compact always-visible seat list from GET /api/cycles/:id/seats; B4 upgrades to panes.
   const [ccPlanWatchLiveOpen, setCcPlanWatchLiveOpen] = useState(false);
+  // A3 (R4.17): cycleId -> { seats: [...] } | 'absent' | undefined(loading)
+  const [ccPlanSeats, setCcPlanSeats] = useState({});
   // B8-T04: Approve Planning gate (R-E3/F1) — busy + inline notice for approve POST outcomes.
   const [ccPlanApproving, setCcPlanApproving] = useState(false);
   const [ccPlanApproveNotice, setCcPlanApproveNotice] = useState('');
@@ -1000,6 +1001,13 @@ function App() {
   useEffect(() => {
     if ((ccWsTab !== 'planning' && ccWsTab !== 'implementation') || !ccWsCycleId || !token) return;
     if (!ccPlanDocs[ccWsCycleId]) loadPlanDocs(ccWsCycleId);
+  }, [ccWsTab, ccWsCycleId, token]);
+  // A3 (R4.17): load cycle seats whenever Planning is open (live or historical).
+  useEffect(() => {
+    if (ccWsTab !== 'planning' || !ccWsCycleId || !token) return;
+    loadCycleSeats(ccWsCycleId);
+    const id = setInterval(() => { loadCycleSeats(ccWsCycleId); }, 4000);
+    return () => clearInterval(id);
   }, [ccWsTab, ccWsCycleId, token]);
   // B11-T04: Final Tests tab data load (R-G3).
   useEffect(() => {
@@ -5032,6 +5040,18 @@ function App() {
       setCcRunState(p => ({ ...p, [cycleId]: 'absent' }));
     }
   };
+  // A3 SEAM-1: cycle-scoped seats (worker_runtimes JOIN runs). Failure → 'absent', never crash.
+  const loadCycleSeats = async (cycleId) => {
+    if (!cycleId || !token) return;
+    try {
+      const r = await authedFetch(`/api/cycles/${cycleId}/seats`, { allowStatuses: [404] });
+      if (!r.ok) { setCcPlanSeats(p => ({ ...p, [cycleId]: 'absent' })); return; }
+      const d = await r.json();
+      setCcPlanSeats(p => ({ ...p, [cycleId]: d }));
+    } catch (e) {
+      setCcPlanSeats(p => ({ ...p, [cycleId]: 'absent' }));
+    }
+  };
   // LV-R3: fetch a role's live terminal pane (server-derives the running worker). Failure keeps the
   // last snapshot (no crash, no flicker to empty); empty text / null session → placeholder in render.
   const loadTaskTerminal = async (cycleId, role) => {
@@ -5583,6 +5603,38 @@ function App() {
         </table>`;
       };
 
+      // A3 (R4.17): compact seat list — live + historical from GET /api/cycles/:id/seats.
+      // Pane surfaces land in B4; here we only name seats with role/model/live|historical.
+      const seatsPayload = ccPlanSeats[cycleId];
+      const seatsList = (seatsPayload && seatsPayload !== 'absent' && Array.isArray(seatsPayload.seats))
+        ? seatsPayload.seats : [];
+      const renderSeatsList = () => {
+        if (!seatsPayload) {
+          return html`<div class="text-sec" data-testid="ws-plan-seats-loading" style="font-size:11px;padding:4px 0">Loading seats…</div>`;
+        }
+        if (seatsPayload === 'absent') {
+          return html`<div class="text-sec" data-testid="ws-plan-seats-empty" style="font-size:11px;padding:4px 0">No seats recorded for this cycle yet.</div>`;
+        }
+        if (seatsList.length === 0) {
+          return html`<div class="text-sec" data-testid="ws-plan-seats-empty" style="font-size:11px;padding:4px 0">No seats recorded for this cycle yet.</div>`;
+        }
+        return html`<div class="cc-plan-seats-list" data-testid="ws-plan-seats" style="display:flex;flex-direction:column;gap:4px;padding:4px 0 8px">
+          ${seatsList.map((s, idx) => {
+            const label = `${s.role || 'seat'}${seatsList.filter(x => x.role === s.role).length > 1 ? ` #${idx + 1}` : ''}`;
+            const liveChip = s.live
+              ? html`<span class="chip chip-green" data-testid=${`ws-plan-seat-live-${s.id}`}>live</span>`
+              : html`<span class="chip chip-orange" data-testid=${`ws-plan-seat-historical-${s.id}`}>historical</span>`;
+            return html`<div class="cc-plan-seat-row" data-testid=${`ws-plan-seat-${s.id}`}
+                style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px;padding:4px 6px;border:1px solid var(--border, #30363d);border-radius:4px">
+              <span data-testid=${`ws-plan-seat-role-${s.id}`} style="font-weight:600">${label}</span>
+              <span class="text-sec" data-testid=${`ws-plan-seat-model-${s.id}`}>${s.model || '—'}</span>
+              <span class="text-sec" data-testid=${`ws-plan-seat-state-${s.id}`}>${s.state || '—'}</span>
+              ${liveChip}
+            </div>`;
+          })}
+        </div>`;
+      };
+
       return html`<div data-testid="ws-plan-progress-wrap">
         <div class="cc-plan-progress-row" data-testid="ws-plan-progress-row">
           <div class="cc-plan-progress-line" data-testid="ws-plan-progress-line">${progressLine}</div>
@@ -5590,8 +5642,12 @@ function App() {
             onclick=${() => setCcPlanWatchLiveOpen(!ccPlanWatchLiveOpen)}>${ccPlanWatchLiveOpen ? 'Hide live' : 'Watch live'}</button>
         </div>
         ${renderStartPlanningRow('ws')}
+        <div class="cc-plan-seats-block" data-testid="ws-plan-seats-block" style="margin:4px 0 8px">
+          <div class="card-title" style="margin-bottom:4px;font-size:12px">Seats</div>
+          ${renderSeatsList()}
+        </div>
         ${ccPlanWatchLiveOpen ? html`<div class="cc-plan-watch-live-pane" data-testid="ws-plan-watch-live-pane">
-          <div class="text-sec" data-testid="ws-plan-watch-live-empty" style="font-size:11px">No live planner pane available for this cycle yet.</div>
+          <div class="text-sec" data-testid="ws-plan-watch-live-empty" style="font-size:11px">Live panes land in a later batch (B4). Seat roster above lists every recorded seat for this cycle.</div>
         </div>` : null}
         ${awaitingApproval ? html`<div class="cc-plan-approve-banner" data-testid="ws-plan-approve-banner">
           <div class="cc-plan-approve-banner-text">
