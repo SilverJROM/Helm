@@ -251,6 +251,28 @@ export class CycleService {
     return path.join(cycleRoot, String(cycle.folder_name));
   }
 
+  /**
+   * B7 (R6.27): resolve the cycle's chat-file scratch dir — <project.directory>/tmp/<folder_name>.
+   * Deliberately flat (no completed/ mirror like getCycleDocDir): these are ephemeral chat paste
+   * artifacts, not an archived cycle deliverable. Never OS /tmp (a reboot wiped /tmp/helm-harness
+   * and crash-looped Helm 1.38M times) — always rooted under the project's own directory.
+   */
+  getCycleTmpDir(cycleId: number): string {
+    const cycle = this.db.prepare('SELECT * FROM cycles WHERE id = ?').get(cycleId) as any;
+    if (!cycle) {
+      const err: any = new Error('unknown cycle');
+      err.code = 'NOT_FOUND';
+      throw err;
+    }
+    const project = this.projectService.getProject(Number(cycle.project_id));
+    if (!project) {
+      const err: any = new Error('unknown project');
+      err.code = 'NOT_FOUND';
+      throw err;
+    }
+    return path.join(project.directory, 'tmp', String(cycle.folder_name));
+  }
+
   /** B11-T05: true when cycle-linked runs have launching/running worker_runtimes (orphan-guard). */
   hasActiveWorkersForCycle(cycleId: number): boolean {
     const row = this.db.prepare(

@@ -353,5 +353,36 @@ export class ProjectDocsService {
       const fp = path.join(helmDocs, stub.name);
       try { await fs.access(fp); } catch { await fs.writeFile(fp, stub.content, 'utf8'); }
     }
+    await this.scaffoldProjectGitignore(directory);
+  }
+
+  /**
+   * B7 (R6.27): idempotently ensure the project's own .gitignore carries a `tmp/` entry — the
+   * cycle chat-file writer's scratch root (project.directory/tmp/<cycle-folder>) must never be
+   * committed. No existing .gitignore -> create one with just `tmp/`. Existing .gitignore -> append
+   * `tmp/` ONLY if no line already ignores it, preserving every existing line untouched (never
+   * overwrites, never duplicates on repeat scaffold calls).
+   */
+  private async scaffoldProjectGitignore(directory: string): Promise<void> {
+    const fp = path.join(directory, '.gitignore');
+    let existing: string | null = null;
+    try {
+      existing = await fs.readFile(fp, 'utf8');
+    } catch {
+      existing = null;
+    }
+    if (existing == null) {
+      await fs.writeFile(fp, 'tmp/\n', 'utf8');
+      return;
+    }
+    const alreadyIgnored = existing
+      .split(/\r?\n/)
+      .some((line) => {
+        const t = line.trim();
+        return t === 'tmp/' || t === 'tmp' || t === '/tmp/' || t === '/tmp';
+      });
+    if (alreadyIgnored) return;
+    const needsNewline = existing.length > 0 && !existing.endsWith('\n');
+    await fs.writeFile(fp, existing + (needsNewline ? '\n' : '') + 'tmp/\n', 'utf8');
   }
 }

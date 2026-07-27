@@ -1393,6 +1393,36 @@ describe('I1: scaffoldProjectFolders (R-05D/G)', () => {
     const content = await fsp.readFile(tmpDir + '/helm_docs/tech-stack.md', 'utf8');
     expect(content).toBe('# Custom Content\n'); // not overwritten
   });
+
+  // B7 (R6.27): .gitignore must carry tmp/ (the cycle chat-file writer's scratch root) —
+  // idempotently: create if absent, append-only (preserving all existing content) if present.
+  it('B7-1: no existing .gitignore — scaffold creates one containing tmp/', async () => {
+    await docsSvc.scaffoldProjectFolders(tmpDir);
+    const fsp = await import('node:fs/promises');
+    const content = await fsp.readFile(tmpDir + '/.gitignore', 'utf8');
+    expect(content.split(/\r?\n/).map((l: string) => l.trim())).toContain('tmp/');
+  });
+
+  it('B7-2: existing .gitignore with custom content — tmp/ is appended, custom content preserved untouched', async () => {
+    const fsp = await import('node:fs/promises');
+    await fsp.writeFile(tmpDir + '/.gitignore', 'node_modules/\ndist/\n', 'utf8');
+    await docsSvc.scaffoldProjectFolders(tmpDir);
+    const content = await fsp.readFile(tmpDir + '/.gitignore', 'utf8');
+    expect(content).toContain('node_modules/');
+    expect(content).toContain('dist/');
+    expect(content.split(/\r?\n/).map((l: string) => l.trim())).toContain('tmp/');
+  });
+
+  it('B7-3: a second scaffold call is a no-op for .gitignore — no duplicate tmp/ line, custom content still intact', async () => {
+    const fsp = await import('node:fs/promises');
+    await fsp.writeFile(tmpDir + '/.gitignore', 'node_modules/\n', 'utf8');
+    await docsSvc.scaffoldProjectFolders(tmpDir);
+    const afterFirst = await fsp.readFile(tmpDir + '/.gitignore', 'utf8');
+    await docsSvc.scaffoldProjectFolders(tmpDir); // second call
+    const afterSecond = await fsp.readFile(tmpDir + '/.gitignore', 'utf8');
+    expect(afterSecond).toBe(afterFirst); // byte-identical — no duplicate tmp/ appended
+    expect(afterSecond.split(/\r?\n/).filter((l: string) => l.trim() === 'tmp/').length).toBe(1);
+  });
 });
 
 describe('I3: project_maintainer seed superseded by B09a/B09b roster (R-05F → R2.8–R2.11)', () => {

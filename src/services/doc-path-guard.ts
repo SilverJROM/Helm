@@ -121,6 +121,100 @@ export async function resolveSafeAttachmentPath(
 }
 
 /**
+ * B7 (R6.27 backend/scaffold): traversal guard for the cycle chat-file writer, under
+ * <project.directory>/tmp/<cycle-folder>/<filename> — text, files AND images, so (unlike
+ * resolveSafeAttachmentPath) there is deliberately no extension allowlist, and no `attachments/`
+ * subfolder prefix (the caller's tmpRootDir already IS the intended write location). Same fence
+ * otherwise: rejects .., absolute paths, realpath escape, and symlink leaves on write.
+ */
+export async function resolveSafeCycleTmpFilePath(
+  tmpRootDir: string,
+  filename: string,
+  opts: ResolveSafeDocPathOptions = {}
+): Promise<ResolvedDocPath> {
+  const containmentLabel = opts.containmentLabel || 'cycle tmp dir';
+  const symlinkRejectMessage = opts.symlinkRejectMessage || 'symlink not allowed for chat-file write';
+
+  const rawInput = String(filename || '').trim();
+  if (!rawInput || rawInput.includes('..') || path.isAbsolute(rawInput)) {
+    const e: any = new Error('path traversal blocked (invalid characters or relative escape in path)');
+    e.code = 'TRAVERSAL';
+    throw e;
+  }
+
+  const safeRel = path.basename(rawInput.replace(/^\/+/, ''));
+  if (!safeRel) {
+    const e: any = new Error('path traversal blocked (empty filename)');
+    e.code = 'TRAVERSAL';
+    throw e;
+  }
+
+  await fs.mkdir(tmpRootDir, { recursive: true });
+
+  const full = path.join(tmpRootDir, safeRel);
+  let realRoot: string;
+  try {
+    realRoot = await fs.realpath(tmpRootDir);
+  } catch {
+    const e: any = new Error('project directory or file not found');
+    e.code = 'NOT_FOUND';
+    throw e;
+  }
+
+  let realFile: string | null = null;
+  try {
+    realFile = await fs.realpath(full);
+  } catch {
+    realFile = null;
+  }
+
+  if (realFile) {
+    if (!containedInRoot(realFile, realRoot)) {
+      const e: any = new Error(`path traversal blocked (realpath not contained in ${containmentLabel})`);
+      e.code = 'TRAVERSAL';
+      throw e;
+    }
+  } else {
+    const parent = path.dirname(full);
+    await fs.mkdir(parent, { recursive: true });
+    let realParent: string;
+    try {
+      realParent = await fs.realpath(parent);
+    } catch {
+      const e: any = new Error('project directory or file not found');
+      e.code = 'NOT_FOUND';
+      throw e;
+    }
+    if (!containedInRoot(realParent, realRoot)) {
+      const e: any = new Error(`path traversal blocked (parent realpath not contained in ${containmentLabel})`);
+      e.code = 'TRAVERSAL';
+      throw e;
+    }
+  }
+
+  try {
+    const leaf = await fs.lstat(full);
+    if (leaf.isSymbolicLink()) {
+      const e: any = new Error(symlinkRejectMessage);
+      e.code = 'TRAVERSAL';
+      throw e;
+    }
+  } catch (err: any) {
+    if (err?.code === 'TRAVERSAL') throw err;
+    if (err?.code !== 'ENOENT') throw err;
+  }
+
+  return {
+    realRoot,
+    full,
+    realFile,
+    safeRel,
+    segments: [safeRel],
+    filename: safeRel
+  };
+}
+
+/**
  * B7-T03: read-only guard for serving an already-saved cycle attachment image back out
  * (e.g. `attachments/mockup.png`). B7-T04 widened it to also allow `mockups/` (approved-mockup
  * deliverables, R-C4) — same fence, same image-extension allowlist, just a second recognized
