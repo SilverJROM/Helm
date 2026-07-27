@@ -483,6 +483,139 @@ describe('planning-phase-service (B9 PLN1) + gate + auto pick', () => {
     }
   }, 15000);
 
+  // A13 (R1.29 reconvene half — D6 per-task half; A9's whole-plan scope half is untouched).
+  describe('A13: per-task ACCEPT/AMEND/ESCALATE conflict-only reconvene', () => {
+    const seedTwoTaskPlan = async (rd: string) => {
+      const plan = {
+        tasks: [
+          { task_key: 'T1', atomic_work: 'first task', complexity: 'low', recommended_model: 'claude-sonnet', effort: 'low', needs_more_info: false, task_type: 'feature', validation_criteria: 'n/a', deps: [] },
+          { task_key: 'T2', atomic_work: 'second task', complexity: 'low', recommended_model: 'claude-sonnet', effort: 'low', needs_more_info: false, task_type: 'feature', validation_criteria: 'n/a', deps: [] },
+        ],
+        meta: { source: 'a13-two-task' }
+      };
+      await fs.writeFile(path.join(rd, 'plan.json'), JSON.stringify(plan, null, 2), 'utf8');
+    };
+
+    it('a plan whose tasks all ACCEPT (or carry no verdict at all) produces exactly one agreement gate and zero per-task convenes', async () => {
+      const batchId = 'batch-A13-all-accept';
+      await seedTwoTaskPlan(runDir);
+      const p = phase.runPlanningPhase({
+        runDir, batchId, northStar: 'Add a small utility function to format dates.',
+        conversationLog: 'clear scope', mode: 'auto',
+      });
+      const cbp = path.join(runDir, 'callbacks.md');
+      const spawnsBefore = transport.spawnCalls.length;
+      await fs.appendFile(cbp,
+        `[helm callback] plancore ${batchId} STATUS: TASK-VERDICT — T1: ACCEPT\n` +
+        `[helm callback] plancore ${batchId} STATUS: PLAN-READY — plan.json written\n`
+      );
+      await sleep(30);
+      await fs.appendFile(cbp,
+        `[helm callback] planner ${batchId}-partner STATUS: TASK-VERDICT — T1: ACCEPT\n` +
+        `[helm callback] planner ${batchId}-partner STATUS: VERDICT-READY — CLEAN: clean\n`
+      );
+      const res = await p;
+      expect(res.agreed).toBe(true);
+      expect(res.reconvenedTaskKeys).toEqual([]);
+      // exactly the 2 whole-plan seats — no reconvene seats spawned for T1 or the verdict-silent T2.
+      expect(transport.spawnCalls.length - spawnsBefore).toBe(2);
+    });
+
+    it('a seeded ESCALATE on one task convenes the pair exactly once (T1 unaffected)', async () => {
+      const batchId = 'batch-A13-escalate';
+      await seedTwoTaskPlan(runDir);
+      const p = phase.runPlanningPhase({
+        runDir, batchId, northStar: 'Add a small utility function to format dates.',
+        conversationLog: 'clear scope', mode: 'auto',
+      });
+      const cbp = path.join(runDir, 'callbacks.md');
+      await fs.appendFile(cbp,
+        `[helm callback] plancore ${batchId} STATUS: TASK-VERDICT — T2: ESCALATE: unclear validation criteria\n` +
+        `[helm callback] plancore ${batchId} STATUS: PLAN-READY — plan.json written\n`
+      );
+      await sleep(30);
+      await fs.appendFile(cbp,
+        `[helm callback] planner ${batchId}-partner STATUS: TASK-VERDICT — T2: ACCEPT\n` +
+        `[helm callback] planner ${batchId}-partner STATUS: VERDICT-READY — CLEAN: clean\n`
+      );
+      const res = await p;
+      expect(res.agreed).toBe(true);
+      expect(res.reconvenedTaskKeys).toEqual(['T2']);
+      const reconveneSpawns = transport.spawnCalls.filter((s) => s.batchId === `${batchId}-reconvene-T2`);
+      expect(reconveneSpawns.length).toBe(1); // convened exactly once, not per-poll-iteration
+    });
+
+    it('a conflicting AMEND pair convenes the pair exactly once; a BYTE-IDENTICAL AMEND from both seats does not conflict', async () => {
+      const batchId = 'batch-A13-amend-conflict';
+      await seedTwoTaskPlan(runDir);
+      const p = phase.runPlanningPhase({
+        runDir, batchId, northStar: 'Add a small utility function to format dates.',
+        conversationLog: 'clear scope', mode: 'auto',
+      });
+      const cbp = path.join(runDir, 'callbacks.md');
+      await fs.appendFile(cbp,
+        `[helm callback] plancore ${batchId} STATUS: TASK-VERDICT — T1: AMEND: shrink scope to the happy path\n` +
+        `[helm callback] plancore ${batchId} STATUS: TASK-VERDICT — T2: AMEND: same wording for both\n` +
+        `[helm callback] plancore ${batchId} STATUS: PLAN-READY — plan.json written\n`
+      );
+      await sleep(30);
+      await fs.appendFile(cbp,
+        `[helm callback] planner ${batchId}-partner STATUS: TASK-VERDICT — T1: AMEND: split into two smaller tasks\n` +
+        `[helm callback] planner ${batchId}-partner STATUS: TASK-VERDICT — T2: AMEND: same wording for both\n` +
+        `[helm callback] planner ${batchId}-partner STATUS: VERDICT-READY — CLEAN: clean\n`
+      );
+      const res = await p;
+      expect(res.agreed).toBe(true);
+      // T1: differing AMEND text -> conflict. T2: byte-identical AMEND -> already agreed, no conflict.
+      expect(res.reconvenedTaskKeys).toEqual(['T1']);
+      expect(transport.spawnCalls.filter((s) => s.batchId === `${batchId}-reconvene-T1`).length).toBe(1);
+      expect(transport.spawnCalls.some((s) => s.batchId === `${batchId}-reconvene-T2`)).toBe(false);
+    });
+
+    it('DB: a convene event is recorded against the run + cycle (auditable trigger)', async () => {
+      const projRow = dbs.raw.prepare('INSERT INTO projects (name, directory) VALUES (?, ?) RETURNING id')
+        .get('a13-convene-proj', '/tmp/a13-convene-proj') as { id: number };
+      const cycleRow = dbs.raw.prepare(
+        `INSERT INTO cycles (project_id, name, folder_name, phase, autonomy, status)
+         VALUES (?, ?, ?, 'planning', 'autonomous_after_discovery', 'active') RETURNING id`
+      ).get(projRow.id, 'A13 cycle', 'a13-cycle') as { id: number };
+      const batchId = 'batch-A13-db-convene';
+      const runRow = dbs.raw.prepare(
+        `INSERT INTO runs (project_id, cycle_id, batch_id, phase) VALUES (?, ?, ?, 'planning') RETURNING id`
+      ).get(projRow.id, cycleRow.id, batchId) as { id: number };
+      await seedTwoTaskPlan(runDir);
+
+      const p = phase.runPlanningPhase({
+        runDir, batchId, northStar: 'Add a small utility function to format dates.',
+        conversationLog: 'clear scope', mode: 'auto',
+        projectId: projRow.id, runId: runRow.id,
+      });
+      const cbp = path.join(runDir, 'callbacks.md');
+      await fs.appendFile(cbp,
+        `[helm callback] plancore ${batchId} STATUS: TASK-VERDICT — T2: ESCALATE: needs owner decision\n` +
+        `[helm callback] plancore ${batchId} STATUS: PLAN-READY — plan.json written\n`
+      );
+      await sleep(30);
+      await fs.appendFile(cbp,
+        `[helm callback] planner ${batchId}-partner STATUS: TASK-VERDICT — T2: ACCEPT\n` +
+        `[helm callback] planner ${batchId}-partner STATUS: VERDICT-READY — CLEAN: clean\n`
+      );
+      const res = await p;
+      expect(res.agreed).toBe(true);
+      expect(res.reconvenedTaskKeys).toEqual(['T2']);
+
+      const eventRow = dbs.raw.prepare(
+        `SELECT run_id, batch_id, event_type, payload_json FROM run_events WHERE run_id = ? AND event_type = 'A13_TASK_RECONVENE'`
+      ).get(String(runRow.id)) as any;
+      expect(eventRow).toBeTruthy();
+      expect(eventRow.batch_id).toBe(batchId);
+      const payload = JSON.parse(eventRow.payload_json);
+      expect(payload.task_key).toBe('T2');
+      expect(payload.cycle_id).toBe(cycleRow.id);
+      expect(payload.trigger).toBe('ESCALATE');
+    });
+  });
+
   // A1 (R4.16): a cycle-linked planning run records plancore + partner as worker_runtimes rows
   // with non-NULL run_id resolving to the cycle via runs.cycle_id, and dispatches is untouched (N5).
   it('A1: cycle-linked planning run inserts worker_runtimes rows with non-NULL run_id resolving via runs.cycle_id', async () => {

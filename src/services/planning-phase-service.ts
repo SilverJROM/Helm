@@ -51,6 +51,47 @@ export function parseConsensusRule(rule: string | null | undefined): ConsensusPo
   return { unanimous, maxRounds };
 }
 
+// A13 (D6 per-task half / R1.29 reconvene half): the per-task machine verdict retained on the plan.
+// ACCEPT is the implicit default when a seat emits no TASK-VERDICT line for a task (never on a task
+// both seats accept — no default per-task convene loop). AMEND/ESCALATE must be explicit.
+export type TaskVerdict = 'ACCEPT' | 'AMEND' | 'ESCALATE';
+
+export interface TaskVerdictConflict {
+  taskKey: string;
+  plancoreVerdict: TaskVerdict;
+  partnerVerdict: TaskVerdict;
+  reason: 'ESCALATE' | 'CONFLICTING-AMEND';
+}
+
+/**
+ * Pure conflict detector (A13/R1.29 reconvene half — A9's scope half, the whole-plan gate, is
+ * untouched and unrelated). Convene the pair ONLY when:
+ * - either seat's verdict for a task is ESCALATE (always dispositive on its own), or
+ * - both propose AMEND but with DIFFERENT notes (a genuine conflicting amendment).
+ * Never convenes when both seats ACCEPT, nor when both seats independently converge on the
+ * byte-identical AMEND (they have already agreed on the same change — no conflict to resolve).
+ * A seat with no TASK-VERDICT line for a task defaults to ACCEPT (the retained default).
+ */
+export function detectTaskReconveneConflicts(
+  taskKeys: string[],
+  plancoreVerdicts: Map<string, { verdict: TaskVerdict; note: string }>,
+  partnerVerdicts: Map<string, { verdict: TaskVerdict; note: string }>
+): TaskVerdictConflict[] {
+  const conflicts: TaskVerdictConflict[] = [];
+  for (const taskKey of taskKeys) {
+    const pc = plancoreVerdicts.get(taskKey) ?? { verdict: 'ACCEPT' as TaskVerdict, note: '' };
+    const pt = partnerVerdicts.get(taskKey) ?? { verdict: 'ACCEPT' as TaskVerdict, note: '' };
+    if (pc.verdict === 'ESCALATE' || pt.verdict === 'ESCALATE') {
+      conflicts.push({ taskKey, plancoreVerdict: pc.verdict, partnerVerdict: pt.verdict, reason: 'ESCALATE' });
+      continue;
+    }
+    if (pc.verdict === 'ACCEPT' && pt.verdict === 'ACCEPT') continue;
+    if (pc.verdict === pt.verdict && pc.note.trim() === pt.note.trim()) continue; // identical AMEND — agreed, no conflict
+    conflicts.push({ taskKey, plancoreVerdict: pc.verdict, partnerVerdict: pt.verdict, reason: 'CONFLICTING-AMEND' });
+  }
+  return conflicts;
+}
+
 function clampedPlanningMs(name: string, fallback: number, min: number, max: number): number {
   const raw = process.env[name];
   if (raw === undefined || raw.trim() === '') return fallback;
@@ -106,6 +147,10 @@ export interface PlanningResult {
   /** A11 (R1.6 + D7): set only when agreed===false — a mechanism-level reason naming the missing
    *  partner batch id(s) and the round-cap budget exhausted, for the caller's visible BLOCKED state. */
   blockedReason?: string;
+  /** A13 (R1.29 reconvene half): task_keys the pair was reconvened for (ESCALATE or a conflicting
+   *  AMEND). Empty when every task was ACCEPTed by both seats (or carried no explicit verdict at all) —
+   *  never populated by the whole-plan gate itself, only by this row's per-task conflict detector. */
+  reconvenedTaskKeys?: string[];
 }
 
 export function selectCoPlannerMode(
@@ -573,6 +618,18 @@ export class PlanningPhaseService {
     const rid = inputs.runId ?? this.artifacts.createRun(inputs.projectId ?? null, batchId, nsPath);
     const { createdTaskIds, keyToId } = await this.parser.ingestExecutionPlan(rid, planMarkdown, this.queue, runDir);
 
+    // A13 (R1.29 reconvene half): AFTER the whole-plan gate (A9's scope half, untouched above), scan
+    // for per-task ACCEPT/AMEND/ESCALATE verdicts and convene the pair ONLY for a genuine conflict —
+    // never a default per-task loop, never re-opening the already-passed whole-plan gate.
+    const taskKeys = plan.tasks.map((t) => t.task_key);
+    const { plancore: plancoreTaskVerdicts, partner: partnerTaskVerdicts } = await this.collectTaskVerdicts(
+      cbPath, batchId, partnerBatchIds, brainRole, partner, agreementFenceOffset
+    );
+    const taskConflicts = detectTaskReconveneConflicts(taskKeys, plancoreTaskVerdicts, partnerTaskVerdicts);
+    const reconvenedTaskKeys = taskConflicts.length
+      ? await this.reconveneConflictingTasks(taskConflicts, batchId, partner, runDir, effectiveProjectDir, briefWriter, rid, this.resolveCycleId(rid), inputs)
+      : [];
+
     // A15: planning phase exit (success) — mark seats done. Orchestrator also finalizes at
     // planning-done-yield (idempotent). Partner no longer depends on the generic janitor alone.
     this.finalizeWorkerRuntime(plancoreRuntimeId, 'done', 'planning-phase-complete');
@@ -589,7 +646,8 @@ export class PlanningPhaseService {
       plan,
       createdTaskIds,
       keyToId,
-      runId: rid
+      runId: rid,
+      reconvenedTaskKeys
     };
   }
 
@@ -719,6 +777,105 @@ export class PlanningPhaseService {
   private async readCallbacksWindow(cbPath: string, sinceOffset: number): Promise<string> {
     const buf = await fs.readFile(cbPath);
     return (sinceOffset > 0 ? buf.subarray(sinceOffset) : buf).toString('utf8');
+  }
+
+  // A13 (R1.29 reconvene half): per-task verdict lines are a SEPARATE STATUS token (TASK-VERDICT) from
+  // the whole-plan PLAN-READY/VERDICT-READY signals A9 already owns — same [helm|projcore callback]
+  // prefix + STATUS-token shape, so this reuses parseAgreementCallbackLine rather than a third parser.
+  // Note payload format: "<task_key>: <ACCEPT|AMEND|ESCALATE>[: free-text reason]".
+  private parseTaskVerdictLine(line: string): { role: string; batchId: string; taskKey: string; verdict: TaskVerdict; note: string } | null {
+    const parsed = this.parseAgreementCallbackLine(line);
+    if (!parsed || parsed.state !== 'TASK-VERDICT' || !parsed.note) return null;
+    const m = /^\s*([^:]+):\s*(ACCEPT|AMEND|ESCALATE)\b(?:\s*:\s*(.*))?$/i.exec(parsed.note);
+    if (!m) return null;
+    return { role: parsed.role, batchId: parsed.batchId, taskKey: m[1].trim(), verdict: m[2].toUpperCase() as TaskVerdict, note: (m[3] || '').trim() };
+  }
+
+  // Scan callbacks.md (same fence-scoped window as the whole-plan gate) for each seat's LATEST
+  // TASK-VERDICT per task_key (reversed scan — a later verdict can never be shadowed by an earlier
+  // one, mirroring waitForAgreement's own latest-wins pattern). A task absent from a seat's map
+  // defaults to ACCEPT in detectTaskReconveneConflicts — never fenced/blocked on here.
+  private async collectTaskVerdicts(
+    cbPath: string,
+    batchId: string,
+    partnerBatchIds: string[],
+    brainRole: string,
+    partnerRole: string,
+    sinceOffset: number
+  ): Promise<{ plancore: Map<string, { verdict: TaskVerdict; note: string }>; partner: Map<string, { verdict: TaskVerdict; note: string }> }> {
+    const plancore = new Map<string, { verdict: TaskVerdict; note: string }>();
+    const partner = new Map<string, { verdict: TaskVerdict; note: string }>();
+    try {
+      const raw = await this.readCallbacksWindow(cbPath, sinceOffset);
+      const lines = raw.split(/\r?\n/).reverse();
+      for (const line of lines) {
+        const tv = this.parseTaskVerdictLine(line);
+        if (!tv) continue;
+        if (tv.batchId === batchId && roleMatches(brainRole, tv.role) && !plancore.has(tv.taskKey)) {
+          plancore.set(tv.taskKey, { verdict: tv.verdict, note: tv.note });
+        }
+        if (partnerBatchIds.includes(tv.batchId) && roleMatches(partnerRole, tv.role) && !partner.has(tv.taskKey)) {
+          partner.set(tv.taskKey, { verdict: tv.verdict, note: tv.note });
+        }
+      }
+    } catch { /* no verdict lines yet — every task defaults to ACCEPT/ACCEPT, zero conflicts */ }
+    return { plancore, partner };
+  }
+
+  private resolveCycleId(runId: number): number | null {
+    try {
+      const db = (this.artifacts as any)['db']?.raw;
+      const row = db?.prepare('SELECT cycle_id FROM runs WHERE id = ?').get(runId) as { cycle_id: number | null } | undefined;
+      return row?.cycle_id ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  // A13: convene the pair for EACH conflicting task — spawn a fresh, task-scoped mini review seat
+  // (mirrors the whole-plan partner spawn) and record a durable, auditable run_events row (run + cycle,
+  // per the AC). Best-effort per conflict: a single convene failing to spawn/record must never retract
+  // the already-agreed whole-plan handoff (D6: the reconvene path is a conflict-only ADDITION on top of
+  // an already-passed gate, not a new blocking gate of its own — "do not build a default per-task
+  // convene loop" applies equally to not inventing a second wait-for-resolution loop here).
+  private async reconveneConflictingTasks(
+    conflicts: TaskVerdictConflict[],
+    batchId: string,
+    partner: 'planner' | 'deliberation',
+    runDir: string,
+    effectiveProjectDir: string,
+    briefWriter: BriefWriterService,
+    runId: number,
+    cycleId: number | null,
+    inputs: PlanningInputs
+  ): Promise<string[]> {
+    const reconvened: string[] = [];
+    for (const c of conflicts) {
+      const safeKey = String(c.taskKey).replace(/[^A-Za-z0-9_.-]/g, '_');
+      const reconveneBatchId = `${batchId}-reconvene-${safeKey}`;
+      try {
+        const brief = briefWriter.generatePanelBrief({
+          role: partner,
+          batchId: reconveneBatchId,
+          seat: `reconvene-${safeKey}`,
+          lens: 'per-task conflict resolution (D6 reconvene-on-conflict half)',
+          requirement: `Task ${c.taskKey}: plancore verdict=${c.plancoreVerdict}, partner verdict=${c.partnerVerdict} (${c.reason}). Reconvene and resolve to a single agreed verdict for THIS task only — do not re-open the whole-plan gate.`,
+          projectDir: effectiveProjectDir,
+          callbacksFile: path.join(runDir, 'callbacks.md'),
+        });
+        await this.artifacts.writeBrief(runDir, `reconvene-${safeKey}`, brief);
+        const spawned = await this.transport.spawn({ role: partner, brief, runDir, batchId: reconveneBatchId, model: inputs.partnerModel, provider: inputs.partnerProvider, attemptId: 0, projectDir: effectiveProjectDir, projectId: inputs.projectId, runId: inputs.runId, ...(inputs.strictReadAllow ? { strictReadAllow: inputs.strictReadAllow } : {}) });
+        this.registerWorkerRuntime(inputs.projectId, inputs.runId, partner, reconveneBatchId, spawned.handle, inputs.partnerProvider, inputs.partnerModel);
+        this.artifacts.recordRunEvent(
+          runId,
+          'A13_TASK_RECONVENE',
+          { task_key: c.taskKey, cycle_id: cycleId, trigger: c.reason, plancore_verdict: c.plancoreVerdict, partner_verdict: c.partnerVerdict },
+          batchId
+        );
+        reconvened.push(c.taskKey);
+      } catch { /* best-effort — one convene failing must never retract the already-agreed handoff */ }
+    }
+    return reconvened;
   }
 
   /**
