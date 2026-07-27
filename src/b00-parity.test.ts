@@ -14,7 +14,7 @@ const expectations = [
   ['Dispatch obeys mutable topology drift', 'B00.s3a', 'src/b00-red-r4r10r11.test.ts', 'B06.s1', 'R13.40, R4.17'],
   ['JROM escalation is deferred rather than owner-gated paged', 'B00.s3b', 'src/b00-red-r4r10r11.test.ts', 'B11.s1', 'R13.40, R10.34'],
   ['Terminal completion ignores contradiction outcome', 'B00.s3c', 'src/b00-red-r4r10r11.test.ts', 'B04.s7 + B05.s2 integration', 'R13.40, R11.38'],
-  ['Planner fast-path bypasses a co-planner', 'B00.s4a', 'src/b00-red-r7.test.ts', 'B08.s1', 'R13.40, R7.27'],
+  // B00.s4a retired: flipped by A8 (R1.2) — see src/b00-red-r7.test.ts's regression guard + plan.md A8 row.
   ['Brief/runtime `plan.json` split-brain', 'B00.s4b', 'src/b00-red-r7.test.ts', 'B08.s2', 'R13.40, R7.28'],
 ] as const;
 

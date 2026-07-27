@@ -164,9 +164,13 @@ describe.sequential('A5 R3.13 finishPlanning in production at planning-done', ()
     });
     expect(runId).toBe(precreatedRunId);
 
-    // No manual UPDATE cycles SET phase=… after planning — finishPlanning did it.
+    // No manual UPDATE cycles SET phase=… after planning — finishPlanning did it. The task's DONE/PASS
+    // callbacks were seeded upfront (fake transport), so the run may race all the way to true
+    // completion before this awaited startRun returns — A7/R3.15 then flips the cycle straight to
+    // 'complete' (see cycle-terminal-on-run-complete.test.ts); either outcome proves finishPlanning
+    // (not a manual patch) drove the cycle out of 'planning'.
     const after = db.raw.prepare('SELECT phase, awaiting_approval FROM cycles WHERE id = ?').get(cycle.id) as any;
-    expect(after.phase).toBe('implementation');
+    expect(['implementation', 'complete']).toContain(after.phase);
     expect(Number(after.awaiting_approval || 0)).toBe(0);
 
     const runRow = db.raw.prepare('SELECT cycle_id, phase, status FROM runs WHERE id = ?').get(runId) as any;
@@ -200,7 +204,10 @@ describe.sequential('A5 R3.13 finishPlanning in production at planning-done', ()
 
     const phaseAfterFirst = (db.raw.prepare('SELECT phase FROM cycles WHERE id = ?').get(cycle.id) as any)
       .phase;
-    expect(phaseAfterFirst).toBe('implementation');
+    // Seeded DONE/PASS callbacks (fake transport) may race the run to true completion before this
+    // awaited startRun returns — A7/R3.15 then flips the cycle straight to 'complete'. Either outcome
+    // is non-'planning', which is what makes the CONFLICT assertion below meaningful.
+    expect(['implementation', 'complete']).toContain(phaseAfterFirst);
 
     // Direct second call throws CONFLICT (N7) — production helper must not propagate it.
     let directConflict: any;
@@ -219,8 +226,8 @@ describe.sequential('A5 R3.13 finishPlanning in production at planning-done', ()
     const runRow = db.raw.prepare('SELECT phase, status FROM runs WHERE id = ?').get(runId) as any;
     expect(runRow).toBeTruthy();
     expect(String(runRow.status)).not.toBe('failed');
-    expect(
+    expect(['implementation', 'complete']).toContain(
       (db.raw.prepare('SELECT phase FROM cycles WHERE id = ?').get(cycle.id) as any).phase
-    ).toBe('implementation');
+    );
   });
 });

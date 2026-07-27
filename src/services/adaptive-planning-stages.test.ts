@@ -924,7 +924,9 @@ patch: {"set_depth":[{"task_key":"T01","plan_depth":"pair"}]}
       });
       await fs.appendFile(
         path.join(runDir, 'callbacks.md'),
-        '[helm callback] plancore batch-off-compat STATUS: PLAN-READY — fixture\n',
+        '[helm callback] plancore batch-off-compat STATUS: PLAN-READY — fixture\n' +
+        // A8 (R1.2): 'planner' mode still convenes + requires the partner's agreement signal.
+        '[helm callback] planner batch-off-compat-partner STATUS: AGREE — clean\n',
       );
       const res = await pending;
       expect(res.agreed).toBe(true);

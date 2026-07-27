@@ -217,6 +217,7 @@ describe('RunOrchestratorService (A2 wiring)', () => {
     await fs.writeFile(
       path.join(ingestRunDir, 'callbacks.md'),
       `[helm callback] plancore ${batchId} STATUS: PLAN-READY — plan ready
+[helm callback] planner ${batchId}-partner STATUS: AGREE — clean
 [helm callback] implementer ${batchId} STATUS: DONE — top-rung implementation complete
 [helm callback] validator ${batchId} STATUS: PASS — top-rung task verified
 [helm callback] panelist ${batchId} STATUS: VERDICT-READY — CLEAN: top-rung result holds (seat top-start:0)
@@ -691,6 +692,8 @@ describe('RunOrchestratorService (A2 wiring)', () => {
     };
     await fs.writeFile(path.join(expectedRunDir, 'plan.json'), JSON.stringify(plan, null, 2), 'utf8');
     await fs.appendFile(cbPath, `[helm callback] plancore ${fixedBatch} STATUS: PLAN-READY — plan agreed with planner; see plan.json\n`);
+    // A8 (R1.2): every mode convenes + requires the partner's agreement signal.
+    await fs.appendFile(cbPath, `[helm callback] planner ${fixedBatch}-partner STATUS: AGREE — clean\n`);
     await fs.appendFile(cbPath, `
 [helm callback] implementer ${fixedBatch} STATUS: DONE — interview policy respected
 [helm callback] validator ${fixedBatch} STATUS: PASS — criteria met

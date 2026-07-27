@@ -18,7 +18,11 @@ import { finalizeWorkerRuntimeRow } from './worker-runtime-finalize.js';
  * - Per projcore agent def (B3 seeds): planning_partner.mode (auto|planner|deliberation), agree_before_proceed.
  * - auto pick: simple/clear/low-risk -> 'planner'; cross-cutting/ambiguous/arch/schema/security -> 'deliberation'.
  * - agree-before-proceed gate: **BLOCKS** ingest/hand-off to the B6 loop until agreement.
- *   POCFIX9: 'planner' fast-path = projcore PLAN-READY + canonical plan.md only (no partner spawn/wait); 'deliberation' still requires partner.
+ *   A8 (R1.2): a planning run always convenes a partner and always requires its agreement signal —
+ *   'planner' selects a single co-reviewer, 'deliberation' a cross-cutting review; neither skips the
+ *   partner. The former POCFIX9 no-co-planner fast path (mode='planner' spawns no partner and PLAN-READY
+ *   alone passes the gate) is deleted; a stall with no partner signal returns agreed:false, never a
+ *   silent pass.
  * - Under USE_FAKE_TMUX: fixture-driven for tests (cbs + spawns); representative plan only on missing file (guarded).
  * - Real path (!USE_FAKE_TMUX / prod): plancore authors canonical og-requirements.md + plan.md; Helm validates plan.md and derives the internal runDir/plan.json.
  * - On agreement + valid plan: delegates to PlanParserService.ingestPlan (no new exec path after).
@@ -154,8 +158,9 @@ export class PlanningPhaseService {
 
   /**
    * Run the planning phase (real projcore-authored canonical plan.md on prod/real path; guarded fixture ONLY under USE_FAKE_TMUX for tests).
-   * Gate: 
-   *   - 'planner' (single, for clear non-cross-cutting features per selectCoPlannerMode): only projcore PLAN-READY + valid canonical plan.md (POCFIX9 fast-path; no partner spawned or waited).
+   * Gate (A8/R1.2 — every mode always convenes a partner and requires its agreement signal):
+   *   - 'planner' (single, for clear non-cross-cutting features per selectCoPlannerMode): partner agreement
+   *     (REVIEW/AGREE/CONSENSUS) + projcore PLAN-READY + valid canonical plan.md.
    *   - 'deliberation': partner agreement (REVIEW/AGREE/CONSENSUS) + projcore PLAN-READY + valid canonical plan.md.
    * Real path: if canonical requirements + plan are absent/invalid -> clear BLOCK error (throw), no ingest, no fixture fallback.
    * Returns the plan + ingest results (task ids) so caller can drive runQueuedTasks.
@@ -209,10 +214,6 @@ export class PlanningPhaseService {
     const partner = mode === 'auto'
       ? selectCoPlannerMode(effectiveNorthStar, inputs.autoSignals)
       : (mode as 'planner' | 'deliberation');
-
-    // POCFIX9 (B): for clear single-feature ('planner' mode) use fast-path — no partner spawned/required.
-    // Only 'deliberation' (cross-cutting) convenes + waits for partner AGREE. This prevents 10min stall on non-functional partner for simple north-stars like Lucky 9 while keeping the 2-agent deliberation path intact.
-    const isPlanner = partner === 'planner';
 
     // Generate contract-compliant planning brief via BriefWriter (projcore role gets its own enum + full v2 sections + streaming/helper/paths etc).
     // This fixes the live POST /runs 400 BRIEF-CONTRACT-MISSING for the planning (projcore) brief under real dispatch/RealTransport.
@@ -277,25 +278,25 @@ export class PlanningPhaseService {
     }
 
     // Always persist the plancore brief so prompts/plancore.brief.md exists on both planner and
-    // deliberation paths. (Previously inside !isPlanner, causing ENOENT on the planner fast-path.)
+    // deliberation paths.
     await this.artifacts.writeBrief(runDir, 'plancore', planningBrief);
 
-    if (!isPlanner) {
-      // Also generate compliant partner brief (planner/deliberation -> panelist-family enum + contract).
-      const partnerBrief = briefWriter.generatePanelBrief({
-        role: partner,
-        batchId: `${batchId}-partner`,
-        seat: 'partner',
-        lens: 'plan atomicity, deps, fields, complexity/recommended_model, validation_criteria',
-        requirement: 'Review canonical plan.md and north-star.md. Pressure-test atomicity, deps, fields, complexity/recommended_model. Return agreement or concrete gaps.',
-        projectDir: effectiveProjectDir,
-        callbacksFile: path.join(runDir, 'callbacks.md'),
-      });
-      await this.artifacts.writeBrief(runDir, partner, partnerBrief);
-      const partnerSpawned = await this.transport.spawn({ role: partner, brief: partnerBrief, runDir, batchId: `${batchId}-partner`, model: inputs.partnerModel, provider: inputs.partnerProvider, attemptId: 0, projectDir: effectiveProjectDir, projectId: inputs.projectId, runId: inputs.runId, ...(inputs.strictReadAllow ? { strictReadAllow: inputs.strictReadAllow } : {}) });  // B-ISO1 + A2: projectId/runId → helm_sessions via createSession
-      // A1 (R4.16): record the partner seat so it is DB-observable with run+cycle linkage.
-      partnerRuntimeId = this.registerWorkerRuntime(inputs.projectId, inputs.runId, partner, `${batchId}-partner`, partnerSpawned.handle, inputs.partnerProvider, inputs.partnerModel);
-    }
+    // A8 (R1.2): a planning run always convenes a partner — 'planner' selects a single co-reviewer,
+    // 'deliberation' a cross-cutting review, but neither mode skips the partner (D1). Default-config
+    // planning therefore always spawns exactly 2 seats (plancore + partner).
+    const partnerBrief = briefWriter.generatePanelBrief({
+      role: partner,
+      batchId: `${batchId}-partner`,
+      seat: 'partner',
+      lens: 'plan atomicity, deps, fields, complexity/recommended_model, validation_criteria',
+      requirement: 'Review canonical plan.md and north-star.md. Pressure-test atomicity, deps, fields, complexity/recommended_model. Return agreement or concrete gaps.',
+      projectDir: effectiveProjectDir,
+      callbacksFile: path.join(runDir, 'callbacks.md'),
+    });
+    await this.artifacts.writeBrief(runDir, partner, partnerBrief);
+    const partnerSpawned = await this.transport.spawn({ role: partner, brief: partnerBrief, runDir, batchId: `${batchId}-partner`, model: inputs.partnerModel, provider: inputs.partnerProvider, attemptId: 0, projectDir: effectiveProjectDir, projectId: inputs.projectId, runId: inputs.runId, ...(inputs.strictReadAllow ? { strictReadAllow: inputs.strictReadAllow } : {}) });  // B-ISO1 + A2: projectId/runId → helm_sessions via createSession
+    // A1 (R4.16): record the partner seat so it is DB-observable with run+cycle linkage.
+    partnerRuntimeId = this.registerWorkerRuntime(inputs.projectId, inputs.runId, partner, `${batchId}-partner`, partnerSpawned.handle, inputs.partnerProvider, inputs.partnerModel);
 
     // Fixture drive: simulate the exchange + agreement (tests append real [helm callback] lines + sleep).
     // The phase "blocks" here in real waits; in fixture the caller (test) drives the callbacks.md to PLAN-READY.
@@ -304,8 +305,9 @@ export class PlanningPhaseService {
     // (In real usage the projcore/partner workers append; here tests control timing.)
 
     // POCFIX8 (B): long timeout on real !USE_FAKE_TMUX (projcore needs minutes to think, write the canonical docs, and emit PLAN-READY); fast 4s preserved under fixture.
-    // POCFIX9 (B): waitForAgreement now fast-paths for 'planner' (see fn): only projcore PLAN-READY + canonical plan.md required (no partner). For 'deliberation' both signals still needed.
-    // real path adds explicit file poll below for BOTH before ingest.
+    // A8 (R1.2): waitForAgreement requires BOTH the partner agreement signal AND projcore PLAN-READY in
+    // every mode — 'planner' no longer fast-paths on PLAN-READY alone. real path adds explicit file poll
+    // below for BOTH before ingest.
     const agreed = await this.waitForAgreement(cbPath, batchId, partner, brainRole, PLANNING_TIMEOUT_MS);
 
     // Short grace for plancore to flush canonical documents before the PLAN-READY callback is consumed.
@@ -566,13 +568,16 @@ export class PlanningPhaseService {
             sawPlanReady = true;
           }
         }
-        // POCFIX9 (B): 'planner' (single) fast-path — PLAN-READY alone is sufficient (partner not spawned/required, avoids 10min stall on non-functional partner).
-        // 'deliberation' (or legacy partner) still requires the partner REVIEW/AGREE/CONSENSUS signal for early return.
-        if (sawPlanReady && (sawPartner || partnerRole === 'planner')) return true;
+        // A8 (R1.2): every mode requires BOTH the partner agreement signal and projcore PLAN-READY —
+        // no mode passes on PLAN-READY alone (the former POCFIX9 no-co-planner fast path is deleted).
+        if (sawPlanReady && sawPartner) return true;
       } catch {}
       await new Promise((r) => setTimeout(r, 20));
     }
-    // 'planner' mode: return on PLAN-READY alone (fast path). Deliberation/partner modes fall back to sawPlanReady only after full timeout (prefers partner signal).
-    return sawPlanReady;
+    // A8 (R1.2): a timeout with no confirmed partner agreement is a bounded stall, never a silent pass —
+    // return false so the caller's existing agreed:false path (reap seats, no ingest) takes over instead
+    // of proceeding on PLAN-READY alone. (sawPlanReady && sawPartner can never both be true here — the
+    // loop above already returns true the instant both flags flip.)
+    return false;
   }
 }

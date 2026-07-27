@@ -4,9 +4,11 @@ import fs from 'node:fs/promises';
 const readSource = (relativePath: string) => fs.readFile(new URL(relativePath, import.meta.url), 'utf8');
 
 describe('B00.s4 R7 red anchors (failing by intent)', () => {
-  it.fails('B00.s4a: planner mode cannot bypass a co-planner', async () => {
-    // §2 evidence: planning-phase-service.ts:117-124 selects planner mode, and 168-181
-    // makes the partner spawn conditional on !isPlanner. Flip: B08.s1.
+  // B00.s4a FLIPPED by A8 (R1.2): the POCFIX9 no-co-planner fast path (isPlanner/!isPlanner gating the
+  // partner spawn) is deleted from planning-phase-service.ts — a planning run always convenes a partner
+  // in every mode. Regression guard kept as a plain (non-`it.fails`) assertion; see
+  // b00-parity.test.ts / parity-matrix.md for the corresponding registry retirement.
+  it('B00.s4a (flipped by A8): planner mode can no longer bypass a co-planner', async () => {
     const source = await readSource('./services/planning-phase-service.ts');
     const partnerSelection = source.slice(
       source.indexOf('// Determine partner'),

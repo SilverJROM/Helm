@@ -54,7 +54,7 @@ describe('planning-phase-service (B9 PLN1) + gate + auto pick', () => {
     expect(selectCoPlannerMode('architecture pivot for security model', { isAmbiguous: true })).toBe('deliberation');
   });
 
-  it('gate BLOCKS handoff until agreement; planner fast-path derives plan.json from canonical plan.md', async () => {
+  it('gate BLOCKS handoff until agreement; planner mode always convenes + waits for the partner (A8/R1.2)', async () => {
     const north = 'Simple single-module feature: add a plan parser that reads json and creates run_tasks.';
     const conv = 'Interview notes: clear scope, no cross module risk.';
 
@@ -73,10 +73,14 @@ describe('planning-phase-service (B9 PLN1) + gate + auto pick', () => {
     await fs.appendFile(cbp, `[helm callback] plancore batch-B9-gate STATUS: PLANNING — starting co-planner selection\n`);
     await sleep(30);
 
-    // Because auto + simple, partner resolves to 'planner' (POCFIX9: single, fast path, no partner spawned or required).
-    // Drive ONLY projcore PLAN-READY (no partner cb line needed; test proves fast path).
-    // (We still append a legacy planner line in some flows but it is not waited for.)
+    // Because auto + simple, partner resolves to 'planner' — A8: this mode still convenes ONE partner
+    // and still requires its agreement signal (D1: "planner mode means one co-reviewer, never no
+    // partner"). PLAN-READY alone must not be sufficient.
     await fs.appendFile(cbp, `[helm callback] plancore batch-B9-gate STATUS: PLAN-READY — plan.json written with all fields + deps\n`);
+    await sleep(30);
+    expect(await Promise.race([p.then(() => 'resolved'), sleep(50).then(() => 'pending')])).toBe('pending');
+
+    await fs.appendFile(cbp, `[helm callback] planner batch-B9-gate-partner STATUS: AGREE — plan is atomic, deps clean\n`);
     await sleep(30);
 
     const res = await p;
@@ -87,9 +91,9 @@ describe('planning-phase-service (B9 PLN1) + gate + auto pick', () => {
     expect(res.createdTaskIds.length).toBeGreaterThan(0);
     expect(res.keyToId['P1']).toBeTypeOf('number');
 
-    // POCFIX9: for 'planner' (simple auto) NO partner role was spawned (fast path; only projcore).
+    // A8: default-config planning always spawns exactly 2 seats (plancore + partner), even in 'planner' mode.
     const plannerSpawns = transport.spawnCalls.filter((s) => s.role === 'planner' || s.role === 'deliberation');
-    expect(plannerSpawns.length).toBe(0);
+    expect(plannerSpawns.length).toBe(1);
 
     // Helm derived plan.json from the canonical plan.md fixture.
     const planRaw = await fs.readFile(path.join(runDir, 'plan.json'), 'utf8');
@@ -99,6 +103,26 @@ describe('planning-phase-service (B9 PLN1) + gate + auto pick', () => {
 
     // queue has the tasks (ingest happened only after gate)
     expect(queue.getQueue(art['db'] ? 0 : 0).length || res.createdTaskIds.length > 0).toBeTruthy(); // indirect via created
+  });
+
+  // (a) Default-config planning always spawns 2 seats (plancore + partner) — no mode skips the partner.
+  it('A8: default-config planning spawns exactly 2 seats (plancore + partner)', async () => {
+    const p = phase.runPlanningPhase({
+      runDir,
+      batchId: 'batch-A8-two-seats',
+      northStar: 'Add a small utility function to format dates.',
+      conversationLog: 'clear scope, no cross module risk.',
+      mode: 'auto'
+    });
+    const cbp = path.join(runDir, 'callbacks.md');
+    await fs.appendFile(cbp, `[helm callback] plancore batch-A8-two-seats STATUS: PLAN-READY — plan.json written\n`);
+    await sleep(30);
+    await fs.appendFile(cbp, `[helm callback] planner batch-A8-two-seats-partner STATUS: AGREE — clean\n`);
+
+    const res = await p;
+    expect(res.agreed).toBe(true);
+    expect(transport.spawnCalls.length).toBe(2);
+    expect(transport.spawnCalls.some((s) => s.role === 'planner')).toBe(true);
   });
 
   it('hands Discovery cycle artifacts through Planning into implementation as one canonical set', async () => {
@@ -128,6 +152,8 @@ describe('planning-phase-service (B9 PLN1) + gate + auto pick', () => {
         mode: 'planner',
       });
       await fs.appendFile(path.join(runDir, 'callbacks.md'), '[helm callback] plancore batch-S6-canonical STATUS: PLAN-READY — canonical docs ready\n');
+      // A8: 'planner' mode still convenes + requires the partner's agreement signal.
+      await fs.appendFile(path.join(runDir, 'callbacks.md'), '[helm callback] planner batch-S6-canonical-partner STATUS: AGREE — clean\n');
       const result = await pending;
 
       expect(result.northStarPath).toBe(path.join(cycleRoot, 'north-star.md'));
@@ -274,17 +300,18 @@ describe('planning-phase-service (B9 PLN1) + gate + auto pick', () => {
     expect(csrc).toMatch(/\/dev\/null/);
   });
 
-  // POCFIX9 (b): 'planner' mode (single) proceeds on PLAN-READY + valid plan.json with NO partner AGREE line and without full-timeout stall;
-  // 'deliberation' still requires the partner signal. Use explicit mode (bypasses auto) + pre-written plan.json.
-  it('POCFIX9 (b): planner mode ingests fast on PLAN-READY + plan.json with no partner required (deliberation still needs partner)', async () => {
+  // A8 (R1.2): the former POCFIX9 fast path let 'planner' mode pass on PLAN-READY alone with no
+  // partner spawned/required. It's deleted: 'planner' now requires the SAME partner agreement signal
+  // as 'deliberation' — PLAN-READY alone does not pass, and a stall with no partner is agreed:false
+  // (bounded), never a silent pass.
+  it('A8: planner mode always convenes a partner and requires its agreement signal (PLAN-READY alone does not pass)', async () => {
     const origPlanTo = process.env.HELM_PLANNING_TIMEOUT_MS;
-    process.env.HELM_PLANNING_TIMEOUT_MS = '5000'; // controlled; logic returns early on PLAN-READY for planner
+    process.env.HELM_PLANNING_TIMEOUT_MS = '5000';
     try {
-      // --- planner fast path: only projcore PLAN-READY, no partner cb lines at all ---
       const northPlanner = 'Add Lucky 9 card game to the cards project (clear single feature).';
       const pPlanner = phase.runPlanningPhase({
         runDir,
-        batchId: 'batch-POCFIX9-planner-fast',
+        batchId: 'batch-A8-planner-partner',
         northStar: northPlanner,
         conversationLog: 'Simple isolated feature.',
         mode: 'planner'  // explicit single-planner
@@ -292,43 +319,57 @@ describe('planning-phase-service (B9 PLN1) + gate + auto pick', () => {
       const cbp = path.join(runDir, 'callbacks.md');
       const plannerPlan = {
         tasks: [{ task_key: 'L9-1', atomic_work: 'Lucky9 core', complexity: 'med', recommended_model: 'claude-sonnet', effort: 'med', needs_more_info: false, task_type: 'feature', validation_criteria: 'core works', deps: [] }],
-        meta: { source: 'pocfix9-planner' }
+        meta: { source: 'a8-planner' }
       };
       await fs.writeFile(path.join(runDir, 'plan.json'), JSON.stringify(plannerPlan, null, 2), 'utf8');
-      await fs.appendFile(cbp, `[helm callback] plancore batch-POCFIX9-planner-fast STATUS: PLAN-READY — plan.json present\n`);
+      await fs.appendFile(cbp, `[helm callback] plancore batch-A8-planner-partner STATUS: PLAN-READY — plan.json present\n`);
+
+      // (b) PLAN-READY alone must NOT resolve the gate, even in 'planner' mode.
+      await sleep(80);
+      const stillPending = await Promise.race([pPlanner.then(() => 'resolved'), sleep(20).then(() => 'pending')]);
+      expect(stillPending).toBe('pending');
+
+      // exactly one partner seat was spawned (default-config planning always spawns 2 seats total).
+      const plannerSpawns = transport.spawnCalls.filter((s) => s.role === 'planner');
+      expect(plannerSpawns.length).toBe(1);
+
+      // The partner's own agreement signal is what completes the gate.
+      await fs.appendFile(cbp, `[helm callback] planner batch-A8-planner-partner-partner STATUS: AGREE — clean\n`);
       const resPlanner = await pPlanner;
       expect(resPlanner.agreed).toBe(true);
       expect(resPlanner.coPlannerUsed).toBe('planner');
       expect(resPlanner.plan.tasks[0].task_key).toBe('L9-1');
-      // no partner line was appended, yet succeeded quickly (fast path)
+    } finally {
+      if (origPlanTo === undefined) delete (process.env as any).HELM_PLANNING_TIMEOUT_MS; else process.env.HELM_PLANNING_TIMEOUT_MS = origPlanTo;
+    }
+  }, 15000);
 
-      // --- deliberation still requires partner ---
-      const pDelib = phase.runPlanningPhase({
+  // (c) The stall this workaround existed for (no partner signal ever arrives) is now a bounded
+  // agreed:false — reap both seats, no ingest — never a silent PLAN-READY-alone pass.
+  it('A8: a stall with no partner signal returns agreed:false (bounded), never a silent pass', async () => {
+    const origPlanTo = process.env.HELM_PLANNING_TIMEOUT_MS;
+    process.env.HELM_PLANNING_TIMEOUT_MS = '150'; // short, deterministic timeout
+    try {
+      const p = phase.runPlanningPhase({
         runDir,
-        batchId: 'batch-POCFIX9-delib-still',
-        northStar: 'Cross module refactor with ambiguity.',
-        conversationLog: 'High risk.',
-        mode: 'deliberation'
+        batchId: 'batch-A8-stall',
+        northStar: 'Add a small utility function to format dates.',
+        conversationLog: 'clear scope',
+        mode: 'planner'
       });
-      const cbp2 = path.join(runDir, 'callbacks.md');  // same runDir reused in sequence; append more
-      const delibPlan = {
-        tasks: [{ task_key: 'X1', atomic_work: 'cross cut work', complexity: 'high', recommended_model: 'codex-5.5', effort: 'high', needs_more_info: false, task_type: 'feature', validation_criteria: 'deps ok', deps: [] }],
-        meta: { source: 'pocfix9-delib' }
+      const cbp = path.join(runDir, 'callbacks.md');
+      const plan = {
+        tasks: [{ task_key: 'S1', atomic_work: 'stall proof', complexity: 'low', recommended_model: 'claude-sonnet', effort: 'low', needs_more_info: false, task_type: 'feature', validation_criteria: 'n/a', deps: [] }],
+        meta: { source: 'a8-stall' }
       };
-      await fs.writeFile(path.join(runDir, 'plan.json'), JSON.stringify(delibPlan, null, 2), 'utf8');
-      await fs.appendFile(cbp2, `[helm callback] plancore batch-POCFIX9-delib-still STATUS: PLANNING\n`);
-      await sleep(10);
-      // intentionally no partner line yet
-      // start the wait, then provide the partner signal
-      const partnerLineP = (async () => {
-        await sleep(30);
-        await fs.appendFile(cbp2, `[helm callback] deliberation batch-POCFIX9-delib-still-partner STATUS: CONSENSUS\n`);
-        await fs.appendFile(cbp2, `[helm callback] plancore batch-POCFIX9-delib-still STATUS: PLAN-READY — agreed\n`);
-      })();
-      const resDelib = await pDelib;
-      await partnerLineP;
-      expect(resDelib.agreed).toBe(true);
-      expect(resDelib.coPlannerUsed).toBe('deliberation');
+      await fs.writeFile(path.join(runDir, 'plan.json'), JSON.stringify(plan, null, 2), 'utf8');
+      // PLAN-READY arrives, but the partner NEVER responds — the exact stall the deleted POCFIX9
+      // fast path used to silently paper over.
+      await fs.appendFile(cbp, `[helm callback] plancore batch-A8-stall STATUS: PLAN-READY — plan.json present\n`);
+
+      const res = await p;
+      expect(res.agreed).toBe(false);
+      expect(res.createdTaskIds).toEqual([]);
     } finally {
       if (origPlanTo === undefined) delete (process.env as any).HELM_PLANNING_TIMEOUT_MS; else process.env.HELM_PLANNING_TIMEOUT_MS = origPlanTo;
     }
