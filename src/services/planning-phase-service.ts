@@ -111,16 +111,6 @@ export function selectCoPlannerMode(
 
 export class PlanningPhaseService {
   private readonly parser: PlanParserService;
-  // A9 send-back (attempt=2): process-local high-water mark per (runDir, batchId) — the byte size of
-  // callbacks.md recorded at the END of the last runPlanningPhase call for that key. A FIRST-ever call
-  // for a key is never fenced (no entry yet — offset 0), so a fixture that pre-seeds the whole
-  // callbacks.md before starting the run (the established pattern in most of this codebase's tests,
-  // and structurally the same as a real run's OWN first attempt) is unaffected. Only a GENUINE repeat
-  // invocation reusing the same (runDir, batchId) — runDir is deterministic per (projectId, batchId)
-  // and callbacks.md is never truncated between attempts — gets fenced against the PRIOR call's own
-  // final state, so a stale VERDICT-READY CLEAN (or PLAN-READY) left over from that prior attempt can
-  // never satisfy a later one just because the batch id was reused.
-  private readonly agreementFenceByKey: Map<string, number> = new Map();
 
   constructor(
     private readonly transport: ITransport,
@@ -196,13 +186,52 @@ export class PlanningPhaseService {
     }
   }
 
-  // A9 send-back (attempt=2): record this key's high-water mark at the end of a runPlanningPhase call
-  // (both the agreed:false and agreed:true exits) — everything this call saw or wrote is now "old" for
-  // any FUTURE call that reuses the same (runDir, batchId). Best-effort: a stat failure just leaves the
-  // prior mark (or none) in place rather than blocking the return.
-  private async advanceAgreementFence(key: string, cbPath: string): Promise<void> {
+  // A9 send-back (attempt=3): the agreement fence is a DURABLE sidecar file in runDir, not a
+  // process-local Map — attempt=2's in-memory high-water mark was wiped by a process/service restart
+  // (a fresh PlanningPhaseService instance has an empty map), so a same-batch restart/rerun landing
+  // after a redeploy or crash was exactly as vulnerable to a stale VERDICT-READY CLEAN as before the
+  // first send-back fix. A file survives the process that wrote it. Named per (runDir, batchId) —
+  // runDir is deterministic per (projectId, batchId) in production, but a test/edge case can reuse one
+  // runDir across different batchIds, so the batchId is embedded in the filename to stay scoped
+  // correctly per key, matching R1.5's own batch-scoping contract for the gate itself.
+  private agreementFencePath(runDir: string, batchId: string): string {
+    const safeBatchId = String(batchId).replace(/[^A-Za-z0-9_.-]/g, '_');
+    return path.join(runDir, `.agreement-fence-${safeBatchId}`);
+  }
+
+  // Absent fence file (a genuinely first-ever attempt for this key, on ANY process instance) reads as
+  // offset 0 — nothing fenced — so a fixture/caller that pre-seeds the whole callbacks.md before
+  // starting the run (the established pattern throughout this codebase's tests, and structurally the
+  // same as a real run's own first attempt) stays unaffected.
+  // Self-heal: callbacks.md is append-only in normal operation, so a valid fence can never exceed the
+  // file's CURRENT size — the recorded high-water mark only ever pointed at a byte offset that existed
+  // at write time, and the file only grows from there. If the fence on disk is somehow larger than the
+  // current file (the runDir was reused for a fresh callbacks.md — recreated/truncated rather than
+  // appended to, e.g. after a disaster-recovery reset, or a test/fixture that rewrites callbacks.md in
+  // place without clearing runDir), that proves the recorded history no longer corresponds to this
+  // file's reality, so it is discarded (treated as a first-ever attempt) rather than blocking every
+  // current line forever.
+  private async readAgreementFence(runDir: string, batchId: string, cbPath: string): Promise<number> {
     try {
-      this.agreementFenceByKey.set(key, (await fs.stat(cbPath)).size);
+      const raw = await fs.readFile(this.agreementFencePath(runDir, batchId), 'utf8');
+      const n = parseInt(raw.trim(), 10);
+      const recorded = Number.isFinite(n) && n >= 0 ? n : 0;
+      if (recorded === 0) return 0;
+      const currentSize = (await fs.stat(cbPath)).size;
+      return recorded <= currentSize ? recorded : 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  // Record this key's high-water mark at the end of a runPlanningPhase call (both the agreed:false and
+  // agreed:true exits) — everything this call saw or wrote is now "old" for any FUTURE call (in this
+  // process or any later one) that reuses the same (runDir, batchId). Best-effort: a write failure
+  // just leaves the prior mark (or none) in place rather than blocking the return.
+  private async advanceAgreementFence(runDir: string, batchId: string, cbPath: string): Promise<void> {
+    try {
+      const size = (await fs.stat(cbPath)).size;
+      await fs.writeFile(this.agreementFencePath(runDir, batchId), String(size), 'utf8');
     } catch { /* leave prior mark (or none) in place */ }
   }
 
@@ -240,12 +269,12 @@ export class PlanningPhaseService {
     const mode = inputs.mode || 'auto';
     const brainRole = inputs.brainRole || 'plancore';
 
-    // A9 send-back (attempt=2): read this key's high-water mark (see agreementFenceByKey doc above).
-    // Absent on a first-ever call for this key — offset 0, nothing fenced — so a fixture/caller that
-    // pre-seeds the whole callbacks.md before starting the run (common throughout this codebase's
+    // A9 send-back (attempt=3): read this key's DURABLE fence (see agreementFencePath doc above) —
+    // survives a process/service restart, unlike attempt=2's in-memory map. Absent on a first-ever
+    // attempt for this key on any process instance — offset 0, nothing fenced — so a fixture/caller
+    // that pre-seeds the whole callbacks.md before starting the run (common throughout this codebase's
     // tests, and structurally the same as a real run's own first attempt) is unaffected.
-    const agreementFenceKey = `${runDir}::${batchId}`;
-    const agreementFenceOffset = this.agreementFenceByKey.get(agreementFenceKey) ?? 0;
+    const agreementFenceOffset = await this.readAgreementFence(runDir, batchId, path.join(runDir, 'callbacks.md'));
 
     // POCFIX8 (B): compute timeout early (after batchId/mode). Real !fake path: long ~10min default (env HELM_PLANNING_TIMEOUT_MS overridable);
     // fake/fixture: keep 4000ms for fast tests. This + post-wait poll for BOTH signals/file fixes real projcore planning (minutes) always blocking on 4s.
@@ -474,7 +503,7 @@ export class PlanningPhaseService {
       // A15: finalize planning seats so they do not stick as running after a failed gate.
       this.finalizeWorkerRuntime(plancoreRuntimeId, 'reaped', 'planning-not-agreed');
       this.finalizeWorkerRuntime(partnerRuntimeId, 'reaped', 'planning-not-agreed');
-      await this.advanceAgreementFence(agreementFenceKey, path.join(runDir, 'callbacks.md'));
+      await this.advanceAgreementFence(runDir, batchId, path.join(runDir, 'callbacks.md'));
       return {
         agreed: false,
         coPlannerUsed: partner,
@@ -499,7 +528,7 @@ export class PlanningPhaseService {
     // planning-done-yield (idempotent). Partner no longer depends on the generic janitor alone.
     this.finalizeWorkerRuntime(plancoreRuntimeId, 'done', 'planning-phase-complete');
     this.finalizeWorkerRuntime(partnerRuntimeId, 'done', 'planning-phase-complete');
-    await this.advanceAgreementFence(agreementFenceKey, path.join(runDir, 'callbacks.md'));
+    await this.advanceAgreementFence(runDir, batchId, path.join(runDir, 'callbacks.md'));
 
     return {
       agreed: true,
@@ -659,9 +688,9 @@ export class PlanningPhaseService {
    * omission) rather than an immediate BROKEN, in case the payload is still being written mid-line.
    * Each poll re-derives the LATEST matching line for each signal (reversed scan) rather than latching a
    * boolean forever, so a later BROKEN can never be shadowed by an earlier accidental CLEAN.
-   * A9 send-back (attempt=2): `sinceOffset` fences BOTH signals to lines appended after the PRIOR
-   * runPlanningPhase call's own end for this (runDir, batchId) key (see agreementFenceByKey / a
-   * first-ever call for a key is never fenced). runDir is deterministic per (projectId, batchId) and
+   * A9 send-back (attempt=2/3): `sinceOffset` fences BOTH signals to lines appended after the PRIOR
+   * runPlanningPhase call's own end for this (runDir, batchId) key (see the durable agreementFencePath
+   * sidecar file / a first-ever call for a key is never fenced). runDir is deterministic per (projectId, batchId) and
    * callbacks.md is never truncated between attempts, so a restart/rerun reusing the same batchId can
    * otherwise leave an OLD VERDICT-READY CLEAN for the same `${batchId}-partner` (or an old PLAN-READY)
    * sitting in the file — same-batch stale, not the different-batch/foreign case R1.5 alone closes. A

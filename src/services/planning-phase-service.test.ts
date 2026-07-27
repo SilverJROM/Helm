@@ -595,13 +595,17 @@ describe('planning-phase-service (B9 PLN1) + gate + auto pick', () => {
       expect(res.agreed).toBe(true);
     });
 
-    // send-back (attempt=2, redteam HIGH): runDir is deterministic per (projectId, batchId) and
-    // callbacks.md is never truncated between attempts, so a restart/rerun reusing the SAME batchId
-    // (not a different one — R1.5 already closes the foreign-batch case) can leave an OLD VERDICT-READY
-    // CLEAN for the same `${batchId}-partner` sitting in the file. Without a generation fence, a fresh
-    // PLAN-READY on the second attempt would pair with that stale CLEAN and pass the gate without the
-    // partner ever having reviewed THIS attempt's plan.
-    it('send-back: a same-batch CLEAN verdict from a PRIOR attempt (restart/rerun reusing the batchId) does not satisfy a later attempt', async () => {
+    // send-back (attempt=2, redteam HIGH; hardened attempt=3, redteam residual HIGH): runDir is
+    // deterministic per (projectId, batchId) and callbacks.md is never truncated between attempts, so
+    // a restart/rerun reusing the SAME batchId (not a different one — R1.5 already closes the
+    // foreign-batch case) can leave an OLD VERDICT-READY CLEAN for the same `${batchId}-partner`
+    // sitting in the file. Without a durable generation fence, a fresh PLAN-READY on the second attempt
+    // would pair with that stale CLEAN and pass the gate without the partner ever having reviewed THIS
+    // attempt's plan. attempt=3 hardening: the fence must be a FILE in runDir, not a process-local Map
+    // — a process/service restart wipes any in-memory state, so this test uses a BRAND NEW
+    // PlanningPhaseService instance for attempt 2 (simulating exactly that restart) to prove the fence
+    // survives it; an in-memory-only fence would fail this specific test.
+    it('send-back: a same-batch CLEAN verdict from a PRIOR attempt does not satisfy a later attempt, even across a fresh service instance (process restart)', async () => {
       const reusedBatchId = 'batch-A9-restart-reuse';
       const cbp = path.join(runDir, 'callbacks.md');
       const plan1 = {
@@ -623,14 +627,19 @@ describe('planning-phase-service (B9 PLN1) + gate + auto pick', () => {
       const res1 = await p1;
       expect(res1.agreed).toBe(true);
 
-      // Attempt 2: a restart/rerun that reuses the EXACT SAME batchId (same runDir, same callbacks.md —
-      // never truncated). NO new partner line is written this time — the old CLEAN from attempt 1 is
-      // still sitting in the file for the identical `${reusedBatchId}-partner` namespace. A fresh
-      // PLAN-READY alone (from THIS attempt) must not pair with that stale verdict and pass.
+      // Attempt 2: a FRESH PlanningPhaseService instance (new transport/queue too) reusing the EXACT
+      // SAME runDir/batchId — simulating a process/service restart between attempts, not just a second
+      // call on the same live instance. callbacks.md itself is untouched (never truncated) and the old
+      // CLEAN from attempt 1 is still sitting in the file for the identical `${reusedBatchId}-partner`
+      // namespace. NO new partner line is written this time. A fresh PLAN-READY alone (from THIS
+      // attempt) must not pair with that stale verdict and pass — proving the fence lives in a durable
+      // file under runDir, not in the (now-discarded) prior instance's memory.
+      const freshTransport = new FakeTransport();
+      const freshPhase = new PlanningPhaseService(freshTransport, art, queue);
       const origPlanTo = process.env.HELM_PLANNING_TIMEOUT_MS;
       process.env.HELM_PLANNING_TIMEOUT_MS = '200'; // short + deterministic: prove it never resolves true
       try {
-        const p2 = phase.runPlanningPhase({
+        const p2 = freshPhase.runPlanningPhase({
           runDir,
           batchId: reusedBatchId,
           northStar: 'Add a small utility function to format dates.',

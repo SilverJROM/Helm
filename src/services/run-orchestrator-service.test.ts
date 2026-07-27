@@ -282,6 +282,7 @@ describe('RunOrchestratorService (A2 wiring)', () => {
   // Shared seed for the two B-ISO1 wiring tests below (mirror of the primary test's minimal plan+callbacks).
   async function seedMinimalRun(pid: number, fixedBatch: string) {
     const expectedRunDir = path.join(os.tmpdir(), `helm-run-${pid}-${fixedBatch}`);
+    await fs.rm(expectedRunDir, { recursive: true, force: true });
     await fs.mkdir(expectedRunDir, { recursive: true });
     const plan = { tasks: [{ task_key: 'T1', atomic_work: 'hello endpoint', complexity: 'low', model: 'gpt-5.5', effort: 'low', needs_more_info: false, task_type: 'feature', validation_criteria: 'ok', deps: [] }], meta: { source: 'b-iso1' } };
     await fs.writeFile(path.join(expectedRunDir, 'plan.json'), JSON.stringify(plan), 'utf8');
@@ -607,6 +608,7 @@ describe('RunOrchestratorService (A2 wiring)', () => {
     const pid = proj.id;
     const fixedBatch = 'promptpersist1';
     const expectedRunDir = path.join(os.tmpdir(), `helm-run-${pid}-${fixedBatch}`);
+    await fs.rm(expectedRunDir, { recursive: true, force: true });
     await fs.mkdir(expectedRunDir, { recursive: true });
     // Same deterministic seed as the b2 test so the BACKGROUND run reaches terminal (no dangling async).
     await fs.writeFile(path.join(expectedRunDir, 'plan.json'), JSON.stringify({
@@ -823,6 +825,7 @@ describe('RunOrchestratorService (A2 wiring)', () => {
     const pid = proj.id;
     const fixedBatch = 'a2bRedBrk';
     const expectedRunDir = path.join(os.tmpdir(), `helm-run-${pid}-${fixedBatch}`);
+    await fs.rm(expectedRunDir, { recursive: true, force: true });
     await fs.mkdir(expectedRunDir, { recursive: true });
     const plan = {
       tasks: [{
@@ -878,6 +881,7 @@ describe('RunOrchestratorService (A2 wiring)', () => {
     const pid = proj.id;
     const fixedBatch = 'pocfix1test';
     const expectedRunDir = path.join(os.tmpdir(), `helm-run-${pid}-${fixedBatch}`);
+    await fs.rm(expectedRunDir, { recursive: true, force: true });
     await fs.mkdir(expectedRunDir, { recursive: true });
     const plan = {
       tasks: [{ task_key: 'T1', atomic_work: 'poc test brief write + agents', complexity: 'low', recommended_model: 'grok-4.5', effort: 'low', needs_more_info: false, task_type: 'feature', validation_criteria: 'ok', deps: [] }],
@@ -925,6 +929,7 @@ describe('RunOrchestratorService (A2 wiring)', () => {
     const pid = proj.id;
     const fixedBatch = 'pocfix4-bound';
     const expectedRunDir = path.join(os.tmpdir(), `helm-run-${pid}-${fixedBatch}`);
+    await fs.rm(expectedRunDir, { recursive: true, force: true });
     await fs.mkdir(expectedRunDir, { recursive: true });
     const plan = {
       tasks: [{ task_key: 'T1', atomic_work: 'bound model test', complexity: 'low', recommended_model: 'grok-4.5', effort: 'low', needs_more_info: false, task_type: 'feature', validation_criteria: 'ok', deps: [] }],
@@ -975,6 +980,7 @@ describe('RunOrchestratorService (A2 wiring)', () => {
     const pid = proj.id;
     const fixedBatch = 'pocfix5-a';
     const expectedRunDir = path.join(os.tmpdir(), `helm-run-${pid}-${fixedBatch}`);
+    await fs.rm(expectedRunDir, { recursive: true, force: true });
     await fs.mkdir(expectedRunDir, { recursive: true });
     const plan = {
       tasks: [{ task_key: 'T1', atomic_work: 'test', complexity: 'low', recommended_model: 'grok-4.5', effort: 'low', needs_more_info: false, task_type: 'feature', validation_criteria: 'ok', deps: [] }],
@@ -1032,6 +1038,7 @@ describe('RunOrchestratorService (A2 wiring)', () => {
     const pid = proj.id;
     const fixedBatch = 'pocfix12-a';
     const expectedRunDir = path.join(os.tmpdir(), `helm-run-${pid}-${fixedBatch}`);
+    await fs.rm(expectedRunDir, { recursive: true, force: true });
     await fs.mkdir(expectedRunDir, { recursive: true });
     const plan = {
       tasks: [{ task_key: 'T1', atomic_work: 'binding test', complexity: 'low', effort: 'low', needs_more_info: false, task_type: 'feature', validation_criteria: 'ok', deps: [] }],
@@ -1282,6 +1289,7 @@ describe('RunOrchestratorService (A2 wiring)', () => {
 
     const fixedBatch = 'b9bNoDiverge';
     const expectedRunDir = path.join(os.tmpdir(), `helm-run-${pid}-${fixedBatch}`);
+    await fs.rm(expectedRunDir, { recursive: true, force: true });
     await fs.mkdir(expectedRunDir, { recursive: true });
     await fs.writeFile(path.join(expectedRunDir, 'plan.json'), JSON.stringify({
       tasks: [{
@@ -1367,6 +1375,7 @@ describe('RunOrchestratorService (A2 wiring)', () => {
     // Case 1: plan WITH per-task model -> must beat project ov
     const fixedBatch = 'c6prec1';
     const expectedRunDir = path.join(os.tmpdir(), `helm-run-${pid}-${fixedBatch}`);
+    await fs.rm(expectedRunDir, { recursive: true, force: true });
     await fs.mkdir(expectedRunDir, { recursive: true });
     const planPerTask = {
       tasks: [{
@@ -1389,6 +1398,7 @@ describe('RunOrchestratorService (A2 wiring)', () => {
     // Case 2: plan with NO per-task model -> project override applies
     const fixedBatch2 = 'c6prec2';
     const expectedRunDir2 = path.join(os.tmpdir(), `helm-run-${pid}-${fixedBatch2}`);
+    await fs.rm(expectedRunDir2, { recursive: true, force: true });
     await fs.mkdir(expectedRunDir2, { recursive: true });
     const planNoPer = {
       tasks: [{
