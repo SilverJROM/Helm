@@ -350,6 +350,18 @@ select option{background:var(--surface)}
 .sp-flex-fill { flex: 1; min-height: 0; min-width: 0; }
 .sp-scroll-owner { overflow: auto; min-height: 0; }
 
+/* B4 (R5.19/R5.20): Planning co-planner pane grid — one B3 shell per SEAM-1 seat */
+.cc-plan-watch-live-pane { margin: 6px 0 10px; }
+.cc-plan-panes {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 8px;
+  align-items: stretch;
+  min-height: 160px;
+}
+.cc-plan-panes .sp-pane { min-height: 180px; max-height: 320px; }
+.cc-plan-panes .sp-pane-body { min-height: 0; }
+
 /* B7-T01: Discovery tab split — chat (reuses .cc-bubble/.cc-composer) | living docs, either pane
    minimizable to a rail (.cc-disc-rail). Scoped to cc-disc-*. Parity ref: v2.1-02-discovery.png. */
 .cc-disc-split { display: flex; gap: 8px; height: 560px; min-height: 420px; align-items: stretch; }

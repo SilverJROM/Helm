@@ -1,0 +1,54 @@
+- text: Helm Agent Platform
+- button "«"
+- text: Agent Studio Project Setup Command Center Memory Tracking TEAMS deliberation-team red-team silverjrom admin
+- button "Dark"
+- text: Command Center Overview
+- button "← Back"
+- text: b4-validation-1785154918708 / B4 panes 1785154918708
+- button "gate-after-planning"
+- button "Cycle switcher"
+- text: Discovery Planning Implementation Final Tests History Planning not started
+- button "Hide live"
+- button "Re-run Planning"
+- text: "Seats plancore opus reaped historical deliberation #2 sol reaped historical deliberation #3 grok-4.5 reaped historical Event trail"
+- list:
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 07:53:32role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 10:44:12role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 10:45:49role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 10:49:26role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 11:05:34role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: A13_TASK_RECONVENE2026-07-27 11:05:49
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 11:06:14role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 11:06:40role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 11:09:22role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 11:12:54role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: A13_TASK_RECONVENE2026-07-27 11:13:09
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 11:20:08role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: A13_TASK_RECONVENE2026-07-27 11:20:23
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 11:22:09role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: A13_TASK_RECONVENE2026-07-27 11:22:24
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 11:40:40role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 11:42:54role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 11:46:11role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 11:47:46role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 11:50:50role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 11:53:05role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 11:54:13role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 11:55:30role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 12:00:24role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 12:06:58role=plancore · outcome=callback · reason=callback · provider=grok
+- text: plancore · opus historical No live terminal — historical / session unavailable. deliberation · sol historical No live terminal — historical / session unavailable. deliberation · grok-4.5 historical No live terminal — historical / session unavailable. og-requirements.md rendered
+- button "Full screen"
+- heading "Requirements" [level=1]
+- list:
+  - listitem:
+    - strong: R5.19
+    - text: — Planning shows live co-planner panes.
+  - listitem:
+    - strong: R5.21
+    - text: — docs + task table remain.
+- text: plan.md schema valid
+- button "Full screen"
+- heading "Plan" [level=1]
+- code: "[{\"id\":\"T1\",\"batch\":\"B4\",\"title\":\"B4 planning panes proof\",\"req_refs\":[\"R5.19\"],\"assignee\":\"grok-4.5\",\"validator_lane\":\"L2\",\"effort\":\"low\",\"type\":\"feature\"},{\"id\":\"T2\",\"batch\":\"B4\",\"title\":\"B4 second task row\",\"req_refs\":[\"R5.21\"],\"assignee\":\"grok-4.5\",\"validator_lane\":\"L2\",\"effort\":\"low\",\"type\":\"feature\"}]"
+- text: Per-task planning view Loading task rows…

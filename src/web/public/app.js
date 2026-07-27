@@ -5,6 +5,8 @@ import { paneLooksGenerating, extractAgentPaneSegment, extractHelmReply } from '
 import { phaseBrainAgentId, preferredPhaseAgentId } from './phase-agent-selection.js';
 import { seatLeaseSendChain } from './cc-session-reconcile.js';
 import { markUndeliveredById, applyDeliveryFailedById, hasOutstandingOptimistic } from './cc-delivery.js';
+import { captureStickIntent, applyStick } from './pane-bottom-stick.js';
+import { SESSION_PANE_CLASSES } from './session-pane.js';
 
 const html = htm.bind(h);
 const PA_DEFINITION_MAX = 50000;
@@ -810,11 +812,13 @@ function App() {
   // B8-T02: per-task planning table (R-D2/D4) — id of the row selected for the detail strip.
   // Non-keyed by cycle (single workspace open at a time); reset on cycle switch below.
   const [ccPlanSelectedTaskId, setCcPlanSelectedTaskId] = useState(null);
-  // B8-T03: "watch live" pane toggle (R-D1/D3/H4) — quiet by default. A3 closes R4.17 with a
-  // compact always-visible seat list from GET /api/cycles/:id/seats; B4 upgrades to panes.
-  const [ccPlanWatchLiveOpen, setCcPlanWatchLiveOpen] = useState(false);
+  // B8-T03: "watch live" pane toggle (R-D1/D3/H4). B4: default open so SEAM-1 panes are visible.
+  const [ccPlanWatchLiveOpen, setCcPlanWatchLiveOpen] = useState(true);
   // A3 (R4.17): cycleId -> { seats: [...] } | 'absent' | undefined(loading)
   const [ccPlanSeats, setCcPlanSeats] = useState({});
+  // B4 (R5.19): cycleId::runtimeId -> { content, session } from path-safe seat capture
+  const [ccPlanSeatPanes, setCcPlanSeatPanes] = useState({});
+  const ccPlanPaneBodyRefs = useRef({}); // runtimeId -> scroll body el (bottom-stick)
   // A4 (R4.18): cycleId -> { hasRun, runId?, events: [...] } | 'absent' | undefined(loading)
   const [ccPlanEvents, setCcPlanEvents] = useState({});
   // B8-T04: Approve Planning gate (R-E3/F1) — busy + inline notice for approve POST outcomes.
@@ -1011,6 +1015,21 @@ function App() {
     const id = setInterval(() => { loadCycleSeats(ccWsCycleId); }, 4000);
     return () => clearInterval(id);
   }, [ccWsTab, ccWsCycleId, token]);
+  // B4 (R5.19): poll path-safe pane capture for every live seat while Planning is open (~2s).
+  useEffect(() => {
+    if (ccWsTab !== 'planning' || !ccWsCycleId || !token) return;
+    const payload = ccPlanSeats[ccWsCycleId];
+    const seats =
+      payload && payload !== 'absent' && Array.isArray(payload.seats) ? payload.seats : [];
+    const live = seats.filter((s) => s && s.live);
+    if (live.length === 0) return;
+    const tick = () => {
+      live.forEach((s) => { loadSeatPaneCapture(ccWsCycleId, s); });
+    };
+    tick();
+    const id = setInterval(tick, 2000);
+    return () => clearInterval(id);
+  }, [ccWsTab, ccWsCycleId, token, ccPlanSeats[ccWsCycleId]]);
   // A4 (R4.18): step-level event trail from run_events (not full transcripts).
   useEffect(() => {
     if (ccWsTab !== 'planning' || !ccWsCycleId || !token) return;
@@ -5061,6 +5080,31 @@ function App() {
       setCcPlanSeats(p => ({ ...p, [cycleId]: 'absent' }));
     }
   };
+  // B4 (R5.19): path-safe capture for one seat — session resolved server-side from (cycleId, runtimeId) only.
+  // NEVER send client session names. Bottom-stick: capture intent before content write, apply after paint.
+  const loadSeatPaneCapture = async (cycleId, seat) => {
+    if (!cycleId || !token || !seat || seat.id == null) return;
+    if (!seat.live) return; // historical: no capture spam
+    const runtimeId = Number(seat.id);
+    const key = `${cycleId}::${runtimeId}`;
+    const bodyEl = ccPlanPaneBodyRefs.current[runtimeId];
+    const intent = captureStickIntent(bodyEl);
+    try {
+      const r = await authedFetch(`/api/cycles/${cycleId}/seats/${runtimeId}`, { allowStatuses: [404] });
+      if (!r.ok) return;
+      const d = await r.json();
+      const content = d && d.content != null ? String(d.content) : '';
+      setCcPlanSeatPanes((p) => ({
+        ...p,
+        [key]: { content, session: d.session || null, live: true },
+      }));
+      requestAnimationFrame(() => {
+        applyStick(ccPlanPaneBodyRefs.current[runtimeId], intent);
+      });
+    } catch (e) {
+      /* keep last snapshot */
+    }
+  };
   // A4 (R4.18): cycle-scoped step trail from run_events. No plan.md dependency. Failure → 'absent'.
   const loadCycleEvents = async (cycleId) => {
     if (!cycleId || !token) return;
@@ -5633,8 +5677,7 @@ function App() {
         </table>`;
       };
 
-      // A3 (R4.17): compact seat list — live + historical from GET /api/cycles/:id/seats.
-      // Pane surfaces land in B4; here we only name seats with role/model/live|historical.
+      // A3 (R4.17) + B4 (R5.19/R5.20): seats list + one shared B3 pane per seat (keyed by worker_runtimes.id).
       const seatsPayload = ccPlanSeats[cycleId];
       const seatsList = (seatsPayload && seatsPayload !== 'absent' && Array.isArray(seatsPayload.seats))
         ? seatsPayload.seats : [];
@@ -5660,6 +5703,42 @@ function App() {
               <span class="text-sec" data-testid=${`ws-plan-seat-model-${s.id}`}>${s.model || '—'}</span>
               <span class="text-sec" data-testid=${`ws-plan-seat-state-${s.id}`}>${s.state || '—'}</span>
               ${liveChip}
+            </div>`;
+          })}
+        </div>`;
+      };
+      // B4: one shared session-pane per seat (B3 .sp-pane shell + path-safe capture + bottom-stick).
+      const renderPlanPanes = () => {
+        if (!seatsPayload) {
+          return html`<div class="text-sec" data-testid="ws-plan-panes-loading" style="font-size:11px;padding:4px 0">Loading panes…</div>`;
+        }
+        if (seatsPayload === 'absent' || seatsList.length === 0) {
+          return html`<div class="text-sec" data-testid="ws-plan-panes-empty" style="font-size:11px;padding:6px">No seat panes for this cycle yet. Start Planning to record co-planner seats.</div>`;
+        }
+        return html`<div class="cc-plan-panes" data-testid="ws-plan-panes" data-pane-count=${seatsList.length}>
+          ${seatsList.map((s) => {
+            const rid = Number(s.id);
+            const key = `${cycleId}::${rid}`;
+            const snap = ccPlanSeatPanes[key];
+            const content = snap && snap.content != null ? String(snap.content) : '';
+            const title = `${s.role || 'seat'}${s.model ? ` · ${s.model}` : ''}`;
+            const liveChip = s.live
+              ? html`<span class="chip chip-green" data-testid=${`ws-plan-pane-live-${rid}`}>live</span>`
+              : html`<span class="chip chip-orange" data-testid=${`ws-plan-pane-historical-${rid}`}>historical</span>`;
+            return html`<div class=${SESSION_PANE_CLASSES.pane} data-testid=${`ws-plan-pane-${rid}`} data-runtime-id=${rid} data-role=${s.role || ''}>
+              <div class=${SESSION_PANE_CLASSES.header}>
+                <span class="sp-pane-title" data-testid=${`ws-plan-pane-title-${rid}`}>${title}</span>
+                ${liveChip}
+              </div>
+              <div class="${SESSION_PANE_CLASSES.body} ${SESSION_PANE_CLASSES.scrollOwner}"
+                data-testid=${`ws-plan-pane-body-${rid}`}
+                ref=${(el) => { if (el) ccPlanPaneBodyRefs.current[rid] = el; else delete ccPlanPaneBodyRefs.current[rid]; }}>
+                ${content
+                  ? html`<pre class=${SESSION_PANE_CLASSES.payload} data-testid=${`ws-plan-pane-payload-${rid}`}>${content}</pre>`
+                  : html`<div class="${SESSION_PANE_CLASSES.empty} text-sec" data-testid=${`ws-plan-pane-empty-${rid}`}>
+                      ${s.live ? 'Waiting for live pane output…' : 'No live terminal — historical / session unavailable.'}
+                    </div>`}
+              </div>
             </div>`;
           })}
         </div>`;
@@ -5708,7 +5787,7 @@ function App() {
           ${renderEventTrail()}
         </div>
         ${ccPlanWatchLiveOpen ? html`<div class="cc-plan-watch-live-pane" data-testid="ws-plan-watch-live-pane">
-          <div class="text-sec" data-testid="ws-plan-watch-live-empty" style="font-size:11px">Live panes land in a later batch (B4). Seat roster above lists every recorded seat for this cycle.</div>
+          ${renderPlanPanes()}
         </div>` : null}
         ${awaitingApproval ? html`<div class="cc-plan-approve-banner" data-testid="ws-plan-approve-banner">
           <div class="cc-plan-approve-banner-text">
