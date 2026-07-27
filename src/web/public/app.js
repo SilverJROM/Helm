@@ -5577,21 +5577,25 @@ function App() {
         </div>`;
       };
 
-      // B8-T02: per-task planning table (R-D2/D4). id/batch/title/req_refs/assignee/
-      // validator_lane/effort/type are the server-validated fields (execution-plan-parser.ts);
-      // redteam/validator_refs/exception_handling are freeform extras
-      // per task, so cells fall back to '—' when a given task omits them (real-data-only).
+      // B2 (R2.9/R2.10/R2.11): task rows from getCycleRunState / run_tasks — NOT parsePlanTasksClient(plan.md).
+      // Document cards above still render authored plan.md; execution view never depends on the file.
       const execDoc = planDocs.execplan;
       const execLoaded = execDoc && execDoc !== 'absent';
-      const tasks = execLoaded && execDoc.valid ? parsePlanTasksClient(execDoc.content) : [];
-      const refsText = (v) => Array.isArray(v) ? (v.length ? v.join(', ') : '—') : (v ? String(v) : '—');
-      const redteamCell = (v) => {
-        const on = v && String(v).toLowerCase() !== 'no' && String(v).toLowerCase() !== 'false';
-        return on
-          ? html`<span class="chip chip-red">${typeof v === 'string' && v.toLowerCase() !== 'true' ? v : 'Yes'}</span>`
-          : html`<span class="text-sec">No</span>`;
+      const planRunState = ccRunState[cycleId];
+      const planRunLoaded = planRunState && planRunState !== 'absent';
+      const tasks = (planRunLoaded && planRunState.hasRun && Array.isArray(planRunState.tasks))
+        ? planRunState.tasks
+        : [];
+      const planStatusChip = (s) => {
+        const st = String(s || 'pending');
+        const chip =
+          st === 'complete' ? 'chip-green' :
+          st === 'working' ? 'chip-blue' :
+          st === 'failed' ? 'chip-red' :
+          st === 'deferred' ? 'chip-orange' : 'chip-gray';
+        return html`<span class="chip ${chip}" data-testid="ws-plan-task-status">${st}</span>`;
       };
-      const selectedTask = tasks.find(t => t.id === ccPlanSelectedTaskId) || null;
+      const selectedTask = tasks.find(t => String(t.taskKey || t.id) === String(ccPlanSelectedTaskId)) || null;
       const awaitingApproval = cycle.autonomy === 'pause_after_planning' && cycle.awaiting_approval;
 
       // B8-T03: planner-progress line (R-D1/D3/H4) — derived from the REAL cycle.phase +
@@ -5604,22 +5608,27 @@ function App() {
           : 'Planning complete';
 
       const tableSection = () => {
-        if (!execLoaded) return null;
-        if (execDoc === 'absent') return html`<div class="text-sec" data-testid="ws-plan-table-empty" style="font-size:11px;padding:6px">No plan yet.</div>`;
-        if (!execDoc.valid || tasks.length === 0) return html`<div class="text-sec" data-testid="ws-plan-table-empty" style="font-size:11px;padding:6px">Plan invalid.</div>`;
+        if (!planRunLoaded) {
+          return html`<div class="text-sec" data-testid="ws-plan-table-empty" style="font-size:11px;padding:6px">Loading task rows…</div>`;
+        }
+        if (!planRunState.hasRun || tasks.length === 0) {
+          return html`<div class="text-sec" data-testid="ws-plan-table-empty" style="font-size:11px;padding:6px">No tasks ingested yet.</div>`;
+        }
         return html`<table class="cc-plan-table" data-testid="ws-plan-table">
-          <thead><tr><th>Task</th><th>Implementer</th><th>Validator</th><th>Effort</th><th>Red-team</th><th>Validator refs</th><th>Exception handling</th></tr></thead>
+          <thead><tr><th>Task</th><th>Key</th><th>Batch</th><th>Status</th><th>Attempts</th></tr></thead>
           <tbody>
-            ${tasks.map(t => html`<tr key=${t.id} data-testid="ws-plan-task-row" class=${ccPlanSelectedTaskId === t.id ? 'sel' : ''}
-                onclick=${() => setCcPlanSelectedTaskId(t.id === ccPlanSelectedTaskId ? null : t.id)}>
-              <td>${t.title}</td>
-              <td>${t.assignee || '—'}</td>
-              <td>${t.validator_lane || t.validator || '—'}</td>
-              <td>${t.effort ? html`<span class="chip chip-orange">${t.effort}</span>` : '—'}</td>
-              <td>${redteamCell(t.redteam)}</td>
-              <td class="text-sec">${refsText(t.validator_refs)}</td>
-              <td class="text-sec">${t.exception_handling || '—'}</td>
-            </tr>`)}
+            ${tasks.map(t => {
+              const rowKey = String(t.taskKey || t.id);
+              return html`<tr key=${t.id} data-testid="ws-plan-task-row" data-task-key=${rowKey} data-task-status=${t.status}
+                  class=${String(ccPlanSelectedTaskId) === rowKey ? 'sel' : ''}
+                  onclick=${() => setCcPlanSelectedTaskId(String(ccPlanSelectedTaskId) === rowKey ? null : rowKey)}>
+                <td>${t.label || '—'}</td>
+                <td class="text-sec">${t.taskKey || '—'}</td>
+                <td class="text-sec">${t.batch || '—'}</td>
+                <td>${planStatusChip(t.status)}</td>
+                <td class="text-sec">${typeof t.attempts === 'number' ? t.attempts : '—'}</td>
+              </tr>`;
+            })}
           </tbody>
         </table>`;
       };
@@ -5721,15 +5730,15 @@ function App() {
           ${selectedTask ? html`<div class="cc-plan-detail" data-testid="ws-plan-detail">
             <div class="cc-plan-detail-cell">
               <div class="cc-plan-detail-label">Selected task</div>
-              <div data-testid="ws-plan-detail-task">${selectedTask.title}</div>
+              <div data-testid="ws-plan-detail-task">${selectedTask.label || selectedTask.taskKey || '—'}</div>
             </div>
             <div class="cc-plan-detail-cell">
-              <div class="cc-plan-detail-label">Inputs</div>
-              <div data-testid="ws-plan-detail-inputs">${refsText(selectedTask.req_refs)}</div>
+              <div class="cc-plan-detail-label">Status</div>
+              <div data-testid="ws-plan-detail-inputs">${selectedTask.status || '—'}</div>
             </div>
             <div class="cc-plan-detail-cell">
-              <div class="cc-plan-detail-label">Gate</div>
-              <div data-testid="ws-plan-detail-gate">${selectedTask.exception_handling || refsText(selectedTask.validator_refs)}</div>
+              <div class="cc-plan-detail-label">Attempts</div>
+              <div data-testid="ws-plan-detail-gate">${typeof selectedTask.attempts === 'number' ? selectedTask.attempts : '—'}</div>
             </div>
           </div>` : null}
         </div>
@@ -5737,24 +5746,19 @@ function App() {
       </div>`;
     };
 
-    // B9-T01/B13-T01b: Implementation tab — metrics row + full task list by state (R-F6). Reuses
-    // the same ccPlanDocs[cycleId].execplan cache + parsePlanTasksClient extraction as the B8-T02
-    // Planning table (no second fetch path). Per-task live state comes from ccRunState[cycleId]
-    // (GET /api/cycles/:id/run-state), keyed by execution_plan task id === run_tasks.task_key.
-    // hasRun:false (or 'absent'/not-yet-loaded) degrades every task to 'pending' — real-or-pending,
-    // never a fabricated mix.
+    // B2 (R2.10/R2.11) + B9/B13: Implementation tab — task rows + every execution status from
+    // getCycleRunState / run_tasks (ORDER BY id). No parsePlanTasksClient(plan.md) dependency.
+    // hasRun:false → honest empty (not plan-invalid). plan.md still gates Start Implementation only.
     const renderImplementationBody = () => {
       const cycleId = cycle.id;
       const planDocs = ccPlanDocs[cycleId] || {};
       const execDoc = planDocs.execplan;
       const execLoaded = execDoc && execDoc !== 'absent';
-      const tasks = execLoaded && execDoc.valid ? parsePlanTasksClient(execDoc.content) : [];
-
-      // B13-T01b: task_key -> live run_tasks row, or {} when no run / not loaded yet (graceful).
       const runState = ccRunState[cycleId];
-      const runRowsByKey = (runState && runState !== 'absent' && runState.hasRun)
-        ? Object.fromEntries((runState.tasks || []).filter(r => r.taskKey).map(r => [r.taskKey, r]))
-        : {};
+      const runLoaded = runState && runState !== 'absent';
+      const tasks = (runLoaded && runState.hasRun && Array.isArray(runState.tasks))
+        ? runState.tasks
+        : [];
       // B3: honest failed vs parked. failed is now its own bucket (enables structural stop + parked rarity).
       // deferred remains parked. Supersedes prior 4-bucket comment.
       const bucketForStatus = (s) => (
@@ -5763,10 +5767,9 @@ function App() {
         s === 'failed' ? 'failed' :
         s === 'deferred' ? 'parked' : 'pending'
       );
-      const taskState = (t) => {
-        const row = runRowsByKey[t.id];
-        return row ? bucketForStatus(row.status) : 'pending';
-      };
+      // Row is already the run_tasks payload — status is first-class, not joined from plan ids.
+      const taskState = (t) => bucketForStatus(t.status);
+      const taskRowKey = (t) => String(t.taskKey || t.id);
       const formatTaskDuration = (sec) => {
         if (sec == null || sec < 0) return '—';
         const m = Math.floor(sec / 60);
@@ -5844,23 +5847,21 @@ function App() {
       </div>`;
 
       const subtitleFor = (t) => {
-        const parts = [t.assignee, t.validator_lane ? `validator ${t.validator_lane}` : null, t.effort].filter(Boolean);
-        return parts.length ? parts.join(' · ') : (t.title ? '' : '—');
+        const parts = [t.batch ? `batch ${t.batch}` : null, t.status].filter(Boolean);
+        return parts.length ? parts.join(' · ') : '—';
       };
       const refsText = (v) => Array.isArray(v) ? (v.length ? v.join(', ') : '—') : (v ? String(v) : '—');
 
-      // B9-T02/B13-T01b: per-task detail (R-F4/F5/F6) — real attempts/escalation/duration/commit
-      // when a run row exists for this task_key, else the original graceful placeholders.
+      // B2/B9/B13: per-task detail from the run_tasks row itself (already the status-bearing record).
       const taskDetail = (t) => {
-        const row = runRowsByKey[t.id];
-        if (!row) return { attempts: 'No attempts yet', escalation: 'Not started', duration: '—', commit: '—' };
-        const notes = row.validationNotes || [];
+        if (!t) return { attempts: 'No attempts yet', escalation: 'Not started', duration: '—', commit: '—' };
+        const notes = t.validationNotes || [];
         const failNote = [...notes].reverse().find(n => n.result === 'FAIL');
         return {
-          attempts: row.attempts > 0 ? `${row.attempts} attempt${row.attempts === 1 ? '' : 's'}` : 'No attempts yet',
+          attempts: t.attempts > 0 ? `${t.attempts} attempt${t.attempts === 1 ? '' : 's'}` : 'No attempts yet',
           escalation: failNote ? (failNote.note || failNote.result) : (notes.length ? 'No escalation' : 'Not started'),
-          duration: formatTaskDuration(row.durationSec),
-          commit: row.commit ? (row.commit.sha ? row.commit.sha.slice(0, 7) : row.commit.path) : '—'
+          duration: formatTaskDuration(t.durationSec),
+          commit: t.commit ? (t.commit.sha ? t.commit.sha.slice(0, 7) : t.commit.path) : '—'
         };
       };
 
@@ -5880,7 +5881,7 @@ function App() {
         return t.trim() ? t : null;
       };
       const taskPanes = (t) => ({
-        implementer: { model: (t && t.assignee) || null, content: termText('implementer') },
+        implementer: { model: (t && (t.taskKey || t.label)) || null, content: termText('implementer') },
         validator: { model: null, content: termText('validator') }
       });
       // Feature 3: a minimized worker collapses to a thin vertical rail; clicking it (or its
@@ -5945,14 +5946,15 @@ function App() {
       };
 
       const docsCell = (t) => {
-        const key = `${cycleId}::${t.id}`;
+        const rk = taskRowKey(t);
+        const key = `${cycleId}::${rk}`;
         const docs = ccImplTaskDocs[key];
         const linkFor = (label, doc) => {
           const loaded = doc && doc !== 'absent';
           return loaded
-            ? html`<div><button class="btn btn-sm" data-testid=${`ws-impl-doclink-${t.id}-${label}`}
+            ? html`<div><button class="btn btn-sm" data-testid=${`ws-impl-doclink-${rk}-${label}`}
                 onclick=${() => openFullScreen('doc', doc.filename || label, doc.content)}>${label}</button></div>`
-            : html`<div class="text-sec" data-testid=${`ws-impl-doclink-${t.id}-${label}-empty`}>${label}: no docs yet</div>`;
+            : html`<div class="text-sec" data-testid=${`ws-impl-doclink-${rk}-${label}-empty`}>${label}: no docs yet</div>`;
         };
         return html`<div>
           ${linkFor('changes.md', docs && docs.changes)}
@@ -5961,40 +5963,43 @@ function App() {
       };
 
       const toggleExpanded = (t) => {
-        const next = ccImplExpandedTaskId === t.id ? null : t.id;
+        const rk = taskRowKey(t);
+        const next = ccImplExpandedTaskId === rk ? null : rk;
         setCcImplExpandedTaskId(next);
-        if (next) loadImplTaskDocs(cycleId, t.id);
+        if (next) loadImplTaskDocs(cycleId, rk);
       };
 
       const renderTaskRow = (t) => {
             const state = taskState(t);
             const meta = STATE_META[state];
-            const expanded = ccImplExpandedTaskId === t.id;
+            const rk = taskRowKey(t);
+            const expanded = ccImplExpandedTaskId === rk;
             const detail = taskDetail(t);
             return html`<div key=${t.id}>
-              <div class="cc-impl-task-row ${expanded ? 'sel' : ''}" data-testid="ws-impl-task-row" onclick=${() => toggleExpanded(t)}>
+              <div class="cc-impl-task-row ${expanded ? 'sel' : ''}" data-testid="ws-impl-task-row" data-task-key=${rk} data-task-status=${t.status}
+                onclick=${() => toggleExpanded(t)}>
                 <div class="cc-impl-task-marker cc-impl-task-marker-${state}">${meta.marker}</div>
                 <div class="cc-impl-task-main">
-                  <div class="cc-impl-task-title">${t.id} ${t.title}</div>
+                  <div class="cc-impl-task-title">${rk} ${t.label || ''}</div>
                   <div class="cc-impl-task-sub text-sec">${subtitleFor(t)}</div>
                 </div>
                 <div class="cc-impl-task-state"><span class="chip ${meta.chip}">${meta.label}</span></div>
                 <div class="cc-impl-task-duration text-sec">${detail.duration}</div>
                 <div class="cc-impl-task-commit text-sec">${detail.commit}</div>
               </div>
-              ${expanded ? html`<div class="cc-impl-task-detail" data-testid=${`ws-impl-task-detail-${t.id}`}>
+              ${expanded ? html`<div class="cc-impl-task-detail" data-testid=${`ws-impl-task-detail-${rk}`}>
                 <div class="cc-impl-task-detail-strip">
                   <div class="cc-impl-task-detail-cell">
-                    <div class="cc-impl-task-detail-label">Requirements</div>
-                    <div data-testid="ws-impl-detail-reqs">${refsText(t.req_refs)}</div>
+                    <div class="cc-impl-task-detail-label">Key</div>
+                    <div data-testid="ws-impl-detail-reqs">${t.taskKey || '—'}</div>
                   </div>
                   <div class="cc-impl-task-detail-cell">
-                    <div class="cc-impl-task-detail-label">Deps</div>
-                    <div data-testid="ws-impl-detail-deps">${refsText(t.deps)}</div>
+                    <div class="cc-impl-task-detail-label">Batch</div>
+                    <div data-testid="ws-impl-detail-deps">${t.batch || '—'}</div>
                   </div>
                   <div class="cc-impl-task-detail-cell">
-                    <div class="cc-impl-task-detail-label">Gate</div>
-                    <div data-testid="ws-impl-detail-gate">${t.exception_handling || refsText(t.validator_refs)}</div>
+                    <div class="cc-impl-task-detail-label">Status</div>
+                    <div data-testid="ws-impl-detail-gate">${t.status || '—'}</div>
                   </div>
                 </div>
                 <div class="cc-impl-task-detail-quad">
@@ -6022,9 +6027,12 @@ function App() {
       // Feature 4: the task list defaults collapsed to the currently-working task(s); the toggle
       // reveals the full T01..Tnn list. Nothing is lost — the full list is one click away.
       const taskListSection = () => {
-        if (!execLoaded) return null;
-        if (execDoc === 'absent') return html`<div class="text-sec" data-testid="ws-impl-list-empty" style="font-size:11px;padding:6px">No plan yet.</div>`;
-        if (!execDoc.valid || tasks.length === 0) return html`<div class="text-sec" data-testid="ws-impl-list-empty" style="font-size:11px;padding:6px">Plan invalid.</div>`;
+        if (!runLoaded) {
+          return html`<div class="text-sec" data-testid="ws-impl-list-empty" style="font-size:11px;padding:6px">Loading task rows…</div>`;
+        }
+        if (!runState.hasRun || tasks.length === 0) {
+          return html`<div class="text-sec" data-testid="ws-impl-list-empty" style="font-size:11px;padding:6px">No tasks ingested yet.</div>`;
+        }
         const expandedList = ccImplTasklistExpanded;
         const activeTasks = tasks.filter(t => taskState(t) === 'working');
         const visible = expandedList ? tasks : activeTasks;
@@ -6047,7 +6055,7 @@ function App() {
       // above) — the rail intentionally shows only the cycle-level docs/flow artifacts that do.
       const railArtifacts = ccDiscArtifacts[cycleId] || {};
       const railItems = [...(railArtifacts.docs || []), ...(railArtifacts.flow || [])];
-      const railTaskRef = runningTask ? `tasks/${runningTask.id}` : null;
+      const railTaskRef = runningTask ? `tasks/${taskRowKey(runningTask)}` : null;
       const openRailDoc = async (f) => {
         const doc = await loadDiscDoc(cycleId, f.path);
         if (doc) openFullScreen('doc', doc.filename || f.name, doc.content);

@@ -81,6 +81,16 @@ describe.sequential('B13-T01b cycle run-state (R-I4/F6/B5)', () => {
     const state = artifacts.getCycleRunState(cycleWithRunId);
     expect(state.hasRun).toBe(true);
     expect(state.tasks).toHaveLength(3);
+    // B2: id ordering + fields Planning/Implementation need (no plan.md dependency)
+    expect(state.tasks.map(t => t.id)).toEqual(
+      [...state.tasks].sort((a, b) => a.id - b.id).map(t => t.id)
+    );
+    for (const t of state.tasks) {
+      expect(typeof t.id).toBe('number');
+      expect(t).toHaveProperty('batch');
+      expect(typeof t.status).toBe('string');
+      expect(typeof t.label).toBe('string');
+    }
 
     const done = state.tasks.find(t => t.taskKey === 'B3-T01')!;
     expect(done.status).toBe('complete');
@@ -98,6 +108,52 @@ describe.sequential('B13-T01b cycle run-state (R-I4/F6/B5)', () => {
     const pending = state.tasks.find(t => t.taskKey === 'B3-T03')!;
     expect(pending.status).toBe('pending');
     expect(pending.commit).toBeNull();
+  });
+
+  // B2 (R2.10/R2.11): payload is independent of plan.md on disk — rename (restorable), still rows+statuses.
+  it('B2: getCycleRunState still returns rows+statuses when plan.md is renamed away (restorable backup)', async () => {
+    const cycleDir = fs.mkdtempSync(path.join(os.tmpdir(), 'helm-b2-plan-'));
+    const planPath = path.join(cycleDir, 'plan.md');
+    const bakPath = path.join(cycleDir, `plan.md.bak-B2-test-${Date.now()}`);
+    fs.writeFileSync(
+      planPath,
+      '# Plan\n\n```json\n[{"id":"T1","batch":"B00","title":"should not be required","req_refs":["R0"],"assignee":"x","validator_lane":"L1","effort":"low","type":"feature"}]\n```\n',
+      'utf8'
+    );
+    // Seed 19 status-bearing run_tasks (memory_mcp-style shape) under the existing cycle run.
+    const runId = artifacts.getCycleRunState(cycleWithRunId).runId!;
+    const statuses = ['pending', 'working', 'complete', 'failed', 'deferred'] as const;
+    for (let i = 1; i <= 19; i++) {
+      const key = `B2-T${String(i).padStart(2, '0')}`;
+      const tid = artifacts.recordTask(runId, key, `B2 task ${i}`, 'B2');
+      dbs.raw.prepare('UPDATE run_tasks SET status=? WHERE id=?').run(statuses[(i - 1) % statuses.length], tid);
+    }
+    // Rename (never rm) — restorable proof that the read path does not open plan.md.
+    fs.renameSync(planPath, bakPath);
+    expect(fs.existsSync(planPath)).toBe(false);
+    expect(fs.existsSync(bakPath)).toBe(true);
+
+    const state = artifacts.getCycleRunState(cycleWithRunId);
+    expect(state.hasRun).toBe(true);
+    const b2 = state.tasks.filter(t => String(t.taskKey || '').startsWith('B2-T'));
+    expect(b2).toHaveLength(19);
+    expect(b2.every(t => typeof t.status === 'string' && t.status.length > 0)).toBe(true);
+    expect(b2.map(t => t.id)).toEqual([...b2].sort((a, b) => a.id - b.id).map(t => t.id));
+    // API surface same payload
+    const app = Fastify({ logger: false });
+    app.get('/api/cycles/:id/run-state', async (request: any) => artifacts.getCycleRunState(Number(request.params.id)));
+    await app.ready();
+    try {
+      const res = await app.inject({ method: 'GET', url: `/api/cycles/${cycleWithRunId}/run-state` });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.tasks.filter((t: any) => String(t.taskKey || '').startsWith('B2-T'))).toHaveLength(19);
+    } finally {
+      await app.close();
+      // restore plan.md so the temp dir is tidy
+      fs.renameSync(bakPath, planPath);
+      try { fs.rmSync(cycleDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
   });
 
   it('getCycleRunState degrades to hasRun:false for a cycle with no run (honest graceful)', () => {

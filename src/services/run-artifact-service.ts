@@ -434,13 +434,20 @@ export class RunArtifactService {
    * (that column is never incremented by any writer). commit is the latest artifacts row of
    * type='commit' for the task, or null if none was recorded (real-or-absent, never invented).
    */
+  /**
+   * B2 (R2.9/R2.10/R2.11): payload is the sole row source for Planning + Implementation task tables.
+   * Exposes run_tasks.id (stable ORDER BY + row key), batch, and execution status fields so the UI
+   * never needs parsePlanTasksClient(plan.md). Document view of plan.md stays separate (doc cards).
+   */
   getCycleRunState(cycleId: number): {
     hasRun: boolean;
     runId?: number;
     runActive?: boolean;
     tasks: Array<{
+      id: number;
       taskKey: string | null;
       label: string;
+      batch: string | null;
       status: string;
       attempts: number;
       durationSec: number | null;
@@ -454,8 +461,9 @@ export class RunArtifactService {
     if (!run) return { hasRun: false, tasks: [] };
     const runActive = !(['complete', 'failed', 'blocked'].includes(String(run.phase)) || ['complete', 'failed'].includes(String(run.status)));
 
+    // Preserve run_tasks.id ordering — UI tables must not re-sort by plan.md order.
     const taskRows = this.db.raw.prepare(
-      'SELECT id, task_key, label, status, created_at, updated_at FROM run_tasks WHERE run_id = ? ORDER BY id ASC'
+      'SELECT id, task_key, label, batch, status, created_at, updated_at FROM run_tasks WHERE run_id = ? ORDER BY id ASC'
     ).all(run.id) as any[];
 
     const tasks = taskRows.map((t) => {
@@ -485,8 +493,10 @@ export class RunArtifactService {
           ? 'working'
           : t.status;
       return {
+        id: Number(t.id),
         taskKey: t.task_key ?? null,
         label: t.label,
+        batch: t.batch != null ? String(t.batch) : null,
         status: derivedStatus,
         attempts: attemptsCount,
         durationSec: durRow ? Number(durRow.sec) : null,
