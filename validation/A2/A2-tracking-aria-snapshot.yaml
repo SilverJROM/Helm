@@ -1,0 +1,7 @@
+- text: "a2-validation-1785111186598 run #30 native phase:"
+- strong: starting
+- text: "status:"
+- strong: active
+- text: "state:"
+- strong: empty
+- text: "0/0 done batch: a2-live-1785111186598 last progress: just now ACTIVE WORKERS (1) plancore grok/grok-4.5 running ACTIVE SESSIONS (2) helm-plancore-a2-validation-1785111186598 plancore active helm-a2-live-1785111186598-partner-deliberation-ms2h4s4t deliberation active"

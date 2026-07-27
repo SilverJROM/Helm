@@ -77,6 +77,22 @@ describe('ST-R1/R2 @helm_child tmux ownership tag', () => {
     await expect(tmux.createSession('helm-w-tagfail')).resolves.toBe('helm-w-tagfail:0.0');
   });
 
+  // A2 (R4.16): createSession forwards projectId/runId into the registry onCreate choke point.
+  it('A2: createSession passes projectId+runId to registry onCreate', async () => {
+    cpMock.impl = async (_cmd: string, args: string[]) => {
+      if (args[0] === 'has-session') throw new Error('no such session');
+      return { stdout: '', stderr: '' };
+    };
+    const seen: Array<{ name: string; opts?: any }> = [];
+    const tmux: any = new TmuxService({
+      onCreate: (name: string, opts?: any) => { seen.push({ name, opts }); },
+      onTerminate: () => {},
+      onUse: () => {},
+    });
+    await tmux.createSession('helm-batch-A2-plancore-x1', '/tmp/proj', { projectId: 7, runId: 88 });
+    expect(seen).toEqual([{ name: 'helm-batch-A2-plancore-x1', opts: { projectId: 7, runId: 88 } }]);
+  });
+
   it('ST-R2: sessionHasHelmChildTag returns true ONLY when the option is exactly "1"', async () => {
     const tmux: any = new TmuxService();
     cpMock.impl = async () => ({ stdout: '1\n', stderr: '' });

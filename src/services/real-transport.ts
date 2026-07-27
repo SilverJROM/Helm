@@ -78,6 +78,11 @@ export class RealTransport implements ITransport {
     // implementer/validator dispatched through RealTransport are a BUILDING path, so they must be
     // fenceable. Absent (every existing caller) → fencedLaunch byte-identical (default read-all).
     strictReadAllow?: string[];
+    // A2 (R4.16): optional run/project linkage threaded into TmuxService.createSession so the
+    // helm_sessions registry row is linked at the single choke point (no post-hoc enrich required
+    // for planning seats). Absent → register(name) with NULL ids (byte-identical to pre-A2).
+    projectId?: number;
+    runId?: number;
   }): Promise<{ handle: string; role: string }> {
     const role = params.role;
     const runDir = params.runDir;
@@ -128,7 +133,11 @@ export class RealTransport implements ITransport {
     // Dedicated fresh session per dispatch (clean context; reuse would require explicit /clear before next)
     // Honor explicit sessionName for per-project projcore (from projects.projcore_session or default <slug>-projcore)
     const sessionName = params.sessionName || `helm-${batchId}-${role}-${Date.now().toString(36).slice(-8)}`;
-    const target = await this.tmux.createSession(sessionName, fenceDir);
+    // A2: pass projectId/runId at the createSession choke point so helm_sessions lands linked.
+    const target = await this.tmux.createSession(sessionName, fenceDir, {
+      projectId: params.projectId ?? null,
+      runId: params.runId ?? null,
+    });
 
     try {
       // Launch the real agent (grok-4.5 etc) under fence + skipSafety (trusted launch path, like WorkerService)

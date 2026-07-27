@@ -391,6 +391,46 @@ describe('planning-phase-service (B9 PLN1) + gate + auto pick', () => {
     expect(dispatchesAfter).toBe(dispatchesBefore);
   });
 
+  // A2 (R4.16): planning spawns forward projectId/runId so RealTransport can register helm_sessions
+  // at the createSession choke point (FakeTransport records the args; product path uses them).
+  it('A2: planning spawns pass projectId+runId into transport.spawn for both seats', async () => {
+    const projRow = dbs.raw.prepare('INSERT INTO projects (name, directory) VALUES (?, ?) RETURNING id')
+      .get('a2-helm-sessions-proj', '/tmp/a2-helm-sessions-proj') as { id: number };
+    const cycleRow = dbs.raw.prepare(
+      `INSERT INTO cycles (project_id, name, folder_name, phase, autonomy, status)
+       VALUES (?, ?, ?, 'planning', 'autonomous_after_discovery', 'active') RETURNING id`
+    ).get(projRow.id, 'A2 cycle', 'a2-cycle') as { id: number };
+    const runRow = dbs.raw.prepare(
+      `INSERT INTO runs (project_id, cycle_id, batch_id, phase) VALUES (?, ?, ?, 'planning') RETURNING id`
+    ).get(projRow.id, cycleRow.id, 'batch-A2-helm-sessions') as { id: number };
+
+    transport.spawnCalls.length = 0;
+    const p = phase.runPlanningPhase({
+      runDir,
+      batchId: 'batch-A2-helm-sessions',
+      northStar: 'Cross module: overhaul the orchestrator with ambiguous deps needing a partner review.',
+      conversationLog: 'High ambiguity on decomposition.',
+      mode: 'auto',
+      autoSignals: { isCrossCutting: true },
+      projectId: projRow.id,
+      runId: runRow.id,
+    });
+
+    const cbp = path.join(runDir, 'callbacks.md');
+    await fs.appendFile(cbp, `[helm callback] plancore batch-A2-helm-sessions STATUS: PLANNING\n`);
+    await sleep(20);
+    await fs.appendFile(cbp, `[helm callback] deliberation batch-A2-helm-sessions-partner STATUS: CONSENSUS — agreed\n`);
+    await sleep(20);
+    await fs.appendFile(cbp, `[helm callback] plancore batch-A2-helm-sessions STATUS: PLAN-READY — plan agreed with deliberation\n`);
+    await sleep(20);
+    await p;
+
+    const withIds = transport.spawnCalls.filter((c) => c.projectId === projRow.id && c.runId === runRow.id);
+    expect(withIds.length).toBeGreaterThanOrEqual(2);
+    expect(withIds.some((c) => c.role === 'plancore')).toBe(true);
+    expect(withIds.some((c) => c.role === 'deliberation')).toBe(true);
+  });
+
   // POCFIX9 (c): selectCoPlannerMode resolves clear single-feature non-cross-cutting north-star to 'planner' (Lucky-9 style).
   it('POCFIX9 (c): selectCoPlannerMode resolves clear single-feature (non-cross-cutting) to planner', () => {
     const clearSingle = 'Add Lucky 9 card game to the cards project (engine + client + tests).';

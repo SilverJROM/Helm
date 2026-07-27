@@ -250,7 +250,7 @@ export class PlanningPhaseService {
         // The concrete seat is phase-owned (`plancore`). The brief/callback face intentionally
         // remains the existing helm_pm/projcore compatibility seam so no raw role token reaches
         // the model and callback ingest remains backward-compatible.
-        const spawned = await this.transport.spawn({ role: brainRole, brief: dispatchBrief, runDir, batchId, sessionName: inputs.sessionName, model: inputs.planningBrainModel, provider: inputs.planningBrainProvider, attemptId: 0, projectDir: effectiveProjectDir, ...(inputs.strictReadAllow ? { strictReadAllow: inputs.strictReadAllow } : {}) });  // B-ISO1: run-scoped strict read fence
+        const spawned = await this.transport.spawn({ role: brainRole, brief: dispatchBrief, runDir, batchId, sessionName: inputs.sessionName, model: inputs.planningBrainModel, provider: inputs.planningBrainProvider, attemptId: 0, projectDir: effectiveProjectDir, projectId: inputs.projectId, runId: inputs.runId, ...(inputs.strictReadAllow ? { strictReadAllow: inputs.strictReadAllow } : {}) });  // B-ISO1 + A2: projectId/runId → helm_sessions via createSession
         // A1 (R4.16): record this plancore seat so it is DB-observable with run+cycle linkage.
         plancoreRuntimeId = this.registerWorkerRuntime(inputs.projectId, inputs.runId, brainRole, batchId, spawned.handle, inputs.planningBrainProvider, inputs.planningBrainModel);
         if (isFakeP) break;
@@ -290,7 +290,7 @@ export class PlanningPhaseService {
         callbacksFile: path.join(runDir, 'callbacks.md'),
       });
       await this.artifacts.writeBrief(runDir, partner, partnerBrief);
-      const partnerSpawned = await this.transport.spawn({ role: partner, brief: partnerBrief, runDir, batchId: `${batchId}-partner`, model: inputs.partnerModel, provider: inputs.partnerProvider, attemptId: 0, projectDir: effectiveProjectDir, ...(inputs.strictReadAllow ? { strictReadAllow: inputs.strictReadAllow } : {}) });  // B-ISO1: run-scoped strict read fence
+      const partnerSpawned = await this.transport.spawn({ role: partner, brief: partnerBrief, runDir, batchId: `${batchId}-partner`, model: inputs.partnerModel, provider: inputs.partnerProvider, attemptId: 0, projectDir: effectiveProjectDir, projectId: inputs.projectId, runId: inputs.runId, ...(inputs.strictReadAllow ? { strictReadAllow: inputs.strictReadAllow } : {}) });  // B-ISO1 + A2: projectId/runId → helm_sessions via createSession
       // A1 (R4.16): record the partner seat so it is DB-observable with run+cycle linkage.
       this.registerWorkerRuntime(inputs.projectId, inputs.runId, partner, `${batchId}-partner`, partnerSpawned.handle, inputs.partnerProvider, inputs.partnerModel);
     }

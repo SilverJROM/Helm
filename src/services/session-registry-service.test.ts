@@ -85,6 +85,22 @@ describe('SL-R1/R2 SessionRegistryService', () => {
     expect(row.run_id).toBe(55);
     expect(row.project_id).toBe(3);
   });
+
+  // A2 (R4.16): planning seats must land in helm_sessions with both ids at register time
+  // (the createSession choke point calls register with opts — this is the DB half of that contract).
+  it('A2: register of a planning seat with projectId+runId stores both ids (not NULL)', () => {
+    reg.register('helm-batch-A2-plancore-abc12', { projectId: 42, runId: 99, kind: 'plancore' });
+    reg.register('helm-batch-A2-partner-def34', { projectId: 42, runId: 99, kind: 'deliberation' });
+    const plancore = reg.get('helm-batch-A2-plancore-abc12')!;
+    const partner = reg.get('helm-batch-A2-partner-def34')!;
+    expect(plancore.project_id).toBe(42);
+    expect(plancore.run_id).toBe(99);
+    expect(plancore.kind).toBe('plancore');
+    expect(plancore.status).toBe('active');
+    expect(partner.project_id).toBe(42);
+    expect(partner.run_id).toBe(99);
+    expect(partner.kind).toBe('deliberation');
+  });
 });
 
 // ---------------------------------------------------------------------------

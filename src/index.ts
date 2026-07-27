@@ -277,7 +277,11 @@ async function main(): Promise<void> {
   const sessionRegistry = new SessionRegistryService(db);
   if (typeof (tmuxService as any).setRegistryHook === 'function') {
     (tmuxService as any).setRegistryHook({
-      onCreate: (name: string) => { try { sessionRegistry.register(name); } catch {} },
+      // A2 (R4.16): forward optional projectId/runId/kind from createSession so helm_sessions
+      // rows land linked at the choke point (planning seats no longer NULL).
+      onCreate: (name: string, opts?: { projectId?: number | null; runId?: number | null; kind?: string }) => {
+        try { sessionRegistry.register(name, opts ?? {}); } catch {}
+      },
       onTerminate: (name: string) => { try { sessionRegistry.markReaped(name); } catch {} },
       // SL-R2/R4: active-input refreshes last_used_at so the TTL means "idle for TTL" (in-use sessions kept).
       onUse: (name: string) => { try { sessionRegistry.touch(name); } catch {} }
@@ -374,7 +378,12 @@ async function main(): Promise<void> {
   const trackingReadService = new TrackingReadService(db);
   const planParser = new PlanParserService(runArtifactService);
   const taskQueue = new TaskQueueService(runArtifactService);
-  const orchT: ITransport = useFakeTmux ? new FakeTransport() : new RealTransport({ artifacts: runArtifactService });
+  // A2 (R4.16): RealTransport MUST use the shared hooked tmuxService. A private new TmuxService()
+  // would bypass the session-registry choke point, so planning seats never landed in helm_sessions
+  // (or landed unlinked). Workers already used this shared instance; planning now matches.
+  const orchT: ITransport = useFakeTmux
+    ? new FakeTransport()
+    : new RealTransport({ artifacts: runArtifactService, tmux: tmuxService });
   const planningPhase = new PlanningPhaseService(orchT, runArtifactService, taskQueue);
   const escalationService = new EscalationService(db, usageGateway, assignmentService);  // B9fix2 F4: project escalation ladder via resolver
   const panelService = new PanelService(orchT, runArtifactService);

@@ -35,8 +35,16 @@ export type TextSubmissionState = "held" | "submitted" | "indeterminate";
 // at the single createSession/terminateSession choke point so every Helm session is captured
 // centrally. Defaults to a no-op — existing tests, FakeTmuxService, and any construction WITHOUT a
 // registry keep working, and TmuxService never hard-depends on the DB.
+// A2 (R4.16): onCreate may carry projectId/runId/kind so helm_sessions rows land linked at create
+// time (planning seats via RealTransport; workers may still enrich later for late-known context).
+export interface TmuxSessionCreateOpts {
+  projectId?: number | null;
+  runId?: number | null;
+  kind?: string;
+}
+
 export interface TmuxSessionRegistryHook {
-  onCreate(name: string): void;
+  onCreate(name: string, opts?: TmuxSessionCreateOpts): void;
   onTerminate(name: string): void;
   // SL-R2/R4: fired on ACTIVE INPUT to a session (sendKeys). Refreshes last_used_at so the janitor's
   // TTL means "idle for TTL" not "alive for TTL" — keeps actively-used standalone sessions alive.
@@ -398,7 +406,7 @@ export class TmuxService {
     }
   }
 
-  async createSession(name: string, cwd?: string): Promise<string> {
+  async createSession(name: string, cwd?: string, opts?: TmuxSessionCreateOpts): Promise<string> {
     this.ensureValidSessionName(name);
     // POCFIX4: idempotent for fixed per-project session names (e.g. 'helm_cards' leftover from prior run).
     // Best-effort kill-if-exists (has-session then kill-session) before new-session so duplicate never throws.
@@ -420,9 +428,10 @@ export class TmuxService {
     // failure must never break/throw the create (swallowed + logged, exactly like the registry hook below).
     await execFileAsync('tmux', ['set-option', '-t', name, '@helm_child', '1'])
       .catch((err) => { console.warn('[tmux] set @helm_child failed (best-effort)', { name, err: String(err) }); });
-    // SL-R1: register EVERY created session centrally (single choke point). Best-effort — a registry
+    // SL-R1 / A2: register EVERY created session centrally (single choke point), carrying optional
+    // projectId/runId/kind so helm_sessions rows are linked at create time. Best-effort — a registry
     // failure must never break session creation.
-    try { this.registryHook.onCreate(name); } catch (err) { console.warn('[tmux] registry onCreate failed', { name, err: String(err) }); }
+    try { this.registryHook.onCreate(name, opts); } catch (err) { console.warn('[tmux] registry onCreate failed', { name, err: String(err) }); }
     return `${name}:0.0`;
   }
 
