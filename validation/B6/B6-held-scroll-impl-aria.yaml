@@ -4,7 +4,7 @@
 - button "Dark"
 - text: Command Center Overview
 - button "← Back"
-- text: b6-validation-1785156305306 / B6 stick 1785156305306
+- text: b6-validation-1785156380228 / B6 stick 1785156380228
 - button "gate-after-planning"
 - button "Graceful Stop"
 - button "Cycle switcher"
@@ -13,7 +13,7 @@
 - button "Show both"
 - text: · implementer active implementer
 - button "–"
-- text: for i in $(seq 1 50); do echo "b6-scroll-line-$i"; done; echo "B6_LIVE_MARKER_1785156305306"; echo "done B6_LIVE_MARKER_ 1785156305306" agjrom@minisserver:~/websites/Helm$ for i in $(seq 1 50); do echo "b6-scroll-line-$i"; done; echo "B6_LIVE_MARKER_178515 6305306"; echo "done B6_LIVE_MARKER_1785156305306" b6-scroll-line-1 b6-scroll-line-2 b6-scroll-line-3 b6-scroll-line-4 b6-scroll-line-5 b6-scroll-line-6 b6-scroll-line-7 b6-scroll-line-8 b6-scroll-line-9 b6-scroll-line-10 b6-scroll-line-11 b6-scroll-line-12 b6-scroll-line-13 b6-scroll-line-14 b6-scroll-line-15 b6-scroll-line-16 b6-scroll-line-17 b6-scroll-line-18 b6-scroll-line-19 b6-scroll-line-20 b6-scroll-line-21 b6-scroll-line-22 b6-scroll-line-23 b6-scroll-line-24 b6-scroll-line-25 b6-scroll-line-26 b6-scroll-line-27 b6-scroll-line-28 b6-scroll-line-29 b6-scroll-line-30 b6-scroll-line-31 b6-scroll-line-32 b6-scroll-line-33 b6-scroll-line-34 b6-scroll-line-35 b6-scroll-line-36 b6-scroll-line-37 b6-scroll-line-38 b6-scroll-line-39 b6-scroll-line-40 b6-scroll-line-41 b6-scroll-line-42 b6-scroll-line-43 b6-scroll-line-44 b6-scroll-line-45 b6-scroll-line-46 b6-scroll-line-47 b6-scroll-line-48 b6-scroll-line-49 b6-scroll-line-50 B6_LIVE_MARKER_1785156305306 done B6_LIVE_MARKER_1785156305306 agjrom@minisserver:~/websites/Helm$ validator
+- text: for i in $(seq 1 50); do echo "b6-scroll-line-$i"; done; echo "B6_LIVE_MARKER_1785156380228"; echo "done B6_LIVE_MARKER_ 1785156380228" agjrom@minisserver:~/websites/Helm$ for i in $(seq 1 50); do echo "b6-scroll-line-$i"; done; echo "B6_LIVE_MARKER_178515 6380228"; echo "done B6_LIVE_MARKER_1785156380228" b6-scroll-line-1 b6-scroll-line-2 b6-scroll-line-3 b6-scroll-line-4 b6-scroll-line-5 b6-scroll-line-6 b6-scroll-line-7 b6-scroll-line-8 b6-scroll-line-9 b6-scroll-line-10 b6-scroll-line-11 b6-scroll-line-12 b6-scroll-line-13 b6-scroll-line-14 b6-scroll-line-15 b6-scroll-line-16 b6-scroll-line-17 b6-scroll-line-18 b6-scroll-line-19 b6-scroll-line-20 b6-scroll-line-21 b6-scroll-line-22 b6-scroll-line-23 b6-scroll-line-24 b6-scroll-line-25 b6-scroll-line-26 b6-scroll-line-27 b6-scroll-line-28 b6-scroll-line-29 b6-scroll-line-30 b6-scroll-line-31 b6-scroll-line-32 b6-scroll-line-33 b6-scroll-line-34 b6-scroll-line-35 b6-scroll-line-36 b6-scroll-line-37 b6-scroll-line-38 b6-scroll-line-39 b6-scroll-line-40 b6-scroll-line-41 b6-scroll-line-42 b6-scroll-line-43 b6-scroll-line-44 b6-scroll-line-45 b6-scroll-line-46 b6-scroll-line-47 b6-scroll-line-48 b6-scroll-line-49 b6-scroll-line-50 B6_LIVE_MARKER_1785156380228 done B6_LIVE_MARKER_1785156380228 agjrom@minisserver:~/websites/Helm$ validator
 - button "–"
 - text: No live terminal for this task yet. No tasks ingested yet.
 - button "Docs collapsed Expand":

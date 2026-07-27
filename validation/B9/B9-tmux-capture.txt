@@ -24,6 +24,6 @@ b9-line-27
 b9-line-28
 b9-line-29
 b9-line-30
-B9_CLI_BAR_1785158591373
+B9_CLI_BAR_1785158731470
 B9 CLI bar legibility sample
 agjrom@minisserver:~/websites/Helm$

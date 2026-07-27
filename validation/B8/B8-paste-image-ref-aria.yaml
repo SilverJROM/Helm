@@ -4,7 +4,7 @@
 - button "Dark"
 - text: Command Center Overview
 - button "← Back"
-- text: b8-validation-1785158197989 / B8 paste 1785158197989
+- text: b8-validation-1785158251194 / B8 paste 1785158251194
 - button "gate-after-planning"
 - button "Cycle switcher"
 - text: Discovery Planning Implementation Final Tests History Discovery chat
@@ -18,7 +18,7 @@
 - button "⏻ Session Off"
 - button "Minimize"
 - text: No messages yet. Type a message to start chatting with discovery.
-- textbox "talk to discovery… (paste text/image → project tmp ref)": tmp/b8-paste-1785158197989_0727/paste-20260727T131638Z.txt tmp/b8-paste-1785158197989_0727/attach-1785158197989.png
+- textbox "talk to discovery… (paste text/image → project tmp ref)": tmp/b8-paste-1785158251194_0727/paste-20260727T131731Z.txt tmp/b8-paste-1785158251194_0727/attach-1785158251194.png
 - button "Attach image"
 - button "Send"
 - button "Docs collapsed Restore docs":

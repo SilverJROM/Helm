@@ -1,8 +1,12 @@
 - text: og-requirements.md rendered
 - button "Full screen"
-- text: "# OG Requirements B1 SEAM-2 live proof — this content must survive the run's scratch dir being deleted (reboot simulation). RUN_TS=1785117748710 plan.md schema valid"
+- heading "OG Requirements" [level=1]
+- paragraph: B1 SEAM-2 live proof — this content must survive the run's scratch dir being deleted (reboot simulation). RUN_TS=1785117908227
+- text: plan.md schema valid
 - button "Full screen"
-- text: "# Plan ```json [{\"id\":\"T1\",\"batch\":\"B00\",\"title\":\"vocabulary\",\"req_refs\":[\"R14.46\"],\"assignee\":\"terra\",\"validator_lane\":\"L2\",\"effort\":\"low\",\"type\":\"feature\"}] ``` Per-task planning view"
+- heading "Plan" [level=1]
+- code: "[{\"id\":\"T1\",\"batch\":\"B00\",\"title\":\"vocabulary\",\"req_refs\":[\"R14.46\"],\"assignee\":\"terra\",\"validator_lane\":\"L2\",\"effort\":\"low\",\"type\":\"feature\"}]"
+- text: Per-task planning view
 - table:
   - rowgroup:
     - row "Task Implementer Validator Effort Red-team Validator refs Exception handling":

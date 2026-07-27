@@ -5,7 +5,7 @@
 - button "☰"
 - text: Command Center Overview
 - button "← Back"
-- text: b9-validation-1785158591373 / B9 capstone 1785158591373
+- text: b9-validation-1785158731470 / B9 capstone 1785158731470
 - button "gate-after-planning"
 - button "Cycle switcher"
 - text: Discovery Planning Implementation Final Tests History Discovery chat
@@ -19,7 +19,7 @@
 - button "⏻ Session Off"
 - button "Minimize"
 - text: No messages yet. Type a message to start chatting with discovery.
-- textbox "talk to discovery… (paste text/image → project tmp ref)": tmp/b9-capstone-1785158591373_0727/paste-20260727T132313Z.txt
+- textbox "talk to discovery… (paste text/image → project tmp ref)": tmp/b9-capstone-1785158731470_0727/paste-20260727T132533Z.txt
 - button "Attach image"
 - button "Send"
 - button "Docs collapsed Restore docs":

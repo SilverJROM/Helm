@@ -4,7 +4,7 @@
 - button "Dark"
 - text: Command Center Overview
 - button "← Back"
-- text: b9-validation-1785158591373 / B9 capstone 1785158591373
+- text: b9-validation-1785158731470 / B9 capstone 1785158731470
 - button "gate-after-planning"
 - button "Cycle switcher"
 - text: Discovery Planning Implementation Final Tests History Planning not started
@@ -36,7 +36,7 @@
   - listitem: CALLBACK_WAIT_RESULT2026-07-27 11:55:30role=plancore · outcome=callback · reason=callback · provider=grok
   - listitem: CALLBACK_WAIT_RESULT2026-07-27 12:00:24role=plancore · outcome=callback · reason=callback · provider=grok
   - listitem: CALLBACK_WAIT_RESULT2026-07-27 12:06:58role=plancore · outcome=callback · reason=callback · provider=grok
-- text: "plancore · grok-4.5 live for i in $(seq 1 30); do echo \"b9-line-$i\"; done; echo \"B9_CLI_BAR_1785158591373\"; echo \"B9 CLI bar legibility sample\" \x1b[1m\x1b[32magjrom@minisserver\x1b[0m:\x1b[1m\x1b[34m~/websites/Helm\x1b[0m$ for i in $(seq 1 30); do echo \"b9-line-$i\"; done; echo \"B9_CLI_BAR_1785158591373\"; e cho \"B9 CLI bar legibility sample\" b9-line-1 b9-line-2 b9-line-3 b9-line-4 b9-line-5 b9-line-6 b9-line-7 b9-line-8 b9-line-9 b9-line-10 b9-line-11 b9-line-12 b9-line-13 b9-line-14 b9-line-15 b9-line-16 b9-line-17 b9-line-18 b9-line-19 b9-line-20 b9-line-21 b9-line-22 b9-line-23 b9-line-24 b9-line-25 b9-line-26 b9-line-27 b9-line-28 b9-line-29 b9-line-30 B9_CLI_BAR_1785158591373 B9 CLI bar legibility sample \x1b[1m\x1b[32magjrom@minisserver\x1b[0m:\x1b[1m\x1b[34m~/websites/Helm\x1b[0m$ deliberation · opus historical No live terminal — historical / session unavailable. og-requirements.md rendered"
+- text: "plancore · grok-4.5 live for i in $(seq 1 30); do echo \"b9-line-$i\"; done; echo \"B9_CLI_BAR_1785158731470\"; echo \"B9 CLI bar legibility sample\" \x1b[1m\x1b[32magjrom@minisserver\x1b[0m:\x1b[1m\x1b[34m~/websites/Helm\x1b[0m$ for i in $(seq 1 30); do echo \"b9-line-$i\"; done; echo \"B9_CLI_BAR_1785158731470\"; e cho \"B9 CLI bar legibility sample\" b9-line-1 b9-line-2 b9-line-3 b9-line-4 b9-line-5 b9-line-6 b9-line-7 b9-line-8 b9-line-9 b9-line-10 b9-line-11 b9-line-12 b9-line-13 b9-line-14 b9-line-15 b9-line-16 b9-line-17 b9-line-18 b9-line-19 b9-line-20 b9-line-21 b9-line-22 b9-line-23 b9-line-24 b9-line-25 b9-line-26 b9-line-27 b9-line-28 b9-line-29 b9-line-30 B9_CLI_BAR_1785158731470 B9 CLI bar legibility sample \x1b[1m\x1b[32magjrom@minisserver\x1b[0m:\x1b[1m\x1b[34m~/websites/Helm\x1b[0m$ deliberation · opus historical No live terminal — historical / session unavailable. og-requirements.md rendered"
 - button "Full screen"
 - heading "Requirements" [level=1]
 - list:

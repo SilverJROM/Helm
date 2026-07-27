@@ -4,7 +4,7 @@
 - button "Dark"
 - text: Command Center Overview
 - button "← Back"
-- text: b6-validation-1785156305306 / B6 stick 1785156305306
+- text: b6-validation-1785156380228 / B6 stick 1785156380228
 - button "gate-after-planning"
 - button "Cycle switcher"
 - text: Discovery Planning Implementation Final Tests History Discovery chat
@@ -20,7 +20,7 @@
 - text: discovery · last reply
 - button "…"
 - button "Hide"
-- text: Line1 B6_LAST_REPLY_1785156305306 first of multi-line last reply. Line2 continues the same last reply for clamp proof. Line3 still the same reply — must not appear twice below. Line4 more text to force two-line collapsed clamp. Line5 end B6_LAST_REPLY_1785156305306. JROM e2e prompt 1785156305306
+- text: Line1 B6_LAST_REPLY_1785156380228 first of multi-line last reply. Line2 continues the same last reply for clamp proof. Line3 still the same reply — must not appear twice below. Line4 more text to force two-line collapsed clamp. Line5 end B6_LAST_REPLY_1785156380228. JROM e2e prompt 1785156380228
 - textbox "talk to discovery…"
 - button "Attach image"
 - button "Send"
