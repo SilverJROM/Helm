@@ -1,4 +1,4 @@
-// Live Helm served on :3110 (CF-tunneled) = the hardened websites/Helm build + cards2-ibrain.db (v91).
+// Live Helm served on :3110 (CF-tunneled) = the hardened websites/Helm build + data/helm.db (schema v100).
 // Repurposed 2026-07-21: was a 2-var stub; now the full, durable definition of the latest-and-greatest
 // engine, moved off the bare :3114 node. The old TGBOTS `helm` app is parked (pm2 stop), not deleted.
 module.exports = {
@@ -20,7 +20,13 @@ module.exports = {
         HELM_HOST: "0.0.0.0",               // bind all interfaces: reachable on the LAN (192.168.x:3110) AND by the CF tunnel
         HELM_ALLOW_LAN_LAUNCH: "1",         // allow mutating/launch ops from private-LAN clients (not just loopback), so the UI works over the LAN IP. Still owner-cred gated; public IPs always rejected.
         HELM_PORT: "3110",
-        HELM_DB_PATH: "/home/agjrom/websites/Helm/data/cards2-ibrain.db",
+        // MIGRATED 2026-07-27 by [north] (JROM-authorised): was data/cards2-ibrain.db — a name inherited
+        // from another project, which JROM confirmed was a MISCONFIGURATION. data/helm.db is the intended
+        // name and is also the code default (src/config/config.ts:68), so all three sources now agree.
+        // Migrated at a zero-active-run boundary after a clean pm2 stop checkpointed the 795KB WAL;
+        // byte-identical copy, integrity ok, schema_version 100, all table counts matched.
+        // Pre-migration copies kept: data/cards2-ibrain.db (source) + data/helm.db.pre-migration-*.
+        HELM_DB_PATH: "/home/agjrom/websites/Helm/data/helm.db",
         // B1 (R2.12/F6): durable run root — src/services/run-paths.ts defaults to os.tmpdir() (wiped on
         // reboot) unless overridden. MUST be absolute (run-orchestrator-service tests + reboot-class
         // proof assert this), and its exact path must be routed through the Landlock write-fence grant
