@@ -59,7 +59,7 @@ import { TaskService } from "./services/task-service.js";
 import { CycleService } from "./services/cycle-service.js";
 import { CycleDocsService } from "./services/cycle-docs-service.js";
 import { CANONICAL_CYCLE_ARTIFACTS } from "./services/cycle-artifact-paths.js";
-import { maybeAutoStartCycleImplementation } from "./services/cycle-auto-start.js";
+import { maybeAutoStartCycleImplementation, startCycleImplementationAfterApproval } from "./services/cycle-auto-start.js";
 import { MemoryService } from "./services/memory-service.js";
 import { AgentProposalService } from './services/agent-proposal-service.js';
 import {
@@ -1420,13 +1420,27 @@ async function main(): Promise<void> {
 
   // B6-T03: POST /api/cycles/:id/approve — gate-mode awaiting-approval → implementation (R-E3).
   // B10b: service-layer FORBIDDEN (jkage L0) → 403.
+  // A6 / R3.14: the run-orchestrator parks a gate-mode cycle's planning run without dispatching
+  // (pause_after_planning gate) — approval is what actually starts the implementation queue.
+  // Best-effort + never let a start failure fail the 200 (mirrors IS-R3 auto-start): the phase
+  // flip is the durable contract; JROM can still click Start Implementation manually if this races.
   app.post('/api/cycles/:id/approve', { preHandler: [authMiddleware, requireOwnerPre] }, async (request: any, reply: any) => {
     const id = Number(request.params.id);
     try {
       // B10b/R2.10: trusted actor from verified token only (never body)
       const actor = decisionActorFromRequestUser(request.user);
       const c = cycleService.approveCycle(id, { actor });
-      return { cycle: c };
+      let implementation: { started: boolean; reason?: string; runId?: number };
+      try {
+        implementation = await startCycleImplementationAfterApproval(
+          { db, cycleService, runArtifacts: runArtifactService, orchestrator: runOrchestratorService },
+          id
+        );
+      } catch (startErr: any) {
+        implementation = { started: false, reason: startErr?.message || 'start failed' };
+        request.log?.warn?.(`[cycle-approve] cycle ${id}: implementation start failed: ${startErr?.message || startErr}`);
+      }
+      return { cycle: c, implementation };
     } catch (e: any) {
       if (e.code === 'NOT_FOUND') return reply.code(404).send({ error: e.message });
       if (e.code === 'CONFLICT') return reply.code(409).send({ error: e.message });

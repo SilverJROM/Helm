@@ -1,0 +1,19 @@
+- button "← Back"
+- text: a6-validation-1785124869682 / A6 gate 1785124869682
+- button "gate-after-planning"
+- button "Graceful Stop"
+- button "Cycle switcher"
+- text: Implementation running. Additive changes still enter through Discovery chat; graceful stop is available for replan. Discovery Planning Implementation Final Tests History Implementation running Run in progress 0/1 done 0 working 1 pending 0 failed 0 parked Deploy target not set Workers
+- 'button "Auto-focus: On" [pressed]'
+- button "Show both"
+- text: implementer
+- button "–"
+- text: No live terminal for this task yet. validator
+- button "–"
+- text: No live terminal for this task yet. No task currently working · 0/1 done
+- button "Show all 1"
+- text: No task is currently working.
+- button "Show all 1"
+- button "Docs collapsed Expand":
+  - text: Docs collapsed
+  - button "Expand"

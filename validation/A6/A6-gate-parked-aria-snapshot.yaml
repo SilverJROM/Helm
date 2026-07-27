@@ -1,0 +1,71 @@
+- button "← Back"
+- text: a6-validation-1785124869682 / A6 gate 1785124869682
+- button "gate-after-planning"
+- button "Cycle switcher"
+- text: Discovery Planning Implementation Final Tests History Planning docs ready — awaiting approval
+- button "Watch live"
+- button "Re-run Planning"
+- text: Seats plancore grok-4.5 running historical Event trail
+- list:
+  - listitem: CALLBACK_WAIT_RESULT2026-07-26 23:35:33role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-26 23:42:09role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-26 23:53:56role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-26 23:58:11role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: REGISTERED2026-07-27 00:00:01role=system · reason=a4-live-seed
+  - listitem: REGISTERED2026-07-27 00:00:01
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 00:00:02role=plancore · outcome=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 00:00:02
+  - listitem: TERMINAL2026-07-27 00:00:03outcome=complete · reason=a4-live
+  - listitem: TERMINAL2026-07-27 00:00:03
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 00:13:44role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 00:27:13role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 00:34:53role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 00:37:30role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 00:42:28role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 00:45:45role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: REGISTERED2026-07-27 00:55:08role=system · reason=a4-live-seed
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 00:55:09role=plancore · outcome=callback · provider=grok
+  - listitem: TERMINAL2026-07-27 00:55:10outcome=complete · reason=a4-live
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 02:33:20role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 02:35:04role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 02:38:17role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 02:41:40role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 02:45:08role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 03:17:43role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 03:23:17role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 03:26:01role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 03:27:41role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 03:31:30role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 03:38:51role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 03:46:27role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 03:54:07role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 04:01:32role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: REGISTERED2076-07-14 00:58:42role=system · reason=a4-live-seed
+  - listitem: CALLBACK_WAIT_RESULT2076-07-14 00:58:43role=plancore · outcome=callback · provider=grok
+  - listitem: TERMINAL2076-07-14 00:58:44outcome=complete · reason=a4-live
+  - listitem: REGISTERED2099-01-01 12:00:01role=system · reason=a4-live-seed
+  - listitem: REGISTERED2099-01-01 12:00:01role=system · reason=a4-live-seed
+  - listitem: CALLBACK_WAIT_RESULT2099-01-01 12:00:02role=plancore · outcome=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2099-01-01 12:00:02role=plancore · outcome=callback · provider=grok
+  - listitem: TERMINAL2099-01-01 12:00:03outcome=complete · reason=a4-live
+  - listitem: TERMINAL2099-01-01 12:00:03outcome=complete · reason=a4-live
+  - listitem: REGISTERED2999-06-26 00:59:02role=system · reason=a4-live-seed
+  - listitem: CALLBACK_WAIT_RESULT2999-06-26 00:59:03role=plancore · outcome=callback · provider=grok
+  - listitem: TERMINAL2999-06-26 00:59:04outcome=complete · reason=a4-live
+  - listitem: REGISTERED2999-06-26 01:00:59role=system · reason=a4-live-seed
+  - listitem: CALLBACK_WAIT_RESULT2999-06-26 01:01:00role=plancore · outcome=callback · provider=grok
+  - listitem: TERMINAL2999-06-26 01:01:01outcome=complete · reason=a4-live
+- text: Awaiting your approval Review og-requirements.md and plan.md. Approving starts Implementation with the current task table.
+- button "Approve"
+- text: og-requirements.md rendered
+- button "Full screen"
+- heading "Requirements" [level=1]
+- list:
+  - listitem:
+    - strong: R3.14
+    - text: — pause_after_planning actually gates the implementation queue.
+- text: plan.md schema valid
+- button "Full screen"
+- heading "Plan" [level=1]
+- code: "[{\"id\":\"T1\",\"batch\":\"A6\",\"title\":\"A6 gate proof task\",\"req_refs\":[\"R3.14\"],\"assignee\":\"grok-4.5\",\"validator_lane\":\"L2\",\"effort\":\"low\",\"type\":\"feature\"}]"
+- text: Per-task planning view Loading task rows…

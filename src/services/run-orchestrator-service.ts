@@ -29,6 +29,7 @@ import { discoverDevDeployConfig, createRealDeployRunner, type DeployRunner } fr
 import { discoverFinalTestConfig, createRealTestRunner, type TestRunner } from './final-test-service.js';
 import { assertNoValCollision, assertRedteamPanelSize, ResolveStallError } from '../db/resolve-time-invariants.js';
 import { CANONICAL_CYCLE_ARTIFACTS, materializeCanonicalArtifactSet, readCycleArtifact } from './cycle-artifact-paths.js';
+import { isAwaitingApproval } from './cycle-service.js';
 import { PROVIDERS } from '../config/providers.js';
 import {
   httpNotificationTransport,
@@ -321,6 +322,53 @@ export class RunOrchestratorService {
         `[RunOrchestrator] finishPlanning(${cycleId}) non-fatal at planning-done: ${e?.message || e}`
       );
     }
+  }
+
+  /**
+   * A6 / R3.14: true when the cycle is gate-mode (pause_after_planning) and finishPlanning has
+   * just flipped it to awaiting_approval. Reads straight from cycles (not the cycleService
+   * structural type, which only exposes getCycleDocDir/finishPlanning) — mirrors cycle-service.ts's
+   * own isAwaitingApproval predicate so the gate can never drift from the DB flag it reads.
+   */
+  private isCycleGateParked(cycleId: number | null): boolean {
+    if (cycleId == null || !Number.isFinite(cycleId)) return false;
+    try {
+      const row: any = this.deps.artifacts['db'].raw
+        .prepare('SELECT autonomy, awaiting_approval FROM cycles WHERE id = ?')
+        .get(cycleId);
+      if (!row) return false;
+      return isAwaitingApproval({ autonomy: row.autonomy, awaiting_approval: Boolean(Number(row.awaiting_approval)) });
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * A6 / R3.14: park a run whose planning finished into a gate-mode awaiting_approval cycle.
+   * Reuses transitionRunToBlocked's #52 operator-pause path (phase='blocked', status='paused') —
+   * NOT a bespoke phase value. A live-run proof (real discovery/planning seats still winding down
+   * in the background after this returns) showed a fresh custom phase string gets raced/clobbered:
+   * every OTHER terminal-phase guard in this file is a literal `NOT IN ('complete','failed',
+   * 'blocked'[,'paused'])` SQL string, so only phases already on that list are protected from being
+   * overwritten by an unrelated later write. 'blocked' is on every one of them. status='paused' is
+   * this codebase's existing "halted for an operator-recoverable reason" contract (#52) — exactly
+   * what awaiting_approval is — and getCycleRunState's runActive check already treats phase='blocked'
+   * as inactive, so a fresh cyclePlan run can start the moment approveCycle flips the cycle.
+   */
+  private async parkRunAwaitingApproval(runId: number, runDir: string, cycleId: number, project?: any): Promise<void> {
+    this.transitionRunToBlocked(
+      runId,
+      `pause_after_planning gate (R3.14): cycle ${cycleId} is awaiting_approval — implementation queue not started until approveCycle`,
+      project,
+      'operator-pause'
+    );
+    try {
+      await this.deps.artifacts.persistState(runDir, ['interview', 'planning', 'awaiting_approval'], 'paused', runId);
+    } catch {}
+    console.log(
+      `[RunOrchestrator] run ${runId} parked at planning-done — cycle ${cycleId} awaiting_approval ` +
+      `(pause_after_planning gate, R3.14); implementation queue not started until approveCycle`
+    );
   }
 
   // R5a (CC-CHAT-4): phase-boundary terminal gate for the run-orchestrator's own steps —
@@ -958,7 +1006,7 @@ export class RunOrchestratorService {
     // A5 / R3.13: production finishPlanning at planning-done. Only on the real planning path
     // (not cyclePlan / seedPlan skip paths — those never ran planning). Resolves cycle id from
     // input or the run row. N7: CONFLICT is swallowed so a second call cannot fail the run.
-    // A6 owns honouring pause_after_planning as a queue gate; this row only flips the cycle board.
+    // A6 / R3.14 honours pause_after_planning as a queue gate right below (isCycleGateParked).
     if (!input.cyclePlan && !input.seedPlan) {
       let planningDoneCycleId: number | null =
         input.cycleId != null && Number.isFinite(Number(input.cycleId)) ? Number(input.cycleId) : null;
@@ -971,6 +1019,15 @@ export class RunOrchestratorService {
         } catch { /* leave null */ }
       }
       this.finishPlanningAtPlanningDone(planningDoneCycleId);
+
+      // A6 / R3.14: honour the pause_after_planning gate. finishPlanning (just above) may have
+      // flipped the cycle to awaiting_approval — if so, this run's job (produce a plan) is done;
+      // park it here instead of falling into runEngineTail. approveCycle (POST /api/cycles/:id/approve)
+      // starts a fresh cyclePlan run against the same plan.md once JROM approves.
+      if (this.isCycleGateParked(planningDoneCycleId)) {
+        await this.parkRunAwaitingApproval(runId, runDir, planningDoneCycleId as number, project);
+        return runId;
+      }
     }
 
     // R5a: phase boundary (planning → executing). Never start the dispatch loop for a run
