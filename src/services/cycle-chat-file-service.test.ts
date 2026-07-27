@@ -87,4 +87,27 @@ describe('B7 (R6.27): CycleChatFileService — path-safe cycle chat-file writer'
     const big = Buffer.alloc(1048577, 'x');
     await expect(chatFileSvc.saveCycleChatFile(cycleId, 'big.bin', big)).rejects.toMatchObject({ code: 'TOO_LARGE' });
   });
+
+  // B7 send-back (attempt=2, redteam HIGH TOCTOU): a check-then-write (fs.access then fs.writeFile)
+  // has a gap a concurrent writer can land in, silently overwriting whatever showed up. Exclusive
+  // create (O_CREAT|O_EXCL) makes the open() syscall itself atomic — this test fires two concurrent
+  // writes at the SAME filename and proves exactly one wins (CONFLICT for the loser, not a silent
+  // overwrite or corrupted/mixed content) — a genuine race, not just a sequential check.
+  it('a genuine concurrent race for the same filename: exactly one write wins, the other gets CONFLICT (exclusive create, not check-then-write)', async () => {
+    const results = await Promise.allSettled([
+      chatFileSvc.saveCycleChatFile(cycleId, 'race.txt', 'writer-A'),
+      chatFileSvc.saveCycleChatFile(cycleId, 'race.txt', 'writer-B'),
+    ]);
+    const fulfilled = results.filter((r) => r.status === 'fulfilled');
+    const rejected = results.filter((r) => r.status === 'rejected');
+    expect(fulfilled.length).toBe(1);
+    expect(rejected.length).toBe(1);
+    expect((rejected[0] as PromiseRejectedResult).reason).toMatchObject({ code: 'CONFLICT' });
+
+    const tmpRoot = path.join(projDir, 'tmp', cycleFolder);
+    const onDisk = fs.readFileSync(path.join(tmpRoot, 'race.txt'), 'utf8');
+    // Whichever writer won, the content is intact and byte-exact — never truncated, mixed, or
+    // silently overwritten by the loser after the fact.
+    expect(['writer-A', 'writer-B']).toContain(onDisk);
+  });
 });

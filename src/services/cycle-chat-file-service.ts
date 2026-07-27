@@ -1,8 +1,20 @@
 import fs from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
 import path from 'node:path';
 import { loadConfig } from '../config/config.js';
 import { CycleService } from './cycle-service.js';
 import { containedInRoot, resolveSafeCycleTmpFilePath } from './doc-path-guard.js';
+
+// B7 send-back (attempt=2, redteam HIGH TOCTOU): fs.access(...) THEN fs.writeFile(...) is a
+// check-then-use race — a concurrent request (or an attacker) can create the file in the gap
+// between the two calls, and the default writeFile flag ('w') silently truncates/overwrites
+// whatever showed up. O_CREAT|O_EXCL makes file creation atomic (the open() syscall itself fails
+// with EEXIST if the path already exists) — no gap to race. O_NOFOLLOW closes the matching race
+// against resolveSafeCycleTmpFilePath's own lstat-based symlink check (also check-then-use): even
+// if a symlink is planted at the leaf AFTER that check but before this write, the OS itself refuses
+// to open through it (ELOOP), rather than trusting an earlier snapshot.
+const EXCLUSIVE_NOFOLLOW_WRITE_FLAGS =
+  fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW;
 
 // B7 (R6.27 backend/scaffold): path-safe cycle chat-file writer under
 // <project.directory>/tmp/<cycle-folder>/<filename> for text, files and images pasted into a
@@ -42,19 +54,27 @@ export class CycleChatFileService {
       symlinkRejectMessage: 'symlink not allowed for chat-file write'
     });
 
-    // Reject on collision — never overwrite, never silently auto-rename (the caller's own
-    // deterministic filename policy, e.g. B8's paste-text naming, decides what to do next).
+    await fs.mkdir(path.dirname(resolved.full), { recursive: true });
+
+    // Atomic exclusive create — never overwrite, never silently auto-rename (the caller's own
+    // deterministic filename policy, e.g. B8's paste-text naming, decides what to do next), and
+    // never follow a symlink planted at the leaf between the guard's check and this write.
     try {
-      await fs.access(resolved.full);
-      const e: any = new Error(`chat-file already exists: ${resolved.filename}`);
-      e.code = 'CONFLICT';
-      throw e;
+      await fs.writeFile(resolved.full, bytes, { flag: EXCLUSIVE_NOFOLLOW_WRITE_FLAGS });
     } catch (err: any) {
-      if (err?.code !== 'ENOENT') throw err;
+      if (err?.code === 'EEXIST') {
+        const e: any = new Error(`chat-file already exists: ${resolved.filename}`);
+        e.code = 'CONFLICT';
+        throw e;
+      }
+      if (err?.code === 'ELOOP') {
+        const e: any = new Error('symlink not allowed for chat-file write');
+        e.code = 'TRAVERSAL';
+        throw e;
+      }
+      throw err;
     }
 
-    await fs.mkdir(path.dirname(resolved.full), { recursive: true });
-    await fs.writeFile(resolved.full, bytes);
     const realFile = await fs.realpath(resolved.full);
     if (!containedInRoot(realFile, resolved.realRoot)) {
       try { await fs.unlink(resolved.full); } catch {}
