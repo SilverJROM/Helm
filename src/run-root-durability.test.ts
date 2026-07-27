@@ -4,10 +4,13 @@
  *   1. Cycle docs (the document view) survive the ephemeral run scratch dir vanishing (a reboot wipes
  *      os.tmpdir()) — they are sourced from the cycle folder, never from runDir.
  *   2. Production actually sets an ABSOLUTE HELM_RUN_ROOT, and that EXACT path is routed through the
- *      Landlock write-fence grant (HELM_SANDBOX_WRITE_ALLOW) — a real kernel-backed write inside it
- *      succeeds, and a sibling outside both the project dir and HELM_RUN_ROOT stays EPERM. This is a
- *      genuine probe against the compiled binary (mirrors sandbox-scaffold-fence.test.ts), not an
- *      assertion about source code.
+ *      Landlock write-fence grant (HELM_SANDBOX_WRITE_ALLOW) — SCOPED TO THE CALLING SEAT'S OWN RUN
+ *      DIRECTORY ONLY. A real kernel-backed write inside that seat's own run dir succeeds; a write
+ *      into a SIBLING run directory under the SAME shared HELM_RUN_ROOT stays EPERM (send-back
+ *      CRITICAL fix — the original version granted the whole shared root, letting any fenced seat
+ *      forge/corrupt another run's callbacks.md); and a write fully outside HELM_RUN_ROOT stays EPERM
+ *      too. This is a genuine probe against the compiled binary (mirrors
+ *      sandbox-scaffold-fence.test.ts), not an assertion about source code.
  */
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -89,17 +92,31 @@ describe('B1 (2/2): production HELM_RUN_ROOT is absolute and routed through the 
   });
 
   it('makeRunRootWriteAllowEnv fail-closed rejects a non-absolute HELM_RUN_ROOT (never silently grants nothing)', () => {
-    expect(() => makeRunRootWriteAllowEnv('relative/path')).toThrow(/absolute/i);
+    expect(() => makeRunRootWriteAllowEnv('/some/run/dir', 'relative/path')).toThrow(/absolute/i);
   });
 
-  it('makeRunRootWriteAllowEnv is a no-op when HELM_RUN_ROOT is unset (byte-identical default)', () => {
-    expect(makeRunRootWriteAllowEnv(undefined)).toBe('');
-    expect(makeRunRootWriteAllowEnv('')).toBe('');
+  it('makeRunRootWriteAllowEnv is a no-op when runDir is absent, HELM_RUN_ROOT is unset, or runDir is not under HELM_RUN_ROOT', () => {
+    expect(makeRunRootWriteAllowEnv(undefined, '/some/run/root')).toBe('');
+    expect(makeRunRootWriteAllowEnv('/some/run/dir', undefined)).toBe('');
+    expect(makeRunRootWriteAllowEnv('/some/run/dir', '')).toBe('');
+    expect(makeRunRootWriteAllowEnv('/elsewhere/not-under-root', '/some/run/root')).toBe('');
   });
 
-  describe('kernel probe: a fenced write actually lands inside HELM_RUN_ROOT and is refused outside both roots', () => {
+  it('makeRunRootWriteAllowEnv grants the EXACT runDir, never the shared root itself (send-back CRITICAL fix)', () => {
+    const root = '/some/run/root';
+    const runDir = '/some/run/root/helm-run-1-batchA';
+    const envLine = makeRunRootWriteAllowEnv(runDir, root);
+    const m = /^HELM_SANDBOX_WRITE_ALLOW='([^']*)'\s*$/.exec(envLine.trim());
+    expect(m, `unexpected env line shape: ${envLine}`).toBeTruthy();
+    expect(m![1]).toBe(runDir);
+    expect(m![1]).not.toBe(root);
+  });
+
+  describe('kernel probe: a fenced write lands in the seat\'s OWN run dir, never a sibling run dir under the same shared root', () => {
     let projDir: string;
     let runRoot: string;
+    let ownRunDir: string;
+    let siblingRunDir: string;
     let outside: string;
 
     beforeAll(() => {
@@ -113,6 +130,13 @@ describe('B1 (2/2): production HELM_RUN_ROOT is absolute and routed through the 
       // /tmp, so a /tmp-based fixture here would make every assertion vacuously true.
       projDir = fs.mkdtempSync(path.join(os.homedir(), 'helm-b1-reboot-kern-proj-'));
       runRoot = fs.mkdtempSync(path.join(os.homedir(), 'helm-b1-reboot-kern-runroot-'));
+      // Two DIFFERENT runs' scratch dirs, both genuine children of the SAME shared HELM_RUN_ROOT —
+      // exactly the shape a real deployment has (helm-run-<projectId>-<batchId> siblings).
+      ownRunDir = path.join(runRoot, 'helm-run-1-owncase');
+      siblingRunDir = path.join(runRoot, 'helm-run-2-siblingcase');
+      fs.mkdirSync(ownRunDir, { recursive: true });
+      fs.mkdirSync(siblingRunDir, { recursive: true });
+      fs.writeFileSync(path.join(siblingRunDir, 'callbacks.md'), 'genuine sibling-run callback\n', 'utf8');
       outside = fs.mkdtempSync(path.join(os.homedir(), 'helm-b1-reboot-kern-outside-'));
     });
     afterAll(() => {
@@ -121,40 +145,56 @@ describe('B1 (2/2): production HELM_RUN_ROOT is absolute and routed through the 
       try { fs.rmSync(outside, { recursive: true, force: true }); } catch {}
     });
 
-    it('the same env prefix the app composes (makeRunRootWriteAllowEnv) grants a real write inside HELM_RUN_ROOT', () => {
-      const envLine = makeRunRootWriteAllowEnv(runRoot); // e.g. "HELM_SANDBOX_WRITE_ALLOW='<runRoot>' "
+    it('the same env prefix the app composes (makeRunRootWriteAllowEnv) grants a real write inside the seat\'s OWN run dir', () => {
+      const envLine = makeRunRootWriteAllowEnv(ownRunDir, runRoot);
       const m = /^HELM_SANDBOX_WRITE_ALLOW='([^']*)'\s*$/.exec(envLine.trim());
       expect(m, `unexpected env line shape: ${envLine}`).toBeTruthy();
-      const r = spawnSync(BIN, [projDir, 'bash', '-c', `echo appended >> "${runRoot}/callbacks.md" && cat "${runRoot}/callbacks.md"`], {
+      expect(m![1]).toBe(ownRunDir);
+      const r = spawnSync(BIN, [projDir, 'bash', '-c', `echo appended >> "${ownRunDir}/callbacks.md" && cat "${ownRunDir}/callbacks.md"`], {
         encoding: 'utf8',
         timeout: 15000,
         env: { ...process.env, HELM_SANDBOX_WRITE_ALLOW: m![1] },
       });
       expect(r.status, `stderr: ${r.stderr}`).toBe(0);
       expect(r.stdout).toContain('appended');
-      expect(fs.readFileSync(path.join(runRoot, 'callbacks.md'), 'utf8')).toContain('appended');
+      expect(fs.readFileSync(path.join(ownRunDir, 'callbacks.md'), 'utf8')).toContain('appended');
     });
 
-    it('a sibling path OUTSIDE both the project dir and HELM_RUN_ROOT stays EPERM even with the grant active', () => {
+    it('SEND-BACK CRITICAL FIX: a write into a SIBLING run dir under the SAME shared HELM_RUN_ROOT stays EPERM — the grant never widens to the shared root', () => {
+      const envLine = makeRunRootWriteAllowEnv(ownRunDir, runRoot); // grant is for ownRunDir ONLY
+      const m = /^HELM_SANDBOX_WRITE_ALLOW='([^']*)'\s*$/.exec(envLine.trim());
+      const r = spawnSync(BIN, [projDir, 'bash', '-c', `echo FORGED >> "${siblingRunDir}/callbacks.md"`], {
+        encoding: 'utf8',
+        timeout: 15000,
+        env: { ...process.env, HELM_SANDBOX_WRITE_ALLOW: m![1] },
+      });
+      expect(r.status).not.toBe(0);
+      expect(r.stderr).toMatch(/permission denied/i);
+      expect(fs.readFileSync(path.join(siblingRunDir, 'callbacks.md'), 'utf8')).toBe('genuine sibling-run callback\n');
+    });
+
+    it('a path fully OUTSIDE HELM_RUN_ROOT stays EPERM even with the own-run-dir grant active', () => {
+      const envLine = makeRunRootWriteAllowEnv(ownRunDir, runRoot);
+      const m = /^HELM_SANDBOX_WRITE_ALLOW='([^']*)'\s*$/.exec(envLine.trim());
       const r = spawnSync(BIN, [projDir, 'bash', '-c', `echo pwned > "${outside}/evil.txt"`], {
         encoding: 'utf8',
         timeout: 15000,
-        env: { ...process.env, HELM_SANDBOX_WRITE_ALLOW: runRoot },
+        env: { ...process.env, HELM_SANDBOX_WRITE_ALLOW: m![1] },
       });
       expect(r.status).not.toBe(0);
       expect(r.stderr).toMatch(/permission denied/i);
       expect(fs.existsSync(path.join(outside, 'evil.txt'))).toBe(false);
     });
 
-    it('WITHOUT the grant, the same HELM_RUN_ROOT path is EPERM — proves the grant (not luck) makes the difference', () => {
-      const r = spawnSync(BIN, [projDir, 'bash', '-c', `echo pwned > "${runRoot}/no-grant.txt"`], {
+    it('WITHOUT the grant, the same own-run-dir path is EPERM — proves the grant (not luck) makes the difference', () => {
+      const r = spawnSync(BIN, [projDir, 'bash', '-c', `echo pwned > "${ownRunDir}/no-grant.txt"`], {
         encoding: 'utf8',
         timeout: 15000,
         env: process.env,
       });
       expect(r.status).not.toBe(0);
       expect(r.stderr).toMatch(/permission denied/i);
-      expect(fs.existsSync(path.join(runRoot, 'no-grant.txt'))).toBe(false);
+      expect(fs.existsSync(path.join(ownRunDir, 'no-grant.txt'))).toBe(false);
     });
   });
 });

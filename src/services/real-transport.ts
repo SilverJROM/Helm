@@ -122,9 +122,10 @@ export class RealTransport implements ITransport {
     // B-ISO1: compose (+ fail-closed validate) the OPT-IN strict read env BEFORE the createSession
     // side effect below, so a bad allowlist refuses the spawn cleanly. Absent → '' (byte-identical).
     const strictEnv = params.strictReadAllow !== undefined ? makeStrictReadProfileEnv(params.strictReadAllow) : '';
-    // B1 (R2.12/F6): opt-in extra write-fence grant for a durable HELM_RUN_ROOT outside /tmp — '' when
-    // unset (byte-identical to every existing caller).
-    const runRootWriteEnv = makeRunRootWriteAllowEnv();
+    // B1 (R2.12/F6, send-back CRITICAL fix): opt-in extra write-fence grant scoped to THIS seat's own
+    // runDir only — never the shared HELM_RUN_ROOT (that would let this seat write sibling runs'
+    // callbacks.md). '' when HELM_RUN_ROOT is unset or runDir isn't under it (byte-identical default).
+    const runRootWriteEnv = makeRunRootWriteAllowEnv(runDir);
     const fencedLaunch = `${strictEnv}${runRootWriteEnv}${envPrefix}${sandboxBin} ${fenceDir} ${launchCmd}`;
 
     // POCFIX7: for claude, pre-ensure trust in launch dir (fenceDir / project cwd) so no interactive dialog blocks boot.

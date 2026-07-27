@@ -15,7 +15,7 @@ import { loadConfig } from "../config/config.js";
 import { UsageGatewayService } from "./usage-gateway-service.js";
 import { AgentAssignmentService } from "./agent-assignment-service.js";
 import { ToolkitService } from "./toolkit-service.js";
-import { resolveHelmSandboxBin, makeWriteFencePolicy, makeStrictReadProfileEnv, makeRunRootWriteAllowEnv } from "../security/landlock-sandbox.js";
+import { resolveHelmSandboxBin, makeWriteFencePolicy, makeStrictReadProfileEnv } from "../security/landlock-sandbox.js";
 import { startGovernedDocGuard, type GovernedDocGuardHandle } from "./doc-path-guard.js";
 import { applyEnvelopeIsolation } from "./envelope-isolation.js";
 import { AuthService } from "../auth/auth-service.js";
@@ -548,10 +548,11 @@ task_id required in convention (include when known); backend warns but records i
     const { envPrefix, launchCmd } = applyEnvelopeIsolation(effective.provider, launchSpec.launch_cmd);
     // B-ISO1: strictEnv (composed fail-closed above) prefixes the sandbox bin so the kernel fence
     // itself enforces the strict read profile; '' when the opt-in is absent (byte-identical cmd).
-    // B1 (R2.12/F6): opt-in extra write-fence grant for a durable HELM_RUN_ROOT outside /tmp — '' when
-    // unset (byte-identical to every existing caller).
-    const runRootWriteEnv = makeRunRootWriteAllowEnv();
-    const fencedCmd = `${strictEnv}${runRootWriteEnv}${envPrefix}${sandboxBin} ${projectDir} ${launchCmd}`;
+    // B1 (send-back CRITICAL): phase-brain launch has no run-directory concept (it writes only to
+    // projectDir, never <run>/callbacks.md) — no HELM_RUN_ROOT write grant belongs here; that would
+    // only ever widen access to the shared root, never narrow to "its own" run. See
+    // makeRunRootWriteAllowEnv's doc comment.
+    const fencedCmd = `${strictEnv}${envPrefix}${sandboxBin} ${projectDir} ${launchCmd}`;
     // A1b: the seat CLI binary (argv[0] of the provider launch command, before envelope/sandbox). If this
     // vanished off the seat PATH (interrupted `npm i -g`), the shell/helm-sandbox prints a not-found error
     // within ms. review #2: emit a unique per-launch marker IMMEDIATELY BEFORE the fenced launch so the

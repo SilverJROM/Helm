@@ -155,25 +155,46 @@ ${readLine}
 }
 
 /**
- * B1 (R2.12/F6): compose the env prefix that grants the sandbox binary's extra WRITE-fence exception
- * for a durable HELM_RUN_ROOT outside /tmp — worker seats append to <run>/callbacks.md under the
- * fence (the Helm-native callback contract), and /tmp is the only run-root location covered by a
- * hardcoded write exception today (tools/helm-sandbox.c). Absent/empty HELM_RUN_ROOT -> '' (byte-
- * identical to every existing caller/test — the default os.tmpdir() root is already covered by /tmp).
- * SET but non-absolute -> THROWS (fail-closed; mirrors the "ABSOLUTE HELM_RUN_ROOT" contract) rather
- * than silently granting nothing while HELM_RUN_ROOT is honoured code-side (the exact false-PASS F6
- * warns about). The returned string ends with a trailing space so callers prepend it directly.
+ * B1 (R2.12/F6) — send-back CRITICAL fix (redteam): grant ONLY the calling seat's OWN run directory,
+ * never the shared HELM_RUN_ROOT itself. The original version turned bare HELM_RUN_ROOT into the
+ * grant, which — because Landlock PATH_BENEATH is recursive — let ANY fenced seat write into ANY
+ * sibling `helm-run-*` directory under that shared root, including another active run's
+ * `callbacks.md` (a forge/corruption vector on a DIFFERENT run's callback stream). A durable
+ * HELM_RUN_ROOT outside /tmp is still required (worker seats append to <run>/callbacks.md under the
+ * fence — the Helm-native callback contract — and /tmp is the only run-root location covered by a
+ * hardcoded write exception in tools/helm-sandbox.c), but the grant must be scoped to the ONE run
+ * directory this seat actually belongs to.
+ *
+ * `runDir` is the caller's own concrete run directory (e.g. RealTransport.spawn's `params.runDir`).
+ * Callers with NO run-directory concept (worker-service.ts's ad-hoc worker spawn, master-runtime-
+ * service.ts's phase-brain launch — neither ever touches a run-scoped path) must NOT call this at
+ * all; passing no `runDir` returns '' rather than falling back to granting the shared root.
+ *
+ * Absent/empty HELM_RUN_ROOT, absent runDir, or a runDir that isn't actually contained under
+ * HELM_RUN_ROOT (e.g. the default os.tmpdir()-based root, already covered by the /tmp exception) ->
+ * '' (byte-identical / no grant — never widens to the root as a fallback). A SET-but-non-absolute
+ * HELM_RUN_ROOT -> THROWS (fail-closed; mirrors the "ABSOLUTE HELM_RUN_ROOT" contract) rather than
+ * silently granting nothing while HELM_RUN_ROOT is honoured code-side elsewhere. The returned string
+ * ends with a trailing space so callers prepend it directly.
  */
-export function makeRunRootWriteAllowEnv(runRootOverride: string | undefined = process.env.HELM_RUN_ROOT): string {
-  const value = (runRootOverride || "").trim();
-  if (!value) return ""; // unset/empty -> default os.tmpdir() root, already covered by the /tmp exception
-  if (!path.isAbsolute(value)) {
-    throw new Error(`HELM_RUN_ROOT must be an absolute path (got '${value}')`);
+export function makeRunRootWriteAllowEnv(
+  runDir: string | undefined,
+  runRootOverride: string | undefined = process.env.HELM_RUN_ROOT
+): string {
+  const root = (runRootOverride || "").trim();
+  if (!root || !runDir) return ""; // no durable run root configured, or this seat has no run directory
+  if (!path.isAbsolute(root)) {
+    throw new Error(`HELM_RUN_ROOT must be an absolute path (got '${root}')`);
   }
-  if (value.includes(":")) {
-    throw new Error(`HELM_RUN_ROOT must not contain ':' (the HELM_SANDBOX_WRITE_ALLOW separator): '${value}'`);
+  if (root.includes(":")) {
+    throw new Error(`HELM_RUN_ROOT must not contain ':' (the HELM_SANDBOX_WRITE_ALLOW separator): '${root}'`);
   }
-  return `HELM_SANDBOX_WRITE_ALLOW='${value.replace(/'/g, `'\\''`)}' `;
+  const resolvedRoot = path.resolve(root);
+  const resolvedRunDir = path.resolve(runDir);
+  const rel = path.relative(resolvedRoot, resolvedRunDir);
+  const contained = resolvedRunDir !== resolvedRoot && rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
+  if (!contained) return ""; // runDir isn't under HELM_RUN_ROOT — nothing to grant here (never widen to root)
+  return `HELM_SANDBOX_WRITE_ALLOW='${resolvedRunDir.replace(/'/g, `'\\''`)}' `;
 }
 
 /**
