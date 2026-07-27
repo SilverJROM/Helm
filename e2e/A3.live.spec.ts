@@ -6,13 +6,19 @@ import Database from 'better-sqlite3';
 // A3 (R4.17 / SEAM-1) live proof on :3110 / cards2-ibrain.db via playwright.cap.config.ts only.
 // Cycle-linked planning seats appear on GET /api/cycles/:id/seats (live + historical) and as a
 // compact Planning seat list. Throwaway project only; scoped teardown (A1-RT-CRIT-1 lesson).
+//
+// A3-RT-CRIT: PROJECT_DIR is unique per run (matches PROJECT_NAME timestamp). Never use a shared
+// fixed path like …/a3-validation — afterAll rmSync would delete real data if that path were reused.
+// Teardown only removes the exact directory this test created (marker file ownership proof).
 
 const BASE = process.env.HELM_BASE_URL || 'http://127.0.0.1:3110';
 const CRED = process.env.HELM_OWNER_CRED || 'cards2-harness-563f750bebc23bba';
 const DB_PATH = process.env.HELM_DB_PATH_LIVE || '/home/agjrom/websites/Helm/data/cards2-ibrain.db';
-const PROJECT_DIR = '/home/agjrom/websites/a3-validation';
-const PROJECT_NAME = `a3-validation-${Date.now()}`;
-const BATCH_ID = `a3-live-${Date.now()}`;
+const RUN_TS = Date.now();
+const PROJECT_NAME = `a3-validation-${RUN_TS}`;
+const PROJECT_DIR = `/home/agjrom/websites/a3-validation-${RUN_TS}`;
+const OWNER_MARKER = '.a3-live-owned';
+const BATCH_ID = `a3-live-${RUN_TS}`;
 
 const HELM_TMPDIR = process.env.HELM_TMPDIR_OVERRIDE || '/tmp/helm-harness';
 function predictRunDir(projectId: number): string {
@@ -37,7 +43,19 @@ test.describe('A3 live: SEAM-1 cycle seats + Planning compact list on :3110', ()
   let runId: number | null = null;
 
   test.beforeAll(async () => {
-    fs.mkdirSync(PROJECT_DIR, { recursive: true });
+    // Fail-fast if the unique dir already exists — never clobber / mass-delete foreign content.
+    if (fs.existsSync(PROJECT_DIR)) {
+      throw new Error(
+        `A3 live refuse: PROJECT_DIR already exists (${PROJECT_DIR}). ` +
+          `Refusing to reuse or delete a path this test did not create.`
+      );
+    }
+    fs.mkdirSync(PROJECT_DIR, { recursive: false });
+    fs.writeFileSync(
+      path.join(PROJECT_DIR, OWNER_MARKER),
+      `owned-by e2e/A3.live.spec.ts ${PROJECT_NAME}\n`,
+      'utf8'
+    );
     token = await login();
 
     const projResp = await fetch(`${BASE}/api/projects`, {
@@ -96,7 +114,18 @@ test.describe('A3 live: SEAM-1 cycle seats + Planning compact list on :3110', ()
       } catch { /* best-effort */ }
     }
 
-    try { fs.rmSync(PROJECT_DIR, { recursive: true, force: true }); } catch {}
+    // Only rm the exact unique dir this test created, and only with ownership marker present.
+    // Never touch a shared fixed path (e.g. …/a3-validation without timestamp).
+    try {
+      const markerPath = path.join(PROJECT_DIR, OWNER_MARKER);
+      if (
+        PROJECT_DIR.includes(`a3-validation-${RUN_TS}`) &&
+        fs.existsSync(markerPath) &&
+        fs.readFileSync(markerPath, 'utf8').includes(PROJECT_NAME)
+      ) {
+        fs.rmSync(PROJECT_DIR, { recursive: true, force: false });
+      }
+    } catch { /* best-effort; leave orphan unique dir rather than widen blast radius */ }
   });
 
   test('cycle seats API returns live+historical; Planning seat list shows both', async ({ page }) => {
