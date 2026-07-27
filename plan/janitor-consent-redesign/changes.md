@@ -1,28 +1,30 @@
-# S03 changes — brain seats assert completion (AC24 brains)
+# S04 changes — helm_sessions.owner column (AC1)
 
 ## Root cause / objective
-S02 propagates `markIdle` only when a seat finalizes through `finalizeWorkerRuntimeRow`. Planning seats (plancore/planner partners) already do that at `planning-phase-complete`. Named `helm-ibrain-*` had **no** worker_runtimes ledger and never called markIdle at run end — D-a3 keeps the session alive for close-confirm while registry stayed `active`.
+Binary decision authority is not stored on the session registry. Without `owner`, the reconciler cannot structurally exclude human/legacy seats. S04 adds the column and threads types; S05 refuses create without owner; S07 backfills legacy rows.
 
 ## Mechanism
-1. **RETAIN** plancore/planner path: `planning-phase-service.ts` still finalizes via `finalizeWorkerRuntimeRow` at true planning-phase exit (S02 markIdle free).
-2. **S03 helper** `finalizeBrainSessionRow` in `worker-runtime-finalize.ts`: register-if-needed a `worker_runtimes` row for the named brain session, then finalize through the shared chokepoint. **Does not reap/terminate** (preserves D-a3 keep-alive). Idempotent when a terminal ledger row already exists for run+session.
-3. **Call sites** (true run terminals only — never intermediate yield / replan wait):
-   - `runEngineTail` complete/failed — after `finalizeRunWorkerRuntimes`, before D-a3 close-confirm write
-   - `transitionRunToBlocked(failure)` — after workers finalize (async ordered)
-   - `stopRun` when prior phase was **not** starting/interview/planning (executing+)
-   - `startRunDetached` `.catch` — after workers finalize, reason `detached-start-failed` (send-back AC1)
-4. Kind map documented in S03 tests (ibrain/plancore assert; discovery human-owned; workers S02; other residual).
+1. **`SessionOwner`** = `helm` | `human` | `legacy:unknown`
+2. **Two-track DDL** `SCHEMA_VERSION` 100→101:
+   - Fresh: `schema.ts` `helm_sessions.owner` with CHECK `(owner IS NULL OR owner IN (...))`
+   - Upgrade: `database.ts` v101 guarded `ALTER TABLE … ADD COLUMN` same CHECK
+3. **Types**: `RegisterOpts.owner?`, `TmuxSessionCreateOpts.owner?`, `HelmSessionRow.owner: SessionOwner | null`
+4. **UPSERT**: `owner = COALESCE(excluded.owner, helm_sessions.owner)` so recreated names never silently drop authority
+5. Existing rows may stay **null** until S07; janitor stays off
 
 ## Code changes
-- `src/services/worker-runtime-finalize.ts` — `finalizeBrainSessionRow`
-- `src/services/run-orchestrator-service.ts` — `assertImplementationBrainComplete` + 3 true-terminal call sites
-- `src/a15-worker-finalize.test.ts` — S03 cases (1)(2)
+- `src/db/schema.ts` — SCHEMA_VERSION 101 + owner column
+- `src/db/database.ts` — v101 migration
+- `src/services/session-registry-service.ts` — SessionOwner, RegisterOpts, INSERT/UPSERT
+- `src/tmux/tmux-service.ts` — TmuxSessionCreateOpts.owner
+- `src/services/session-registry-service.test.ts` — S04 synthetic suite
 
 ## Guardrails
 - `HELM_SESSION_JANITOR=0` unchanged (`.env` + `ecosystem.config.cjs`)
-- Synthetic DB only; no live tmux reaping invented on ibrain assert path
-- Deferral OFF
+- Synthetic DB only; live `data/helm.db` mtime asserted untouched in tests
+- No create-path refusal (S05); no backfill (S07)
 
 ## Test status
-`npx vitest run src/a15-worker-finalize.test.ts --poolOptions.forks.maxForks=2` → **11 passed**  
-`npx tsc --noEmit -p .` → **exit 0**
+`npx vitest run src/services/session-registry-service.test.ts --poolOptions.forks.maxForks=2` → **30 passed**  
+`npx tsc --noEmit -p .` → **exit 0**  
+Live `data/helm.db` mtime asserted untouched by S04 suite.

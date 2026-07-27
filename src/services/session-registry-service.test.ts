@@ -2,7 +2,9 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import Database from 'better-sqlite3';
 import { DatabaseService } from '../db/database.js';
+import { SCHEMA_VERSION } from '../db/schema.js';
 import { SessionRegistryService, deriveSessionKind } from './session-registry-service.js';
 import { WorkerService } from './worker-service.js';
 
@@ -100,6 +102,126 @@ describe('SL-R1/R2 SessionRegistryService', () => {
     expect(partner.project_id).toBe(42);
     expect(partner.run_id).toBe(99);
     expect(partner.kind).toBe('deliberation');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S04 / AC1 — helm_sessions.owner column, CHECK, round-trip, upsert authority preserve.
+// Synthetic DB only; HELM_SESSION_JANITOR stays 0; never touch live data/helm.db.
+// ---------------------------------------------------------------------------
+describe('S04 helm_sessions.owner (AC1)', () => {
+  let db: DatabaseService;
+  let cleanup: () => void;
+  let reg: SessionRegistryService;
+  let liveMtimeBefore: number | null;
+
+  beforeEach(() => {
+    const livePath = path.join(process.cwd(), 'data', 'helm.db');
+    liveMtimeBefore = fs.existsSync(livePath) ? fs.statSync(livePath).mtimeMs : null;
+    const t = makeTempDb();
+    db = t.db;
+    cleanup = t.cleanup;
+    reg = new SessionRegistryService(db);
+  });
+  afterEach(() => {
+    cleanup();
+    const livePath = path.join(process.cwd(), 'data', 'helm.db');
+    if (liveMtimeBefore != null && fs.existsSync(livePath)) {
+      expect(fs.statSync(livePath).mtimeMs).toBe(liveMtimeBefore);
+    }
+  });
+
+  it('fresh DB: owner column present, SCHEMA_VERSION ≥ 101, null allowed until S07', () => {
+    expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(101);
+    const ver = (db.raw.prepare('SELECT version FROM schema_version').get() as any).version;
+    expect(ver).toBe(SCHEMA_VERSION);
+    const cols = db.raw.prepare('PRAGMA table_info(helm_sessions)').all().map((c: any) => c.name);
+    expect(cols).toContain('owner');
+    reg.register('helm-w-owner-null-ok');
+    expect(reg.get('helm-w-owner-null-ok')!.owner).toBeNull();
+  });
+
+  it('owner round-trip: helm | human | legacy:unknown', () => {
+    reg.register('helm-w-owner-helm', { owner: 'helm', kind: 'worker' });
+    reg.register('helm-discovery-owner-human', { owner: 'human', kind: 'discovery' });
+    reg.register('helm-legacy-seat', { owner: 'legacy:unknown', kind: 'other' });
+    expect(reg.get('helm-w-owner-helm')!.owner).toBe('helm');
+    expect(reg.get('helm-discovery-owner-human')!.owner).toBe('human');
+    expect(reg.get('helm-legacy-seat')!.owner).toBe('legacy:unknown');
+  });
+
+  it('CHECK rejects invalid owner values', () => {
+    expect(() => {
+      db.raw.prepare(
+        `INSERT INTO helm_sessions (name, kind, owner, status) VALUES ('helm-bad-owner', 'test', 'robot', 'active')`
+      ).run();
+    }).toThrow();
+  });
+
+  it('recreated-name upsert does not silently drop authority (COALESCE owner)', () => {
+    reg.register('helm-w-cards-auth', { owner: 'helm', projectId: 1, runId: 10 });
+    expect(reg.get('helm-w-cards-auth')!.owner).toBe('helm');
+    reg.markReaped('helm-w-cards-auth', 'test-reap');
+    // Re-register same name WITHOUT owner — must preserve prior authority, not null it.
+    reg.register('helm-w-cards-auth', { projectId: 1, runId: 11 });
+    const row = reg.get('helm-w-cards-auth')!;
+    expect(row.status).toBe('active');
+    expect(row.owner).toBe('helm');
+    expect(row.ended_at).toBeNull();
+    // Explicit new owner may update authority (not silent drop — intentional set).
+    reg.register('helm-w-cards-auth', { owner: 'human' });
+    expect(reg.get('helm-w-cards-auth')!.owner).toBe('human');
+  });
+
+  it('v100→v101 synthetic fixture: adds owner column, existing rows stay null, version=SCHEMA_VERSION', () => {
+    const fixturePath = path.join(os.tmpdir(), `helm-s04-v100-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+    try {
+      const raw = new Database(fixturePath);
+      raw.exec(`
+        CREATE TABLE schema_version (version INTEGER PRIMARY KEY);
+        INSERT INTO schema_version (version) VALUES (100);
+        CREATE TABLE helm_sessions (
+          id INTEGER PRIMARY KEY,
+          name TEXT UNIQUE NOT NULL,
+          kind TEXT,
+          project_id INTEGER,
+          run_id INTEGER,
+          status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','idle','reaped')),
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          last_used_at TEXT,
+          ended_at TEXT,
+          reason TEXT
+        );
+        INSERT INTO helm_sessions (name, kind, status) VALUES ('helm-pre-s04', 'worker', 'active');
+      `);
+      raw.close();
+
+      const migrated = new DatabaseService(fixturePath);
+      const ver = (migrated.raw.prepare('SELECT version FROM schema_version').get() as any).version;
+      expect(ver).toBe(SCHEMA_VERSION);
+      const cols = migrated.raw.prepare('PRAGMA table_info(helm_sessions)').all().map((c: any) => c.name);
+      expect(cols).toContain('owner');
+      const pre = migrated.raw.prepare(`SELECT owner FROM helm_sessions WHERE name = 'helm-pre-s04'`).get() as any;
+      expect(pre.owner).toBeNull();
+      // CHECK still rejects bad values after upgrade.
+      expect(() => {
+        migrated.raw.prepare(
+          `INSERT INTO helm_sessions (name, owner, status) VALUES ('helm-bad-mig', 'robot', 'active')`
+        ).run();
+      }).toThrow();
+      // Allowed values write after upgrade.
+      migrated.raw.prepare(
+        `INSERT INTO helm_sessions (name, owner, status) VALUES ('helm-ok-mig', 'helm', 'active')`
+      ).run();
+      expect(
+        (migrated.raw.prepare(`SELECT owner FROM helm_sessions WHERE name = 'helm-ok-mig'`).get() as any).owner
+      ).toBe('helm');
+      migrated.close();
+    } finally {
+      for (const suf of ['', '-wal', '-shm']) {
+        try { fs.unlinkSync(fixturePath + suf); } catch {}
+      }
+    }
   });
 });
 

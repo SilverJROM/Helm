@@ -3299,6 +3299,21 @@ ALTER TABLE runs_new RENAME TO runs;
         }
         this.db.prepare('UPDATE schema_version SET version = 100').run();
       }
+
+      // v101 / S04 AC1: helm_sessions.owner — decision authority for reaping (helm|human|legacy:unknown).
+      // Two-track: fresh SCHEMA_SQL has the column; this upgrades live/pre-existing DBs.
+      // Nullable until S07 name/context backfill. Janitor remains off for the whole effort.
+      if (current && current.version < 101) {
+        if (hasTable('helm_sessions')) {
+          const cols = this.db.prepare('PRAGMA table_info(helm_sessions)').all() as any[];
+          if (!cols.some((c) => c.name === 'owner')) {
+            this.db.exec(
+              "ALTER TABLE helm_sessions ADD COLUMN owner TEXT CHECK(owner IS NULL OR owner IN ('helm','human','legacy:unknown'))"
+            );
+          }
+        }
+        this.db.prepare('UPDATE schema_version SET version = 101').run();
+      }
     }
   }
 

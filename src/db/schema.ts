@@ -2,7 +2,7 @@ import type Database from "better-sqlite3";
 import { assertAllRoleTiersInvariants } from "./role-tier-invariants.js";
 import { PROVIDERS } from "../config/providers.js";
 
-export const SCHEMA_VERSION = 100;
+export const SCHEMA_VERSION = 101;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -486,6 +486,8 @@ CREATE TABLE IF NOT EXISTS helm_sessions (
   kind TEXT,
   project_id INTEGER,
   run_id INTEGER,
+  -- S04 / AC1: binary decision authority (+ closed legacy sentinel). Nullable until S07 backfill.
+  owner TEXT CHECK(owner IS NULL OR owner IN ('helm','human','legacy:unknown')),
   status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','idle','reaped')),
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   last_used_at TEXT,

@@ -37,10 +37,13 @@ export type TextSubmissionState = "held" | "submitted" | "indeterminate";
 // registry keep working, and TmuxService never hard-depends on the DB.
 // A2 (R4.16): onCreate may carry projectId/runId/kind so helm_sessions rows land linked at create
 // time (planning seats via RealTransport; workers may still enrich later for late-known context).
+// S04 / AC1: owner (helm|human|legacy:unknown) threaded here; S05 makes it required + refuses create.
 export interface TmuxSessionCreateOpts {
   projectId?: number | null;
   runId?: number | null;
   kind?: string;
+  /** Decision authority. Optional until S05 pre-spawn refusal. */
+  owner?: 'helm' | 'human' | 'legacy:unknown';
 }
 
 export interface TmuxSessionRegistryHook {

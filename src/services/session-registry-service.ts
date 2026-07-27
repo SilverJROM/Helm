@@ -8,12 +8,17 @@ import type { DatabaseService } from '../db/database.js';
 
 export type HelmSessionStatus = 'active' | 'idle' | 'reaped';
 
+/** S04 / AC1: binary decision authority + closed legacy sentinel. Stored on helm_sessions.owner. */
+export type SessionOwner = 'helm' | 'human' | 'legacy:unknown';
+
 export interface HelmSessionRow {
   id: number;
   name: string;
   kind: string | null;
   project_id: number | null;
   run_id: number | null;
+  /** Null only for pre-S07 rows; new registers should pass owner. S05 refuses create without it. */
+  owner: SessionOwner | null;
   status: HelmSessionStatus;
   created_at: string;
   last_used_at: string | null;
@@ -22,6 +27,8 @@ export interface HelmSessionRow {
 }
 
 export interface RegisterOpts {
+  /** S04: threaded storage contract. S05 makes create-path required + refuse. */
+  owner?: SessionOwner;
   kind?: string;
   projectId?: number | null;
   runId?: number | null;
@@ -59,20 +66,23 @@ export class SessionRegistryService {
     const kind = opts.kind ?? deriveSessionKind(name);
     const projectId = opts.projectId ?? null;
     const runId = opts.runId ?? null;
+    const owner = opts.owner ?? null;
     // Upsert: a re-created session name resets to active + refreshes context/created_at.
+    // S04: owner uses COALESCE so recreated names never silently drop decision authority.
     this.db.prepare(`
-INSERT INTO helm_sessions (name, kind, project_id, run_id, status, created_at, last_used_at, ended_at, reason)
-VALUES (?, ?, ?, ?, 'active', datetime('now'), datetime('now'), NULL, NULL)
+INSERT INTO helm_sessions (name, kind, project_id, run_id, owner, status, created_at, last_used_at, ended_at, reason)
+VALUES (?, ?, ?, ?, ?, 'active', datetime('now'), datetime('now'), NULL, NULL)
 ON CONFLICT(name) DO UPDATE SET
   kind = COALESCE(excluded.kind, helm_sessions.kind),
   project_id = COALESCE(excluded.project_id, helm_sessions.project_id),
   run_id = COALESCE(excluded.run_id, helm_sessions.run_id),
+  owner = COALESCE(excluded.owner, helm_sessions.owner),
   status = 'active',
   created_at = datetime('now'),
   last_used_at = datetime('now'),
   ended_at = NULL,
   reason = NULL
-`).run(name, kind, projectId, runId);
+`).run(name, kind, projectId, runId, owner);
   }
 
   /**
