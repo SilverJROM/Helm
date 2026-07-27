@@ -269,10 +269,12 @@ describe.sequential('A6 R3.14 pause_after_planning gate', () => {
     expect(Number(implAttemptsRow.c)).toBeGreaterThan(0);
   });
 
-  it('A6b: recycled runs.id does not inherit a stale abort — cyclePlan still dispatches', async () => {
+  it('A6b: recycled runs.id does not inherit stale abort OR stuck queue inFlight — cyclePlan dispatches', async () => {
     // Mechanism: INTEGER PRIMARY KEY without AUTOINCREMENT reuses free rowids after DELETE.
-    // A prior stop left requestRunAbort(id) in the process-local registry; createRun must clear it
-    // so a fresh cyclePlan run is not aborted at pre-execution with zero attempts.
+    // Two process-local maps are keyed by runId and survive CASCADE delete:
+    //  1) abort registry — createRun clears (attempt=1)
+    //  2) TaskQueueService inFlight/allTasks — if stuck, getNextReady always null →
+    //     DB has pending run_tasks but drain never records attempts (attempt=3 live FAIL).
     const proj = projectSvc.createProject({ name: 'a6b-abort-recycle', directory: projDir });
     const cycle = await cycleSvc.createCycle(proj.id, 'A6b abort recycle', 'pause_after_planning');
     cycleSvc.setCyclePhase(cycle.id, 'planning');
@@ -302,8 +304,13 @@ describe.sequential('A6 R3.14 pause_after_planning gate', () => {
     // Poison a run id that SQLite will reuse after delete (max free rowid).
     const poisonId = artifacts.createRun(proj.id, 'a6b-poison', null, cycle.id);
     requestRunAbort(poisonId, 'A6 live evidence capture complete');
+    // Stick inFlight: claim a task without markComplete — the live unknown-pending-stall pattern.
+    const poisonTask = artifacts.recordTask(poisonId, 'POISON', 'stuck inFlight', 'B1');
+    queue.enqueue(poisonId, poisonTask, [], false, 'B1');
+    expect(queue.getNextReady(poisonId)).toBe(poisonTask);
+    expect(queue.getNextReady(poisonId)).toBeNull(); // strictly one-in-flight stuck
     expect(getRunAbort(poisonId)?.reason).toContain('A6 live evidence');
-    db.raw.prepare('DELETE FROM runs WHERE id = ?').run(poisonId);
+    db.raw.prepare('DELETE FROM runs WHERE id = ?').run(poisonId); // cascade tasks; queue state remains
 
     // createRun must clear the recycled id's abort (product contract).
     const implBatchId = `a6b-impl-${Date.now().toString(36)}`;

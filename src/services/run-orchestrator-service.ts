@@ -273,6 +273,11 @@ export class RunOrchestratorService {
     const batchId = input.batchId || `r${Date.now().toString(36)}`;
     const runDir = resolveRunDir(input.projectId, batchId); // #46: single resolver
     const runId = this.deps.artifacts.createRun(input.projectId, batchId, path.join(runDir, CANONICAL_CYCLE_ARTIFACTS.northStar), input.cycleId ?? null);
+    // A6b: process-local TaskQueueService is keyed by runId. SQLite reuses free runs.id after CASCADE
+    // delete; a prior run's stuck inFlight / failedTasks / allTasks then makes getNextReady() return
+    // null forever → DB has pending run_tasks but drainDispatch immediately pending-after-drain stalls
+    // (live A6b: "implementation queue never dispatched after approve"). Wipe queue state for this id.
+    try { this.deps.queue.clearRun(runId); } catch { /* never block start */ }
     try { this.deps.artifacts['db'].raw.prepare("UPDATE runs SET phase = 'starting' WHERE id = ?").run(runId); } catch {}
     // CC-CHAT-2 R3: persist the run-starting prompt as an owner bubble in the project chat
     // transcript (this is the choke point every run start passes through). Must never block/fail
@@ -415,9 +420,12 @@ export class RunOrchestratorService {
 
     // A6b belt-and-braces: createRun already clearRunAborts the new id, but a caller that reuses a
     // precreatedRunId after an external stop (or a recycled-id race before createRun was fixed)
-    // must not inherit a stale abort at pre-execution / task-boundary.
+    // must not inherit a stale abort at pre-execution / task-boundary. Same for process-local queue
+    // state (stuck inFlight → getNextReady always null → unknown-pending-stall with zero attempts).
     if (input.precreatedRunId != null && Number.isFinite(Number(input.precreatedRunId))) {
-      clearRunAbort(Number(input.precreatedRunId));
+      const rid = Number(input.precreatedRunId);
+      clearRunAbort(rid);
+      try { this.deps.queue.clearRun(rid); } catch { /* never block start */ }
     }
 
     // B-ISO1 (sol wiring review fix #4): resolve the RUN-SCOPED strict read policy ONCE, at run start,
@@ -1542,6 +1550,8 @@ export class RunOrchestratorService {
     const stopReason = (reason && String(reason).trim()) || 'operator stop via POST /api/runs/:id/stop';
     const { requestRunAbort } = await import('./run-abort-registry.js');
     requestRunAbort(runId, stopReason);
+    // Drop process-local queue claim so a later recycled runId does not inherit stuck inFlight.
+    try { this.deps.queue.clearRun(runId); } catch { /* stop must not fail on bookkeeping */ }
     db.prepare(`UPDATE runs SET phase = 'failed', status = 'failed', ended_at = datetime('now') WHERE id = ? AND phase NOT IN ('complete','failed','blocked')`).run(runId);
     try {
       this.deps.events?.recordEvent({
@@ -1740,6 +1750,8 @@ export class RunOrchestratorService {
     // The complete canonical set was materialized from the cycle workspace before this seed runs.
     const nsPath = path.join(runDir, CANONICAL_CYCLE_ARTIFACTS.northStar);
     const rid = precreatedRunId ?? this.deps.artifacts.createRun(projectId, batchId, nsPath, cycleId);
+    // Fresh ingest must not see leftover inFlight/failedTasks from a prior occupant of this runId.
+    try { this.deps.queue.clearRun(rid); } catch { /* never block seed */ }
     await this.deps.parser.ingestExecutionPlan(rid, md, this.deps.queue, runDir);
     console.error(`[cycle-plan] cycle ${cycleId}: ingested plan.md into run ${rid} — implementation-only (no interview/planning)`);
     return rid;
