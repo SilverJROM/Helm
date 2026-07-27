@@ -594,6 +594,57 @@ describe('planning-phase-service (B9 PLN1) + gate + auto pick', () => {
       const res = await p;
       expect(res.agreed).toBe(true);
     });
+
+    // send-back (attempt=2, redteam HIGH): runDir is deterministic per (projectId, batchId) and
+    // callbacks.md is never truncated between attempts, so a restart/rerun reusing the SAME batchId
+    // (not a different one — R1.5 already closes the foreign-batch case) can leave an OLD VERDICT-READY
+    // CLEAN for the same `${batchId}-partner` sitting in the file. Without a generation fence, a fresh
+    // PLAN-READY on the second attempt would pair with that stale CLEAN and pass the gate without the
+    // partner ever having reviewed THIS attempt's plan.
+    it('send-back: a same-batch CLEAN verdict from a PRIOR attempt (restart/rerun reusing the batchId) does not satisfy a later attempt', async () => {
+      const reusedBatchId = 'batch-A9-restart-reuse';
+      const cbp = path.join(runDir, 'callbacks.md');
+      const plan1 = {
+        tasks: [{ task_key: 'RS-1', atomic_work: 'first attempt', complexity: 'low', recommended_model: 'claude-sonnet', effort: 'low', needs_more_info: false, task_type: 'feature', validation_criteria: 'n/a', deps: [] }],
+        meta: { source: 'a9-restart-1' }
+      };
+
+      // Attempt 1: genuinely agrees (proves the fixture/fence works normally, not just fails-safe).
+      const p1 = phase.runPlanningPhase({
+        runDir,
+        batchId: reusedBatchId,
+        northStar: 'Add a small utility function to format dates.',
+        conversationLog: 'clear scope',
+        mode: 'planner',
+      });
+      await fs.writeFile(path.join(runDir, 'plan.json'), JSON.stringify(plan1, null, 2), 'utf8');
+      await fs.appendFile(cbp, `[helm callback] plancore ${reusedBatchId} STATUS: PLAN-READY — attempt 1\n`);
+      await fs.appendFile(cbp, `[helm callback] planner ${reusedBatchId}-partner STATUS: VERDICT-READY — CLEAN: attempt 1 agreed\n`);
+      const res1 = await p1;
+      expect(res1.agreed).toBe(true);
+
+      // Attempt 2: a restart/rerun that reuses the EXACT SAME batchId (same runDir, same callbacks.md —
+      // never truncated). NO new partner line is written this time — the old CLEAN from attempt 1 is
+      // still sitting in the file for the identical `${reusedBatchId}-partner` namespace. A fresh
+      // PLAN-READY alone (from THIS attempt) must not pair with that stale verdict and pass.
+      const origPlanTo = process.env.HELM_PLANNING_TIMEOUT_MS;
+      process.env.HELM_PLANNING_TIMEOUT_MS = '200'; // short + deterministic: prove it never resolves true
+      try {
+        const p2 = phase.runPlanningPhase({
+          runDir,
+          batchId: reusedBatchId,
+          northStar: 'Add a small utility function to format dates.',
+          conversationLog: 'clear scope',
+          mode: 'planner',
+        });
+        await fs.appendFile(cbp, `[helm callback] plancore ${reusedBatchId} STATUS: PLAN-READY — attempt 2 (fresh)\n`);
+        const res2 = await p2;
+        expect(res2.agreed).toBe(false);
+        expect(res2.createdTaskIds).toEqual([]);
+      } finally {
+        if (origPlanTo === undefined) delete (process.env as any).HELM_PLANNING_TIMEOUT_MS; else process.env.HELM_PLANNING_TIMEOUT_MS = origPlanTo;
+      }
+    });
   });
 
   // A9 (N11): parseConsensusRule — pure unit coverage, direct import (no phase/transport needed).
