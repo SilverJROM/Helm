@@ -2,7 +2,7 @@
 
 **Target:** `http://127.0.0.1:3110` · **DB:** cards2-ibrain.db (live) / `/tmp/helm-test-*` (unit)  
 **No product invention.** Failures reopen owning row.  
-**Date:** 2026-07-27 · **Capstone commit:** (see DONE)
+**Date:** 2026-07-27 · **Capstone commit:** `fda4e47`
 
 ## Commands
 
