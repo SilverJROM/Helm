@@ -815,6 +815,8 @@ function App() {
   const [ccPlanWatchLiveOpen, setCcPlanWatchLiveOpen] = useState(false);
   // A3 (R4.17): cycleId -> { seats: [...] } | 'absent' | undefined(loading)
   const [ccPlanSeats, setCcPlanSeats] = useState({});
+  // A4 (R4.18): cycleId -> { hasRun, runId?, events: [...] } | 'absent' | undefined(loading)
+  const [ccPlanEvents, setCcPlanEvents] = useState({});
   // B8-T04: Approve Planning gate (R-E3/F1) — busy + inline notice for approve POST outcomes.
   const [ccPlanApproving, setCcPlanApproving] = useState(false);
   const [ccPlanApproveNotice, setCcPlanApproveNotice] = useState('');
@@ -1007,6 +1009,13 @@ function App() {
     if (ccWsTab !== 'planning' || !ccWsCycleId || !token) return;
     loadCycleSeats(ccWsCycleId);
     const id = setInterval(() => { loadCycleSeats(ccWsCycleId); }, 4000);
+    return () => clearInterval(id);
+  }, [ccWsTab, ccWsCycleId, token]);
+  // A4 (R4.18): step-level event trail from run_events (not full transcripts).
+  useEffect(() => {
+    if (ccWsTab !== 'planning' || !ccWsCycleId || !token) return;
+    loadCycleEvents(ccWsCycleId);
+    const id = setInterval(() => { loadCycleEvents(ccWsCycleId); }, 4000);
     return () => clearInterval(id);
   }, [ccWsTab, ccWsCycleId, token]);
   // B11-T04: Final Tests tab data load (R-G3).
@@ -5052,6 +5061,18 @@ function App() {
       setCcPlanSeats(p => ({ ...p, [cycleId]: 'absent' }));
     }
   };
+  // A4 (R4.18): cycle-scoped step trail from run_events. No plan.md dependency. Failure → 'absent'.
+  const loadCycleEvents = async (cycleId) => {
+    if (!cycleId || !token) return;
+    try {
+      const r = await authedFetch(`/api/cycles/${cycleId}/events`, { allowStatuses: [404] });
+      if (!r.ok) { setCcPlanEvents(p => ({ ...p, [cycleId]: 'absent' })); return; }
+      const d = await r.json();
+      setCcPlanEvents(p => ({ ...p, [cycleId]: d }));
+    } catch (e) {
+      setCcPlanEvents(p => ({ ...p, [cycleId]: 'absent' }));
+    }
+  };
   // LV-R3: fetch a role's live terminal pane (server-derives the running worker). Failure keeps the
   // last snapshot (no crash, no flicker to empty); empty text / null session → placeholder in render.
   const loadTaskTerminal = async (cycleId, role) => {
@@ -5635,6 +5656,33 @@ function App() {
         </div>`;
       };
 
+      // A4 (R4.18): compact step-level event trail from run_events — "what happened at 1, 2, 3".
+      // Explicitly not full transcripts. Independent of plan.md presence.
+      const eventsPayload = ccPlanEvents[cycleId];
+      const eventsList = (eventsPayload && eventsPayload !== 'absent' && Array.isArray(eventsPayload.events))
+        ? eventsPayload.events : [];
+      const renderEventTrail = () => {
+        if (!eventsPayload) {
+          return html`<div class="text-sec" data-testid="ws-plan-event-trail-loading" style="font-size:11px;padding:4px 0">Loading event trail…</div>`;
+        }
+        if (eventsPayload === 'absent') {
+          return html`<div class="text-sec" data-testid="ws-plan-event-trail-empty" style="font-size:11px;padding:4px 0">No event trail for this cycle yet.</div>`;
+        }
+        if (!eventsPayload.hasRun || eventsList.length === 0) {
+          return html`<div class="text-sec" data-testid="ws-plan-event-trail-empty" style="font-size:11px;padding:4px 0">No events recorded for this run yet.</div>`;
+        }
+        return html`<ol class="cc-plan-event-trail-list" data-testid="ws-plan-event-trail" style="margin:0;padding:4px 0 8px 20px;font-size:12px;line-height:1.35">
+          ${eventsList.map((ev, idx) => html`<li key=${ev.id || idx} data-testid=${`ws-plan-event-${idx + 1}`}
+              style="margin:2px 0;padding:2px 0">
+            <span data-testid=${`ws-plan-event-type-${idx + 1}`} style="font-weight:600">${ev.type || 'event'}</span>
+            <span class="text-sec" data-testid=${`ws-plan-event-ts-${idx + 1}`} style="margin-left:8px">${ev.createdAt || '—'}</span>
+            ${ev.summary && ev.summary !== ev.type
+              ? html`<span class="text-sec" data-testid=${`ws-plan-event-summary-${idx + 1}`} style="margin-left:8px">${ev.summary}</span>`
+              : null}
+          </li>`)}
+        </ol>`;
+      };
+
       return html`<div data-testid="ws-plan-progress-wrap">
         <div class="cc-plan-progress-row" data-testid="ws-plan-progress-row">
           <div class="cc-plan-progress-line" data-testid="ws-plan-progress-line">${progressLine}</div>
@@ -5645,6 +5693,10 @@ function App() {
         <div class="cc-plan-seats-block" data-testid="ws-plan-seats-block" style="margin:4px 0 8px">
           <div class="card-title" style="margin-bottom:4px;font-size:12px">Seats</div>
           ${renderSeatsList()}
+        </div>
+        <div class="cc-plan-event-trail-block" data-testid="ws-plan-event-trail-block" style="margin:4px 0 8px">
+          <div class="card-title" style="margin-bottom:4px;font-size:12px">Event trail</div>
+          ${renderEventTrail()}
         </div>
         ${ccPlanWatchLiveOpen ? html`<div class="cc-plan-watch-live-pane" data-testid="ws-plan-watch-live-pane">
           <div class="text-sec" data-testid="ws-plan-watch-live-empty" style="font-size:11px">Live panes land in a later batch (B4). Seat roster above lists every recorded seat for this cycle.</div>

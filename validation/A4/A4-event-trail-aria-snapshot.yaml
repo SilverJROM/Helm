@@ -1,0 +1,33 @@
+- text: Event trail
+- list:
+  - listitem: CALLBACK_WAIT_RESULT2026-07-26 23:35:33role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-26 23:42:09role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-26 23:53:56role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-26 23:58:11role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: REGISTERED2026-07-27 00:00:01role=system · reason=a4-live-seed
+  - listitem: REGISTERED2026-07-27 00:00:01
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 00:00:02role=plancore · outcome=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 00:00:02
+  - listitem: TERMINAL2026-07-27 00:00:03outcome=complete · reason=a4-live
+  - listitem: TERMINAL2026-07-27 00:00:03
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 00:13:44role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 00:27:13role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 00:34:53role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 00:37:30role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 00:42:28role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 00:45:45role=plancore · outcome=callback · reason=callback · provider=grok
+  - listitem: REGISTERED2026-07-27 00:55:08role=system · reason=a4-live-seed
+  - listitem: CALLBACK_WAIT_RESULT2026-07-27 00:55:09role=plancore · outcome=callback · provider=grok
+  - listitem: TERMINAL2026-07-27 00:55:10outcome=complete · reason=a4-live
+  - listitem: REGISTERED2076-07-14 00:58:42role=system · reason=a4-live-seed
+  - listitem: CALLBACK_WAIT_RESULT2076-07-14 00:58:43role=plancore · outcome=callback · provider=grok
+  - listitem: TERMINAL2076-07-14 00:58:44outcome=complete · reason=a4-live
+  - listitem: REGISTERED2099-01-01 12:00:01role=system · reason=a4-live-seed
+  - listitem: REGISTERED2099-01-01 12:00:01role=system · reason=a4-live-seed
+  - listitem: CALLBACK_WAIT_RESULT2099-01-01 12:00:02role=plancore · outcome=callback · provider=grok
+  - listitem: CALLBACK_WAIT_RESULT2099-01-01 12:00:02role=plancore · outcome=callback · provider=grok
+  - listitem: TERMINAL2099-01-01 12:00:03outcome=complete · reason=a4-live
+  - listitem: TERMINAL2099-01-01 12:00:03outcome=complete · reason=a4-live
+  - listitem: REGISTERED2999-06-26 00:59:02role=system · reason=a4-live-seed
+  - listitem: CALLBACK_WAIT_RESULT2999-06-26 00:59:03role=plancore · outcome=callback · provider=grok
+  - listitem: TERMINAL2999-06-26 00:59:04outcome=complete · reason=a4-live

@@ -36,6 +36,31 @@ export const PREFERRED_DEFECT_CLASSES = [
 
 export type ValidatorClassificationSource = 'declared' | 'derived' | 'protocol-defect' | 'none';
 
+/** A4 (R4.18): one-line summary from run_events payload — never a full transcript dump. */
+export function compactRunEventSummary(eventType: string, payloadJson: unknown): string {
+  let payload: Record<string, unknown> = {};
+  try {
+    if (typeof payloadJson === 'string') {
+      const parsed = JSON.parse(payloadJson || '{}');
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) payload = parsed as Record<string, unknown>;
+    } else if (payloadJson && typeof payloadJson === 'object' && !Array.isArray(payloadJson)) {
+      payload = payloadJson as Record<string, unknown>;
+    }
+  } catch {
+    payload = {};
+  }
+  // Prefer short operational keys only — never body/text/transcript/pane dumps.
+  const keys = ['role', 'outcome', 'reason', 'kind', 'provider', 'remedy', 'phase'] as const;
+  const parts: string[] = [];
+  for (const k of keys) {
+    const v = payload[k];
+    if (v == null || v === '') continue;
+    const s = String(v).replace(/\s+/g, ' ').trim().slice(0, 48);
+    if (s) parts.push(`${k}=${s}`);
+  }
+  return parts.length > 0 ? parts.join(' · ') : eventType;
+}
+
 export interface NormalizedValidatorVerdict {
   state: 'PASS' | 'FAIL' | 'BLOCKED';
   defectClass: string | null;
@@ -471,6 +496,50 @@ export class RunArtifactService {
     });
 
     return { hasRun: true, runId: Number(run.id), runActive, tasks };
+  }
+
+  /**
+   * A4 (R4.18): step-level event trail for a cycle's latest run — surfacing only.
+   * Substrate is run_events + recordRunEvent; this is the read path.
+   * Compact type + timestamp + short summary — NOT full transcripts / raw payload dumps.
+   * No plan.md or filesystem dependency.
+   */
+  listCycleRunEvents(cycleId: number): {
+    hasRun: boolean;
+    runId?: number;
+    events: Array<{
+      id: number;
+      runId: string;
+      batchId: string | null;
+      type: string;
+      createdAt: string;
+      summary: string;
+    }>;
+  } {
+    const run: any = this.db.raw
+      .prepare('SELECT id, status, phase FROM runs WHERE cycle_id = ? ORDER BY id DESC LIMIT 1')
+      .get(cycleId);
+    if (!run) return { hasRun: false, events: [] };
+
+    const rows = this.db.raw
+      .prepare(
+        `SELECT id, run_id, batch_id, event_type, payload_json, created_at
+         FROM run_events
+         WHERE run_id = ?
+         ORDER BY created_at ASC, id ASC`
+      )
+      .all(String(run.id)) as any[];
+
+    const events = rows.map((r) => ({
+      id: Number(r.id),
+      runId: String(r.run_id),
+      batchId: r.batch_id != null ? String(r.batch_id) : null,
+      type: String(r.event_type),
+      createdAt: String(r.created_at),
+      summary: compactRunEventSummary(String(r.event_type), r.payload_json)
+    }));
+
+    return { hasRun: true, runId: Number(run.id), events };
   }
 
   // B10 DSP9/10: read the canonical req-matrix.md for final validation gate (every row must be VERIFIED)

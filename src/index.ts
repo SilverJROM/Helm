@@ -1704,6 +1704,16 @@ async function main(): Promise<void> {
     return runArtifactService.getCycleRunState(id);
   });
 
+  // A4 (R4.18): step-level event trail from run_events — compact type+timestamp list, not transcripts.
+  // Server-derives latest run from cycle_id (same guard as run-state/seats). No plan.md dependency.
+  app.get('/api/cycles/:id/events', { preHandler: [authMiddleware, requireOwnerPre] }, async (request: any, reply: any) => {
+    const id = Number(request.params.id);
+    if (!Number.isInteger(id) || id <= 0) return reply.code(400).send({ error: 'invalid cycle id' });
+    const cycle: any = db.prepare('SELECT id FROM cycles WHERE id = ?').get(id);
+    if (!cycle) return reply.code(404).send({ error: 'unknown cycle' });
+    return runArtifactService.listCycleRunEvents(id);
+  });
+
   // LV-R2: GET /api/cycles/:id/task-terminal?role=implementer|validator — live pane of the cycle's
   // CURRENTLY-RUNNING worker for that role. PATH-SAFE + server-derived (mirrors B13-T01b's guard):
   // never accepts a client-supplied session/path — derives run + session purely from the cycle id +
