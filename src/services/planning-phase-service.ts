@@ -85,9 +85,15 @@ export function detectTaskReconveneConflicts(
       conflicts.push({ taskKey, plancoreVerdict: pc.verdict, partnerVerdict: pt.verdict, reason: 'ESCALATE' });
       continue;
     }
-    if (pc.verdict === 'ACCEPT' && pt.verdict === 'ACCEPT') continue;
-    if (pc.verdict === pt.verdict && pc.note.trim() === pt.note.trim()) continue; // identical AMEND — agreed, no conflict
-    conflicts.push({ taskKey, plancoreVerdict: pc.verdict, partnerVerdict: pt.verdict, reason: 'CONFLICTING-AMEND' });
+    // A13 send-back (attempt=2, redteam HIGH): CONFLICTING-AMEND requires BOTH seats to actually
+    // propose AMEND — a unilateral AMEND against an (implicit or explicit) ACCEPT is not a conflict
+    // per the locked contract ("never on a task both seats accept... convene only on ESCALATE or a
+    // conflicting AMEND"). The prior fallthrough treated ANY non-identical pair as CONFLICTING-AMEND,
+    // which incorrectly reconvened on AMEND-vs-ACCEPT. Only two AMENDs with differing notes conflict;
+    // identical AMEND (already handled above) and every other combination proceed with no reconvene.
+    if (pc.verdict === 'AMEND' && pt.verdict === 'AMEND' && pc.note.trim() !== pt.note.trim()) {
+      conflicts.push({ taskKey, plancoreVerdict: pc.verdict, partnerVerdict: pt.verdict, reason: 'CONFLICTING-AMEND' });
+    }
   }
   return conflicts;
 }
