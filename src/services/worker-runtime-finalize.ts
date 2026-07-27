@@ -126,6 +126,88 @@ export async function finalizeRunWorkerRuntimes(
 }
 
 /**
+ * S03 — assert completion for a named brain session that may not already have a
+ * worker_runtimes row (ibrain/master path). Register-if-needed, then finalize via the
+ * shared chokepoint so S02 markIdle propagates.
+ *
+ * Does NOT reap/terminate tmux — preserves D-a3 keep-alive / close-confirm.
+ * Call only at true run/phase terminals, never intermediate yields.
+ */
+export function finalizeBrainSessionRow(
+  db: FinalizeDb,
+  opts: {
+    projectId: number;
+    runId: number;
+    session: string;
+    reason: string;
+    role?: string;
+    state?: WorkerTerminalState;
+    provider?: string;
+    model?: string;
+  }
+): boolean {
+  const session = String(opts.session ?? '').trim();
+  if (!session) return false;
+  if (opts.projectId == null || !Number.isFinite(Number(opts.projectId))) return false;
+  if (opts.runId == null || !Number.isFinite(Number(opts.runId))) return false;
+
+  const role = (opts.role && String(opts.role).trim()) || 'ibrain';
+  const state: WorkerTerminalState = opts.state ?? 'done';
+  const reason = opts.reason || 'brain-phase-complete';
+  const provider = opts.provider || 'unknown';
+  const model = opts.model || 'unknown';
+
+  try {
+    // Prefer an existing non-terminal ledger row for this run+session.
+    const existing = db
+      .prepare(
+        `SELECT id FROM worker_runtimes
+         WHERE run_id = ? AND session = ? AND state NOT IN ('done','failed','reaped')
+         ORDER BY id DESC LIMIT 1`
+      )
+      .get(opts.runId, session) as { id?: number } | undefined;
+
+    let id = existing?.id != null ? Number(existing.id) : null;
+
+    // Already terminal for this run+session → idempotent no-op (do not insert a second ledger row).
+    if (id == null || !Number.isFinite(id)) {
+      const prior = db
+        .prepare(
+          `SELECT id FROM worker_runtimes
+           WHERE run_id = ? AND session = ? AND state IN ('done','failed','reaped')
+           ORDER BY id DESC LIMIT 1`
+        )
+        .get(opts.runId, session) as { id?: number } | undefined;
+      if (prior?.id != null) return false;
+    }
+
+    // Register-if-needed only when no ledger row exists for this run+session.
+    if (id == null || !Number.isFinite(id)) {
+      const info = db
+        .prepare(
+          `INSERT INTO worker_runtimes
+             (project_id, role, provider, model, session, correlation_id, state, spawned_by, run_id, started_at)
+           VALUES (?,?,?,?,?,?,'running','brain-phase-end',?, datetime('now'))`
+        )
+        .run(
+          opts.projectId,
+          role,
+          provider,
+          model,
+          session,
+          `brain:${role}:${opts.runId}`,
+          opts.runId
+        );
+      id = Number((info as { lastInsertRowid?: number | bigint }).lastInsertRowid);
+    }
+    if (id == null || !Number.isFinite(id)) return false;
+    return finalizeWorkerRuntimeRow(db, id, state, reason);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * A15 session-gone pass: any launching|running row whose session is missing from tmux
  * is finalized to reaped/session-gone. Returns count finalized.
  */

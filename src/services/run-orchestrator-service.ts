@@ -39,6 +39,7 @@ import {
 import type { PlannerPanelService } from './planner-panel-service.js';
 import type { PlannerPanel } from './adaptive-planning-phase.js';
 import { makeGrokAwareProviderModelAvailability } from './grok-auth-availability.js';
+import { finalizeBrainSessionRow } from './worker-runtime-finalize.js';
 
 // CYCLE-BUILDDIR: a cycle-plan run builds the deliverable in this subdir OF the cycle workspace (never the
 // workspace root — that holds north-star.md, which puts helm-sandbox in PROTECTED-ROOT mode and blocks
@@ -297,8 +298,27 @@ export class RunOrchestratorService {
       // missing deploy/final-test config) is recoverable — leave cycles.phase alone.
       if (kind === 'failure') {
         this.terminalizeCycleAtRunEnd({ runId });
-        // A15: seat ledger — finalize non-terminal worker_runtimes for this run.
-        void this.finalizeRunWorkerRuntimes(runId, 'run-blocked-failure');
+        // A15 + S03: finalize workers first, THEN assert ibrain (no race where a just-registered
+        // ibrain ledger row is picked up by finalizeRunWorkerRuntimes and reaped — D-a3 keep-alive).
+        const projId =
+          project?.id != null
+            ? Number(project.id)
+            : Number(
+                (db.prepare('SELECT project_id FROM runs WHERE id = ?').get(runId) as any)?.project_id
+              );
+        void (async () => {
+          try {
+            await this.finalizeRunWorkerRuntimes(runId, 'run-blocked-failure');
+            if (Number.isFinite(projId)) {
+              this.assertImplementationBrainComplete({
+                projectId: projId,
+                runId,
+                reason: 'run-blocked-failure',
+                state: 'failed',
+              });
+            }
+          } catch { /* best-effort terminal bookkeeping */ }
+        })();
       }
     } catch { /* terminal transition and operator alert are best-effort */ }
   }
@@ -391,6 +411,44 @@ export class RunOrchestratorService {
       });
     } catch {
       return 0;
+    }
+  }
+
+  /**
+   * S03 / AC24 brains: assert the named implementation brain (helm-ibrain-*) complete at a true
+   * run terminal only. Register-if-needed worker_runtimes + finalizeWorkerRuntimeRow → S02 markIdle.
+   * Does NOT reap/terminate — preserves D-a3 close-confirm keep-alive. Never call on intermediate yield.
+   */
+  private assertImplementationBrainComplete(opts: {
+    projectId: number;
+    runId: number;
+    session?: string | null;
+    reason: string;
+    state?: 'done' | 'failed' | 'reaped';
+    provider?: string;
+    model?: string;
+  }): void {
+    try {
+      const db = this.deps.artifacts['db'].raw;
+      let session = String(opts.session ?? '').trim();
+      if (!session) {
+        const proj: any = db.prepare('SELECT name FROM projects WHERE id = ?').get(opts.projectId);
+        if (!proj?.name) return;
+        const slug = String(proj.name).toLowerCase().replace(/[^a-z0-9]+/g, '_');
+        session = `helm-ibrain-${slug}`;
+      }
+      finalizeBrainSessionRow(db, {
+        projectId: opts.projectId,
+        runId: opts.runId,
+        session,
+        role: 'ibrain',
+        reason: opts.reason,
+        state: opts.state ?? 'done',
+        provider: opts.provider,
+        model: opts.model,
+      });
+    } catch {
+      /* best-effort bookkeeping — never block the run terminal path */
     }
   }
 
@@ -1407,6 +1465,18 @@ export class RunOrchestratorService {
     // A15: seat ledger clean on run terminal (success or task-failed).
     await this.finalizeRunWorkerRuntimes(runId, hadFailed ? 'run-failed' : 'run-complete');
 
+    // S03 / AC24: ibrain completion assertion at true run terminal ONLY.
+    // finalizeBrainSessionRow → finalizeWorkerRuntimeRow → S02 markIdle. No tmux reap (D-a3 below).
+    this.assertImplementationBrainComplete({
+      projectId,
+      runId,
+      session: implementationSessionName,
+      reason: hadFailed ? 'run-failed' : 'run-complete',
+      state: hadFailed ? 'failed' : 'done',
+      provider: implementationBrainProvider,
+      model: implementationBrainModel,
+    });
+
     // D-a3: do NOT reap on completion (was silent reap). Instead set the close-confirm state
     // (an ibrain master_runtimes row with no closed_reason yet).
     // This makes completion prompt the operator (UI banner + POST /api/projects/:id/master/close)
@@ -1698,17 +1768,27 @@ export class RunOrchestratorService {
     // session, not a worker_runtimes row — reap it too so a stopped
     // interview doesn't leave a live TUI burning tokens. (In 'executing' the normal flow already
     // reaped it at 'planning-done-yield-to-algo'.)
-    if (['starting', 'interview', 'planning'].includes(String(run.phase))) {
+    const priorPhase = String(run.phase);
+    if (['starting', 'interview', 'planning'].includes(priorPhase)) {
       try {
         const proj: any = db.prepare('SELECT name, plancore_session FROM projects WHERE id = ?').get(run.project_id);
         if (proj) {
           const pslug = (proj.name || 'proj').toLowerCase().replace(/[^a-z0-9]+/g, '_');
-          const sess = String(run.phase) === 'interview'
+          const sess = priorPhase === 'interview'
             ? `helm-discovery-${pslug}`
             : (proj.plancore_session || `helm-plancore-${pslug}`);
           await this.deps.transport.reap(`${sess}:0.0`, 'run-stopped-preexec');
         }
       } catch { /* best-effort */ }
+    } else {
+      // S03: executing (or later) stop — assert ibrain complete without inventing a reap of the
+      // named brain (D-a3 keep-alive; worker seats already finalized/reaped above).
+      this.assertImplementationBrainComplete({
+        projectId: Number(run.project_id),
+        runId,
+        reason: 'run-stopped',
+        state: 'reaped',
+      });
     }
     console.warn(`[run-orchestrator] run ${runId} STOP requested (${stopReason}); marked terminal + abort flag set (reaped ${reapedWorkers} worker rows)`);
     return { ok: true, phase: 'failed', status: 'failed', reapedWorkers };

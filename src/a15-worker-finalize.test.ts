@@ -7,11 +7,12 @@ import {
   finalizeWorkerRuntimeRow,
   finalizeSessionGoneWorkers,
   finalizeRunWorkerRuntimes,
+  finalizeBrainSessionRow,
   configureWorkerRuntimeFinalize,
 } from './services/worker-runtime-finalize.js';
 import { ProjectService } from './services/project-service.js';
 import { RunArtifactService } from './services/run-artifact-service.js';
-import { SessionRegistryService } from './services/session-registry-service.js';
+import { SessionRegistryService, deriveSessionKind } from './services/session-registry-service.js';
 
 /**
  * A15 / R4.16–R4.17 — finalize-to-reaped / truthful live.
@@ -265,5 +266,153 @@ describe.sequential('S02 finalizeWorkerRuntimeRow markIdle propagation', () => {
     const idMissing = insertRunning('helm-w-s02-never-registered');
     expect(() => finalizeWorkerRuntimeRow(db.raw, idMissing, 'done', 'reaped-DONE')).not.toThrow();
     expect(reg.get('helm-w-s02-never-registered')).toBeUndefined();
+  });
+});
+
+/**
+ * S03 — brain seat completion assertion (AC24 brains).
+ *
+ * Kind ownership map (helm_sessions.kind → assertion / scope):
+ * | kind | assertion path |
+ * | plancore | planning-phase-service planning-phase-complete → finalizeWorkerRuntimeRow (RETAIN) |
+ * | planner / deliberation (planning partners) | same planning-phase finalize (RETAIN) |
+ * | ibrain | S03 finalizeBrainSessionRow at true run terminals only |
+ * | implementer / validator / worker / red-team / panelist / coord / routine-implementer | S02 finalizeWorkerRuntimeRow |
+ * | discovery | human-owned chat — out of automatic assertion scope (S14 manual close) |
+ * | test | helm probe seats — reaped by terminate path; not a phase brain |
+ * | other (incl. retired helm-projcore / helm-pm names) | residual; no automatic brain lifecycle |
+ *
+ * Fake transports / synthetic DB only. No live tmux. HELM_SESSION_JANITOR stays 0.
+ */
+describe.sequential('S03 brain completion assertion (finalizeBrainSessionRow)', () => {
+  let db: DatabaseService;
+  let tmpDb: string;
+  let projectId: number;
+  let runId: number;
+  let projDir: string;
+  let reg: SessionRegistryService;
+
+  beforeEach(() => {
+    tmpDb = path.join(os.tmpdir(), `helm-s03-brain-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+    db = new DatabaseService(tmpDb);
+    projDir = fs.mkdtempSync(path.join(os.tmpdir(), 'helm-s03-proj-'));
+    const projects = new ProjectService(db);
+    const proj = projects.createProject({ name: 's03-brain', directory: projDir });
+    projectId = proj.id;
+    const artifacts = new RunArtifactService(db);
+    runId = artifacts.createRun(projectId, `s03-b-${Date.now()}`, path.join(projDir, 'ns.md'), null);
+    reg = new SessionRegistryService(db);
+    configureWorkerRuntimeFinalize({
+      markIdle: (name, reason) => reg.markIdle(name, reason),
+    });
+  });
+
+  afterEach(() => {
+    configureWorkerRuntimeFinalize({ markIdle: null });
+    try {
+      db.close();
+    } catch {}
+    try {
+      fs.rmSync(tmpDb, { force: true });
+    } catch {}
+    try {
+      fs.rmSync(projDir, { recursive: true, force: true });
+    } catch {}
+  });
+
+  it('(1) ibrain becomes idle only at true terminal finalizeBrainSessionRow — not before; no reap invented', () => {
+    const session = 'helm-ibrain-s03_brain';
+    reg.register(session, { projectId, runId, kind: 'ibrain' });
+    expect(reg.get(session)!.status).toBe('active');
+    expect(deriveSessionKind(session)).toBe('ibrain');
+
+    // Intermediate / pre-terminal: registry still active, no worker_runtimes row yet.
+    const mid = db.raw
+      .prepare(`SELECT COUNT(*) AS n FROM worker_runtimes WHERE session = ? AND run_id = ?`)
+      .get(session, runId) as { n: number };
+    expect(Number(mid.n)).toBe(0);
+    expect(reg.get(session)!.status).toBe('active');
+
+    // True terminal assertion (run-complete) — register-if-needed + finalizeWorkerRuntimeRow path.
+    const changed = finalizeBrainSessionRow(db.raw, {
+      projectId,
+      runId,
+      session,
+      role: 'ibrain',
+      reason: 'run-complete',
+      state: 'done',
+      provider: 'grok',
+      model: 'grok-4.5',
+    });
+    expect(changed).toBe(true);
+
+    const wr = db.raw
+      .prepare(
+        `SELECT state, exit_reason, session, role FROM worker_runtimes WHERE run_id = ? AND session = ? ORDER BY id DESC LIMIT 1`
+      )
+      .get(runId, session) as any;
+    expect(wr.state).toBe('done');
+    expect(wr.exit_reason).toBe('run-complete');
+    expect(wr.role).toBe('ibrain');
+
+    const sess = reg.get(session)!;
+    expect(sess.status).toBe('idle');
+    expect(sess.reason).toBe('run-complete');
+    // D-a3 keep-alive: idle is not reaped; session row still present without ended_at from markReaped.
+    expect(sess.ended_at).toBeNull();
+
+    // Idempotent: second terminal assert is no-op (already terminal ledger).
+    const changed2 = finalizeBrainSessionRow(db.raw, {
+      projectId,
+      runId,
+      session,
+      role: 'ibrain',
+      reason: 'run-complete',
+      state: 'done',
+    });
+    expect(changed2).toBe(false);
+    expect(reg.get(session)!.status).toBe('idle');
+  });
+
+  it('(2) plancore planning-phase finalize path still marks idle; kind map smoke; finalizeBrain does not call reap', () => {
+    // plancore RETAIN path: same finalizeWorkerRuntimeRow chokepoint used by planning-phase-service.
+    const plancoreSession = 'helm-plancore-s03_brain';
+    reg.register(plancoreSession, { projectId, runId, kind: 'plancore' });
+    const info = db.raw
+      .prepare(
+        `INSERT INTO worker_runtimes (project_id, role, provider, model, session, correlation_id, state, spawned_by, run_id, started_at)
+         VALUES (?,?,?,?,?,?,'running','planning-phase',?, datetime('now'))`
+      )
+      .run(projectId, 'plancore', 'grok', 'grok-4.5', plancoreSession, 's03-plan', runId);
+    const plancoreId = Number(info.lastInsertRowid);
+    const pcChanged = finalizeWorkerRuntimeRow(db.raw, plancoreId, 'done', 'planning-phase-complete');
+    expect(pcChanged).toBe(true);
+    expect(reg.get(plancoreSession)!.status).toBe('idle');
+    expect(reg.get(plancoreSession)!.reason).toBe('planning-phase-complete');
+    expect(deriveSessionKind(plancoreSession)).toBe('plancore');
+
+    // Kind enumeration smoke (canonical names + residual).
+    expect(deriveSessionKind('helm-ibrain-x')).toBe('ibrain');
+    expect(deriveSessionKind('helm-discovery-x')).toBe('discovery');
+    expect(deriveSessionKind('helm-w-x-1')).toBe('worker');
+    expect(deriveSessionKind('helm-projcore-x')).toBe('other'); // retired name
+    expect(deriveSessionKind('helm-batch-A1-implementer-abc')).toBe('implementer');
+    expect(deriveSessionKind('helm-batch-A1-validator-abc')).toBe('validator');
+    expect(deriveSessionKind('helm-batch-A1-planner-abc')).toBe('planner');
+
+    // finalizeBrainSessionRow is pure ledger/registry — no transport.reap side channel to invent.
+    // Prove it never needs a reap callback and leaves a live registry row as idle (not reaped).
+    const ibrain = 'helm-ibrain-s03_no_reap';
+    reg.register(ibrain, { projectId, runId, kind: 'ibrain' });
+    finalizeBrainSessionRow(db.raw, {
+      projectId,
+      runId,
+      session: ibrain,
+      reason: 'run-failed',
+      state: 'failed',
+    });
+    expect(reg.get(ibrain)!.status).toBe('idle');
+    expect(reg.get(ibrain)!.status).not.toBe('reaped');
+    expect(reg.get(ibrain)!.ended_at).toBeNull();
   });
 });

@@ -1,39 +1,27 @@
-# S02 changes — markIdle propagation at finalize chokepoint
+# S03 changes — brain seats assert completion (AC24 brains)
 
 ## Root cause / objective
-`SessionRegistryService.markIdle` had zero callers, so `helm_sessions` never became `idle` when worker/planning seats finished. S01 consolidated orchestrator terminal writes onto `finalizeWorkerRuntimeRow`, but boundary-sweep `reapLiveRunWorkers` and `WorkerService` launch-error still wrote terminal state inline — S02 markIdle-only-inside-finalizer would have missed those paths.
+S02 propagates `markIdle` only when a seat finalizes through `finalizeWorkerRuntimeRow`. Planning seats (plancore/planner partners) already do that at `planning-phase-complete`. Named `helm-ibrain-*` had **no** worker_runtimes ledger and never called markIdle at run end — D-a3 keeps the session alive for close-confirm while registry stayed `active`.
 
 ## Mechanism
-1. After a **first successful** `worker_runtimes` terminal transition (`changes===1`), call injected `markIdle(session, reason)` reusing `SessionRegistryService.markIdle` (no status SQL duplication).
-2. `configureWorkerRuntimeFinalize({ markIdle })` wired in `src/index.ts` beside existing registry hooks.
-3. Preserve markIdle no-ops: absent row, already-`reaped`, null/empty session (no throw).
-4. Prefer same-connection `db.transaction` when available (SD1); markIdle errors are swallowed so they never block the runtime write.
+1. **RETAIN** plancore/planner path: `planning-phase-service.ts` still finalizes via `finalizeWorkerRuntimeRow` at true planning-phase exit (S02 markIdle free).
+2. **S03 helper** `finalizeBrainSessionRow` in `worker-runtime-finalize.ts`: register-if-needed a `worker_runtimes` row for the named brain session, then finalize through the shared chokepoint. **Does not reap/terminate** (preserves D-a3 keep-alive). Idempotent when a terminal ledger row already exists for run+session.
+3. **Call sites** (true run terminals only — never intermediate yield / replan wait):
+   - `runEngineTail` complete/failed — after `finalizeRunWorkerRuntimes`, before D-a3 close-confirm write
+   - `transitionRunToBlocked(failure)` — after workers finalize (async ordered)
+   - `stopRun` when prior phase was **not** starting/interview/planning (executing+)
+4. Kind map documented in S03 tests (ibrain/plancore assert; discovery human-owned; workers S02; other residual).
 
 ## Code changes
-- `src/services/worker-runtime-finalize.ts`
-  - Added `configureWorkerRuntimeFinalize` / markIdle hook.
-  - On successful first transition: `SELECT session` → `markIdle(session, reason)`.
-- `src/index.ts`
-  - Wire production markIdle: `sessionRegistry.markIdle`.
-- `src/services/orchestrator-loop.ts`
-  - **MANDATORY residual:** `reapLiveRunWorkers` inline `UPDATE … reaped` → `finalizeWorkerRuntimeRow` (transport.reap still first).
-- `src/services/worker-service.ts`
-  - Launch-error catch (~247) inline `failed` write → `finalizeWorkerRuntimeRow` (session already terminated → markReaped; markIdle correctly no-ops).
-- `src/a15-worker-finalize.test.ts`
-  - S02 cases (1)–(4): idle+reason, reaped stays reaped, no-op no registry change, null/empty/absent safe.
-- `src/services/orchestrator-loop.test.ts`
-  - S02 case (5)/(5b): `reapLiveRunWorkers` uses chokepoint + registry idle/reaped-aligned.
+- `src/services/worker-runtime-finalize.ts` — `finalizeBrainSessionRow`
+- `src/services/run-orchestrator-service.ts` — `assertImplementationBrainComplete` + 3 true-terminal call sites
+- `src/a15-worker-finalize.test.ts` — S03 cases (1)(2)
 
-## Guardrails maintained
-- `HELM_SESSION_JANITOR` untouched (stays `0`).
-- Synthetic temp DB only; FakeTransport only; no live tmux reaping.
-- Deferral OFF.
-
-## Domain notes
-- `worker-service.ts` launch-error: folded for chokepoint hygiene (worker_runtimes terminal writer). Registry already `reaped` via terminate→onTerminate before finalize.
-- Planning-phase seats already call `finalizeWorkerRuntimeRow` → get markIdle for free once hook is configured.
+## Guardrails
+- `HELM_SESSION_JANITOR=0` unchanged (`.env` + `ecosystem.config.cjs`)
+- Synthetic DB only; no live tmux reaping invented on ibrain assert path
+- Deferral OFF
 
 ## Test status
-Ran: `npx vitest run src/a15-worker-finalize.test.ts src/services/orchestrator-loop.test.ts --poolOptions.forks.maxForks=2`
-
-**Result: 77 passed | 2 skipped (79)** — exit 0. Pre-existing 2 skips (C2/C3/C4 wiring). New S02 cases green: markIdle (1)–(4) in a15 + reapLiveRunWorkers (5)/(5b) in orchestrator-loop. Live `data/helm.db` mtime untouched (predates this work). `HELM_SESSION_JANITOR=0` in `.env` and `ecosystem.config.cjs`.
+`npx vitest run src/a15-worker-finalize.test.ts --poolOptions.forks.maxForks=2` → **11 passed**  
+`npx tsc --noEmit -p .` → **exit 0**
