@@ -1,0 +1,39 @@
+- text: "Project:"
+- combobox:
+  - option "— select / follows chat tab —"
+  - option "a1-validation-1785110277294" [selected]
+  - option "memory_mcp"
+  - option "imgedt"
+  - option "cards2"
+- text: ● live capture tmux mirror
+- button "Refresh"
+- text: 2 working now 0 passed / done 0 idle 0 fail / blocked Visible grid
+- group "Grid size":
+  - button "1x2"
+  - button "2x2"
+- text: Overflow tabs 2 ≤ 4 — all fit in one grid Selected 2/4 panes
+- article:
+  - text: "deliberation grok grok-4.5 ● WORKING \x1b[48;5;233m \x1b[38;5;240m/home/agjrom/websites/a1-validation\x1b[39m \x1b[38;5;254m16K / 500K\x1b[39m \x1b[48;5;235m \x1b[48;5;233m \x1b[48;5;235m \x1b[38;5;251m❯ \x1b[38;5;254mRead /tmp/helm-harness/helm-run-4-a1-live-1785110277294/\x1b[39m \x1b[38;5;242m 11:58 PM\x1b[39m \x1b[48;5;233m \x1b[48;5;235m \x1b[38;5;251m \x1b[38;5;254mprompts/deliberation.brief.md and follow its instructions.\x1b[39m \x1b[48;5;233m \x1b[48;5;235m \x1b[38;5;251m \x1b[38;5;254m(dispatch marker: DISPATCH-a1-live-1785110277294-partner- …\x1b[39m \x1b[48;5;233m \x1b[48;5;235m \x1b[48;5;233m \x1b[38;5;238m❙\x1b[39m \x1b[38;5;242m◈ \x1b[1m\x1b[38;5;243mRead 1 file\x1b[0m\x1b[48;5;233m \x1b[38;5;251mStarting with the required callback append, then reviewing the\x1b[39m \x1b[38;5;242m 11:58 PM\x1b[39m \x1b[38;5;251mplan and north-star for the deliberation verdict.\x1b[39m \x1b[38;5;65m❙\x1b[39m \x1b[38;5;65m◆\x1b[38;5;149m \x1b[1m\x1b[38;5;242mRun \x1b[0m\x1b[38;5;242m\x1b[48;5;233mAppend WORKING callback first per mandate\x1b[39m \x1b[38;5;251m⠹ Waiting for response…\x1b[38;5;242m 1.0s\x1b[39m \x1b[38;5;242m10s ⇣16.3k [stop]\x1b[39m \x1b[38;5;239m╭────────────────────────────────────────────────────────────────────────────╮\x1b[39m \x1b[38;5;239m│\x1b[38;5;254m \x1b[38;5;251m❯ \x1b[38;5;254m \x1b[38;5;239m│\x1b[39m \x1b[38;5;239m╰─────────────────────────────────────── \x1b[38;5;244mGrok 4.5 (medium)\x1b[38;5;240m · \x1b[38;5;242malways-approve\x1b[38;5;239m ─╯\x1b[39m \x1b[1m\x1b[38;5;251mShift+Tab\x1b[0m\x1b[38;5;242m\x1b[48;5;233m:mode\x1b[2m │ \x1b[0;1m\x1b[38;5;251m\x1b[48;5;233mEsc\x1b[0m\x1b[38;5;242m\x1b[48;5;233m:cancel\x1b[2m │ \x1b[0;1m\x1b[38;5;251m\x1b[48;5;233mCtrl+x\x1b[0m\x1b[38;5;242m\x1b[48;5;233m:shortcuts \x1b[39m helm-a1-live-1785110277294-partner-deliberation-ms2gksjc"
+  - button "remove"
+- article:
+  - text: "plancore grok grok-4.5 ● WORKING \x1b[48;5;233m \x1b[38;5;240m/home/agjrom/websites/a1-validation\x1b[39m \x1b[38;5;254m24K / 500K\x1b[39m \x1b[48;5;235m \x1b[48;5;233m \x1b[48;5;235m \x1b[38;5;251m❯ \x1b[38;5;254mRead /tmp/helm-harness/helm-run-4-a1-live-1785110277294/\x1b[39m \x1b[38;5;242m 11:58 PM\x1b[39m \x1b[48;5;233m \x1b[38;5;234m█ \x1b[39m \x1b[48;5;235m \x1b[38;5;251m \x1b[38;5;254mprompts/plancore.brief.md and follow its instructions.\x1b[39m \x1b[48;5;233m \x1b[38;5;234m█ \x1b[39m \x1b[48;5;235m \x1b[38;5;251m \x1b[38;5;254m(dispatch marker: DISPATCH-a1-live-1785110277294-plancore- …\x1b[39m \x1b[48;5;233m \x1b[38;5;234m█ \x1b[39m \x1b[48;5;235m \x1b[48;5;233m \x1b[38;5;234m█ \x1b[39m \x1b[38;5;234m█ \x1b[39m \x1b[38;5;234m█ \x1b[39m \x1b[38;5;251mStarting planning: first callback append, then reading north-\x1b[39m \x1b[38;5;242m 11:58 PM\x1b[39m \x1b[38;5;234m█ \x1b[39m \x1b[38;5;251mstar, conversation log, and decisions.\x1b[39m \x1b[38;5;234m█ \x1b[39m \x1b[38;5;234m█ \x1b[39m \x1b[38;5;65m❙\x1b[39m \x1b[38;5;65m◆\x1b[38;5;149m \x1b[1m\x1b[38;5;242mRun \x1b[0m\x1b[38;5;242m\x1b[48;5;233mAppend PLANNING status to callbacks.md\x1b[39m \x1b[38;5;234m█ \x1b[39m \x1b[38;5;210m┃\x1b[39m \x1b[38;5;210m◈ \x1b[1m\x1b[38;5;243mRead 9 files, Listed 6 dirs\x1b[0m\x1b[38;5;210m\x1b[48;5;233m · 1 failed\x1b[39m \x1b[38;5;234m█ \x1b[39m \x1b[38;5;65m❙\x1b[39m \x1b[38;5;65m◆\x1b[38;5;149m \x1b[1m\x1b[38;5;242mRun \x1b[0m\x1b[38;5;242m\x1b[48;5;233mExplore run and project structure\x1b[39m \x1b[38;5;234m█ \x1b[39m \x1b[38;5;242m◆ \x1b[1mThought\x1b[0m\x1b[38;5;242m\x1b[48;5;233m for 3.1s\x1b[39m \x1b[38;5;234m█ \x1b[39m \x1b[38;5;65m❙\x1b[39m \x1b[38;5;65m◆\x1b[38;5;149m \x1b[1m\x1b[38;5;242mRun \x1b[0m\x1b[38;5;242m\x1b[48;5;233mFind similar helm run artifacts for patterns\x1b[39m \x1b[38;5;234m█ \x1b[39m \x1b[38;5;242m◆ \x1b[1mThought\x1b[0m\x1b[38;5;242m\x1b[48;5;233m for 0.9s\x1b[39m \x1b[38;5;234m█ \x1b[39m \x1b[38;5;65m❙\x1b[39m \x1b[38;5;65m◆\x1b[38;5;149m \x1b[1m\x1b[38;5;242mRun \x1b[0m\x1b[38;5;242m\x1b[48;5;233mCompare a1-live run north-stars\x1b[39m \x1b[38;5;234m█ \x1b[39m \x1b[38;5;238m❙\x1b[39m \x1b[38;5;242m◈ \x1b[1m\x1b[38;5;243mRead 2 files\x1b[0m\x1b[48;5;233m \x1b[38;5;234m█ \x1b[39m \x1b[38;5;234m█ \x1b[39m \x1b[38;5;235m┃\x1b[39m \x1b[38;5;235m◆\x1b[38;5;240m \x1b[1m\x1b[38;5;242mThinking…\x1b[0m\x1b[48;5;233m \x1b[38;5;234m█ \x1b[39m \x1b[38;5;234m┃\x1b[39m \x1b[38;5;234m█ \x1b[39m \x1b[38;5;233m┃\x1b[39m \x1b[38;5;246mLet me look at successful a1-live runs that have og-requirements and\x1b[39m \x1b[38;5;234m█ \x1b[39m \x1b[38;5;233m┃\x1b[39m \x1b[38;5;246mplan.md, and also callbacks from previous attempts.\x1b[39m \x1b[38;5;234m█ \x1b[39m \x1b[38;5;234m█ \x1b[39m \x1b[38;5;251m⠸ Thinking…\x1b[38;5;242m 0.5s\x1b[39m \x1b[38;5;242m24s ⇣24.1k [stop]\x1b[39m \x1b[38;5;239m╭────────────────────────────────────────────────────────────────────────────╮\x1b[39m \x1b[38;5;239m│\x1b[38;5;254m \x1b[38;5;251m❯ \x1b[38;5;254m \x1b[38;5;239m│\x1b[39m \x1b[38;5;239m╰─────────────────────────────────────── \x1b[38;5;244mGrok 4.5 (medium)\x1b[38;5;240m · \x1b[38;5;242malways-approve\x1b[38;5;239m ─╯\x1b[39m \x1b[1m\x1b[38;5;251mShift+Tab\x1b[0m\x1b[38;5;242m\x1b[48;5;233m:mode\x1b[2m │ \x1b[0;1m\x1b[38;5;251m\x1b[48;5;233mEsc\x1b[0m\x1b[38;5;242m\x1b[48;5;233m:cancel\x1b[2m │ \x1b[0;1m\x1b[38;5;251m\x1b[48;5;233mCtrl+x\x1b[0m\x1b[38;5;242m\x1b[48;5;233m:shortcuts \x1b[39m helm-plancore-a1-validation-1785110277294"
+  - button "remove"
+- article: Empty pane 3 choose a worker from the roster →
+- article: Empty pane 4 choose a worker from the roster →
+- complementary "Worker picker":
+  - text: Workers 2 total
+  - button "Fill from active tab"
+  - button "Clear"
+  - text: deliberation · grok worker WORKING grok-4.5
+  - button "1"
+  - button "2"
+  - button "3"
+  - button "4"
+  - button "Remove from grid"
+  - text: plancore · grok worker WORKING grok-4.5
+  - button "1"
+  - button "2"
+  - button "3"
+  - button "4"
+  - button "Remove from grid"
+- text: "CC-MT: live per-worker tmux tails via /api/projects/:id/terminals/:wid (capture-pane, poll 1.5s). Grid density + roster slot placement persist per project. Degrades to idle/empty panes when no live sessions."
