@@ -411,6 +411,7 @@ export class OrchestratorLoop {
 
   // R5a: best-effort cleanup of any still-live run workers (sessions reaped via transport,
   // worker_runtimes rows transitioned) so an aborted run leaves nothing spawning/streaming.
+  // S02: route terminal writes through finalizeWorkerRuntimeRow so markIdle propagates.
   private async reapLiveRunWorkers(reason: string): Promise<void> {
     try {
       const db = (this.artifactService as any)?.['db']?.raw;
@@ -421,9 +422,7 @@ export class OrchestratorLoop {
       for (const r of rows) {
         if (r.session) { try { await this.transport.reap(`${r.session}:0.0`, reason); } catch {} }
         try {
-          db.prepare(
-            `UPDATE worker_runtimes SET state='reaped', exit_reason=?, ended_at=datetime('now') WHERE id = ?`
-          ).run(reason, r.id);
+          finalizeWorkerRuntimeRow(db, Number(r.id), 'reaped', reason);
         } catch {}
       }
     } catch { /* best-effort */ }

@@ -38,6 +38,7 @@ import { MasterRuntimeService } from "./services/master-runtime-service.js";
 import { WorkerService } from "./services/worker-service.js";
 import { HelmIdentityService, requireActiveNativeProject } from "./services/helm-identity-service.js";
 import { SessionRegistryService } from "./services/session-registry-service.js";
+import { configureWorkerRuntimeFinalize } from "./services/worker-runtime-finalize.js";
 import { UsageGatewayService } from "./services/usage-gateway-service.js";
 import { ModelService } from "./services/model-service.js";
 import { RoleTierService } from "./services/role-tier-service.js";
@@ -288,6 +289,13 @@ async function main(): Promise<void> {
       onUse: (name: string) => { try { sessionRegistry.touch(name); } catch {} }
     });
   }
+  // S02: wire markIdle into shared worker_runtimes finalizer (no SQL dup — reuses SessionRegistryService).
+  // First successful terminal transition asserts helm_sessions idle so the janitor later sees ownership truth.
+  configureWorkerRuntimeFinalize({
+    markIdle: (name, reason) => {
+      try { sessionRegistry.markIdle(name, reason); } catch {}
+    },
+  });
   const modelValidationService = new ModelValidationService(db, undefined, {}, tmuxService);
   // B2 (kloo/D3+D5): runtime discovery of kloo routes (profiles.json) + per-route live model catalog.
   const klooDiscovery = new KlooDiscoveryService();

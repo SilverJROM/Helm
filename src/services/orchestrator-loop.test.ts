@@ -2389,6 +2389,112 @@ describe('S01 finalizeWorkerRuntime chokepoint: all terminal paths use finalizeW
   });
 });
 
+/**
+ * S02 (5) — reapLiveRunWorkers residual: boundary-sweep must use finalizeWorkerRuntimeRow
+ * and leave helm_sessions consistent (idle when still active; reaped stays reaped).
+ */
+describe('S02 reapLiveRunWorkers routes through finalizeWorkerRuntimeRow + registry', () => {
+  let runDir: string;
+  let transport: FakeTransport;
+  let loop: OrchestratorLoop;
+  let dbs: DatabaseService;
+  let svc: RunArtifactService;
+  let tmpDbPath: string;
+  let projectId: number;
+  let runId: number;
+  let reg: import('./session-registry-service.js').SessionRegistryService;
+
+  beforeEach(async () => {
+    runDir = await fs.mkdtemp(path.join(os.tmpdir(), 'helm-s02-reap-'));
+    await fs.writeFile(path.join(runDir, 'callbacks.md'), '# S02 reapLiveRunWorkers\n', 'utf8');
+
+    tmpDbPath = path.join(os.tmpdir(), `helm-s02-reap-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+    dbs = new DatabaseService(tmpDbPath);
+    svc = new RunArtifactService(dbs);
+
+    const projects = new ProjectService(dbs);
+    const project = projects.createProject({
+      name: `s02-reap-${Date.now()}`,
+      directory: path.join(os.tmpdir(), 'helm-s02-reap-project'),
+    });
+    projectId = project.id;
+    runId = svc.createRun(projectId, 'batch-S02-reap');
+
+    const { SessionRegistryService } = await import('./session-registry-service.js');
+    reg = new SessionRegistryService(dbs);
+    WorkerRuntimeFinalize.configureWorkerRuntimeFinalize({
+      markIdle: (name, reason) => reg.markIdle(name, reason),
+    });
+
+    transport = new FakeTransport();
+    loop = new OrchestratorLoop(transport, {
+      runDir,
+      batchId: 'batch-S02-reap',
+      artifactService: svc,
+    });
+    (loop as any).projectId = projectId;
+    (loop as any).runId = runId;
+  });
+
+  afterEach(async () => {
+    WorkerRuntimeFinalize.configureWorkerRuntimeFinalize({ markIdle: null });
+    vi.restoreAllMocks();
+    if (runDir) await fs.rm(runDir, { recursive: true, force: true }).catch(() => {});
+    if (dbs) dbs.close();
+    if (tmpDbPath) await fs.rm(tmpDbPath).catch(() => {});
+  });
+
+  it('(5) reapLiveRunWorkers finalizes via chokepoint and marks active registry idle', async () => {
+    const session = 'helm-w-s02-boundary-sweep';
+    reg.register(session, { projectId, runId, kind: 'worker' });
+    expect(reg.get(session)!.status).toBe('active');
+
+    const info = dbs.raw
+      .prepare(
+        `INSERT INTO worker_runtimes (project_id, role, provider, model, session, correlation_id, state, spawned_by, run_id, started_at)
+         VALUES (?,?,?,?,?,?,'running','s02-test',?, datetime('now'))`
+      )
+      .run(projectId, 'implementer', 'grok', 'grok-4.5', session, 's02-reap-corr', runId);
+    const workerId = Number(info.lastInsertRowid);
+
+    const finalizeSpy = vi.spyOn(WorkerRuntimeFinalize, 'finalizeWorkerRuntimeRow');
+    await (loop as any).reapLiveRunWorkers('run-aborted');
+
+    expect(finalizeSpy).toHaveBeenCalledWith(expect.anything(), workerId, 'reaped', 'run-aborted');
+
+    const wr = dbs.raw
+      .prepare('SELECT state, exit_reason, ended_at FROM worker_runtimes WHERE id=?')
+      .get(workerId) as any;
+    expect(wr.state).toBe('reaped');
+    expect(wr.exit_reason).toBe('run-aborted');
+    expect(wr.ended_at).toBeTruthy();
+
+    // FakeTransport.reap does not markReaped — markIdle must leave registry idle for janitor.
+    const sess = reg.get(session)!;
+    expect(sess.status).toBe('idle');
+    expect(sess.reason).toBe('run-aborted');
+  });
+
+  it('(5b) reapLiveRunWorkers leaves already-reaped registry reaped', async () => {
+    const session = 'helm-w-s02-boundary-reaped';
+    reg.register(session, { projectId, runId, kind: 'worker' });
+    reg.markReaped(session, 'prior-terminate');
+
+    dbs.raw
+      .prepare(
+        `INSERT INTO worker_runtimes (project_id, role, provider, model, session, correlation_id, state, spawned_by, run_id, started_at)
+         VALUES (?,?,?,?,?,?,'running','s02-test',?, datetime('now'))`
+      )
+      .run(projectId, 'implementer', 'grok', 'grok-4.5', session, 's02-reap-corr-2', runId);
+
+    await (loop as any).reapLiveRunWorkers('run-aborted');
+
+    const sess = reg.get(session)!;
+    expect(sess.status).toBe('reaped');
+    expect(sess.reason).toBe('prior-terminate');
+  });
+});
+
 // C0: thread the kloo `route` (models.route, B1) from a bound model through to spawn, so
 // `kloo --provider <route> --model <model> --ctx <ctx>` resolves a real <route> instead of ''.
 describe('C0 (kloo route threading)', () => {

@@ -244,7 +244,8 @@ VALUES (?,?,?,?,?,?,?,?,datetime('now'), ?)
         this.governedDocGuards.delete(sessionName);
         const reason = /ready-timeout/.test(String(e)) ? 'ready-timeout'
           : /feed-failed/.test(String(e)) ? 'feed-failed' : 'launch-error';
-        try { this.db.prepare("UPDATE worker_runtimes SET state='failed', exit_reason=?, ended_at=datetime('now') WHERE id=?").run(reason, id); } catch {}
+        // S02: shared finalizer (idempotent; markIdle no-ops after terminate→markReaped above).
+        try { finalizeWorkerRuntimeRow(this.db.raw, id, 'failed', reason); } catch {}
         throw e;
       }
     } catch (e) {

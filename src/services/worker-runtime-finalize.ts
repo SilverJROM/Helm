@@ -2,6 +2,9 @@
  * A15 / R4.16–R4.17 — shared finalize writer for worker_runtimes.
  * Single choke for transitioning seats to a terminal state with non-NULL ended_at.
  * Idempotent: no-op when already done|failed|reaped.
+ *
+ * S02: on first successful terminal transition, assert helm_sessions idle via injected
+ * markIdle (SessionRegistryService.markIdle) so the janitor later sees ownership truth.
  */
 
 export type WorkerTerminalState = 'done' | 'failed' | 'reaped';
@@ -13,10 +16,45 @@ export type FinalizeDb = {
     all: (...args: any[]) => any[];
     get: (...args: any[]) => any;
   };
+  /** Optional better-sqlite3 transaction for SD1 co-commit of runtime + registry. */
+  transaction?: <T>(fn: () => T) => () => T;
 };
+
+/** Injected registry-idle assertion (reuse SessionRegistryService.markIdle — no SQL dup). */
+export type FinalizeMarkIdle = (session: string, reason?: string) => void;
+
+let markIdleHook: FinalizeMarkIdle | null = null;
+
+/**
+ * Wire production/test markIdle into the shared finalizer.
+ * Pass `{ markIdle: null }` (or omit) to clear — used by tests for isolation.
+ */
+export function configureWorkerRuntimeFinalize(opts: { markIdle?: FinalizeMarkIdle | null } = {}): void {
+  markIdleHook = opts.markIdle ?? null;
+}
+
+/** Test/introspection helper. */
+export function getWorkerRuntimeFinalizeMarkIdle(): FinalizeMarkIdle | null {
+  return markIdleHook;
+}
+
+function assertRegistryIdle(db: FinalizeDb, id: number, reason: string): void {
+  if (!markIdleHook) return;
+  try {
+    const row = db.prepare(`SELECT session FROM worker_runtimes WHERE id=?`).get(id) as
+      | { session?: string | null }
+      | undefined;
+    const session = String(row?.session ?? '').trim();
+    if (!session) return;
+    markIdleHook(session, reason);
+  } catch {
+    /* best-effort: never fail the worker_runtimes terminal write */
+  }
+}
 
 /**
  * Finalize one worker_runtimes row. Returns true if the row was transitioned.
+ * On first successful transition, propagates markIdle(session, reason) when configured.
  */
 export function finalizeWorkerRuntimeRow(
   db: FinalizeDb,
@@ -25,14 +63,27 @@ export function finalizeWorkerRuntimeRow(
   reason: string
 ): boolean {
   if (id == null || !Number.isFinite(Number(id))) return false;
-  try {
+  const exitReason = reason || 'finalized';
+
+  const apply = (): boolean => {
     const r = db
       .prepare(
         `UPDATE worker_runtimes SET state=?, exit_reason=?, ended_at=datetime('now')
          WHERE id=? AND state NOT IN ('done','failed','reaped')`
       )
-      .run(state, reason || 'finalized', id);
-    return Number(r?.changes || 0) === 1;
+      .run(state, exitReason, id);
+    const changed = Number(r?.changes || 0) === 1;
+    if (changed) {
+      assertRegistryIdle(db, id, exitReason);
+    }
+    return changed;
+  };
+
+  try {
+    if (typeof db.transaction === 'function') {
+      return db.transaction(apply)();
+    }
+    return apply();
   } catch {
     return false;
   }
