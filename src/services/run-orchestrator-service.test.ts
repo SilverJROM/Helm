@@ -124,7 +124,7 @@ describe('RunOrchestratorService (A2 wiring)', () => {
 
     // Pre-seed callbacks.md with PLAN-READY + partner so planning wait succeeds immediately (deterministic)
     const cbPath = path.join(expectedRunDir, 'callbacks.md');
-    await fs.writeFile(cbPath, `[helm callback] plancore ${fixedBatch} STATUS: PLAN-READY — plan agreed with planner; see plan.json\n[helm callback] planner ${fixedBatch}-partner STATUS: REVIEW-READY\n`, 'utf8');
+    await fs.writeFile(cbPath, `[helm callback] plancore ${fixedBatch} STATUS: PLAN-READY — plan agreed with planner; see plan.json\n[helm callback] planner ${fixedBatch}-partner STATUS: VERDICT-READY — CLEAN: agreed\n`, 'utf8');
 
     // Pre-seed task terminal callbacks for the loop drive (use seam batchId)
     // A2b: include 2 panelist CLEAN so auto red-team (now wired) after val PASS succeeds (prevents timeout on existing test)
@@ -217,7 +217,7 @@ describe('RunOrchestratorService (A2 wiring)', () => {
     await fs.writeFile(
       path.join(ingestRunDir, 'callbacks.md'),
       `[helm callback] plancore ${batchId} STATUS: PLAN-READY — plan ready
-[helm callback] planner ${batchId}-partner STATUS: AGREE — clean
+[helm callback] planner ${batchId}-partner STATUS: VERDICT-READY — CLEAN: clean
 [helm callback] implementer ${batchId} STATUS: DONE — top-rung implementation complete
 [helm callback] validator ${batchId} STATUS: PASS — top-rung task verified
 [helm callback] panelist ${batchId} STATUS: VERDICT-READY — CLEAN: top-rung result holds (seat top-start:0)
@@ -286,7 +286,7 @@ describe('RunOrchestratorService (A2 wiring)', () => {
     const plan = { tasks: [{ task_key: 'T1', atomic_work: 'hello endpoint', complexity: 'low', model: 'gpt-5.5', effort: 'low', needs_more_info: false, task_type: 'feature', validation_criteria: 'ok', deps: [] }], meta: { source: 'b-iso1' } };
     await fs.writeFile(path.join(expectedRunDir, 'plan.json'), JSON.stringify(plan), 'utf8');
     const cbPath = path.join(expectedRunDir, 'callbacks.md');
-    await fs.writeFile(cbPath, `[helm callback] plancore ${fixedBatch} STATUS: PLAN-READY — plan agreed; see plan.json\n[helm callback] planner ${fixedBatch}-partner STATUS: REVIEW-READY\n`, 'utf8');
+    await fs.writeFile(cbPath, `[helm callback] plancore ${fixedBatch} STATUS: PLAN-READY — plan agreed; see plan.json\n[helm callback] planner ${fixedBatch}-partner STATUS: VERDICT-READY — CLEAN: agreed\n`, 'utf8');
     await fs.appendFile(cbPath, `\n[helm callback] implementer ${fixedBatch} STATUS: DONE — wired\n[helm callback] validator ${fixedBatch} STATUS: PASS — verified\n[helm callback] panelist ${fixedBatch} STATUS: VERDICT-READY — CLEAN: all gates pass (seat red-a2:0)\n[helm callback] panelist ${fixedBatch} STATUS: VERDICT-READY — CLEAN: regressions hold (seat red-a2:1)\n`, 'utf8');
   }
 
@@ -551,7 +551,7 @@ describe('RunOrchestratorService (A2 wiring)', () => {
     };
     await fs.writeFile(path.join(expectedRunDir, 'plan.json'), JSON.stringify(plan, null, 2), 'utf8');
     const cbPath = path.join(expectedRunDir, 'callbacks.md');
-    await fs.writeFile(cbPath, `[helm callback] plancore ${fixedBatch} STATUS: PLAN-READY — plan agreed; see plan.json\n[helm callback] planner ${fixedBatch}-partner STATUS: REVIEW-READY\n`, 'utf8');
+    await fs.writeFile(cbPath, `[helm callback] plancore ${fixedBatch} STATUS: PLAN-READY — plan agreed; see plan.json\n[helm callback] planner ${fixedBatch}-partner STATUS: VERDICT-READY — CLEAN: agreed\n`, 'utf8');
     await fs.appendFile(cbPath, `
 [helm callback] implementer ${fixedBatch} STATUS: DONE — wired
 [helm callback] validator ${fixedBatch} STATUS: PASS — verified
@@ -614,7 +614,7 @@ describe('RunOrchestratorService (A2 wiring)', () => {
       meta: { source: 'cc-chat-2-test' }
     }, null, 2), 'utf8');
     const cbPath = path.join(expectedRunDir, 'callbacks.md');
-    await fs.writeFile(cbPath, `[helm callback] plancore ${fixedBatch} STATUS: PLAN-READY — plan agreed; see plan.json\n[helm callback] planner ${fixedBatch}-partner STATUS: REVIEW-READY\n[helm callback] implementer ${fixedBatch} STATUS: DONE — wired\n[helm callback] validator ${fixedBatch} STATUS: PASS — verified\n[helm callback] panelist ${fixedBatch} STATUS: VERDICT-READY — CLEAN: gates pass (seat r:0)\n[helm callback] panelist ${fixedBatch} STATUS: VERDICT-READY — CLEAN: regressions hold (seat r:1)\n`, 'utf8');
+    await fs.writeFile(cbPath, `[helm callback] plancore ${fixedBatch} STATUS: PLAN-READY — plan agreed; see plan.json\n[helm callback] planner ${fixedBatch}-partner STATUS: VERDICT-READY — CLEAN: agreed\n[helm callback] implementer ${fixedBatch} STATUS: DONE — wired\n[helm callback] validator ${fixedBatch} STATUS: PASS — verified\n[helm callback] panelist ${fixedBatch} STATUS: VERDICT-READY — CLEAN: gates pass (seat r:0)\n[helm callback] panelist ${fixedBatch} STATUS: VERDICT-READY — CLEAN: regressions hold (seat r:1)\n`, 'utf8');
 
     const promptText = 'Smoke: create lib/pingPong.js exporting ping() returning pong';
     const { runId } = orchWithEvents.startRunDetached({ projectId: pid, prompt: promptText, batchId: fixedBatch });
@@ -693,7 +693,7 @@ describe('RunOrchestratorService (A2 wiring)', () => {
     await fs.writeFile(path.join(expectedRunDir, 'plan.json'), JSON.stringify(plan, null, 2), 'utf8');
     await fs.appendFile(cbPath, `[helm callback] plancore ${fixedBatch} STATUS: PLAN-READY — plan agreed with planner; see plan.json\n`);
     // A8 (R1.2): every mode convenes + requires the partner's agreement signal.
-    await fs.appendFile(cbPath, `[helm callback] planner ${fixedBatch}-partner STATUS: AGREE — clean\n`);
+    await fs.appendFile(cbPath, `[helm callback] planner ${fixedBatch}-partner STATUS: VERDICT-READY — CLEAN: clean\n`);
     await fs.appendFile(cbPath, `
 [helm callback] implementer ${fixedBatch} STATUS: DONE — interview policy respected
 [helm callback] validator ${fixedBatch} STATUS: PASS — criteria met
@@ -744,7 +744,7 @@ describe('RunOrchestratorService (A2 wiring)', () => {
     };
     await fs.writeFile(path.join(expectedRunDir, 'plan.json'), JSON.stringify(plan, null, 2), 'utf8');
     const cbPath = path.join(expectedRunDir, 'callbacks.md');
-    await fs.writeFile(cbPath, `[helm callback] plancore ${fixedBatch} STATUS: PLAN-READY — plan agreed\n[helm callback] planner ${fixedBatch}-partner STATUS: REVIEW-READY\n`, 'utf8');
+    await fs.writeFile(cbPath, `[helm callback] plancore ${fixedBatch} STATUS: PLAN-READY — plan agreed\n[helm callback] planner ${fixedBatch}-partner STATUS: VERDICT-READY — CLEAN: agreed\n`, 'utf8');
 
     const runP = orch.startRun({ projectId: pid, prompt: 'test: explicit incapability flag asks brain to judge rung bump', batchId: fixedBatch });
     const waitForSpawnCount = async (role: string, count: number) => {
@@ -832,7 +832,7 @@ describe('RunOrchestratorService (A2 wiring)', () => {
     };
     await fs.writeFile(path.join(expectedRunDir, 'plan.json'), JSON.stringify(plan, null, 2), 'utf8');
     const cbPath = path.join(expectedRunDir, 'callbacks.md');
-    await fs.writeFile(cbPath, `[helm callback] plancore ${fixedBatch} STATUS: PLAN-READY — p\n[helm callback] planner ${fixedBatch}-partner STATUS: REVIEW-READY\n`, 'utf8');
+    await fs.writeFile(cbPath, `[helm callback] plancore ${fixedBatch} STATUS: PLAN-READY — p\n[helm callback] planner ${fixedBatch}-partner STATUS: VERDICT-READY — CLEAN: agreed\n`, 'utf8');
 
     const runP = orch.startRun({ 
       projectId: pid, 
@@ -885,7 +885,7 @@ describe('RunOrchestratorService (A2 wiring)', () => {
     };
     await fs.writeFile(path.join(expectedRunDir, 'plan.json'), JSON.stringify(plan, null, 2), 'utf8');
     const cbPath = path.join(expectedRunDir, 'callbacks.md');
-    await fs.writeFile(cbPath, `[helm callback] plancore ${fixedBatch} STATUS: PLAN-READY — plan agreed with planner; see plan.json\n[helm callback] planner ${fixedBatch}-partner STATUS: REVIEW-READY\n[helm callback] implementer ${fixedBatch} STATUS: DONE\n[helm callback] validator ${fixedBatch} STATUS: PASS\n`, 'utf8');
+    await fs.writeFile(cbPath, `[helm callback] plancore ${fixedBatch} STATUS: PLAN-READY — plan agreed with planner; see plan.json\n[helm callback] planner ${fixedBatch}-partner STATUS: VERDICT-READY — CLEAN: agreed\n[helm callback] implementer ${fixedBatch} STATUS: DONE\n[helm callback] validator ${fixedBatch} STATUS: PASS\n`, 'utf8');
     // panelist cbs (not red-team) to satisfy final conveneRedTeamPanel wait when no roleBindings passed (matches basic startRun test wiring; panelSvc present uses panelist seats)
     await fs.appendFile(cbPath, `
 [helm callback] panelist ${fixedBatch} STATUS: VERDICT-READY — CLEAN: all gates pass (seat poc-pocfix1:0)
@@ -932,7 +932,7 @@ describe('RunOrchestratorService (A2 wiring)', () => {
     };
     await fs.writeFile(path.join(expectedRunDir, 'plan.json'), JSON.stringify(plan, null, 2), 'utf8');
     const cbPath = path.join(expectedRunDir, 'callbacks.md');
-    await fs.writeFile(cbPath, `[helm callback] plancore ${fixedBatch} STATUS: PLAN-READY — plan agreed\n[helm callback] planner ${fixedBatch}-partner STATUS: REVIEW-READY\n[helm callback] implementer ${fixedBatch} STATUS: DONE\n[helm callback] validator ${fixedBatch} STATUS: PASS\n`, 'utf8');
+    await fs.writeFile(cbPath, `[helm callback] plancore ${fixedBatch} STATUS: PLAN-READY — plan agreed\n[helm callback] planner ${fixedBatch}-partner STATUS: VERDICT-READY — CLEAN: agreed\n[helm callback] implementer ${fixedBatch} STATUS: DONE\n[helm callback] validator ${fixedBatch} STATUS: PASS\n`, 'utf8');
 
     // explicit roleBindings (preferred path, like red-team test); planner for the auto partner
     const runId = await orch.startRun({
@@ -982,7 +982,7 @@ describe('RunOrchestratorService (A2 wiring)', () => {
     };
     await fs.writeFile(path.join(expectedRunDir, 'plan.json'), JSON.stringify(plan, null, 2), 'utf8');
     const cbPath = path.join(expectedRunDir, 'callbacks.md');
-    await fs.writeFile(cbPath, `[helm callback] plancore ${fixedBatch} STATUS: PLAN-READY — plan agreed\n[helm callback] planner ${fixedBatch}-partner STATUS: REVIEW-READY\n[helm callback] implementer ${fixedBatch} STATUS: DONE\n[helm callback] validator ${fixedBatch} STATUS: PASS\n`, 'utf8');
+    await fs.writeFile(cbPath, `[helm callback] plancore ${fixedBatch} STATUS: PLAN-READY — plan agreed\n[helm callback] planner ${fixedBatch}-partner STATUS: VERDICT-READY — CLEAN: agreed\n[helm callback] implementer ${fixedBatch} STATUS: DONE\n[helm callback] validator ${fixedBatch} STATUS: PASS\n`, 'utf8');
 
     const runId = await orch.startRun({
       projectId: pid,
@@ -1039,7 +1039,7 @@ describe('RunOrchestratorService (A2 wiring)', () => {
     };
     await fs.writeFile(path.join(expectedRunDir, 'plan.json'), JSON.stringify(plan, null, 2), 'utf8');
     const cbPath = path.join(expectedRunDir, 'callbacks.md');
-    await fs.writeFile(cbPath, `[helm callback] plancore ${fixedBatch} STATUS: PLAN-READY\n[helm callback] planner ${fixedBatch}-partner STATUS: REVIEW-READY\n[helm callback] implementer ${fixedBatch} STATUS: DONE\n[helm callback] validator ${fixedBatch} STATUS: PASS\n`, 'utf8');
+    await fs.writeFile(cbPath, `[helm callback] plancore ${fixedBatch} STATUS: PLAN-READY\n[helm callback] planner ${fixedBatch}-partner STATUS: VERDICT-READY — CLEAN: agreed\n[helm callback] implementer ${fixedBatch} STATUS: DONE\n[helm callback] validator ${fixedBatch} STATUS: PASS\n`, 'utf8');
 
     const runId = await orch.startRun({
       projectId: pid,
@@ -1299,7 +1299,7 @@ describe('RunOrchestratorService (A2 wiring)', () => {
     }, null, 2), 'utf8');
     await fs.writeFile(path.join(expectedRunDir, 'callbacks.md'), [
       `[helm callback] plancore ${fixedBatch} STATUS: PLAN-READY — plan agreed`,
-      `[helm callback] planner ${fixedBatch}-partner STATUS: REVIEW-READY`,
+      `[helm callback] planner ${fixedBatch}-partner STATUS: VERDICT-READY — CLEAN: agreed`,
       `[helm callback] implementer ${fixedBatch} STATUS: DONE — built`,
       `[helm callback] validator ${fixedBatch} STATUS: PASS — verified`,
       `[helm callback] red-team ${fixedBatch} STATUS: VERDICT-READY — CLEAN: resolver match`,
@@ -1377,7 +1377,7 @@ describe('RunOrchestratorService (A2 wiring)', () => {
     };
     await fs.writeFile(path.join(expectedRunDir, 'plan.json'), JSON.stringify(planPerTask, null, 2), 'utf8');
     const cbPath = path.join(expectedRunDir, 'callbacks.md');
-    await fs.writeFile(cbPath, `[helm callback] plancore ${fixedBatch} STATUS: PLAN-READY\n[helm callback] planner ${fixedBatch}-partner STATUS: REVIEW-READY\n[helm callback] implementer ${fixedBatch} STATUS: DONE\n[helm callback] validator ${fixedBatch} STATUS: PASS\n[helm callback] panelist ${fixedBatch} STATUS: VERDICT-READY — CLEAN\n[helm callback] panelist ${fixedBatch} STATUS: VERDICT-READY — CLEAN\n`, 'utf8');
+    await fs.writeFile(cbPath, `[helm callback] plancore ${fixedBatch} STATUS: PLAN-READY\n[helm callback] planner ${fixedBatch}-partner STATUS: VERDICT-READY — CLEAN: agreed\n[helm callback] implementer ${fixedBatch} STATUS: DONE\n[helm callback] validator ${fixedBatch} STATUS: PASS\n[helm callback] panelist ${fixedBatch} STATUS: VERDICT-READY — CLEAN\n[helm callback] panelist ${fixedBatch} STATUS: VERDICT-READY — CLEAN\n`, 'utf8');
 
     const runId1 = await orch.startRun({ projectId: pid, prompt: 'prec per-task > proj', batchId: fixedBatch });
     expect(runId1).toBeGreaterThan(0);
@@ -1399,7 +1399,7 @@ describe('RunOrchestratorService (A2 wiring)', () => {
     };
     await fs.writeFile(path.join(expectedRunDir2, 'plan.json'), JSON.stringify(planNoPer, null, 2), 'utf8');
     const cbPath2 = path.join(expectedRunDir2, 'callbacks.md');
-    await fs.writeFile(cbPath2, `[helm callback] plancore ${fixedBatch2} STATUS: PLAN-READY\n[helm callback] planner ${fixedBatch2}-partner STATUS: REVIEW-READY\n[helm callback] implementer ${fixedBatch2} STATUS: DONE\n[helm callback] validator ${fixedBatch2} STATUS: PASS\n[helm callback] panelist ${fixedBatch2} STATUS: VERDICT-READY — CLEAN\n[helm callback] panelist ${fixedBatch2} STATUS: VERDICT-READY — CLEAN\n`, 'utf8');
+    await fs.writeFile(cbPath2, `[helm callback] plancore ${fixedBatch2} STATUS: PLAN-READY\n[helm callback] planner ${fixedBatch2}-partner STATUS: VERDICT-READY — CLEAN: agreed\n[helm callback] implementer ${fixedBatch2} STATUS: DONE\n[helm callback] validator ${fixedBatch2} STATUS: PASS\n[helm callback] panelist ${fixedBatch2} STATUS: VERDICT-READY — CLEAN\n[helm callback] panelist ${fixedBatch2} STATUS: VERDICT-READY — CLEAN\n`, 'utf8');
 
     const countBefore = fakeT.spawnCalls.filter((c: any) => c.role === 'implementer').length;
     const runId2 = await orch.startRun({ projectId: pid, prompt: 'prec no per-task', batchId: fixedBatch2 });
@@ -2154,7 +2154,7 @@ describe('B1: SEAM-2 canonicalArtifactRoot for cycle-linked non-cyclePlan runs',
     const plan = { tasks: [{ task_key: 'T1', atomic_work: 'noop', complexity: 'low', model: 'gpt-5.5', effort: 'low', needs_more_info: false, task_type: 'feature', validation_criteria: 'ok', deps: [] }], meta: { source: 'b1-seam2' } };
     await fs.writeFile(path.join(expectedRunDir, 'plan.json'), JSON.stringify(plan, null, 2), 'utf8');
     const cbPath = path.join(expectedRunDir, 'callbacks.md');
-    await fs.writeFile(cbPath, `[helm callback] plancore ${fixedBatch} STATUS: PLAN-READY — plan agreed with planner; see plan.json\n[helm callback] planner ${fixedBatch}-partner STATUS: REVIEW-READY\n`, 'utf8');
+    await fs.writeFile(cbPath, `[helm callback] plancore ${fixedBatch} STATUS: PLAN-READY — plan agreed with planner; see plan.json\n[helm callback] planner ${fixedBatch}-partner STATUS: VERDICT-READY — CLEAN: agreed\n`, 'utf8');
     await fs.appendFile(cbPath, `
 [helm callback] implementer ${fixedBatch} STATUS: DONE — wired
 [helm callback] validator ${fixedBatch} STATUS: PASS — verified
@@ -2233,7 +2233,7 @@ describe('B1: SEAM-2 canonicalArtifactRoot for cycle-linked non-cyclePlan runs',
     const plan = { tasks: [{ task_key: 'T1', atomic_work: 'noop', complexity: 'low', model: 'gpt-5.5', effort: 'low', needs_more_info: false, task_type: 'feature', validation_criteria: 'ok', deps: [] }], meta: { source: 'b1-seam2-soft' } };
     await fs.writeFile(path.join(expectedRunDir, 'plan.json'), JSON.stringify(plan, null, 2), 'utf8');
     const cbPath = path.join(expectedRunDir, 'callbacks.md');
-    await fs.writeFile(cbPath, `[helm callback] plancore ${fixedBatch} STATUS: PLAN-READY — plan agreed with planner; see plan.json\n[helm callback] planner ${fixedBatch}-partner STATUS: REVIEW-READY\n`, 'utf8');
+    await fs.writeFile(cbPath, `[helm callback] plancore ${fixedBatch} STATUS: PLAN-READY — plan agreed with planner; see plan.json\n[helm callback] planner ${fixedBatch}-partner STATUS: VERDICT-READY — CLEAN: agreed\n`, 'utf8');
     await fs.appendFile(cbPath, `
 [helm callback] implementer ${fixedBatch} STATUS: DONE — wired
 [helm callback] validator ${fixedBatch} STATUS: PASS — verified

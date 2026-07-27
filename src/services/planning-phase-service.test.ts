@@ -5,7 +5,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { FakeTransport } from './fake-transport.js';
-import { PlanningPhaseService, selectCoPlannerMode } from './planning-phase-service.js';
+import { PlanningPhaseService, selectCoPlannerMode, parseConsensusRule } from './planning-phase-service.js';
 import { RunArtifactService } from './run-artifact-service.js';
 import { TaskQueueService } from './task-queue-service.js';
 import { DatabaseService } from '../db/database.js';
@@ -80,7 +80,7 @@ describe('planning-phase-service (B9 PLN1) + gate + auto pick', () => {
     await sleep(30);
     expect(await Promise.race([p.then(() => 'resolved'), sleep(50).then(() => 'pending')])).toBe('pending');
 
-    await fs.appendFile(cbp, `[helm callback] planner batch-B9-gate-partner STATUS: AGREE — plan is atomic, deps clean\n`);
+    await fs.appendFile(cbp, `[helm callback] planner batch-B9-gate-partner STATUS: VERDICT-READY — CLEAN: plan is atomic, deps clean\n`);
     await sleep(30);
 
     const res = await p;
@@ -117,7 +117,7 @@ describe('planning-phase-service (B9 PLN1) + gate + auto pick', () => {
     const cbp = path.join(runDir, 'callbacks.md');
     await fs.appendFile(cbp, `[helm callback] plancore batch-A8-two-seats STATUS: PLAN-READY — plan.json written\n`);
     await sleep(30);
-    await fs.appendFile(cbp, `[helm callback] planner batch-A8-two-seats-partner STATUS: AGREE — clean\n`);
+    await fs.appendFile(cbp, `[helm callback] planner batch-A8-two-seats-partner STATUS: VERDICT-READY — CLEAN: clean\n`);
 
     const res = await p;
     expect(res.agreed).toBe(true);
@@ -153,7 +153,7 @@ describe('planning-phase-service (B9 PLN1) + gate + auto pick', () => {
       });
       await fs.appendFile(path.join(runDir, 'callbacks.md'), '[helm callback] plancore batch-S6-canonical STATUS: PLAN-READY — canonical docs ready\n');
       // A8: 'planner' mode still convenes + requires the partner's agreement signal.
-      await fs.appendFile(path.join(runDir, 'callbacks.md'), '[helm callback] planner batch-S6-canonical-partner STATUS: AGREE — clean\n');
+      await fs.appendFile(path.join(runDir, 'callbacks.md'), '[helm callback] planner batch-S6-canonical-partner STATUS: VERDICT-READY — CLEAN: clean\n');
       const result = await pending;
 
       expect(result.northStarPath).toBe(path.join(cycleRoot, 'north-star.md'));
@@ -188,7 +188,7 @@ describe('planning-phase-service (B9 PLN1) + gate + auto pick', () => {
     const cbp = path.join(runDir, 'callbacks.md');
     await fs.appendFile(cbp, `[helm callback] plancore batch-B9-delib STATUS: PLANNING\n`);
     await sleep(20);
-    await fs.appendFile(cbp, `[helm callback] deliberation batch-B9-delib-partner STATUS: CONSENSUS — agreed after 2 rounds\n`);
+    await fs.appendFile(cbp, `[helm callback] deliberation batch-B9-delib-partner STATUS: VERDICT-READY — CLEAN: agreed after 2 rounds\n`);
     await sleep(20);
     await fs.appendFile(cbp, `[helm callback] plancore batch-B9-delib STATUS: PLAN-READY — plan agreed with deliberation\n`);
     await sleep(20);
@@ -222,7 +222,7 @@ describe('planning-phase-service (B9 PLN1) + gate + auto pick', () => {
 
     await fs.appendFile(cbp, `[helm callback] plancore batch-POCFIX3-realpath STATUS: PLANNING\n`);
     await sleep(20);
-    await fs.appendFile(cbp, `[helm callback] planner batch-POCFIX3-realpath-partner STATUS: CONSENSUS — atomic + fields good\n`);
+    await fs.appendFile(cbp, `[helm callback] planner batch-POCFIX3-realpath-partner STATUS: VERDICT-READY — CLEAN: atomic + fields good\n`);
     await sleep(20);
     await fs.appendFile(cbp, `[helm callback] plancore batch-POCFIX3-realpath STATUS: PLAN-READY — plan agreed with planner; see plan.md\n`);
     await sleep(20);
@@ -268,7 +268,7 @@ describe('planning-phase-service (B9 PLN1) + gate + auto pick', () => {
       }]), 'utf8');
       await fs.appendFile(cbp, `[helm callback] plancore batch-POCFIX8-timeout STATUS: PLANNING\n`);
       await sleep(5);
-      await fs.appendFile(cbp, `[helm callback] planner batch-POCFIX8-timeout-partner STATUS: CONSENSUS\n`);
+      await fs.appendFile(cbp, `[helm callback] planner batch-POCFIX8-timeout-partner STATUS: VERDICT-READY — CLEAN: consensus reached\n`);
       await sleep(5);
       await fs.appendFile(cbp, `[helm callback] plancore batch-POCFIX8-timeout STATUS: PLAN-READY — plan.json present\n`);
       const res = await p;
@@ -334,7 +334,7 @@ describe('planning-phase-service (B9 PLN1) + gate + auto pick', () => {
       expect(plannerSpawns.length).toBe(1);
 
       // The partner's own agreement signal is what completes the gate.
-      await fs.appendFile(cbp, `[helm callback] planner batch-A8-planner-partner-partner STATUS: AGREE — clean\n`);
+      await fs.appendFile(cbp, `[helm callback] planner batch-A8-planner-partner-partner STATUS: VERDICT-READY — CLEAN: clean\n`);
       const resPlanner = await pPlanner;
       expect(resPlanner.agreed).toBe(true);
       expect(resPlanner.coPlannerUsed).toBe('planner');
@@ -405,7 +405,7 @@ describe('planning-phase-service (B9 PLN1) + gate + auto pick', () => {
     const cbp = path.join(runDir, 'callbacks.md');
     await fs.appendFile(cbp, `[helm callback] plancore batch-A1-worker-runtimes STATUS: PLANNING\n`);
     await sleep(20);
-    await fs.appendFile(cbp, `[helm callback] deliberation batch-A1-worker-runtimes-partner STATUS: CONSENSUS — agreed after 2 rounds\n`);
+    await fs.appendFile(cbp, `[helm callback] deliberation batch-A1-worker-runtimes-partner STATUS: VERDICT-READY — CLEAN: agreed after 2 rounds\n`);
     await sleep(20);
     await fs.appendFile(cbp, `[helm callback] plancore batch-A1-worker-runtimes STATUS: PLAN-READY — plan agreed with deliberation\n`);
     await sleep(20);
@@ -460,7 +460,7 @@ describe('planning-phase-service (B9 PLN1) + gate + auto pick', () => {
     const cbp = path.join(runDir, 'callbacks.md');
     await fs.appendFile(cbp, `[helm callback] plancore batch-A2-helm-sessions STATUS: PLANNING\n`);
     await sleep(20);
-    await fs.appendFile(cbp, `[helm callback] deliberation batch-A2-helm-sessions-partner STATUS: CONSENSUS — agreed\n`);
+    await fs.appendFile(cbp, `[helm callback] deliberation batch-A2-helm-sessions-partner STATUS: VERDICT-READY — CLEAN: agreed\n`);
     await sleep(20);
     await fs.appendFile(cbp, `[helm callback] plancore batch-A2-helm-sessions STATUS: PLAN-READY — plan agreed with deliberation\n`);
     await sleep(20);
@@ -481,5 +481,144 @@ describe('planning-phase-service (B9 PLN1) + gate + auto pick', () => {
     // signals or trigger words still force deliberation
     expect(selectCoPlannerMode('Refactor entire schema + auth across modules', { isCrossCutting: true })).toBe('deliberation');
     expect(selectCoPlannerMode('Add security model with high risk')).toBe('deliberation');
+  });
+
+  // A9 (R1.4/R1.5/R1.29 scope half): rewrites waitForAgreement's partner matcher.
+  describe('A9: waitForAgreement rewrite (payload verdict, batch-scoped partner, dual-prefix)', () => {
+    it('(a) a BROKEN verdict fails the gate — no ingest, no hand-off', async () => {
+      const p = phase.runPlanningPhase({
+        runDir,
+        batchId: 'batch-A9-broken',
+        northStar: 'Add a small utility function to format dates.',
+        conversationLog: 'clear scope',
+        mode: 'planner',
+      });
+      const cbp = path.join(runDir, 'callbacks.md');
+      const plan = {
+        tasks: [{ task_key: 'BR-1', atomic_work: 'broken proof', complexity: 'low', recommended_model: 'claude-sonnet', effort: 'low', needs_more_info: false, task_type: 'feature', validation_criteria: 'n/a', deps: [] }],
+        meta: { source: 'a9-broken' }
+      };
+      await fs.writeFile(path.join(runDir, 'plan.json'), JSON.stringify(plan, null, 2), 'utf8');
+      await fs.appendFile(cbp, `[helm callback] plancore batch-A9-broken STATUS: PLAN-READY — plan.json present\n`);
+      // VERDICT-READY is the literal STATUS token for BOTH verdicts — the BROKEN payload must still
+      // fail the gate, never pass byte-identical to a CLEAN verdict.
+      await fs.appendFile(cbp, `[helm callback] planner batch-A9-broken-partner STATUS: VERDICT-READY — BROKEN: missing validation criteria for T3\n`);
+
+      const res = await p;
+      expect(res.agreed).toBe(false);
+      expect(res.createdTaskIds).toEqual([]);
+      expect(res.keyToId).toEqual({});
+    });
+
+    it('(b) a stale VERDICT-READY from a different run/batch does not satisfy — the deadlock/foreign-acceptance fix', async () => {
+      const origPlanTo = process.env.HELM_PLANNING_TIMEOUT_MS;
+      process.env.HELM_PLANNING_TIMEOUT_MS = '200'; // short + deterministic: prove the stale line never resolves it
+      try {
+        const p = phase.runPlanningPhase({
+          runDir,
+          batchId: 'batch-A9-stale',
+          northStar: 'Add a small utility function to format dates.',
+          conversationLog: 'clear scope',
+          mode: 'planner',
+        });
+        const cbp = path.join(runDir, 'callbacks.md');
+        const plan = {
+          tasks: [{ task_key: 'ST-1', atomic_work: 'stale-line proof', complexity: 'low', recommended_model: 'claude-sonnet', effort: 'low', needs_more_info: false, task_type: 'feature', validation_criteria: 'n/a', deps: [] }],
+          meta: { source: 'a9-stale' }
+        };
+        await fs.writeFile(path.join(runDir, 'plan.json'), JSON.stringify(plan, null, 2), 'utf8');
+        await fs.appendFile(cbp, `[helm callback] plancore batch-A9-stale STATUS: PLAN-READY — plan.json present\n`);
+        // A partner CLEAN verdict for a DIFFERENT batch (a previous run's own `-partner` namespace, and
+        // separately the bare, unscoped batchId a naive equality check would have required) — neither
+        // should satisfy THIS run's gate.
+        await fs.appendFile(cbp, `[helm callback] planner batch-A9-stale-OLDRUN-partner STATUS: VERDICT-READY — CLEAN: from a different run\n`);
+        await fs.appendFile(cbp, `[helm callback] planner batch-A9-stale STATUS: VERDICT-READY — CLEAN: wrong batch (bare, unscoped)\n`);
+
+        const res = await p;
+        expect(res.agreed).toBe(false);
+      } finally {
+        if (origPlanTo === undefined) delete (process.env as any).HELM_PLANNING_TIMEOUT_MS; else process.env.HELM_PLANNING_TIMEOUT_MS = origPlanTo;
+      }
+    });
+
+    it('(c) a genuine current-batch CLEAN verdict passes (anti-deadlock guard) — exactly one whole-plan gate, no per-task loop', async () => {
+      transport.spawnCalls.length = 0;
+      const p = phase.runPlanningPhase({
+        runDir,
+        batchId: 'batch-A9-clean',
+        northStar: 'Add a small utility function to format dates.',
+        conversationLog: 'clear scope',
+        mode: 'planner',
+      });
+      const cbp = path.join(runDir, 'callbacks.md');
+      const plan = {
+        tasks: [
+          { task_key: 'CL-1', atomic_work: 'task one', complexity: 'low', recommended_model: 'claude-sonnet', effort: 'low', needs_more_info: false, task_type: 'feature', validation_criteria: 'n/a', deps: [] },
+          { task_key: 'CL-2', atomic_work: 'task two', complexity: 'low', recommended_model: 'claude-sonnet', effort: 'low', needs_more_info: false, task_type: 'feature', validation_criteria: 'n/a', deps: [] },
+        ],
+        meta: { source: 'a9-clean' }
+      };
+      await fs.writeFile(path.join(runDir, 'plan.json'), JSON.stringify(plan, null, 2), 'utf8');
+      await fs.appendFile(cbp, `[helm callback] plancore batch-A9-clean STATUS: PLAN-READY — plan.json present\n`);
+      // R1.5/N3: scoped correctly to the partner's OWN batch (`${batchId}-partner`) — the anti-deadlock
+      // positive case (a naive bare-batchId check would never match this and stall to timeout).
+      await fs.appendFile(cbp, `[helm callback] planner batch-A9-clean-partner STATUS: VERDICT-READY — CLEAN: all good\n`);
+
+      const res = await p;
+      expect(res.agreed).toBe(true);
+      expect(res.createdTaskIds.length).toBe(2); // whole-plan ingest, both tasks, one gate
+
+      // Exactly one plancore spawn and one partner spawn — a single whole-plan gate, never a per-task
+      // convene loop (that reconvene behaviour does not exist in the engine yet — it's A13's row).
+      expect(transport.spawnCalls.filter((s) => s.role === 'plancore').length).toBe(1);
+      expect(transport.spawnCalls.filter((s) => s.role === 'planner').length).toBe(1);
+    });
+
+    it('N4: accepts a [projcore callback]-prefixed partner verdict, not just [helm callback]', async () => {
+      const p = phase.runPlanningPhase({
+        runDir,
+        batchId: 'batch-A9-projcore-prefix',
+        northStar: 'Add a small utility function to format dates.',
+        conversationLog: 'clear scope',
+        mode: 'planner',
+      });
+      const cbp = path.join(runDir, 'callbacks.md');
+      const plan = {
+        tasks: [{ task_key: 'PJ-1', atomic_work: 'projcore-prefix proof', complexity: 'low', recommended_model: 'claude-sonnet', effort: 'low', needs_more_info: false, task_type: 'feature', validation_criteria: 'n/a', deps: [] }],
+        meta: { source: 'a9-projcore-prefix' }
+      };
+      await fs.writeFile(path.join(runDir, 'plan.json'), JSON.stringify(plan, null, 2), 'utf8');
+      await fs.appendFile(cbp, `[projcore callback] plancore batch-A9-projcore-prefix STATUS: PLAN-READY — plan.json present\n`);
+      await fs.appendFile(cbp, `[projcore callback] planner batch-A9-projcore-prefix-partner STATUS: VERDICT-READY — CLEAN: all good\n`);
+
+      const res = await p;
+      expect(res.agreed).toBe(true);
+    });
+  });
+
+  // A9 (N11): parseConsensusRule — pure unit coverage, direct import (no phase/transport needed).
+  describe('A9: parseConsensusRule (teams.consensus_rule wiring)', () => {
+    it('sources unanimous + the round cap from the seeded deliberation-team rule; does NOT expose the settle clause', () => {
+      const parsed = parseConsensusRule('unanimous <=3 rounds; opus+codex-5.5 settle');
+      expect(parsed.unanimous).toBe(true);
+      expect(parsed.maxRounds).toBe(3);
+      // The settle-role clause is undecided and contradicts topology.yaml (N11) — it must never be
+      // extracted/exposed, only the two locked clauses.
+      expect(Object.keys(parsed).sort()).toEqual(['maxRounds', 'unanimous']);
+      expect(JSON.stringify(parsed)).not.toMatch(/settle|opus|codex/i);
+    });
+
+    it('defaults maxRounds to 3 (D7) when the clause is absent or unparseable', () => {
+      expect(parseConsensusRule('unanimous').maxRounds).toBe(3);
+      expect(parseConsensusRule('').maxRounds).toBe(3);
+      expect(parseConsensusRule(null).maxRounds).toBe(3);
+      expect(parseConsensusRule('unanimous <=7 rounds').maxRounds).toBe(7);
+    });
+
+    it('unanimous reflects only what the rule literally states', () => {
+      expect(parseConsensusRule('unanimous <=3 rounds').unanimous).toBe(true);
+      expect(parseConsensusRule('<=3 rounds; opus settle').unanimous).toBe(false);
+      expect(parseConsensusRule(null).unanimous).toBe(false);
+    });
   });
 });

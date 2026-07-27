@@ -31,6 +31,26 @@ import { finalizeWorkerRuntimeRow } from './worker-runtime-finalize.js';
 
 export type CoPlannerMode = 'auto' | 'planner' | 'deliberation';
 
+// A9 (N11): teams.consensus_rule is a free-text policy string (seed: 'unanimous <=3 rounds;
+// opus+codex-5.5 settle'). Two of its three clauses are locked policy (D1 unanimous, D7 <=3 rounds,
+// per-project configurable); the third (settle role) is undecided and contradicts topology.yaml, so it
+// is deliberately never parsed/exposed here — wiring it would install an undecided arbitration rule as
+// live behaviour. maxRounds defaults to 3 (D7's configured default) when the clause is absent or
+// unparseable; unanimous reflects only what the clause literally states (no default — an omission is
+// a real config gap the caller should see, not something to paper over).
+export interface ConsensusPolicy {
+  unanimous: boolean;
+  maxRounds: number;
+}
+
+export function parseConsensusRule(rule: string | null | undefined): ConsensusPolicy {
+  const text = (rule || '').toLowerCase();
+  const unanimous = text.includes('unanimous');
+  const roundsMatch = /<=\s*(\d+)\s*rounds?/.exec(text);
+  const maxRounds = roundsMatch ? Math.max(1, parseInt(roundsMatch[1], 10)) : 3;
+  return { unanimous, maxRounds };
+}
+
 function clampedPlanningMs(name: string, fallback: number, min: number, max: number): number {
   const raw = process.env[name];
   if (raw === undefined || raw.trim() === '') return fallback;
@@ -148,6 +168,24 @@ export class PlanningPhaseService {
     }
   }
 
+  // A9 (N11): resolve the deliberation team's consensus_rule and log it as the consensus source for
+  // this planning run — "wire it or delete it" (og-requirements §5) for the two decided clauses.
+  // Best-effort/never-throw (same bracket-idiom DB access as registerWorkerRuntime): a missing
+  // teams row or DB access failure falls back to parseConsensusRule's own defaults, it never blocks
+  // planning. Round-cap ENFORCEMENT (blocking after maxRounds) is A11's row, not this one — this only
+  // sources the policy so A11 has a config value to read instead of a constant.
+  private resolveConsensusPolicy(): ConsensusPolicy {
+    try {
+      const db = (this.artifacts as any)['db']?.raw;
+      const row = db?.prepare("SELECT consensus_rule FROM teams WHERE type = 'deliberation' LIMIT 1").get() as
+        | { consensus_rule: string | null }
+        | undefined;
+      return parseConsensusRule(row?.consensus_rule ?? null);
+    } catch {
+      return parseConsensusRule(null);
+    }
+  }
+
   private async ensureDir(sub: string, runDir: string): Promise<void> {
     await fs.mkdir(path.join(runDir, sub), { recursive: true });
   }
@@ -214,6 +252,16 @@ export class PlanningPhaseService {
     const partner = mode === 'auto'
       ? selectCoPlannerMode(effectiveNorthStar, inputs.autoSignals)
       : (mode as 'planner' | 'deliberation');
+
+    // A9 (N11): source the consensus policy from teams.consensus_rule (unanimous + round cap) rather
+    // than a hardcoded constant — "wire it or delete it" for D1/D7's two locked clauses. This run's
+    // gate below already requires BOTH seats to agree (unanimous, by construction); maxRounds is
+    // exposed here for A11 (round-cap-exceeded BLOCKED), which owns enforcement, not this row.
+    const consensusPolicy = this.resolveConsensusPolicy();
+    console.log(
+      `[planning-phase] consensus policy for batch ${batchId} (mode=${partner}): ` +
+      `unanimous=${consensusPolicy.unanimous} maxRounds=${consensusPolicy.maxRounds} (source: teams.consensus_rule; settle-role clause not wired)`
+    );
 
     // Generate contract-compliant planning brief via BriefWriter (projcore role gets its own enum + full v2 sections + streaming/helper/paths etc).
     // This fixes the live POST /runs 400 BRIEF-CONTRACT-MISSING for the planning (projcore) brief under real dispatch/RealTransport.
@@ -547,37 +595,72 @@ export class PlanningPhaseService {
     }
   }
 
+  // A9 (R1.4/R1.5/N4): local dual-prefix callback parser scoped to THIS function only. The shared
+  // parseCallbackLine (agent-event-ingest.ts) is genuinely [helm callback]-only despite several nearby
+  // comments elsewhere claiming otherwise (it is used unchanged by orchestrator-loop.ts, panel-service.ts,
+  // waitForFirstCallback below, and run-orchestrator-service.ts's waitForNorthStarReady — broadening it
+  // is a wider, separate fix outside this row's scope: "rewrite the partner matcher in waitForAgreement").
+  private parseAgreementCallbackLine(line: string): { role: string; batchId: string; state: string; note: string | null } | null {
+    const match = /^\[(?:helm|projcore) callback\]\s+(\S+)\s+(\S+)\s+STATUS:\s+([A-Z-]+)(?:\s+[—-]\s+(.+))?\s*$/.exec(line);
+    if (!match) return null;
+    return { role: match[1], batchId: match[2], state: match[3], note: match[4] ?? null };
+  }
+
+  /**
+   * Whole-plan agreement gate (D6/R1.29 scope half — exactly ONE gate per planning run; the per-task
+   * reconvene-on-conflict half is A13's, not built here). Requires BOTH signals in the SAME poll pass:
+   * - projcore's PLAN-READY for this run's own batchId (brainRole).
+   * - the partner's own VERDICT-READY for `${batchId}-partner` (R1.5/N3 — the partner is spawned under
+   *   its own namespaced batch; a bare `batchId` equality matches nothing, dead-locking every run, and an
+   *   unscoped match would accept a stale/foreign partner line from a different run).
+   * R1.4/N2: VERDICT-READY is the literal STATUS token for BOTH verdicts — the actual CLEAN/BROKEN
+   * verdict lives in the note payload after the em-dash, never the token. Only a note that resolves to
+   * CLEAN satisfies the gate; a confirmed BROKEN verdict fails it FAST (returns false as soon as it's
+   * seen — it must not wait out the full timeout, which is 600_000ms/10min in production: the verdict
+   * has already arrived and is negative, there is nothing left to wait for under this row's scope).
+   * A missing/unparseable verdict body is treated as "no verdict yet" (keeps waiting, fail-closed by
+   * omission) rather than an immediate BROKEN, in case the payload is still being written mid-line.
+   * Each poll re-derives the LATEST matching line for each signal (reversed scan) rather than latching a
+   * boolean forever, so a later BROKEN can never be shadowed by an earlier accidental CLEAN.
+   */
   private async waitForAgreement(cbPath: string, batchId: string, partnerRole: string, brainRole: string, timeoutMs: number): Promise<boolean> {
     const start = Date.now();
-    let sawPartner = false;
-    let sawPlanReady = false;
+    const partnerBatchId = `${batchId}-partner`;
     while (Date.now() - start < timeoutMs) {
       try {
         const raw = await fs.readFile(cbPath, 'utf8');
-        const lines = raw.split(/\r?\n/).reverse();
-        // POCFIX16: accept BOTH [helm callback] and [projcore callback] prefixes (projcore/partner may emit
-        // either depending on raw-echo vs the helper). Was raw [helm callback]-only includes → missed
-        // [projcore callback] PLAN-READY → planning never handed off to the execution loop (run stalled post-plan).
-        const partnerRe = new RegExp(`\\[helm callback\\]\\s+(?:${partnerRole}|planner|deliberation)\\b`);
+        const lines = raw.split(/\r?\n/).reverse(); // newest first
+        let sawPlanReady = false;
+        let partnerVerdict: 'CLEAN' | 'BROKEN' | null = null;
         for (const line of lines) {
-          if (partnerRe.test(line)) {
-            if (/REVIEW|READY|AGREE|CONSENSUS/i.test(line)) sawPartner = true;
-          }
-          const parsed = parseCallbackLine(line);
-          if (parsed && parsed.batchId === batchId && parsed.state === 'PLAN-READY' && roleMatches(brainRole, parsed.role)) {
+          const parsed = this.parseAgreementCallbackLine(line);
+          if (!parsed) continue;
+          if (!sawPlanReady && parsed.batchId === batchId && parsed.state === 'PLAN-READY' && roleMatches(brainRole, parsed.role)) {
             sawPlanReady = true;
           }
+          if (
+            partnerVerdict === null &&
+            parsed.batchId === partnerBatchId &&
+            parsed.state === 'VERDICT-READY' &&
+            roleMatches(partnerRole, parsed.role)
+          ) {
+            const verdictMatch = /^\s*(CLEAN|BROKEN)\b/i.exec(parsed.note || '');
+            partnerVerdict = verdictMatch ? (verdictMatch[1].toUpperCase() as 'CLEAN' | 'BROKEN') : null;
+          }
+          if (sawPlanReady && partnerVerdict !== null) break; // latest of each already locked in (reversed scan)
         }
-        // A8 (R1.2): every mode requires BOTH the partner agreement signal and projcore PLAN-READY —
-        // no mode passes on PLAN-READY alone (the former POCFIX9 no-co-planner fast path is deleted).
-        if (sawPlanReady && sawPartner) return true;
+        if (sawPlanReady && partnerVerdict === 'CLEAN') return true;
+        // R1.4: a confirmed BROKEN verdict fails the gate immediately — dispositive on its own, whether
+        // or not PLAN-READY has arrived yet. It has already arrived and is negative, so there is nothing
+        // left to wait for (never byte-identical to a silent CLEAN pass, and never forced to burn the
+        // full 10min production timeout to reach the same conclusion).
+        if (partnerVerdict === 'BROKEN') return false;
       } catch {}
       await new Promise((r) => setTimeout(r, 20));
     }
-    // A8 (R1.2): a timeout with no confirmed partner agreement is a bounded stall, never a silent pass —
-    // return false so the caller's existing agreed:false path (reap seats, no ingest) takes over instead
-    // of proceeding on PLAN-READY alone. (sawPlanReady && sawPartner can never both be true here — the
-    // loop above already returns true the instant both flags flip.)
+    // A8 (R1.2) still holds: a timeout with no confirmed CLEAN partner agreement is a bounded stall,
+    // never a silent pass — return false so the caller's existing agreed:false path (reap seats, no
+    // ingest) takes over instead of proceeding on PLAN-READY alone.
     return false;
   }
 }

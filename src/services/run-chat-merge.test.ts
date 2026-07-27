@@ -10,7 +10,7 @@ const CB = `[helm callback] helm_pm rsmoke1 STATUS: WORKING — beginning north-
 [helm callback] implementer rsmoke1 STATUS: DONE — committed abc1234; tests pass
 [helm callback] validator rsmoke1 STATUS: PASS — verified ping() returns 'pong'
 [projcore callback] projcore rsmoke1 STATUS: PLAN-READY — plan agreed; see plan.json
-[helm callback] planner rsmoke1-partner STATUS: REVIEW-READY
+[helm callback] planner rsmoke1-partner STATUS: VERDICT-READY
 [helm callback] implementer otherbatch STATUS: DONE — must be filtered out
 not a callback line at all
 `;
@@ -24,7 +24,7 @@ describe('run-chat-merge (CC-CHAT-2 R3)', () => {
       'implementer:WORKING',
       'implementer:DONE',
       'validator:PASS',
-      'planner:REVIEW-READY'
+      'planner:VERDICT-READY'
     ]);
     expect(lines[0].note).toBe('beginning north-star interview');
     expect(lines[5].note).toBe(''); // no em-dash note
@@ -73,7 +73,7 @@ describe('run-chat-merge (CC-CHAT-2 R3)', () => {
     expect(merged[1].role).toBe('helm-pm');
     expect(merged[2].id).toBe(2); // mid-run owner message interleaves by ts
     expect(merged.slice(3).map((m: any) => m.state)).toEqual([
-      'NORTH-STAR-READY', 'WORKING', 'DONE', 'PASS', 'REVIEW-READY'
+      'NORTH-STAR-READY', 'WORKING', 'DONE', 'PASS', 'VERDICT-READY'
     ]);
     // stable: intra-source relative order preserved
     const cbOnly = merged.filter((m: any) => m.run_cb).map((m: any) => m.correlation_id);

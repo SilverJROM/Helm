@@ -128,7 +128,7 @@ describe.sequential('A6 R3.14 pause_after_planning gate', () => {
     await fs.writeFile(
       cbPath,
       `[helm callback] plancore ${batchId} STATUS: PLAN-READY — plan agreed with planner; see plan.json\n` +
-        `[helm callback] planner ${batchId}-partner STATUS: REVIEW-READY\n` +
+        `[helm callback] planner ${batchId}-partner STATUS: VERDICT-READY — CLEAN: agreed\n` +
         `[helm callback] implementer ${batchId} STATUS: DONE — wired\n` +
         `[helm callback] validator ${batchId} STATUS: PASS — verified\n` +
         `[helm callback] panelist ${batchId} STATUS: VERDICT-READY — CLEAN: all gates pass (seat red-a6:0)\n` +
