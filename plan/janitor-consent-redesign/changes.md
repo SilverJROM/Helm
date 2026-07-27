@@ -10,6 +10,7 @@ S02 propagates `markIdle` only when a seat finalizes through `finalizeWorkerRunt
    - `runEngineTail` complete/failed — after `finalizeRunWorkerRuntimes`, before D-a3 close-confirm write
    - `transitionRunToBlocked(failure)` — after workers finalize (async ordered)
    - `stopRun` when prior phase was **not** starting/interview/planning (executing+)
+   - `startRunDetached` `.catch` — after workers finalize, reason `detached-start-failed` (send-back AC1)
 4. Kind map documented in S03 tests (ibrain/plancore assert; discovery human-owned; workers S02; other residual).
 
 ## Code changes

@@ -415,4 +415,33 @@ describe.sequential('S03 brain completion assertion (finalizeBrainSessionRow)', 
     expect(reg.get(ibrain)!.status).not.toBe('reaped');
     expect(reg.get(ibrain)!.ended_at).toBeNull();
   });
+
+  it('(3) detached-start-failed terminal uses same finalizeBrainSessionRow path (register-if-needed → idle)', () => {
+    // Mirrors startRunDetached .catch: reason detached-start-failed, state failed.
+    // Project name 's03-brain' → slug s03_brain → helm-ibrain-s03_brain (assertImplementationBrainComplete resolve).
+    const session = 'helm-ibrain-s03_brain';
+    reg.register(session, { projectId, runId, kind: 'ibrain' });
+    expect(reg.get(session)!.status).toBe('active');
+
+    const changed = finalizeBrainSessionRow(db.raw, {
+      projectId,
+      runId,
+      session,
+      role: 'ibrain',
+      reason: 'detached-start-failed',
+      state: 'failed',
+    });
+    expect(changed).toBe(true);
+
+    const wr = db.raw
+      .prepare(
+        `SELECT state, exit_reason FROM worker_runtimes WHERE run_id = ? AND session = ? ORDER BY id DESC LIMIT 1`
+      )
+      .get(runId, session) as any;
+    expect(wr.state).toBe('failed');
+    expect(wr.exit_reason).toBe('detached-start-failed');
+    expect(reg.get(session)!.status).toBe('idle');
+    expect(reg.get(session)!.reason).toBe('detached-start-failed');
+    expect(reg.get(session)!.ended_at).toBeNull();
+  });
 });

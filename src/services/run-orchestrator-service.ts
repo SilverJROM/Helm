@@ -365,8 +365,18 @@ export class RunOrchestratorService {
       } catch {}
       // A7 / R3.15: detached failure is a true terminal — advance cycle board if linked.
       this.terminalizeCycleAtRunEnd({ runId, cycleId: input.cycleId ?? null });
-      // A15: seat ledger on detached failure.
-      void this.finalizeRunWorkerRuntimes(runId, 'detached-start-failed');
+      // A15 + S03: finalize workers first, then ibrain assert (true terminal; no reap — D-a3).
+      void (async () => {
+        try {
+          await this.finalizeRunWorkerRuntimes(runId, 'detached-start-failed');
+          this.assertImplementationBrainComplete({
+            projectId: input.projectId,
+            runId,
+            reason: 'detached-start-failed',
+            state: 'failed',
+          });
+        } catch { /* best-effort terminal bookkeeping */ }
+      })();
     });
     return { runId, batchId };
   }
