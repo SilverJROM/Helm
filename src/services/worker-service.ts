@@ -245,7 +245,8 @@ VALUES (?,?,?,?,?,?,?,?,datetime('now'), ?)
         const reason = /ready-timeout/.test(String(e)) ? 'ready-timeout'
           : /feed-failed/.test(String(e)) ? 'feed-failed' : 'launch-error';
         // S02: shared finalizer (idempotent; markIdle no-ops after terminate→markReaped above).
-        try { finalizeWorkerRuntimeRow(this.db.raw, id, 'failed', reason); } catch {}
+        // Number(id): lastInsertRowid is number|bigint under better-sqlite3 typings (tsc TS2345).
+        try { finalizeWorkerRuntimeRow(this.db.raw, Number(id), 'failed', reason); } catch {}
         throw e;
       }
     } catch (e) {
