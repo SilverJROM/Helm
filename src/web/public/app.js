@@ -897,9 +897,9 @@ function App() {
   #sidebar.sidebar-collapsed .sidebar-account-row{justify-content:center}
   #sidebar.sidebar-collapsed .sidebar-teams{max-height:none}
 }
-/* Feature 2: taller, more readable worker terminals */
-.cc-impl-term-row{height:60vh;min-height:440px;grid-template-columns:50% 50%;transition:grid-template-columns .28s ease}
-.cc-impl-term-row .cmt-term-body{font-size:12.5px;line-height:1.5}
+/* Feature 2 + B5: readable worker terminals without rigid 440/60vh floor (R6.25) */
+.cc-impl-term-row{height:min(50vh,100%);min-height:200px;grid-template-columns:50% 50%;transition:grid-template-columns .28s ease}
+.cc-impl-term-row .cmt-term-body{font-size:12.5px;line-height:1.5;min-height:0;overflow:auto}
 /* Feature 3: focus active worker — dynamic SHRINK (both visible) + manual full-collapse (rail) */
 .cc-impl-term-controls{display:flex;align-items:center;gap:8px;padding:2px 0 8px;flex-wrap:wrap}
 .cc-impl-pane-toolbtn{background:transparent;border:1px solid var(--border);border-radius:5px;color:var(--text-sec);cursor:pointer;font-size:11px;line-height:1;padding:3px 8px}
@@ -5419,9 +5419,9 @@ function App() {
             <button class="btn btn-sm" data-testid="ws-disc-chat-restore" onclick=${(e) => { e.stopPropagation(); setCcDiscChatMin(false); }}>Restore chat</button>
           </div>`
         : html`<div class="cc-disc-pane" data-testid="ws-disc-chat-pane">
-            <div class="cc-disc-pane-header">
+            <div class="cc-disc-pane-header" data-testid="ws-disc-chat-header">
               <span>Discovery chat</span>
-              <div style="display:flex;gap:4px;align-items:center;flex-wrap:wrap">
+              <div data-testid="ws-disc-chat-header-controls" style="display:flex;gap:4px;align-items:center;flex-wrap:nowrap">
                 ${agentSelect}
                 <button class="btn btn-sm" data-testid="ws-disc-session-toggle" disabled=${connecting}
                   onclick=${() => ccToggleSession(pid, discAgentId)}>${connecting ? '⏳ Connecting…' : sessOn ? '⏻ Session On' : '⏻ Session Off'}</button>
@@ -9713,7 +9713,8 @@ function App() {
                 ${tabs.map(t => html`<div class=${`tab ${currentSlug===t.slug?'active':''}`} data-testid=${`tab-${t.key}`} onclick=${() => onTab(t.slug)}>${t.label}</div>`)}
               </div>
             </div>
-            <div style="flex:1;overflow-y:auto;padding:16px 20px" data-testid=${`content-${activeSection}`}>
+            <div class=${`main-content-scroll${ccWsCycleId ? ' main-content-scroll--workspace' : ''}`}
+              data-testid=${`content-${activeSection}`}>
               ${html`<div key=${currentSlug} style="display:contents">${mainContent}</div>`}
             </div>
           </div>

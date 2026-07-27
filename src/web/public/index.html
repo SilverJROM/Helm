@@ -283,19 +283,110 @@ select option{background:var(--surface)}
 
 /* B6-T01: project cycle workspace shell (header + cycle switcher + phase tabs). Scoped to cc-ws-*.
    Parity ref: v2.1-02-discovery.png / v2.1-03-planning.png header region. */
-.cc-ws-header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }
-.cc-ws-title { font-size: 16px; font-weight: 700; color: var(--text); flex: 1; }
-.cc-ws-actions { display: flex; align-items: center; gap: 8px; position: relative; }
+/* B5 / R6.26: header chrome ≤2 rows — avoid flex-wrap accident that parks Minimize alone on row 3. */
+.cc-ws-header {
+  display: flex;
+  align-items: center;
+  gap: 8px 12px;
+  flex-wrap: nowrap;
+  margin-bottom: 10px;
+  flex: 0 0 auto;
+  min-height: 0;
+}
+.cc-ws-title {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--text);
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cc-ws-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  position: relative;
+  flex: 0 0 auto;
+  flex-wrap: nowrap;
+}
 /* B9-T05: Implementation-tab-only header subtitle (R-F7 additive-injection note + Graceful Stop
    note), forced onto its own row below the title/actions row within cc-ws-header's flex-wrap. */
 .cc-ws-impl-subtitle { flex-basis: 100%; font-size: 12px; margin-top: 2px; }
-.cc-ws-switcher-wrap { position: relative; }
+.cc-ws-switcher-wrap { position: relative; flex: 0 0 auto; }
 .cc-ws-switcher-menu { position: absolute; top: 32px; right: 0; z-index: 50; display: flex; flex-direction: column; gap: 4px; min-width: 220px; padding: 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); box-shadow: 0 8px 24px rgba(0,0,0,0.3); }
 .cc-ws-switcher-item { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 8px; border: 1px solid transparent; border-radius: 6px; background: transparent; color: var(--text); font-size: 12px; cursor: pointer; text-align: left; }
 .cc-ws-switcher-item:hover { background: var(--surface-2); }
 .cc-ws-switcher-item.sel { border-color: var(--accent); background: var(--accent-surface); }
 .cc-ws-body { margin-top: 14px; padding: 16px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-2); color: var(--text-sec); font-size: 12px; }
-.cc-ws-body-disc { padding: 0; background: transparent; border: none; }
+/* B5: Discovery body fills remaining workspace height (R6.25) */
+.cc-ws-body-disc {
+  padding: 0;
+  background: transparent;
+  border: none;
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+/* B5: main content area fills #main; workspace mode avoids nested outer scroll */
+.main-content-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 16px 20px;
+}
+.main-content-scroll--workspace {
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  padding: 12px 16px;
+}
+/* B5: workspace shell fills remaining viewport under section chrome */
+[data-testid="content-cmd-workspace"] {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  height: 100%;
+}
+[data-testid="content-cmd-workspace"] .tab-strip {
+  flex: 0 0 auto;
+}
+@media (max-width: 760px) {
+  /* B5 / R6.26: exactly 2 rows at narrow — back|title then full-width actions (no 3rd Minimize orphan) */
+  .cc-ws-header {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    grid-template-rows: auto auto;
+    gap: 6px 8px;
+    align-items: center;
+  }
+  .cc-ws-header > .btn:first-of-type,
+  .cc-ws-header > [data-testid="ws-back"] {
+    grid-column: 1;
+    grid-row: 1;
+  }
+  .cc-ws-title {
+    grid-column: 2;
+    grid-row: 1;
+    white-space: nowrap;
+  }
+  .cc-ws-actions {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    justify-content: flex-end;
+    flex-basis: auto;
+    width: 100%;
+  }
+  .cc-ws-impl-subtitle {
+    grid-column: 1 / -1;
+  }
+  .main-content-scroll { padding: 10px 12px; }
+}
 
 /* B3 / R5.19 R6.23 R6.25 foundation — shared session-pane shell + flex utilities.
    B4 consumes for planning panes; B5 applies viewport strip; B6 wires bottom-stick.
@@ -362,27 +453,73 @@ select option{background:var(--surface)}
 .cc-plan-panes .sp-pane { min-height: 180px; max-height: 320px; }
 .cc-plan-panes .sp-pane-body { min-height: 0; }
 
-/* B7-T01: Discovery tab split — chat (reuses .cc-bubble/.cc-composer) | living docs, either pane
-   minimizable to a rail (.cc-disc-rail). Scoped to cc-disc-*. Parity ref: v2.1-02-discovery.png. */
-.cc-disc-split { display: flex; gap: 8px; height: 560px; min-height: 420px; align-items: stretch; }
-.cc-disc-pane { flex: 1; min-width: 0; display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; background: var(--surface); }
-.cc-disc-pane-docs { flex: 1.4; }
-.cc-disc-pane-header { flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 6px 8px; border-bottom: 1px solid var(--border); background: var(--surface-2); font-size: 12px; font-weight: 600; color: var(--text); }
-.cc-disc-pane-body { flex: 1; overflow: auto; padding: 4px 6px; }
+/* B7-T01 + B5 (R6.22/R6.25/R6.26): Discovery tab split fills remaining viewport.
+   Removed fixed height:560px + min-height:420px (N8). Single scrollbar owner = pane-body. */
+.cc-disc-split {
+  display: flex;
+  gap: 8px;
+  flex: 1 1 auto;
+  min-height: 0;
+  height: 100%;
+  align-items: stretch;
+}
+.cc-disc-pane {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: var(--surface);
+}
+.cc-disc-pane-docs { flex: 1.4; min-height: 0; }
+/* B5 / R6.26: pane header stays one row — no wrapped standalone Minimize */
+.cc-disc-pane-header {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-2);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  flex-wrap: nowrap;
+  min-height: 0;
+}
+.cc-disc-pane-header > div {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: nowrap;
+  flex: 0 1 auto;
+  min-width: 0;
+}
+/* B5: chat body was missing min-height:0 (docs-body already had it) — flex shrink + single scroll owner */
+.cc-disc-pane-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 4px 6px;
+}
 .cc-disc-pane-footer { flex: 0 0 auto; padding: 6px 8px; border-top: 1px solid var(--border); background: var(--surface-2); }
-.cc-disc-docs-body { flex: 1; min-height: 0; display: flex; }
-.cc-disc-docs-list { flex: 0 0 150px; overflow: auto; padding: 6px; border-right: 1px solid var(--border); background: var(--surface-2); }
+.cc-disc-docs-body { flex: 1; min-height: 0; display: flex; overflow: hidden; }
+.cc-disc-docs-list { flex: 0 0 150px; overflow: auto; padding: 6px; border-right: 1px solid var(--border); background: var(--surface-2); min-height: 0; }
 .cc-disc-doc-item { padding: 4px 6px; font-size: 11px; border-radius: 4px; cursor: pointer; margin-bottom: 2px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cc-disc-doc-item:hover { background: rgba(88,166,255,.06); }
 .cc-disc-doc-item.sel { background: rgba(88,166,255,.12); border-left: 2px solid var(--accent); }
-.cc-disc-docs-view { flex: 1; min-width: 0; overflow: auto; padding: 8px; }
+.cc-disc-docs-view { flex: 1; min-width: 0; min-height: 0; overflow: auto; padding: 8px; }
 .cc-disc-docs-view .md-viewer { max-height: none; height: 100%; }
-.cc-disc-rail { flex: 0 0 180px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-2); cursor: pointer; padding: 12px; text-align: center; }
+.cc-disc-rail { flex: 0 0 180px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-2); cursor: pointer; padding: 12px; text-align: center; min-height: 0; }
 .cc-disc-rail:hover { background: var(--surface); }
 .cc-disc-rail-label { font-size: 11px; font-weight: 600; color: var(--text-sec); letter-spacing: .02em; }
 @media (max-width: 900px) {
-  .cc-disc-split { flex-direction: column; height: auto; }
-  .cc-disc-pane, .cc-disc-rail { min-height: 260px; }
+  .cc-disc-split { flex-direction: column; height: auto; min-height: 0; flex: 1 1 auto; }
+  .cc-disc-pane, .cc-disc-rail { min-height: 180px; }
 }
 
 /* B7-T03: Discovery composer image attach (R-C3) + saved image artifacts gallery (R-C4).
@@ -480,7 +617,8 @@ select option{background:var(--surface)}
 .cc-impl-main { flex: 1 1 auto; min-width: 0; }
 .cc-impl-docs-rail { flex: 0 0 56px; align-self: stretch; min-height: 200px; }
 .cc-impl-docs-rail-task { font-size: 10px; writing-mode: vertical-rl; }
-.cc-impl-docs-pane { flex: 0 0 260px; max-height: 560px; }
+/* B5: docs rail stretches with split — drop fixed 560px cap */
+.cc-impl-docs-pane { flex: 0 0 260px; max-height: none; min-height: 0; align-self: stretch; }
 .cc-impl-docs-list { flex: 1; overflow: auto; padding: 4px 6px; }
 @media (max-width: 760px) {
   .cc-impl-split { flex-direction: column; }
@@ -633,9 +771,10 @@ select option{background:var(--surface)}
   z-index: 2;
   box-shadow: 0 2px 8px rgba(0,0,0,.16);
 }
+/* B5 / R6.25: remove nested 340px log cap — stream grows with pane-body (single scrollbar owner) */
 .cc-disc-pane-body .cc-live-stream {
-  max-height: 340px;
-  overflow: auto;
+  max-height: none;
+  overflow: visible;
 }
 .cc-chat-scroll { flex: 1; overflow: auto; padding: 2px 4px; }
 .cc-composer { padding: 4px 6px; }
@@ -1085,8 +1224,28 @@ select option{background:var(--surface)}
 /* B9-T03: Implementation tab implementer/validator terminal panes (R-F6). Reuses .cmt-pane /
    .cmt-term-header / .cmt-term-role / .cmt-term-body / .cmt-pane-empty from CC-MT as-is; only the
    two-column row wrapper is new. */
-.cc-impl-term-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 10px 0; height: 190px; }
-@media (max-width: 760px) { .cc-impl-term-row { grid-template-columns: 1fr; height: auto; } }
+/* B5: impl terminals use flexible height (not fixed 190px); single scroll on .cmt-term-body */
+.cc-impl-term-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin: 10px 0;
+  height: auto;
+  min-height: 200px;
+  flex: 1 1 auto;
+}
+.cc-impl-term-row .cmt-pane {
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.cc-impl-term-row .cmt-term-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+}
+@media (max-width: 760px) { .cc-impl-term-row { grid-template-columns: 1fr; height: auto; min-height: 0; } }
 </style>
 </head>
 <body>
