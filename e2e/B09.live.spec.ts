@@ -123,13 +123,35 @@ test.describe('B09 live: human collision refusal visible (intercepted :3110)', (
     expect(errText).toMatch(/collision|will not replace|human/i);
     expect(errText).not.toMatch(/^fetch fail$/i);
 
+    // B09 fix1 / AC12: refusal must be fully human-readable in the default viewport
+    // (Desktop Chrome 1280×720). toBeVisible alone is insufficient when the box is clipped.
+    await err.evaluate((el) => {
+      if (typeof (el as HTMLElement).scrollIntoView === 'function') {
+        (el as HTMLElement).scrollIntoView({ block: 'nearest', inline: 'nearest' });
+      }
+    });
+    const box = await err.boundingBox();
+    expect(box, 'chat-err must have a layout box').toBeTruthy();
+    const vp = page.viewportSize();
+    expect(vp, 'viewport size required for readability assert').toBeTruthy();
+    expect(box!.height).toBeGreaterThan(10);
+    expect(box!.width).toBeGreaterThan(40);
+    expect(box!.y).toBeGreaterThanOrEqual(0);
+    expect(box!.x).toBeGreaterThanOrEqual(0);
+    expect(box!.y + box!.height).toBeLessThanOrEqual(vp!.height + 0.5);
+    expect(box!.x + box!.width).toBeLessThanOrEqual(vp!.width + 0.5);
+
     // At least one create POST was intercepted (never live).
     expect(createPosts.length).toBeGreaterThanOrEqual(1);
     expect(createPosts.every((p) => p.method === 'POST')).toBe(true);
 
     const shotName = 'B09-human-collision-refusal';
     const png = path.join(EVIDENCE_DIR, `${shotName}.png`);
-    await page.screenshot({ path: png, fullPage: true });
+    const cropPng = path.join(EVIDENCE_DIR, `${shotName}-banner.png`);
+    // Viewport capture (not fullPage) so the proof matches what a human sees at :3110 default size.
+    await page.screenshot({ path: png, fullPage: false });
+    await err.screenshot({ path: cropPng });
     fs.copyFileSync(png, path.join(PLAN_DIR_EVIDENCE, `${shotName}.png`));
+    fs.copyFileSync(cropPng, path.join(PLAN_DIR_EVIDENCE, `${shotName}-banner.png`));
   });
 });

@@ -2120,6 +2120,28 @@ function App() {
 
   useEffect(() => { chatTmuxSessionRef.current = chatTmuxSession; }, [chatTmuxSession]);
 
+  // B09 fix1 / AC12: keep refusal banners fully readable (scroll into view if layout still overflows).
+  useEffect(() => {
+    if (!chatErr) return;
+    const id = requestAnimationFrame(() => {
+      const el = document.querySelector('[data-testid="chat-err"]');
+      if (el && typeof el.scrollIntoView === 'function') {
+        el.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+      }
+    });
+    return () => cancelAnimationFrame(id);
+  }, [chatErr]);
+  useEffect(() => {
+    if (!ccErr) return;
+    const id = requestAnimationFrame(() => {
+      const el = document.querySelector('[data-testid="cc-session-err"]');
+      if (el && typeof el.scrollIntoView === 'function') {
+        el.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+      }
+    });
+    return () => cancelAnimationFrame(id);
+  }, [ccErr]);
+
   useEffect(() => {
     if (!token || !currentSlug.startsWith('02-studio')) return;
     loadActiveSessions();
@@ -6954,6 +6976,8 @@ function App() {
                 <button data-testid="cc-fav-toggle" class="btn btn-sm" style="padding:3px 6px;font-size:11px;" title="Toggle ⭐ favorite for the selected agent (pins it near the top)" disabled=${!selAid || isCcBrainAgent(pid, selAid)} onclick=${()=>toggleCcFav(selAid)}>${ccFavAgents.includes(selAid) ? '⭐' : '☆'}</button>
                 <button data-testid="cc-session-toggle" class="btn btn-sm" style=${`padding:3px 8px;font-size:10px;white-space:nowrap;${ccSessOn ? 'color:#3fb950;border-color:#3fb950;' : ''}`} disabled=${ccConnecting} aria-pressed=${ccSessOn ? 'true' : 'false'} title=${ccSessOn ? 'Session ON — click to shut down the agent session' : 'Session OFF — click to spawn the agent in a fenced project session'} onclick=${()=>ccToggleSession(pid)}>${ccConnecting ? '⏳ Connecting…' : ccSessOn ? '⏻ Session On' : '⏻ Session Off'}</button>
               </div>
+              ${/* B09 fix1 / AC12: session refusal next to Session On (not clipped under the fold) */ ''}
+              ${ccErr ? html`<div data-testid="cc-session-err" role="alert" style="flex-shrink:0;color:#f85149;font-size:11px;line-height:1.35;padding:6px 8px;margin:0 0 4px;border:1px solid rgba(248,81,73,.45);border-radius:6px;background:rgba(248,81,73,.08);white-space:pre-wrap;word-break:break-word">${ccErr}</div>` : null}
               <div style="display:flex;gap:4px;margin-bottom:3px;align-items:center;">
                 <button data-testid="cc-clear-ctx" class="btn btn-sm" style="padding:2px 6px;font-size:9px;" disabled=${!ccSessOn} title=${ccSessOn ? "Clear this session's context" : 'Turn on a session to enable Clear'} onclick=${()=>ccCtxAction(pid,'clear')}>Clear</button>
                 <button data-testid="cc-compact-ctx" class="btn btn-sm" style="padding:2px 6px;font-size:9px;" disabled=${!ccSessOn} title=${ccSessOn ? "Compact this session's context" : 'Turn on a session to enable Compact'} onclick=${()=>ccCtxAction(pid,'compact')}>Compact</button>
@@ -6994,7 +7018,6 @@ function App() {
           </div>
         </div>
 
-        ${ccErr && html`<div data-testid="cc-session-err" style="color:#f85149;font-size:11px;padding:4px 8px;border-top:1px solid var(--border);">${ccErr}</div>`}
         ${!pid ? html`<div class="inline-note" style="padding:3px 6px;font-size:10px;">Select project in left sidebar (or open idle) to load chat + live terminal feed. 3-way above controls panes.</div>` : null}
       </div>
     </div>`;
@@ -8209,6 +8232,8 @@ function App() {
           ` : null}
           ${chatTmuxSession ? html`<span class="as-chat-tmux-attach" data-testid="as-chat-tmux-attach" title="This agent's tmux session — attach in a terminal">tmux: <code>${chatTmuxSession}</code><button class="as-chat-tmux-copy" type="button" title="Copy attach command" onclick=${() => { try { navigator.clipboard.writeText('tmux attach -t ' + chatTmuxSession); setChatErr('Copied: tmux attach -t ' + chatTmuxSession); } catch {} }}>⧉ attach</button></span>` : null}
         </div>
+        ${/* B09 fix1 / AC12: collision refusal under header (not after past-sessions below the fold) */ ''}
+        ${chatErr ? html`<div data-testid="chat-err" role="alert" style="flex-shrink:0;color:#f85149;font-size:12px;line-height:1.35;padding:8px 10px;margin:0 0 8px;border:1px solid rgba(248,81,73,.45);border-radius:6px;background:rgba(248,81,73,.08);white-space:pre-wrap;word-break:break-word">${chatErr}</div>` : null}
         ${(() => {
           const logsPre = html`<pre data-testid="as-chat-logs" class="as-chat-logs">${chatLogs || (chatSid ? 'Loading session logs…' : 'No live session — turn the session On to view its tmux logs.')}</pre>`;
           const chatThread = html`
@@ -8255,8 +8280,7 @@ function App() {
                       </div>`;
                   })
                 : html`<div data-testid="as-past-sessions-empty" class="as-past-sessions-empty">No past sessions yet</div>`}
-            </div>
-            ${chatErr ? html`<div data-testid="chat-err" style="color:#f85149;font-size:12px;margin-top:6px">${chatErr}</div>` : null}`;
+            </div>`;
           if (effectiveChatCenterMode === 'split') {
             const splitLogsW = clampChatLogsWidth(chatLogsWidth, chatCenterSplitRef.current?.offsetWidth || 900);
             return html`
