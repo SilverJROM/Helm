@@ -2,7 +2,7 @@ import type Database from "better-sqlite3";
 import { assertAllRoleTiersInvariants } from "./role-tier-invariants.js";
 import { PROVIDERS } from "../config/providers.js";
 
-export const SCHEMA_VERSION = 102;
+export const SCHEMA_VERSION = 103;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -1608,7 +1608,7 @@ export const V89_KNOWN_CANONICAL_PLANCORE_HASHES = new Set([
 /**
  * B09a / c01 R2.8–R2.9: canonical project + house roster seed set.
  * Project: discovery, plancore, ibrain, planner, implementer, validator, panelist.
- * House: agent-master, overseer, jkage.
+ * House: agent-master, overseer, jkage, housekeeper (S15).
  * Additive + idempotent (INSERT OR IGNORE by name). MIG1: never overwrite non-empty definition_md.
  * Forces kind (agent_type) for each seed. Does NOT prune extras (B09b).
  * Legacy house stubs (master_agent, jkagebunshin) remain until B09b prune.
@@ -1622,6 +1622,59 @@ export type B09aCanonicalAgentSeed = {
   spawn_pref: string;
   definition_md: string;
 };
+
+/**
+ * S15 / AC28+AC31: housekeeper prompt — four locked §1c guardrails + bounded-input contract.
+ * Seeded empty-only (MIG1); Studio edits survive re-seed.
+ */
+export const HOUSEKEEPER_DEFINITION_MD = `---
+role: housekeeper
+kind: house
+agent_type: house
+classification: tiered
+lifecycle: hours-idle-investigation
+default_provider: grok
+default_model: grok-4.5
+default_effort: medium
+spawn_pref: tmux
+main_model_slug: grok45
+backup_1_slug: spark
+backup_2_slug: haiku
+callback_contract: "[helm callback] housekeeper <session> STATUS: <done|needs-human>"
+---
+# housekeeper — tier-2 hours-idle status investigator (house)
+
+You are the Helm **housekeeper**: a house agent spawned only for hours-idle anomalies on
+**helm-owned** seats. You repair **status** when evidence shows work is done; you never reap
+and never kill sessions. The deterministic reconciler remains the only reaper.
+
+## Four guardrails (non-negotiable)
+
+1. **Keep-biased.** If you cannot establish that the work is done, write **needs-human**,
+   never **done**. Uncertainty must never resolve to a kill. A cheap model is not an
+   authority on destroying work.
+2. **Evidence recorded, verdict auditable.** Persist *what you examined* and *why you
+   concluded* (pane tail, terminal callback present/absent, run + task state, last dispatch).
+   A status written with no recorded basis is forbidden.
+3. **helm-owned seats only.** You are structurally incapable of marking a **human**-owned
+   session done. Ownership is enforced at the query/apply path, not by prompt alone — still
+   refuse any non-helm owner you are handed.
+4. **Cooldown / one investigation per seat per state.** Do not re-investigate a seat already
+   marked needs-human for the same unchanged state. Wait until state changes.
+
+## Bounded-input contract
+
+You investigate from a **bounded diagnosis envelope only** — not open-ended judgement:
+
+- seat pane tail
+- whether a terminal callback was emitted
+- owning run / task state
+- callbacks.md (if present in the envelope)
+- last dispatch record
+
+Do not invent extra sources. Do not improvise outside this envelope. Verdicts are only
+**done** (status repair toward idle via markIdle path) or **needs-human**. Never reap.
+`;
 
 export const B09A_CANONICAL_AGENT_SEEDS: readonly B09aCanonicalAgentSeed[] = [
   {
@@ -1798,6 +1851,15 @@ authority, no approval path. Capture/profile layer is queued, not built. Never d
 project run.
 `,
   },
+  {
+    name: 'housekeeper',
+    kind: 'house',
+    provider: 'grok',
+    model: 'grok-4.5',
+    default_effort: 'medium',
+    spawn_pref: 'tmux',
+    definition_md: HOUSEKEEPER_DEFINITION_MD,
+  },
 ] as const;
 
 export const B09A_PROJECT_NAMES: readonly string[] = B09A_CANONICAL_AGENT_SEEDS.filter(
@@ -1848,6 +1910,95 @@ export function applyB09aCanonicalRosterSeeds(db: Database.Database): void {
     `UPDATE agents SET default_model_id = (SELECT id FROM models WHERE model_id = 'claude-sonnet-4-6' LIMIT 1)
      WHERE name = 'agent-master' AND default_model_id IS NULL`
   ).run();
+}
+
+/**
+ * S15 / AC28+AC31: housekeeper tiered house seed (idempotent, Studio-edit safe).
+ * - Row + agent_type via B09a-style INSERT OR IGNORE + force house.
+ * - definition_md: MIG1 empty-only (four guardrails + bounded-input).
+ * - classification: tiered (contract for Studio tier editor).
+ * - default_model_id: main grok45 only when NULL.
+ * - agent_escalations: pos1=spark, pos2=haiku via INSERT OR IGNORE only.
+ * No new agent-configuration schema. No-op when agents/models tables missing.
+ */
+export function applyHousekeeperSeed(db: Database.Database): void {
+  const hasAgents = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agents'").get();
+  if (!hasAgents) return;
+  const cols = (db.prepare('PRAGMA table_info(agents)').all() as Array<{ name: string }>).map((c) => c.name);
+  if (!cols.includes('agent_type')) return;
+
+  const sql = (db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='agents'`).get() as
+    | { sql?: string }
+    | undefined)?.sql;
+  const houseValue = sql && sql.includes("'helm'") && !sql.includes("'house'") ? 'helm' : 'house';
+
+  db.prepare(
+    `INSERT OR IGNORE INTO agents (name, provider, model, default_effort, spawn_pref, definition_md, agent_type)
+     VALUES (?,?,?,?,?,NULL,?)`
+  ).run('housekeeper', 'grok', 'grok-4.5', 'medium', 'tmux', houseValue);
+
+  db.prepare(
+    `UPDATE agents SET definition_md = ?, updated_at = datetime('now')
+     WHERE name = 'housekeeper' AND (definition_md IS NULL OR TRIM(IFNULL(definition_md, '')) = '')`
+  ).run(HOUSEKEEPER_DEFINITION_MD);
+
+  db.prepare(
+    `UPDATE agents SET agent_type = ?, updated_at = datetime('now') WHERE name = 'housekeeper'`
+  ).run(houseValue);
+
+  if (cols.includes('classification')) {
+    db.prepare(
+      `UPDATE agents SET classification = 'tiered', updated_at = datetime('now') WHERE name = 'housekeeper'`
+    ).run();
+  }
+
+  const resolveModelId = (slug: string, modelId: string, nameHint?: string): number | undefined => {
+    const hasModels = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='models'").get();
+    if (!hasModels) return undefined;
+    const mcols = new Set((db.prepare('PRAGMA table_info(models)').all() as Array<{ name: string }>).map((c) => c.name));
+    if (mcols.has('slug')) {
+      const bySlug = db.prepare('SELECT id FROM models WHERE slug = ? LIMIT 1').get(slug) as { id: number } | undefined;
+      if (bySlug) return bySlug.id;
+    }
+    const byModelId = db
+      .prepare('SELECT id FROM models WHERE model_id = ? LIMIT 1')
+      .get(modelId) as { id: number } | undefined;
+    if (byModelId) return byModelId.id;
+    if (nameHint) {
+      const byName = db.prepare('SELECT id FROM models WHERE name = ? LIMIT 1').get(nameHint) as
+        | { id: number }
+        | undefined;
+      if (byName) return byName.id;
+    }
+    return undefined;
+  };
+
+  if (cols.includes('default_model_id')) {
+    const mainId = resolveModelId('grok45', 'grok-4.5', 'grok-4.5');
+    if (mainId != null) {
+      db.prepare(
+        `UPDATE agents SET default_model_id = ?, updated_at = datetime('now')
+         WHERE name = 'housekeeper' AND default_model_id IS NULL`
+      ).run(mainId);
+    }
+  }
+
+  const hasEsc = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_escalations'").get();
+  if (!hasEsc) return;
+  const agent = db.prepare("SELECT id FROM agents WHERE name = 'housekeeper'").get() as { id: number } | undefined;
+  if (!agent) return;
+
+  const ladder: Array<{ position: number; slug: string; modelId: string; nameHint: string }> = [
+    { position: 1, slug: 'spark', modelId: 'gpt-5.3-codex-spark', nameHint: 'spark' },
+    { position: 2, slug: 'haiku', modelId: 'claude-haiku-4-5', nameHint: 'claude-haiku' },
+  ];
+  for (const rung of ladder) {
+    const mid = resolveModelId(rung.slug, rung.modelId, rung.nameHint);
+    if (mid == null) continue;
+    db.prepare(
+      `INSERT OR IGNORE INTO agent_escalations (agent_id, position, model_id, trigger) VALUES (?,?,?, 'on-fail')`
+    ).run(agent.id, rung.position, mid);
+  }
 }
 
 /**

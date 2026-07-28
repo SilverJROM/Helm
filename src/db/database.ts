@@ -2,7 +2,7 @@ import Database from "better-sqlite3";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import fs from "node:fs";
-import { SCHEMA_VERSION, SCHEMA_SQL, V89_IBRAIN_DEFINITION_MD, V89_KNOWN_CANONICAL_PLANCORE_HASHES, V89_PLANCORE_DEFINITION_MD, applyFreshDbExtras, applyB04CanonicalModelSeeds, applyB12bRoleTierSeeds, applyB17TeamTierSeeds, applyB1TeamsSeeds, applyB3AgentRoleCapabilitySeeds, applyB2HelmAgentSeeds, applyB09aCanonicalRosterSeeds, applyB09bPruneNonCanonicalAgents, applyB25OrphanModelHygiene, applyB25dDeleteUnknownProviderMasterRuntimes, applyB6AgentMemorySeeds, applyB11PanelistRetirement, seedRoutingRules } from "./schema.js";
+import { SCHEMA_VERSION, SCHEMA_SQL, V89_IBRAIN_DEFINITION_MD, V89_KNOWN_CANONICAL_PLANCORE_HASHES, V89_PLANCORE_DEFINITION_MD, applyFreshDbExtras, applyB04CanonicalModelSeeds, applyB12bRoleTierSeeds, applyB17TeamTierSeeds, applyB1TeamsSeeds, applyB3AgentRoleCapabilitySeeds, applyB2HelmAgentSeeds, applyB09aCanonicalRosterSeeds, applyB09bPruneNonCanonicalAgents, applyB25OrphanModelHygiene, applyB25dDeleteUnknownProviderMasterRuntimes, applyB6AgentMemorySeeds, applyB11PanelistRetirement, applyHousekeeperSeed, seedRoutingRules } from "./schema.js";
 import { deriveSessionOwner } from "../services/session-registry-service.js";
 
 // Schema-data constants live in ./schema.ts. Migration logic stub here
@@ -67,13 +67,14 @@ export class DatabaseService {
       applyB09aCanonicalRosterSeeds(this.db);  // B09a: R2.8–R2.9 project+house canonical roster (after agent_type exists)
       applyB3AgentRoleCapabilitySeeds(this.db);  // v89: discovery exists after B09a, so bind its role default
       applyB09bPruneNonCanonicalAgents(this.db);  // B09b: R2.11 prune non-canonical + FK cleanup (after B09a seeds)
+      applyHousekeeperSeed(this.db);  // S15: housekeeper house+tiered main+2 (after models + B09a so prune allowlist holds)
       applyB25OrphanModelHygiene(this.db);  // B25 fix1: remap orphan agents.model + prune unreferenced orphan models
       applyB25dDeleteUnknownProviderMasterRuntimes(this.db);  // B25d: no unknown-provider master_runtimes
       applyB1TeamsSeeds(this.db);  // B1: after full SCHEMA_SQL (teams present)
       applyB6AgentMemorySeeds(this.db);  // B6: HB13 three-color memory seeds (after agents/projects exist)
       seedRoutingRules(this.db);  // A3: seed the 9 core routing rules VERBATIM from OrchestratorLoop's hardcoded FSM
       // AC-2: name-map classification on fresh seeds (same map as v94 migration backfill)
-      this.db.exec("UPDATE agents SET classification='tiered' WHERE name IN ('implementer','validator')");
+      this.db.exec("UPDATE agents SET classification='tiered' WHERE name IN ('implementer','validator','housekeeper')");
       this.db.exec("UPDATE agents SET classification='team'   WHERE name = 'planner'");
       this.db.exec("UPDATE agents SET classification='solo'   WHERE name IN ('discovery','plancore','ibrain','panelist')");
       // B11 / AC-3: retire panelist as product seat (hidden seed + unbind role_defaults/bindings)
@@ -3335,6 +3336,14 @@ ALTER TABLE runs_new RENAME TO runs;
           }
         }
         this.db.prepare('UPDATE schema_version SET version = 102').run();
+      }
+
+      // v103 / S15 AC28+AC31: seed housekeeper house+tiered main grok45 + spark/haiku backups.
+      // Idempotent; definition_md + default_model_id only when empty/NULL; escalations INSERT OR IGNORE.
+      // Janitor remains off. No new agent-configuration schema.
+      if (current && current.version < 103) {
+        applyHousekeeperSeed(this.db);
+        this.db.prepare('UPDATE schema_version SET version = 103').run();
       }
     }
   }

@@ -39,7 +39,7 @@ describe('B09a canonical roster seeds (R2.8–R2.9)', () => {
     while (cleanups.length) cleanups.pop()!();
   });
 
-  it('fresh DB: SCHEMA_VERSION ≥64; all 10 canonical names present with stable kinds', () => {
+  it('fresh DB: SCHEMA_VERSION ≥64; all 11 canonical names present with stable kinds', () => {
     const t = tempDbPath('helm-b09a-fresh-');
     cleanups.push(t.cleanup);
     process.env.HELM_DB_PATH = t.dbPath;
@@ -49,7 +49,7 @@ describe('B09a canonical roster seeds (R2.8–R2.9)', () => {
       SCHEMA_VERSION
     );
     expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(64);
-    // B09b (v65) may also have run on this open — still must keep all 10 seeds.
+    // B09b (v65) may also have run on this open — still must keep all 11 seeds (S15 +housekeeper).
 
     expect(B09A_PROJECT_NAMES).toEqual([
       'discovery',
@@ -60,8 +60,8 @@ describe('B09a canonical roster seeds (R2.8–R2.9)', () => {
       'validator',
       'panelist',
     ]);
-    expect(B09A_HOUSE_NAMES).toEqual(['agent-master', 'overseer', 'jkage']);
-    expect(B09A_CANONICAL_NAMES).toHaveLength(10);
+    expect(B09A_HOUSE_NAMES).toEqual(['agent-master', 'overseer', 'jkage', 'housekeeper']);
+    expect(B09A_CANONICAL_NAMES).toHaveLength(11);
 
     const as = new AgentAssignmentService(dbs);
     const byName = new Map(as.listAgents().map((a) => [a.name, a]));
@@ -111,7 +111,7 @@ describe('B09a canonical roster seeds (R2.8–R2.9)', () => {
         )
         .get(...B09A_CANONICAL_NAMES) as { c: number }
     ).c;
-    expect(nameCount).toBe(10);
+    expect(nameCount).toBe(11);
 
     const distinct = (
       dbs.raw
@@ -120,7 +120,7 @@ describe('B09a canonical roster seeds (R2.8–R2.9)', () => {
         )
         .get(...B09A_CANONICAL_NAMES) as { c: number }
     ).c;
-    expect(distinct).toBe(10);
+    expect(distinct).toBe(11);
 
     for (const seed of B09A_CANONICAL_AGENT_SEEDS) {
       const raw = dbs.raw.prepare('SELECT agent_type FROM agents WHERE name = ?').get(seed.name) as any;
