@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -416,6 +416,7 @@ describe('S12 session reconciler (WorkerService.sessionJanitorTick)', () => {
   let terminated: string[];
   let tmuxSpy: any;
   let ws: WorkerService;
+  let janitorModeBefore: string | undefined;
   /** Map of session name → existence tri-state (default true = live). */
   let existsMap: Map<string, boolean | null>;
   /** Map of session name → attached tri-state (default false = unattached, may REAP). */
@@ -462,6 +463,8 @@ describe('S12 session reconciler (WorkerService.sessionJanitorTick)', () => {
     terminated = [];
     existsMap = new Map();
     attachedMap = new Map();
+    janitorModeBefore = process.env.HELM_SESSION_JANITOR;
+    process.env.HELM_SESSION_JANITOR = 'on';
     tmuxSpy = {
       terminateSession: async (name: string) => {
         terminated.push(name);
@@ -475,13 +478,15 @@ describe('S12 session reconciler (WorkerService.sessionJanitorTick)', () => {
         attachedMap.has(name) ? attachedMap.get(name)! : false,
     };
     ws = new WorkerService(db, {} as any, tmuxSpy as any, {} as any, {} as any, undefined, reg);
-    // Enable janitor for synthetic path only. Deploy flag remains 0 (asserted below).
-    delete process.env.HELM_SESSION_JANITOR;
     delete process.env.HELM_SESSION_TTL_MS;
   });
   afterEach(() => {
     cleanup();
-    delete process.env.HELM_SESSION_JANITOR;
+    if (janitorModeBefore === undefined) {
+      delete process.env.HELM_SESSION_JANITOR;
+    } else {
+      process.env.HELM_SESSION_JANITOR = janitorModeBefore;
+    }
     delete process.env.HELM_SESSION_TTL_MS;
   });
 
@@ -582,6 +587,41 @@ describe('S12 session reconciler (WorkerService.sessionJanitorTick)', () => {
     await ws.sessionJanitorTick();
     expect(terminated).toEqual([]);
     expect(reg.get('helm-w-cards-disabled')!.status).toBe('idle');
+  });
+
+  it('SHADOW: REAP candidate is logged and never terminated', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      process.env.HELM_SESSION_JANITOR = 'shadow';
+      seedSession('helm-w-cards-shadow', { status: 'idle' });
+      await ws.sessionJanitorTick();
+      expect(terminated).toEqual([]);
+      expect(reg.get('helm-w-cards-shadow')!.status).toBe('idle');
+      const log = warnSpy.mock.calls.some((entry) =>
+        String(entry[0]).includes('[session-janitor][shadow]')
+      );
+      expect(log).toBe(true);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it('SHADOW: gone session stays untouched (would converge only)', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      process.env.HELM_SESSION_JANITOR = 'shadow';
+      seedSession('helm-w-cards-shadow-gone', { status: 'active' });
+      existsMap.set('helm-w-cards-shadow-gone', false);
+      await ws.sessionJanitorTick();
+      expect(terminated).toEqual([]);
+      expect(reg.get('helm-w-cards-shadow-gone')!.status).toBe('active');
+      const log = warnSpy.mock.calls.some((entry) =>
+        String(entry[0]).includes('[session-janitor][shadow]')
+      );
+      expect(log).toBe(true);
+    } finally {
+      warnSpy.mockRestore();
+    }
   });
 
   it('CONVERGE: sessionExists=false → markReaped with zero kill (AC14)', async () => {

@@ -372,11 +372,13 @@ VALUES (?,?,?,?,?,?,?,?,datetime('now'), ?)
   // Retired kill authority: grace TTL / last_used_at age, run-terminal "done", run_id-null orphan.
   // Preserved rails: registry membership, helm- prefix, active-worker veto, final @helm_child tag,
   // targeted terminate only, idempotent markReaped, gone-session CONVERGE without kill.
-  // HELM_SESSION_JANITOR='0' disables (deploy stays 0 until JROM AC20 release).
+  // HELM_SESSION_JANITOR='off|shadow|on' (default 0/off).
   async sessionJanitorTick(): Promise<void> {
     if (!this.sessionRegistry) return;
     const cfg = loadConfig() as any;
-    if (cfg.HELM_SESSION_JANITOR === false) return;
+    const janitorMode = cfg.HELM_SESSION_JANITOR;
+    if (janitorMode === "off") return;
+    const shadowMode = janitorMode === "shadow";
 
     // Candidate rows: anything not already reaped. Decision + rails evaluate each.
     // (Registry membership guardrail: we only iterate helm_sessions rows.)
@@ -405,6 +407,13 @@ VALUES (?,?,?,?,?,?,?,?,datetime('now'), ?)
 
       if (decision.action === 'CONVERGE') {
         // AC14/27: session provably gone — converge registry only; never kill.
+        if (shadowMode) {
+          console.warn('[session-janitor][shadow] WOULD CONVERGE row (no-write)', {
+            name: row.name,
+            reason: decision.reason,
+          });
+          continue;
+        }
         try {
           this.sessionRegistry.markReaped(row.name, `reconcile:${decision.reason}`);
         } catch (err) {
@@ -449,6 +458,14 @@ VALUES (?,?,?,?,?,?,?,?,datetime('now'), ?)
       }
 
       // Targeted terminate only. S12-V2: markReaped only on success, or post-fail if provably gone.
+      // In shadow mode, decide only; no termination + no persistence mutation.
+      if (shadowMode) {
+        console.warn('[session-janitor][shadow] WOULD REAP row (no terminate)', {
+          name: row.name,
+          reason: decision.reason,
+        });
+        continue;
+      }
       // A failed kill with session still live/unknown leaves the row retryable (level-triggered).
       try {
         await this.tmux.terminateSession(row.name);
@@ -470,11 +487,11 @@ VALUES (?,?,?,?,?,?,?,?,datetime('now'), ?)
   }
 
   // S12 startup reconcile: same guarded path as the tick (level-triggered, idempotent).
-  // Disable with HELM_SESSION_JANITOR='0'.
+  // Disable with HELM_SESSION_JANITOR=off (or 0).
   async sweepOrphanSessionsAtStartup(): Promise<void> {
     if (!this.sessionRegistry) return;
     const cfg = loadConfig() as any;
-    if (cfg.HELM_SESSION_JANITOR === false) return;
+    if (cfg.HELM_SESSION_JANITOR === "off") return;
     await this.sessionJanitorTick();
   }
 
