@@ -94,6 +94,15 @@ export function assertValidSessionOwner(owner: unknown): asserts owner is TmuxSe
   }
 }
 
+/** B08: registry row shape needed for same-name replace eligibility (subset of helm_sessions). */
+export type TmuxSessionLookupRow = {
+  id: number;
+  name: string;
+  owner: string | null | undefined;
+  status: string;
+  generation: number;
+};
+
 export interface TmuxSessionRegistryHook {
   /**
    * B02 C1: may return the register() SessionStatusToken so createSession can fill sessionTokenOut.
@@ -107,6 +116,33 @@ export interface TmuxSessionRegistryHook {
   // SL-R2/R4: fired on ACTIVE INPUT to a session (sendKeys). Refreshes last_used_at so the janitor's
   // TTL means "idle for TTL" not "alive for TTL" — keeps actively-used standalone sessions alive.
   onUse(name: string): void;
+  /**
+   * B08 / AC9: read-only lookup of the existing same-name registry row at create-time eligibility.
+   * Optional — missing hook or missing row is treated as unknown ownership (refuse live replace).
+   */
+  onLookup?(name: string): TmuxSessionLookupRow | null | undefined;
+}
+
+/** B08 / AC9–12: typed refusal when createSession will not destroy an existing same-name lifecycle. */
+export type SessionCollisionReason =
+  | 'human'
+  | 'unknown_owner'
+  | 'legacy_unknown'
+  | 'unasserted'
+  | 'untagged'
+  | 'exists_unknown'
+  | 'replace_refused';
+
+export class SessionNameCollisionError extends Error {
+  readonly code = 'SESSION_NAME_COLLISION' as const;
+  constructor(
+    public readonly sessionName: string,
+    public readonly reason: SessionCollisionReason,
+    message?: string
+  ) {
+    super(message ?? `session name collision refused (${reason}): ${sessionName}`);
+    this.name = 'SessionNameCollisionError';
+  }
 }
 
 const NOOP_REGISTRY_HOOK: TmuxSessionRegistryHook = {
@@ -115,7 +151,10 @@ const NOOP_REGISTRY_HOOK: TmuxSessionRegistryHook = {
   onTerminate() {
     return false;
   },
-  onUse() {}
+  onUse() {},
+  onLookup() {
+    return undefined;
+  },
 };
 
 export class TmuxService {
@@ -527,35 +566,215 @@ export class TmuxService {
     }
   }
 
+  /**
+   * B08 / F-03 AC9–11: create (or fail-closed replace) a named session.
+   * - Provably gone → new-session under final name (no kill).
+   * - Existence unknown → refuse (zero kill).
+   * - Live same-name → eligibility gate, then stage-before-close replace:
+   *   new-session under staging name → terminateSession(old) → rename → register(final).
+   * Never raw kill-if-exists. Staging failure leaves the old lifecycle untouched (AC11 structural).
+   */
   async createSession(name: string, cwd?: string, opts?: TmuxSessionCreateOpts): Promise<string> {
     this.ensureValidSessionName(name);
     // S05 / AC2 (F2): owner refusal MUST be pre-spawn. register()/onCreate runs AFTER new-session and is
     // try/caught — refusing there would leave a live untracked unreapable session. Check before ANY tmux cmd.
     assertValidSessionOwner(opts?.owner);
-    // POCFIX4: idempotent for fixed per-project session names (e.g. 'helm_cards' leftover from prior run).
-    // Best-effort kill-if-exists (has-session then kill-session) before new-session so duplicate never throws.
+
+    const exists = await this.sessionExistsTriState(name);
+    if (exists === null) {
+      throw new SessionNameCollisionError(
+        name,
+        'exists_unknown',
+        `session name collision refused (exists_unknown): cannot prove ${name} is gone`
+      );
+    }
+    if (exists === true) {
+      await this.createSessionReplacingLive(name, cwd, opts!);
+      return `${name}:0.0`;
+    }
+
+    // Provably absent: create under the final name directly (no prior kill).
+    await this.spawnTaggedSession(name, cwd);
+    this.publishCreatedSession(name, opts);
+    return `${name}:0.0`;
+  }
+
+  /**
+   * B08: live same-name replace — eligibility first (zero kill on refuse), then stage-before-close.
+   * Eligible completed Helm: owner=helm + status=idle + @helm_child, closed via terminateSession CAS.
+   * Reaped+live orphan (row already converged): physical close via noRegistryWrite after successful stage.
+   */
+  private async createSessionReplacingLive(
+    name: string,
+    cwd: string | undefined,
+    opts: TmuxSessionCreateOpts
+  ): Promise<void> {
+    const row = this.lookupExistingSession(name);
+    if (!row) {
+      throw new SessionNameCollisionError(
+        name,
+        'unknown_owner',
+        `session name collision refused (unknown_owner): no registry row for live ${name}`
+      );
+    }
+
+    const owner = row.owner;
+    if (owner === 'human') {
+      throw new SessionNameCollisionError(
+        name,
+        'human',
+        `session name collision refused (human): will not replace live human session ${name}`
+      );
+    }
+    if (owner === 'legacy:unknown') {
+      throw new SessionNameCollisionError(
+        name,
+        'legacy_unknown',
+        `session name collision refused (legacy_unknown): will not replace live legacy session ${name}`
+      );
+    }
+    if (owner !== 'helm') {
+      throw new SessionNameCollisionError(
+        name,
+        'unknown_owner',
+        `session name collision refused (unknown_owner): live ${name} has owner ${JSON.stringify(owner)}`
+      );
+    }
+
+    const status = String(row.status || '');
+    // AC9: live replace requires completion assertion (idle) or already-converged reaped orphan.
+    // Active-without-completion is never eligible.
+    if (status === 'active') {
+      throw new SessionNameCollisionError(
+        name,
+        'unasserted',
+        `session name collision refused (unasserted): live ${name} is active without completion`
+      );
+    }
+    if (status !== 'idle' && status !== 'reaped') {
+      throw new SessionNameCollisionError(
+        name,
+        'unasserted',
+        `session name collision refused (unasserted): live ${name} has status ${JSON.stringify(status)}`
+      );
+    }
+
+    // AC9: any live old target must carry positive @helm_child (untagged never killed via replace).
+    const tagged = await this.sessionHasHelmChildTag(name);
+    if (!tagged) {
+      throw new SessionNameCollisionError(
+        name,
+        'untagged',
+        `session name collision refused (untagged): live ${name} lacks @helm_child`
+      );
+    }
+
+    // Capture old CAS token at decision boundary before any mutation (idle path only).
+    let oldToken: TmuxSessionStatusToken | undefined;
+    if (status === 'idle') {
+      try {
+        oldToken = {
+          id: row.id,
+          name: row.name,
+          owner: 'helm',
+          expectedStatus: 'idle',
+          generation: row.generation,
+        };
+      } catch {
+        throw new SessionNameCollisionError(
+          name,
+          'unasserted',
+          `session name collision refused (unasserted): cannot build token for ${name}`
+        );
+      }
+    }
+
+    // Stage under a unique name FIRST so a create failure never touches the old lifecycle (AC11).
+    const stagingName = this.makeStagingSessionName(name);
     try {
-      await execFileAsync("tmux", ["has-session", "-t", name]);
-      // exists -> kill (ignore errors, best-effort)
-      await execFileAsync("tmux", ["kill-session", "-t", name]).catch(() => {});
-    } catch {
-      // does not exist: proceed to create
+      await this.spawnTaggedSession(stagingName, cwd);
+    } catch (err) {
+      // Staging failed — old session and registry must remain untouched.
+      throw err;
     }
-    const args = ["new-session", "-d", "-s", name];
+
+    // Authorized close of the old lifecycle through terminateSession (AC10), not raw kill-session.
+    let closed = false;
+    try {
+      if (status === 'idle' && oldToken) {
+        closed = await this.terminateSession(name, { sessionToken: oldToken });
+      } else {
+        // reaped row already converged — physical cleanup only.
+        closed = await this.terminateSession(name, { noRegistryWrite: true });
+      }
+    } catch (err) {
+      await this.killSessionRaw(stagingName).catch(() => {});
+      throw err;
+    }
+    if (!closed) {
+      await this.killSessionRaw(stagingName).catch(() => {});
+      throw new SessionNameCollisionError(
+        name,
+        'replace_refused',
+        `session name collision refused (replace_refused): terminateSession did not close ${name}`
+      );
+    }
+
+    // Publish under the FINAL name (registry row must not name the staging session).
+    try {
+      await execFileAsync('tmux', ['rename-session', '-t', stagingName, name]);
+    } catch (err) {
+      // Old is gone; staging may still exist — best-effort cleanup, then surface the failure.
+      await this.killSessionRaw(stagingName).catch(() => {});
+      throw err;
+    }
+
+    this.publishCreatedSession(name, opts);
+  }
+
+  /** B08: lookup existing same-name registry row for replace eligibility (fail-closed if absent). */
+  private lookupExistingSession(name: string): TmuxSessionLookupRow | null {
+    const lookup = this.registryHook.onLookup;
+    if (typeof lookup !== 'function') return null;
+    try {
+      const row = lookup.call(this.registryHook, name);
+      if (!row || typeof row.id !== 'number' || !row.name) return null;
+      return row;
+    } catch (err) {
+      console.warn('[tmux] registry onLookup failed → treating as unknown', { name, err: String(err) });
+      return null;
+    }
+  }
+
+  /** Unique staging name under ensureValidSessionName charset (no second session under final name). */
+  private makeStagingSessionName(finalName: string): string {
+    const suffix = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+    const staging = `${finalName}-stg-${suffix}`;
+    this.ensureValidSessionName(staging);
+    return staging;
+  }
+
+  /**
+   * ST-R1: new-session + @helm_child tag. No registry write (caller publishes under the final name).
+   */
+  private async spawnTaggedSession(sessionName: string, cwd?: string): Promise<void> {
+    const args = ['new-session', '-d', '-s', sessionName];
     if (cwd) {
-      args.push("-c", cwd);
+      args.push('-c', cwd);
     }
-    await execFileAsync("tmux", args);
-    // ST-R1: positive, name-independent Helm ownership tag. Set a tmux session user-option `@helm_child 1`
-    // on EVERY session Helm creates (single choke point). This is the marker the janitor (ST-R2) REQUIRES
-    // before it will ever terminate a session — nothing untagged is ever killed. Best-effort: a set-option
-    // failure must never break/throw the create (swallowed + logged, exactly like the registry hook below).
-    await execFileAsync('tmux', ['set-option', '-t', name, '@helm_child', '1'])
-      .catch((err) => { console.warn('[tmux] set @helm_child failed (best-effort)', { name, err: String(err) }); });
-    // SL-R1 / A2 / S05: register EVERY created session centrally (single choke point), carrying owner +
-    // optional projectId/runId/kind so helm_sessions rows are linked at create time. Best-effort — a
-    // registry failure must never break session creation (owner already validated pre-spawn).
-    // B02 C1: retain the register() CAS token via sessionTokenOut (create/acquire boundary only).
+    await execFileAsync('tmux', args);
+    // ST-R1: positive Helm ownership tag on every session Helm creates. Best-effort — a set-option
+    // failure must never break/throw the create (swallowed + logged).
+    await execFileAsync('tmux', ['set-option', '-t', sessionName, '@helm_child', '1']).catch((err) => {
+      console.warn('[tmux] set @helm_child failed (best-effort)', { name: sessionName, err: String(err) });
+    });
+  }
+
+  /**
+   * SL-R1 / A2 / S05 / B02: register under the FINAL session name and optionally fill sessionTokenOut.
+   * Best-effort — registry failure must never break a successful tmux create.
+   */
+  private publishCreatedSession(name: string, opts?: TmuxSessionCreateOpts): void {
     try {
       const createdToken = this.registryHook.onCreate(name, opts);
       if (createdToken && opts?.sessionTokenOut) {
@@ -564,7 +783,6 @@ export class TmuxService {
     } catch (err) {
       console.warn('[tmux] registry onCreate failed', { name, err: String(err) });
     }
-    return `${name}:0.0`;
   }
 
   // ST-R2: positive Helm-ownership probe. Returns true ONLY if the live session carries the

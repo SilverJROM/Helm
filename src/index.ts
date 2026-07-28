@@ -323,7 +323,15 @@ async function main(): Promise<void> {
         }
       },
       // SL-R2/R4: active-input refreshes last_used_at so the TTL means "idle for TTL" (in-use sessions kept).
-      onUse: (name: string) => { try { sessionRegistry.touch(name); } catch {} }
+      onUse: (name: string) => { try { sessionRegistry.touch(name); } catch {} },
+      // B08 / AC9: createSession same-name replace eligibility — read-only registry lookup (no invent).
+      onLookup: (name: string) => {
+        try {
+          return sessionRegistry.get(name) ?? undefined;
+        } catch {
+          return undefined;
+        }
+      },
     });
   }
   // S02 + B02: wire CAS markIdle into shared worker_runtimes finalizer (no SQL dup).
