@@ -203,17 +203,17 @@ WHERE name = ? AND status != 'reaped'
   /**
    * SL-R2 / B02 AC6: work done, awaiting cleanup (janitor's target).
    * Full CAS predicates — id, name, owner, expected status, generation. Zero rows ⇒ stale.
+   * Legal source status is **active only** (C2: idle→idle same-token replay is stale).
    * Callers must not refresh a rejected token and retry.
    */
   markIdle(token: SessionStatusToken, reason?: string): SessionStatusCasResult {
     if (!token?.name) return { applied: false, stale: true };
-    // Preserve pre-B02 invariant: never resurrect a reaped lifecycle (old SQL had status != 'reaped').
-    // A token captured against a reaped row is treated as stale, not an active→idle transition.
-    if (token.expectedStatus === 'reaped') return { applied: false, stale: true };
+    // C2: only active→idle is a real transition. idle/reaped tokens do not re-apply.
+    if (token.expectedStatus !== 'active') return { applied: false, stale: true };
     const info = this.db.prepare(`
 UPDATE helm_sessions SET status = 'idle', last_used_at = datetime('now'), reason = ?
 WHERE id = ? AND name = ? AND owner = ? AND status = ? AND generation = ?
-  AND status != 'reaped'
+  AND status = 'active'
 `).run(reason ?? null, token.id, token.name, token.owner, token.expectedStatus, token.generation);
     return Number(info.changes) === 1 ? { applied: true } : { applied: false, stale: true };
   }
@@ -221,14 +221,34 @@ WHERE id = ? AND name = ? AND owner = ? AND status = ? AND generation = ?
   /**
    * SL-R2 / B02 AC6: session terminated/closed. Sets ended_at.
    * Full CAS predicates — id, name, owner, expected status, generation. Zero rows ⇒ stale.
+   * Legal source is non-reaped only (C2: reaped→reaped same-token replay is stale).
    */
   markReaped(token: SessionStatusToken, reason?: string): SessionStatusCasResult {
     if (!token?.name) return { applied: false, stale: true };
+    // C2: already-reaped tokens must not re-apply or rewrite reason indefinitely.
+    if (token.expectedStatus === 'reaped') return { applied: false, stale: true };
     const info = this.db.prepare(`
 UPDATE helm_sessions SET status = 'reaped', ended_at = datetime('now'), reason = COALESCE(?, reason)
 WHERE id = ? AND name = ? AND owner = ? AND status = ? AND generation = ?
+  AND status != 'reaped'
 `).run(reason ?? null, token.id, token.name, token.owner, token.expectedStatus, token.generation);
     return Number(info.changes) === 1 ? { applied: true } : { applied: false, stale: true };
+  }
+
+  /**
+   * B02 C1: capture a decision-boundary token for a named session (one shot).
+   * Returns undefined when absent or already reaped — callers should use
+   * `terminateSession(name, { noRegistryWrite: true })` rather than invent a token.
+   */
+  captureStatusToken(name: string): SessionStatusToken | undefined {
+    if (!name) return undefined;
+    const row = this.get(name);
+    if (!row || row.status === 'reaped') return undefined;
+    try {
+      return sessionStatusTokenFromRow(row);
+    } catch {
+      return undefined;
+    }
   }
 
   /**

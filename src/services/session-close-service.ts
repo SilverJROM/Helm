@@ -17,6 +17,7 @@ export interface SessionCloseTmux {
         expectedStatus: 'active' | 'idle' | 'reaped';
         generation: number;
       };
+      noRegistryWrite?: boolean;
     }
   ): Promise<void>;
   sessionHasHelmChildTag(name: string): Promise<boolean>;
@@ -159,10 +160,10 @@ export class SessionCloseService {
       };
     }
 
-    // Claim won: targeted terminate (fake tmux in tests). Best-effort — row already converged.
-    // Pass claim token so onTerminate does not re-read a different lifecycle.
+    // Claim won: registry already CAS-reaped. Kill is explicit no-registry-write (C1: never
+    // re-read/rebuild a token; claim was the sole status mutation).
     try {
-      await this.tmux.terminateSession(name, { sessionToken: claimToken });
+      await this.tmux.terminateSession(name, { noRegistryWrite: true });
     } catch (err) {
       console.warn('[session-close] terminateSession failed after claim (registry already reaped)', {
         name,

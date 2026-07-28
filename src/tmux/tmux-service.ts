@@ -60,11 +60,17 @@ export function assertValidSessionOwner(owner: unknown): asserts owner is TmuxSe
   }
 }
 
-/** B02: optional CAS token carried through terminate so markReaped predicates the snapshot lifecycle. */
+/**
+ * B02 C1: termination registry policy.
+ * - `sessionToken`: decision-boundary CAS token — only path that may mutate helm_sessions.
+ * - `noRegistryWrite: true`: explicit kill-only (tmux destroy, no markReaped).
+ * Passing neither is treated as kill-only (fail-safe); never re-read by name to invent a token.
+ */
 export interface TmuxTerminateOpts {
   /**
-   * Captured session status token (id/name/owner/expectedStatus/generation). When present, the
-   * registry onTerminate hook must CAS-reap with this token — never re-read to force success.
+   * Captured at the caller's decision boundary (id/name/owner/expectedStatus/generation).
+   * Required for any registry markReaped on terminate. Must not be rebuilt from get(name) inside
+   * the terminate hook after a name-only call.
    */
   sessionToken?: {
     id: number;
@@ -73,13 +79,18 @@ export interface TmuxTerminateOpts {
     expectedStatus: 'active' | 'idle' | 'reaped';
     generation: number;
   };
+  /**
+   * Explicit: kill tmux only — do not mutate helm_sessions.
+   * Use when no decision-boundary token exists (unregistered / already reaped / probe cleanup).
+   */
+  noRegistryWrite?: boolean;
 }
 
 export interface TmuxSessionRegistryHook {
   onCreate(name: string, opts?: TmuxSessionCreateOpts): void;
   /**
-   * B02: second arg is the optional CAS token from terminateSession. Absent token ⇒ hook may do
-   * one capture via get(name) at the terminate boundary (not a retry loop).
+   * B02 C1: registry mutation only when a decision-boundary token is supplied.
+   * Name-only / missing token ⇒ no registry write (never get(name) fallback).
    */
   onTerminate(name: string, token?: TmuxTerminateOpts['sessionToken']): void;
   // SL-R2/R4: fired on ACTIVE INPUT to a session (sendKeys). Refreshes last_used_at so the janitor's
@@ -609,10 +620,14 @@ export class TmuxService {
     await execFileAsync("tmux", ["kill-session", "-t", sessionName]);
     // S09: drop prior pane snapshot so a recreated same-name session re-baselines (no stale delta).
     this.lastPaneSnapshots.delete(sessionName);
-    // SL-R1/R2 + B02: mark reaped centrally on terminate with optional CAS token.
-    // Best-effort — never mask a real kill.
+    // B02 C1: registry mutation ONLY with a decision-boundary sessionToken.
+    // Explicit noRegistryWrite (or missing token) ⇒ kill-only; never get(name) to invent a token.
+    const token = opts?.sessionToken;
+    if (!token || opts?.noRegistryWrite) {
+      return;
+    }
     try {
-      this.registryHook.onTerminate(sessionName, opts?.sessionToken);
+      this.registryHook.onTerminate(sessionName, token);
     } catch (err) {
       console.warn('[tmux] registry onTerminate failed', { sessionName, err: String(err) });
     }

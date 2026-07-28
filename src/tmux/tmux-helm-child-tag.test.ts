@@ -416,12 +416,9 @@ describe('ST-R1/R2 @helm_child tmux ownership tag', () => {
 
     const tmux: any = new TmuxService({
       onCreate: (n: string) => reg.register(n, { owner: 'helm' }),
-      onTerminate: (n: string, token?: any) => {
+      // B02 C1: no get(name) fallback — token required for registry mutation.
+      onTerminate: (_n: string, token?: any) => {
         if (token) reg.markReaped(token);
-        else {
-          const row = reg.get(n);
-          if (row) reg.markReaped(sessionStatusTokenFromRow(row));
-        }
       },
       onUse: (n: string) => reg.touch(n),
     });

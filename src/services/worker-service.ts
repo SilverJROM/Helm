@@ -11,6 +11,7 @@ import { resolveHelmSandboxBin, makeWriteFencePolicy, makeStrictReadProfileEnv }
 import { startGovernedDocGuard, type GovernedDocGuardHandle } from './doc-path-guard.js';
 import { applyEnvelopeIsolation } from './envelope-isolation.js';
 import { sessionStatusTokenFromRow, type SessionRegistryService } from './session-registry-service.js';
+import type { TmuxTerminateOpts } from '../tmux/tmux-service.js';
 import { HelmIdentityService } from './helm-identity-service.js';
 import { finalizeWorkerRuntimeRow, finalizeSessionGoneWorkers } from './worker-runtime-finalize.js';
 import { decideSessionReconcile } from './session-reconcile-decision.js';
@@ -37,6 +38,16 @@ export class WorkerService {
     identity?: HelmIdentityService
   ) {
     this.identity = identity;
+  }
+
+  /**
+   * B02 C1: decision-boundary terminate opts — CAS token when registry row is live, else
+   * explicit kill-only (never name-only get→markReaped inside the terminate hook).
+   */
+  private terminateOptsForSession(name: string): TmuxTerminateOpts {
+    const token = this.sessionRegistry?.captureStatusToken(name);
+    if (token) return { sessionToken: token };
+    return { noRegistryWrite: true };
   }
 
   // AC1/AC2: the native active project (never a legacy numeric-ID match) is the sole slug source;
@@ -239,7 +250,7 @@ VALUES (?,?,?,?,?,?,?,?,datetime('now'), ?)
         });
         return this.db.prepare("SELECT * FROM worker_runtimes WHERE id=?").get(id);
       } catch (e: any) {
-        try { await this.tmux.terminateSession(sessionName); } catch {}
+        try { await this.tmux.terminateSession(sessionName, this.terminateOptsForSession(sessionName)); } catch {}
         this.activeWorkerSessions.delete(sessionName);
         try { this.governedDocGuards.get(sessionName)?.stop(); } catch {}
         this.governedDocGuards.delete(sessionName);
@@ -270,7 +281,8 @@ VALUES (?,?,?,?,?,?,?,?,datetime('now'), ?)
       // H3: always best-effort kill the session when one is present. getPanePid() returns null
       // on a tmux error, so gating the kill on a truthy PID could leave a live session orphaned
       // while the row is marked terminal (idempotency then blocks any future cleanup).
-      try { await this.tmux.terminateSession(session); } catch {}
+      // B02 C1: capture token at this reap decision boundary (not name-only terminate).
+      try { await this.tmux.terminateSession(session, this.terminateOptsForSession(session)); } catch {}
       this.activeWorkerSessions.delete(session);
       try { this.governedDocGuards.get(session)?.stop(); } catch {}
       this.governedDocGuards.delete(session);

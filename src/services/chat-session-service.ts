@@ -92,6 +92,11 @@ export interface ChatSessionDeps {
   projectService?: ProjectService;
   fenceDir?: string;
   nowFn?: () => number;
+  /**
+   * B02 C1: optional decision-boundary token capture for terminate.
+   * Absent → explicit noRegistryWrite (kill-only).
+   */
+  captureSessionToken?: (name: string) => import('./lifecycle-cas.js').SessionStatusToken | undefined;
 }
 
 export interface ActiveCycleContext {
@@ -765,7 +770,13 @@ export class ChatSessionService {
       });
     } catch (err) {
       // Boot failed — tear down the half-created pane so we never leak a session.
-      try { await this.deps.tmux.terminateSession(sessionName); } catch {}
+      try {
+        const tok = this.deps.captureSessionToken?.(sessionName);
+        await this.deps.tmux.terminateSession(
+          sessionName,
+          tok ? { sessionToken: tok } : { noRegistryWrite: true }
+        );
+      } catch {}
       try { this.governedDocGuards.get(sessionName)?.stop(); } catch {}
       this.governedDocGuards.delete(sessionName);
       throw err;
@@ -912,7 +923,14 @@ export class ChatSessionService {
     const sess = this.sessions.get(sessionId);
     if (!sess) return; // no-op if already gone (idempotent for DELETE + shutdown sweep)
     this.sessions.delete(sessionId);
-    try { await this.deps.tmux.terminateSession(sess.tmuxSession); } catch {}
+    try {
+      // B02 C1: decision-boundary token or explicit kill-only.
+      const tok = this.deps.captureSessionToken?.(sess.tmuxSession);
+      await this.deps.tmux.terminateSession(
+        sess.tmuxSession,
+        tok ? { sessionToken: tok } : { noRegistryWrite: true }
+      );
+    } catch {}
     try { this.governedDocGuards.get(sess.tmuxSession)?.stop(); } catch {}
     this.governedDocGuards.delete(sess.tmuxSession);
   }

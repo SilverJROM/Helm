@@ -37,7 +37,7 @@ import { createScopedChatSidPre } from "./services/delivery-channel.js";
 import { MasterRuntimeService } from "./services/master-runtime-service.js";
 import { WorkerService } from "./services/worker-service.js";
 import { HelmIdentityService, requireActiveNativeProject } from "./services/helm-identity-service.js";
-import { SessionRegistryService, sessionStatusTokenFromRow } from "./services/session-registry-service.js";
+import { SessionRegistryService } from "./services/session-registry-service.js";
 import type { SessionStatusToken } from "./services/lifecycle-cas.js";
 import { SessionCloseService } from "./services/session-close-service.js";
 import { registerSessionCloseRoutes } from "./api/routes/session-close-routes.js";
@@ -308,16 +308,11 @@ async function main(): Promise<void> {
       onCreate: (name: string, opts?: { projectId?: number | null; runId?: number | null; kind?: string; owner?: 'helm' | 'human' | 'legacy:unknown' }) => {
         try { sessionRegistry.register(name, opts as any); } catch {}
       },
-      // B02 AC6: prefer caller-supplied CAS token; else one capture at terminate boundary (no retry).
-      onTerminate: (name: string, token?: SessionStatusToken) => {
+      // B02 C1: registry mutation only with decision-boundary token — never get(name) fallback.
+      onTerminate: (_name: string, token?: SessionStatusToken) => {
         try {
-          if (token) {
-            sessionRegistry.markReaped(token);
-            return;
-          }
-          const row = sessionRegistry.get(name);
-          if (!row) return;
-          sessionRegistry.markReaped(sessionStatusTokenFromRow(row));
+          if (!token) return;
+          sessionRegistry.markReaped(token);
         } catch {}
       },
       // SL-R2/R4: active-input refreshes last_used_at so the TTL means "idle for TTL" (in-use sessions kept).
@@ -378,7 +373,9 @@ async function main(): Promise<void> {
     resolverService,
     memoryService,
     projectService,
-    fenceDir: process.env.HELM_FENCE_DIR || process.cwd()
+    fenceDir: process.env.HELM_FENCE_DIR || process.cwd(),
+    // B02 C1: decision-boundary capture for chat terminate (no name-only registry write).
+    captureSessionToken: (name) => sessionRegistry.captureStatusToken(name),
   });
 
   // F2 round-8 (finding #1): SID↔scope binding. ONE shared pre-handler resolves the session and verifies the
@@ -429,7 +426,12 @@ async function main(): Promise<void> {
   // (or landed unlinked). Workers already used this shared instance; planning now matches.
   const orchT: ITransport = useFakeTmux
     ? new FakeTransport()
-    : new RealTransport({ artifacts: runArtifactService, tmux: tmuxService });
+    : new RealTransport({
+        artifacts: runArtifactService,
+        tmux: tmuxService,
+        // B02 C1: decision-boundary capture for reap/terminate (no name-only registry write).
+        captureSessionToken: (name) => sessionRegistry.captureStatusToken(name),
+      });
   const housekeeperService = new HousekeeperService(
     db,
     sessionRegistry,
@@ -3367,7 +3369,12 @@ async function main(): Promise<void> {
       return reply.code(409).send({ error: 'already closed' });
     }
     try {
-      await tmuxService.terminateSession(session);
+      // B02 C1: capture token at close decision boundary (or kill-only if absent/reaped).
+      const closeTok = sessionRegistry.captureStatusToken(session);
+      await tmuxService.terminateSession(
+        session,
+        closeTok ? { sessionToken: closeTok } : { noRegistryWrite: true }
+      );
     } catch (e: any) {
       // best effort; continue to mark closed
     }

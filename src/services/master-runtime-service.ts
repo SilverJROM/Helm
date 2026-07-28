@@ -6,7 +6,8 @@ import { setTimeout as setTimeoutPromise } from "node:timers/promises";
 
 import { DatabaseService } from "../db/database.js";
 import { AgentEventsService, AgentEventInput } from "./agent-events-service.js";
-import { TmuxService } from "../tmux/tmux-service.js";
+import { TmuxService, type TmuxTerminateOpts } from "../tmux/tmux-service.js";
+import { sessionStatusTokenFromRow } from "./session-registry-service.js";
 import { ProviderResolverService, ProviderLaunchSpec } from "./provider-resolver-service.js";
 import { MasterModelService, MasterModelEntry } from "./master-model-service.js";
 import { PROVIDERS, ProviderDefinition } from "../config/providers.js";
@@ -95,6 +96,28 @@ export class MasterRuntimeService {
     this.identity = identity;
     // RT4: reap stale locks on startup
     this.reapStaleSwitches();
+  }
+
+  /**
+   * B02 C1: capture helm_sessions token at the terminate decision boundary (one SELECT).
+   * No row / already reaped / invalid authority → explicit kill-only (noRegistryWrite).
+   * Never relies on terminateSession's removed name-only get→markReaped fallback.
+   */
+  private terminateOptsForSession(name: string): TmuxTerminateOpts {
+    if (!name) return { noRegistryWrite: true };
+    try {
+      const row = this.db
+        .prepare(
+          `SELECT id, name, owner, status, generation FROM helm_sessions WHERE name = ?`
+        )
+        .get(name) as
+        | { id: number; name: string; owner: string | null; status: string; generation: number }
+        | undefined;
+      if (!row || row.status === "reaped") return { noRegistryWrite: true };
+      return { sessionToken: sessionStatusTokenFromRow(row) };
+    } catch {
+      return { noRegistryWrite: true };
+    }
   }
 
   /** B25 fix2: chain entry is launch-legal iff PROVIDERS allow-list (or dynamic) accepts it. */
@@ -228,7 +251,7 @@ export class MasterRuntimeService {
       // leave any unverified binary as fail-closed MISSING
     } finally {
       if (created) {
-        try { await this.tmux.terminateSession(probeSession); } catch {}
+        try { await this.tmux.terminateSession(probeSession, this.terminateOptsForSession(probeSession)); } catch {}
       }
     }
     return result;
@@ -309,7 +332,7 @@ export class MasterRuntimeService {
   }): Promise<never> {
     this.seatScanCtx.delete(p.target);
     if (p.createdThisTime) {
-      try { await this.tmux.terminateSession(p.sessionName); } catch { /* best-effort */ }
+      try { await this.tmux.terminateSession(p.sessionName, this.terminateOptsForSession(p.sessionName)); } catch { /* best-effort */ }
     }
     try { this.governedDocGuards.get(p.sessionName)?.stop(); } catch {}
     this.governedDocGuards.delete(p.sessionName);
@@ -615,7 +638,7 @@ task_id required in convention (include when known); backend warns but records i
       // (If it pre-existed we do not kill it here.)
       if (createdThisTime) {
         try {
-          await this.tmux.terminateSession(sessionName);
+          await this.tmux.terminateSession(sessionName, this.terminateOptsForSession(sessionName));
         } catch {
           // best-effort; do not swallow the original timeout error
         }
@@ -680,7 +703,7 @@ task_id required in convention (include when known); backend warns but records i
       }
       if (!codexGenuine) {
         if (createdThisTime) {
-          try { await this.tmux.terminateSession(sessionName); } catch {}
+          try { await this.tmux.terminateSession(sessionName, this.terminateOptsForSession(sessionName)); } catch {}
         }
         try { this.governedDocGuards.get(sessionName)?.stop(); } catch {}
         this.governedDocGuards.delete(sessionName);
@@ -1446,7 +1469,7 @@ task_id required in convention (include when known); backend warns but records i
         // P2-r2: the NEW master launched but never ACKed. Do NOT leave it 'running' for the supervisor
         // to adopt as a valid context-resumed master. Kill the un-acked session + mark the runtime row
         // 'failed' so the supervisor recovers it cleanly (fresh relaunch) next tick.
-        try { await this.tmux.terminateSession(sess); } catch {}
+        try { await this.tmux.terminateSession(sess, this.terminateOptsForSession(sess)); } catch {}
         try { this.governedDocGuards.get(sess)?.stop(); } catch {}
         this.governedDocGuards.delete(sess);
         try { this.db.prepare("UPDATE master_runtimes SET state='failed', intentional_park_until=NULL WHERE project_id = ?").run(projectId); } catch {}
@@ -1612,7 +1635,7 @@ task_id required in convention (include when known); backend warns but records i
   async terminateAllActiveMasters(): Promise<void> {
     for (const sess of Array.from(this.activeMasterSessions)) {
       try {
-        await this.tmux.terminateSession(sess);
+        await this.tmux.terminateSession(sess, this.terminateOptsForSession(sess));
         this.activeMasterSessions.delete(sess);
       } catch (e) {
         console.warn('[MasterRuntimeService] terminateAllActiveMasters failed', { sess, err: String(e) });
