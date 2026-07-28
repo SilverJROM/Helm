@@ -49,6 +49,14 @@ export interface SessionStatusToken extends LifecycleToken {
   name: string;
   owner: SessionCasOwner;
   expectedStatus: SessionCasStatus;
+  /**
+   * B05 fix cycle 1 / AC5: when true, a reap claim requires the row's CURRENT status to equal
+   * `expectedStatus` exactly, not merely "still active or idle". Only the janitor's own
+   * pre-terminate snapshot token sets this — create-time cleanup tokens (worker/session-close/
+   * real-transport/master-runtime) never set it, and keep the broader active|idle window they
+   * legitimately need across an active->idle progression within the SAME lifecycle.
+   */
+  exactStatusOnly?: boolean;
 }
 
 /**
@@ -66,13 +74,16 @@ const VALID_CAS_STATUSES = new Set<SessionCasStatus>(['active', 'idle', 'reaped'
  * Build a SessionStatusToken from a registry row (or equivalent SELECT). Throws if owner/status
  * are missing or outside the closed sets — callers must not invent authority.
  */
-export function sessionStatusTokenFromRow(row: {
-  id: number;
-  name: string;
-  owner: string | null | undefined;
-  status: string;
-  generation: number;
-}): SessionStatusToken {
+export function sessionStatusTokenFromRow(
+  row: {
+    id: number;
+    name: string;
+    owner: string | null | undefined;
+    status: string;
+    generation: number;
+  },
+  opts?: { exactStatusOnly?: boolean }
+): SessionStatusToken {
   const owner = row.owner as SessionCasOwner;
   const expectedStatus = row.status as SessionCasStatus;
   if (typeof row.id !== 'number' || !Number.isFinite(row.id)) {
@@ -98,6 +109,7 @@ export function sessionStatusTokenFromRow(row: {
     owner,
     expectedStatus,
     generation: row.generation,
+    ...(opts?.exactStatusOnly ? { exactStatusOnly: true as const } : {}),
   };
 }
 

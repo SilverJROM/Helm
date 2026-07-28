@@ -975,6 +975,31 @@ describe('B05 AC5: janitor final CAS immediately before terminate (real TmuxServ
     expect(after.generation).toBeGreaterThan(created.generation);
   });
 
+  // B05 fix cycle 1 (redteam-sol CRITICAL C1): markReaped's SQL validated expectedStatus in JS
+  // but bound only `status IN ('active','idle')`, never the snapshot's exact value — so an idle
+  // snapshot token still claimed/killed a row whose id/name/owner/generation never changed but
+  // whose status flipped back to active. Reproduce that exact repro: a raw same-lifecycle status
+  // flip (nothing else about the row changes) injected at the same point as the tests above.
+  it('status flips idle→active between snapshot and claim (id/name/owner/generation unchanged) → zero kill-session', async () => {
+    const created = reg.register('helm-w-b05-race-status', { owner: 'helm' })!;
+    reg.markIdle(sessionStatusTokenFromRow(created));
+
+    tmux.onTagProbe = (name) => {
+      if (name === 'helm-w-b05-race-status') {
+        // Synthetic same-lifecycle status flip — id/name/owner/generation all untouched.
+        db.prepare("UPDATE helm_sessions SET status = 'active' WHERE name = ?").run(name);
+      }
+    };
+
+    await ws.sessionJanitorTick();
+
+    expect(tmux.kills).toEqual([]);
+    const after = reg.get('helm-w-b05-race-status')!;
+    expect(after.owner).toBe('helm');
+    expect(after.status).toBe('active');
+    expect(after.generation).toBe(created.generation);
+  });
+
   it('unchanged Helm idle lifecycle → claims once and performs exactly one targeted kill-session', async () => {
     const created = reg.register('helm-w-b05-race-none', { owner: 'helm' })!;
     reg.markIdle(sessionStatusTokenFromRow(created));

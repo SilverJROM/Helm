@@ -224,6 +224,10 @@ WHERE id = ? AND name = ? AND owner = ? AND status = ? AND generation = ?
    * Status may progress active→idle within the same lifecycle before reap (create-time token
    * retained through cleanup); legal sources are active|idle only.
    * C2: reaped→reaped same-token replay is stale (no reason rewrite).
+   * B05 fix cycle 1 / AC5: `token.exactStatusOnly` narrows the status predicate to an exact
+   * match against `token.expectedStatus` — the janitor's own pre-terminate claim sets this so an
+   * idle snapshot cannot still reap a row that has since become active at the same id/name/owner/
+   * generation. Create-time cleanup tokens never set it and keep the broader active|idle window.
    */
   markReaped(token: SessionStatusToken, reason?: string): SessionStatusCasResult {
     if (!token?.name) return { applied: false, stale: true };
@@ -232,12 +236,16 @@ WHERE id = ? AND name = ? AND owner = ? AND status = ? AND generation = ?
     if (token.expectedStatus !== 'active' && token.expectedStatus !== 'idle') {
       return { applied: false, stale: true };
     }
-    // Same lifecycle may be active or idle at kill time; generation+id fence replacement.
+    // Same lifecycle may be active or idle at kill time (unless exactStatusOnly narrows this);
+    // generation+id fence replacement either way.
+    const statusPredicate = token.exactStatusOnly ? 'status = ?' : `status IN ('active', 'idle')`;
+    const params: unknown[] = [reason ?? null, token.id, token.name, token.owner, token.generation];
+    if (token.exactStatusOnly) params.push(token.expectedStatus);
     const info = this.db.prepare(`
 UPDATE helm_sessions SET status = 'reaped', ended_at = datetime('now'), reason = COALESCE(?, reason)
 WHERE id = ? AND name = ? AND owner = ? AND generation = ?
-  AND status IN ('active', 'idle')
-`).run(reason ?? null, token.id, token.name, token.owner, token.generation);
+  AND ${statusPredicate}
+`).run(...params);
     return Number(info.changes) === 1 ? { applied: true } : { applied: false, stale: true };
   }
 

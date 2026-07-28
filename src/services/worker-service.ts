@@ -508,7 +508,10 @@ VALUES (?,?,?,?,?,?,?,?,datetime('now'), ?)
       }
       // A failed kill with session still live/unknown leaves the row retryable (level-triggered).
       // B02: carry snapshot CAS token through terminate + markReaped (no name-only write).
-      const reapToken = sessionStatusTokenFromRow(row);
+      // B05 fix cycle 1 / AC5: exactStatusOnly — the janitor's own pre-terminate claim must match
+      // the snapshot's status exactly (idle), not merely "still active or idle", so a same-id/name/
+      // owner/generation row that flipped back to active since the snapshot aborts the kill.
+      const reapToken = sessionStatusTokenFromRow(row, { exactStatusOnly: true });
       try {
         await this.tmux.terminateSession(row.name, { sessionToken: reapToken });
         try {
