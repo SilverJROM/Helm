@@ -3349,7 +3349,8 @@ ALTER TABLE runs_new RENAME TO runs;
       // v104 / S18a: housekeeper investigation dispatch evidence.
       // Investigation-only; no status repair, markIdle, markReaped, or reap in this migration.
       if (current && current.version < 104) {
-        this.db.exec(`
+        if (hasTable('helm_sessions')) {
+          this.db.exec(`
 CREATE TABLE IF NOT EXISTS housekeeper_investigations (
   id INTEGER PRIMARY KEY,
   helm_session_id INTEGER REFERENCES helm_sessions(id) ON DELETE SET NULL,
@@ -3374,7 +3375,76 @@ CREATE TABLE IF NOT EXISTS housekeeper_investigations (
 CREATE INDEX IF NOT EXISTS idx_housekeeper_investigations_session ON housekeeper_investigations(session_name, created_at);
 CREATE INDEX IF NOT EXISTS idx_housekeeper_investigations_status ON housekeeper_investigations(status);
 `);
+        }
         this.db.prepare('UPDATE schema_version SET version = 104').run();
+      }
+
+      // v105 / S18b: housekeeper callback/apply contract + cooldown state signature.
+      // Additive only; done applies by marking helm_sessions idle in the service, never by reaping.
+      if (current && current.version < 105) {
+        if (hasTable('housekeeper_investigations')) {
+          const tableSql = (this.db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='housekeeper_investigations'`).get() as any)?.sql as string | undefined;
+          if (tableSql && !tableSql.includes('applied_done')) {
+            this.db.exec(`
+ALTER TABLE housekeeper_investigations RENAME TO housekeeper_investigations_v104;
+CREATE TABLE housekeeper_investigations (
+  id INTEGER PRIMARY KEY,
+  helm_session_id INTEGER REFERENCES helm_sessions(id) ON DELETE SET NULL,
+  session_name TEXT NOT NULL,
+  owner TEXT NOT NULL CHECK(owner = 'helm'),
+  status TEXT NOT NULL CHECK(status IN ('no_dispatch','dispatching','dispatched','applied_done','needs_human','apply_rejected')) DEFAULT 'dispatching',
+  trigger_reason TEXT NOT NULL,
+  state_signature TEXT,
+  observation_json TEXT NOT NULL,
+  pane_tail TEXT NOT NULL,
+  pane_tail_provenance TEXT NOT NULL,
+  envelope_json TEXT NOT NULL,
+  usage_json TEXT NOT NULL,
+  selected_provider TEXT,
+  selected_model TEXT,
+  selected_slug TEXT,
+  selected_rung_index INTEGER,
+  selected_reason TEXT,
+  dispatch_handle TEXT,
+  dispatched_at TEXT,
+  callback_verdict TEXT CHECK(callback_verdict IS NULL OR callback_verdict IN ('done','needs-human')),
+  callback_evidence TEXT,
+  callback_rationale TEXT,
+  applied_at TEXT,
+  apply_error TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+INSERT INTO housekeeper_investigations (
+  id, helm_session_id, session_name, owner, status, trigger_reason, observation_json,
+  pane_tail, pane_tail_provenance, envelope_json, usage_json,
+  selected_provider, selected_model, selected_slug, selected_rung_index, selected_reason,
+  dispatch_handle, dispatched_at, created_at
+)
+SELECT
+  id, helm_session_id, session_name, owner, status, trigger_reason, observation_json,
+  pane_tail, pane_tail_provenance, envelope_json, usage_json,
+  selected_provider, selected_model, selected_slug, selected_rung_index, selected_reason,
+  dispatch_handle, dispatched_at, created_at
+FROM housekeeper_investigations_v104;
+DROP TABLE housekeeper_investigations_v104;
+`);
+          }
+          const cols = this.db.prepare('PRAGMA table_info(housekeeper_investigations)').all() as any[];
+          const hasCol = (name: string) => cols.some((c) => c.name === name);
+          if (!hasCol('state_signature')) this.db.exec(`ALTER TABLE housekeeper_investigations ADD COLUMN state_signature TEXT`);
+          if (!hasCol('callback_verdict')) this.db.exec(`ALTER TABLE housekeeper_investigations ADD COLUMN callback_verdict TEXT CHECK(callback_verdict IS NULL OR callback_verdict IN ('done','needs-human'))`);
+          if (!hasCol('callback_evidence')) this.db.exec(`ALTER TABLE housekeeper_investigations ADD COLUMN callback_evidence TEXT`);
+          if (!hasCol('callback_rationale')) this.db.exec(`ALTER TABLE housekeeper_investigations ADD COLUMN callback_rationale TEXT`);
+          if (!hasCol('applied_at')) this.db.exec(`ALTER TABLE housekeeper_investigations ADD COLUMN applied_at TEXT`);
+          if (!hasCol('apply_error')) this.db.exec(`ALTER TABLE housekeeper_investigations ADD COLUMN apply_error TEXT`);
+        }
+        if (hasTable('housekeeper_investigations')) {
+          this.db.exec(`
+CREATE INDEX IF NOT EXISTS idx_housekeeper_investigations_signature
+  ON housekeeper_investigations(session_name, state_signature, created_at);
+`);
+        }
+        this.db.prepare('UPDATE schema_version SET version = 105').run();
       }
     }
   }

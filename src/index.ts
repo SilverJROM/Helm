@@ -3565,6 +3565,7 @@ async function main(): Promise<void> {
         try { await chatSessionService.terminate(sid); } catch {}
       }
       workerService.stopReaper();
+      housekeeperService.stopScheduler();
       await workerService.reapAll();
       runtimeService.stopSupervisor();
       // P2-3: stop auto-fallback before dbs (like supervisor)
@@ -3595,6 +3596,7 @@ async function main(): Promise<void> {
         try { await chatSessionService.terminate(sid); } catch {}
       }
       workerService.stopReaper();
+      housekeeperService.stopScheduler();
       await workerService.reapAll();
       // P2-3: stop auto-fallback (before app.close)
       runtimeService.stopAutoFallback();
@@ -3608,6 +3610,10 @@ async function main(): Promise<void> {
 
   await app.listen({ port: config.port, host: config.host });
   console.log(`Helm listening on ${config.host}:${config.port}`);
+
+  housekeeperService.startScheduler(config.HELM_HOUSEKEEPER_SCHEDULER_MS, {
+    investigationCooldownMs: config.HELM_HOUSEKEEPER_COOLDOWN_MS,
+  });
 
   // R2 (CC-CHAT-3): CLI freshness preflight — once, best-effort, fire-and-forget AFTER listen so
   // it can never block or fail boot (belt-and-suspenders on top of the R1 interstitial interceptor;

@@ -638,3 +638,38 @@ See `plan/c01-agent-studio-rebuild/batch-B06/changes.md` for full R8.29 justific
 
 Evidence: `plan/c01-agent-studio-rebuild/validation/b06/` (12/12 checks PASS) + `validation/b06-models-cascade.md`.
 Also: `plan/c01-agent-studio-rebuild/batch-B06/changes.md` (gitignored batch-* dir; full write-up).
+
+## S18b Housekeeper Callback/Apply
+
+## User Report
+
+Implementer L3 codex55 for S18b. Base 687797b branch s18b-housekeeper-apply.
+Read plan.md S18b row and housekeeper-service from S18a.
+
+Scope: complete housekeeper callback/apply: accept only done|needs-human; persist evidence+rationale; re-check owner=helm at apply; done may only markIdle never reap; uncertainty needs-human; one investigation per seat per unchanged state cooldown; then enable hours-scale scheduler.
+HARD SAFETY: HELM_SESSION_JANITOR=0; synthetic only; zero terminate; no reap.
+Tests per plan. Elite redteam expected after.
+Append PROPOSED then implement (exec pre-approved for plan-locked S18b).
+DONE: [projcore callback] impl S18b STATUS: DONE — COMPLETE | commit=...
+
+## PROPOSED
+
+- Extend `housekeeper_investigations` to v105 with callback verdict/evidence/rationale/apply metadata plus a stable state signature for cooldown.
+- Add `applyCallback`: accept only `done` and `needs-human`; persist bounded evidence/rationale; re-read `helm_sessions.owner` before applying; `done` calls only `SessionRegistryService.markIdle`; no terminate/reap calls.
+- Add cooldown suppression for repeated investigations of the same session when the stored state signature is unchanged.
+- Add an owner/local protected apply route and a six-hour scheduler/cooldown config, wired to the existing housekeeper no-op transport.
+- Keep tests synthetic with `HELM_SESSION_JANITOR=0`, fake tmux/transport, and explicit zero terminate/reap assertions.
+
+## Implemented
+
+- `src/services/housekeeper-service.ts`: callback/apply contract, owner recheck, evidence/rationale persistence, stable unchanged-state cooldown, and scheduler helpers.
+- `src/api/routes/housekeeper-routes.ts`: `POST /api/housekeeper/investigations/:id/apply`.
+- `src/db/schema.ts` + `src/db/database.ts`: schema v105, v104→v105 table rebuild for widened status CHECK, additive callback/cooldown columns, old synthetic fixture guards.
+- `src/config/config.ts` + `src/index.ts`: hours-scale scheduler config and startup/shutdown wiring.
+- `src/s18a-housekeeper-dispatch.test.ts`: S18b apply/cooldown coverage; done marks idle only; needs-human keeps active; owner flip rejects; invalid uncertainty verdict rejects; zero terminate/reap.
+
+## Verification
+
+- `npm run typecheck` — PASS.
+- `npm test -- --run src/s18a-housekeeper-dispatch.test.ts src/b18-inheritance.test.ts src/b19-freeze.test.ts src/b04-models-seed.test.ts src/b09a-roster-seed.test.ts` — PASS, 42 tests.
+- `npm test` full suite was attempted and failed outside S18b: 34 files failed / 57 tests failed, including pre-existing real tmux delivery timeouts, exact `SCHEMA_VERSION` expectations still pinned to 98, live model oracle residuals, and unrelated provider/model expectations. The S18b targeted suite and representative migration guard files pass after the v105 guard fix.

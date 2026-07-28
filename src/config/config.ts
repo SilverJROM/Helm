@@ -58,6 +58,8 @@ export interface HelmConfig {
   // SL-R3: session-lifecycle janitor — grace TTL (ms) after a session's work is done before it is closed; janitor + startup sweep enable/disable.
   HELM_SESSION_TTL_MS: number;
   HELM_SESSION_JANITOR: HelmSessionJanitorMode;
+  HELM_HOUSEKEEPER_SCHEDULER_MS: number;
+  HELM_HOUSEKEEPER_COOLDOWN_MS: number;
 }
 
 export function loadConfig(): HelmConfig {
@@ -98,6 +100,9 @@ export function loadConfig(): HelmConfig {
     HELM_SANDBOX_BIN: optional("HELM_SANDBOX_BIN", ""),
     // SL-R3: default off (0); shadow logs would-be actions, on performs reaping.
     HELM_SESSION_TTL_MS: optionalNumber("HELM_SESSION_TTL_MS", 1200000),
-    HELM_SESSION_JANITOR: parseJanitorMode(optional("HELM_SESSION_JANITOR", "0"))
+    HELM_SESSION_JANITOR: parseJanitorMode(optional("HELM_SESSION_JANITOR", "0")),
+    // S18b: housekeeper investigation scheduler is hours-scale and separate from the session janitor.
+    HELM_HOUSEKEEPER_SCHEDULER_MS: optionalNumber("HELM_HOUSEKEEPER_SCHEDULER_MS", 6 * 60 * 60 * 1000),
+    HELM_HOUSEKEEPER_COOLDOWN_MS: optionalNumber("HELM_HOUSEKEEPER_COOLDOWN_MS", 6 * 60 * 60 * 1000),
   };
 }

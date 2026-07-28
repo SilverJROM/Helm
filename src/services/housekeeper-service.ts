@@ -27,6 +27,7 @@ export interface HousekeeperDispatchOptions {
   runDir?: string;
   nowMs?: number;
   idleThresholdMs?: number;
+  investigationCooldownMs?: number;
   paneTailProvenance?: string;
 }
 
@@ -38,11 +39,25 @@ export type HousekeeperDispatchResult =
 interface InsertInvestigationParams {
   row: HelmSessionRow;
   observation: SessionObservationResult;
+  stateSignature: string;
   paneTail: string;
   paneTailProvenance: string;
   envelope: HousekeeperEnvelope;
   usage: HouseSelectResult;
 }
+
+export interface HousekeeperApplyInput {
+  verdict: string;
+  evidence: string;
+  rationale: string;
+}
+
+export type HousekeeperApplyResult =
+  | { ok: true; outcome: 'applied_done'; investigationId: number; sessionName: string }
+  | { ok: true; outcome: 'needs_human'; investigationId: number; sessionName: string }
+  | { ok: false; outcome: 'invalid_verdict'; error: string }
+  | { ok: false; outcome: 'not_found'; error: string }
+  | { ok: false; outcome: 'owner_recheck_failed'; investigationId: number; sessionName: string; owner: string | null; error: string };
 
 export interface HousekeeperEnvelope {
   schema_version: 1;
@@ -69,6 +84,9 @@ export interface HousekeeperEnvelope {
 }
 
 export class HousekeeperService {
+  private scheduler: NodeJS.Timeout | null = null;
+  private schedulerInFlight = false;
+
   constructor(
     private readonly db: DatabaseService,
     private readonly sessionRegistry: SessionRegistryService,
@@ -90,6 +108,7 @@ export class HousekeeperService {
       opts.paneTailProvenance ??
       'runtime tmux capturePane tail; tests use src/test-fixtures/panes/discovery-finished-turn-20260727.txt captured from a real agent turn';
     const evidence = this.loadDurableEvidence(candidate.row.run_id);
+    const stateSignature = buildStateSignature(candidate.row, candidate.observation);
 
     const envelope = buildHousekeeperEnvelope({
       row: candidate.row,
@@ -106,6 +125,7 @@ export class HousekeeperService {
     const investigationId = this.insertInvestigation({
       row: candidate.row,
       observation: candidate.observation,
+      stateSignature,
       paneTail,
       paneTailProvenance,
       envelope: boundedEnvelope,
@@ -166,6 +186,88 @@ export class HousekeeperService {
       .all() as any[];
   }
 
+  applyCallback(id: number, input: HousekeeperApplyInput): HousekeeperApplyResult {
+    const verdict = normalizeHousekeeperVerdict(input.verdict);
+    if (!verdict) {
+      return { ok: false, outcome: 'invalid_verdict', error: 'housekeeper verdict must be done or needs-human' };
+    }
+
+    const row = this.getInvestigation(id);
+    if (!row) return { ok: false, outcome: 'not_found', error: 'housekeeper investigation not found' };
+
+    const session = this.sessionRegistry.get(row.session_name);
+    const evidence = boundText(input.evidence, 4000);
+    const rationale = boundText(input.rationale, 4000);
+
+    if (!session || session.owner !== 'helm') {
+      this.db
+        .prepare(
+          `UPDATE housekeeper_investigations
+           SET callback_verdict = ?, callback_evidence = ?, callback_rationale = ?,
+               status = 'apply_rejected', apply_error = ?, applied_at = datetime('now')
+           WHERE id = ?`
+        )
+        .run(verdict, evidence, rationale, 'owner_recheck_failed', id);
+      return {
+        ok: false,
+        outcome: 'owner_recheck_failed',
+        investigationId: id,
+        sessionName: row.session_name,
+        owner: session?.owner ?? null,
+        error: 'session owner is no longer helm',
+      };
+    }
+
+    if (verdict === 'needs-human') {
+      this.db
+        .prepare(
+          `UPDATE housekeeper_investigations
+           SET callback_verdict = ?, callback_evidence = ?, callback_rationale = ?,
+               status = 'needs_human', apply_error = NULL, applied_at = datetime('now')
+           WHERE id = ?`
+        )
+        .run(verdict, evidence, rationale, id);
+      return { ok: true, outcome: 'needs_human', investigationId: id, sessionName: row.session_name };
+    }
+
+    this.sessionRegistry.markIdle(row.session_name, 'housekeeper-done');
+    this.db
+      .prepare(
+        `UPDATE housekeeper_investigations
+         SET callback_verdict = ?, callback_evidence = ?, callback_rationale = ?,
+             status = 'applied_done', apply_error = NULL, applied_at = datetime('now')
+         WHERE id = ?`
+      )
+      .run(verdict, evidence, rationale, id);
+    return { ok: true, outcome: 'applied_done', investigationId: id, sessionName: row.session_name };
+  }
+
+  startScheduler(intervalMs: number, opts: HousekeeperDispatchOptions = {}): boolean {
+    if (this.scheduler || !Number.isFinite(intervalMs) || intervalMs <= 0) return false;
+    this.scheduler = setInterval(() => {
+      void this.schedulerTick(opts);
+    }, intervalMs);
+    this.scheduler.unref?.();
+    return true;
+  }
+
+  stopScheduler(): void {
+    if (this.scheduler) clearInterval(this.scheduler);
+    this.scheduler = null;
+  }
+
+  async schedulerTick(opts: HousekeeperDispatchOptions = {}): Promise<void> {
+    if (this.schedulerInFlight) return;
+    this.schedulerInFlight = true;
+    try {
+      await this.dispatchOnce(opts);
+    } catch (e) {
+      console.warn('[housekeeper] scheduler dispatch failed', { err: String(e) });
+    } finally {
+      this.schedulerInFlight = false;
+    }
+  }
+
   private async findFirstInvestigable(opts: HousekeeperDispatchOptions): Promise<{
     row: HelmSessionRow;
     observation: SessionObservationResult;
@@ -186,6 +288,10 @@ export class HousekeeperService {
         idleThresholdMs: opts.idleThresholdMs ?? DEFAULT_IDLE_THRESHOLD_MS,
       });
       if (observation.action === 'INVESTIGATE') {
+        const stateSignature = buildStateSignature(row, observation);
+        if (this.hasRecentInvestigationForUnchangedState(row.name, stateSignature, opts.investigationCooldownMs ?? 6 * 60 * 60 * 1000)) {
+          continue;
+        }
         return { row, observation };
       }
     }
@@ -197,15 +303,16 @@ export class HousekeeperService {
     const info = this.db
       .prepare(
         `INSERT INTO housekeeper_investigations (
-          helm_session_id, session_name, owner, status, trigger_reason, observation_json,
+          helm_session_id, session_name, owner, status, trigger_reason, state_signature, observation_json,
           pane_tail, pane_tail_provenance, envelope_json, usage_json,
           selected_provider, selected_model, selected_slug, selected_rung_index, selected_reason
-        ) VALUES (?, ?, 'helm', 'dispatching', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ) VALUES (?, ?, 'helm', 'dispatching', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         params.row.id,
         params.row.name,
         params.observation.reason,
+        params.stateSignature,
         JSON.stringify(params.observation),
         params.paneTail,
         params.paneTailProvenance,
@@ -218,6 +325,21 @@ export class HousekeeperService {
         selected?.reason ?? params.usage.reason,
       );
     return Number(info.lastInsertRowid);
+  }
+
+  private hasRecentInvestigationForUnchangedState(sessionName: string, stateSignature: string, cooldownMs: number): boolean {
+    if (!Number.isFinite(cooldownMs) || cooldownMs <= 0) return false;
+    const cutoffMs = Date.now() - cooldownMs;
+    const row = this.db
+      .prepare(
+        `SELECT created_at FROM housekeeper_investigations
+         WHERE session_name = ? AND state_signature = ?
+         ORDER BY id DESC LIMIT 1`
+      )
+      .get(sessionName, stateSignature) as { created_at: string } | undefined;
+    if (!row?.created_at) return false;
+    const createdMs = Date.parse(row.created_at.endsWith('Z') ? row.created_at : `${row.created_at}Z`);
+    return Number.isFinite(createdMs) && createdMs >= cutoffMs;
   }
 
   private loadDurableEvidence(runId: number | null): {
@@ -299,6 +421,30 @@ function buildHousekeeperEnvelope(params: {
     task_facts: params.taskFacts,
     last_dispatch: params.lastDispatch,
   };
+}
+
+function normalizeHousekeeperVerdict(raw: string): 'done' | 'needs-human' | null {
+  const verdict = String(raw ?? '').trim().toLowerCase();
+  if (verdict === 'done') return 'done';
+  if (verdict === 'needs-human') return 'needs-human';
+  return null;
+}
+
+function buildStateSignature(row: HelmSessionRow, observation: SessionObservationResult): string {
+  return JSON.stringify({
+    session: {
+      name: row.name,
+      owner: row.owner,
+      status: row.status,
+      run_id: row.run_id,
+      last_used_at: row.last_used_at,
+    },
+    observation: {
+      action: observation.action,
+      reason: observation.reason,
+      effectiveActivityMs: observation.effectiveActivityMs,
+    },
+  });
 }
 
 function boundEnvelope(envelope: HousekeeperEnvelope): HousekeeperEnvelope {

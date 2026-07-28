@@ -2,7 +2,7 @@ import type Database from "better-sqlite3";
 import { assertAllRoleTiersInvariants } from "./role-tier-invariants.js";
 import { PROVIDERS } from "../config/providers.js";
 
-export const SCHEMA_VERSION = 104;
+export const SCHEMA_VERSION = 105;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -497,15 +497,15 @@ CREATE TABLE IF NOT EXISTS helm_sessions (
 CREATE INDEX IF NOT EXISTS idx_helm_sessions_status ON helm_sessions(status);
 CREATE INDEX IF NOT EXISTS idx_helm_sessions_run ON helm_sessions(run_id);
 
--- v104 / S18a: durable housekeeper investigation dispatch evidence.
--- Investigation-only in this slice: callbacks/apply/cooldown land in S18b.
+-- v104 / S18a + v105 / S18b: durable housekeeper investigation dispatch/apply evidence.
 CREATE TABLE IF NOT EXISTS housekeeper_investigations (
   id INTEGER PRIMARY KEY,
   helm_session_id INTEGER REFERENCES helm_sessions(id) ON DELETE SET NULL,
   session_name TEXT NOT NULL,
   owner TEXT NOT NULL CHECK(owner = 'helm'),
-  status TEXT NOT NULL CHECK(status IN ('no_dispatch','dispatching','dispatched')) DEFAULT 'dispatching',
+  status TEXT NOT NULL CHECK(status IN ('no_dispatch','dispatching','dispatched','applied_done','needs_human','apply_rejected')) DEFAULT 'dispatching',
   trigger_reason TEXT NOT NULL,
+  state_signature TEXT,
   observation_json TEXT NOT NULL,
   pane_tail TEXT NOT NULL,
   pane_tail_provenance TEXT NOT NULL,
@@ -518,6 +518,11 @@ CREATE TABLE IF NOT EXISTS housekeeper_investigations (
   selected_reason TEXT,
   dispatch_handle TEXT,
   dispatched_at TEXT,
+  callback_verdict TEXT CHECK(callback_verdict IS NULL OR callback_verdict IN ('done','needs-human')),
+  callback_evidence TEXT,
+  callback_rationale TEXT,
+  applied_at TEXT,
+  apply_error TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_housekeeper_investigations_session ON housekeeper_investigations(session_name, created_at);
