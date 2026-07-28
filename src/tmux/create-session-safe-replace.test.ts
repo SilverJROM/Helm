@@ -344,6 +344,120 @@ describe('B08 AC9–11 createSession safe same-name replace', () => {
     expect(renameSessionCalls()).toEqual([]);
   });
 
+  it('fix2: CAS-refusal branch + staging rollback kill also fails → AggregateError; staging orphan provably survives (no swallow)', async () => {
+    const name = 'helm-w-b14fix2-casrefuse';
+    const row = reg.register(name, { owner: 'helm', kind: 'worker' })!;
+    const tok = sessionStatusTokenFromRow(row);
+    reg.markIdle(tok, 'completed');
+    expect(reg.get(name)!.status).toBe('idle');
+
+    let stagingName = '';
+    cpMock.impl = async (_cmd: string, args: string[]) => {
+      const sub = args[0];
+      if (sub === 'has-session') {
+        const target = args[args.indexOf('-t') + 1];
+        if (stagingName && target === stagingName) {
+          return { stdout: '', stderr: '' }; // staging is live once created (rollback kill fails below)
+        }
+        return { stdout: '', stderr: '' }; // final name: live until CAS-closed
+      }
+      if (sub === 'show-options' && args.includes('@helm_child')) {
+        return { stdout: '1\n', stderr: '' };
+      }
+      if (sub === 'new-session') {
+        stagingName = args[args.indexOf('-s') + 1];
+        return { stdout: '', stderr: '' };
+      }
+      if (sub === 'set-option' && args.includes('@helm_child')) {
+        // Staging tag succeeds, then flip the SAME id/name/owner/generation row idle→active — the
+        // exact fix1-C2 technique — so the exactStatusOnly CAS refuses (closed === false) below.
+        db.prepare(`UPDATE helm_sessions SET status = 'active' WHERE name = ?`).run(name);
+        return { stdout: '', stderr: '' };
+      }
+      if (sub === 'kill-session') {
+        throw new Error('kill-session boom (staging rollback fails)');
+      }
+      return { stdout: '', stderr: '' };
+    };
+
+    const err: any = await tmux.createSession(name, '/tmp', { owner: 'helm' }).catch((e: any) => e);
+    expect(err).toBeInstanceOf(AggregateError);
+    const inner = (err.errors ?? []).map((e: any) => String(e?.message ?? e));
+    expect(inner.some((m: string) => /replace_refused/.test(m))).toBe(true);
+    expect(inner.some((m: string) => /kill-session boom/.test(m))).toBe(true);
+
+    // The orphan the old swallow used to hide: staging session survives, still live AND still tagged.
+    expect(stagingName).toMatch(new RegExp(`^${name}-stg-`));
+    await expect(tmux.sessionExistsTriState(stagingName)).resolves.toBe(true);
+    await expect(tmux.sessionHasHelmChildTag(stagingName)).resolves.toBe(true);
+
+    // The final (old) name is never touched by this rollback.
+    const killsOfFinal = killSessionCalls().filter((c) => {
+      const ti = c.args.indexOf('-t');
+      return ti >= 0 && c.args[ti + 1] === name;
+    });
+    expect(killsOfFinal).toEqual([]);
+    expect(createdNames).toEqual([]);
+  });
+
+  it('fix2: post-old-close rename-session failure + staging rollback kill also fails → AggregateError; staging orphan provably survives', async () => {
+    const name = 'helm-w-b14fix2-renamefail';
+    const row = reg.register(name, { owner: 'helm', kind: 'worker' })!;
+    const tok = sessionStatusTokenFromRow(row);
+    reg.markIdle(tok, 'completed');
+
+    let stagingName = '';
+    cpMock.impl = async (_cmd: string, args: string[]) => {
+      const sub = args[0];
+      if (sub === 'has-session') {
+        const target = args[args.indexOf('-t') + 1];
+        if (stagingName && target === stagingName) {
+          return { stdout: '', stderr: '' }; // staging is live once created (rollback kill fails below)
+        }
+        return { stdout: '', stderr: '' }; // final name: live until CAS-closed
+      }
+      if (sub === 'show-options' && args.includes('@helm_child')) {
+        return { stdout: '1\n', stderr: '' };
+      }
+      if (sub === 'new-session') {
+        stagingName = args[args.indexOf('-s') + 1];
+        return { stdout: '', stderr: '' };
+      }
+      if (sub === 'set-option' && args.includes('@helm_child')) {
+        return { stdout: '', stderr: '' }; // staging tag succeeds; no CAS interference this time
+      }
+      if (sub === 'rename-session') {
+        throw new Error('rename-session boom');
+      }
+      if (sub === 'kill-session') {
+        const target = args[args.indexOf('-t') + 1];
+        // The authorized CAS close of the OLD final name must succeed (so the flow actually
+        // reaches rename) — only the STAGING rollback kill (post-rename-failure) fails.
+        if (target === name) return { stdout: '', stderr: '' };
+        throw new Error('kill-session boom (staging rollback fails)');
+      }
+      return { stdout: '', stderr: '' };
+    };
+
+    const err: any = await tmux.createSession(name, '/tmp', { owner: 'helm' }).catch((e: any) => e);
+    expect(err).toBeInstanceOf(AggregateError);
+    const inner = (err.errors ?? []).map((e: any) => String(e?.message ?? e));
+    expect(inner.some((m: string) => /rename-session boom/.test(m))).toBe(true);
+    expect(inner.some((m: string) => /kill-session boom/.test(m))).toBe(true);
+
+    // Old final name killed exactly once (the authorized CAS close) — rollback never re-targets it.
+    const killsOfFinal = killSessionCalls().filter((c) => {
+      const ti = c.args.indexOf('-t');
+      return ti >= 0 && c.args[ti + 1] === name;
+    });
+    expect(killsOfFinal.length).toBe(1);
+
+    // The orphan the old swallow used to hide: staging session survives, still live AND still tagged.
+    await expect(tmux.sessionExistsTriState(stagingName)).resolves.toBe(true);
+    await expect(tmux.sessionHasHelmChildTag(stagingName)).resolves.toBe(true);
+    expect(createdNames).toEqual([]);
+  });
+
   it('T3: eligible completed Helm → terminateSession CAS + rename + one new generation', async () => {
     const name = 'helm-w-b08-eligible';
     const row = reg.register(name, { owner: 'helm', kind: 'worker' })!;

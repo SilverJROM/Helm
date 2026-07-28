@@ -712,6 +712,11 @@ export class TmuxService {
     }
 
     // Authorized close of the old lifecycle through terminateSession (AC10), not raw kill-session.
+    // fix2 (AC19 / F-07 R2): every branch below that must tear down the (already tagged) staging
+    // session on failure routes through rollbackOrphanSession — never a bare killSessionRaw(...).catch
+    // (() => {}) — so a staging kill failure surfaces instead of leaving a live, tagged, unregistered
+    // orphan invisible to both the caller and any registry-driven sweep. Always targets stagingName;
+    // the final (old) name is never touched here.
     let closed = false;
     try {
       if (status === 'idle' && oldToken) {
@@ -721,15 +726,16 @@ export class TmuxService {
         closed = await this.terminateSession(name, { noRegistryWrite: true });
       }
     } catch (err) {
-      await this.killSessionRaw(stagingName).catch(() => {});
-      throw err;
+      await this.rollbackOrphanSession(stagingName, err);
     }
     if (!closed) {
-      await this.killSessionRaw(stagingName).catch(() => {});
-      throw new SessionNameCollisionError(
-        name,
-        'replace_refused',
-        `session name collision refused (replace_refused): terminateSession did not close ${name}`
+      await this.rollbackOrphanSession(
+        stagingName,
+        new SessionNameCollisionError(
+          name,
+          'replace_refused',
+          `session name collision refused (replace_refused): terminateSession did not close ${name}`
+        )
       );
     }
 
@@ -737,9 +743,8 @@ export class TmuxService {
     try {
       await execFileAsync('tmux', ['rename-session', '-t', stagingName, name]);
     } catch (err) {
-      // Old is gone; staging may still exist — best-effort cleanup, then surface the failure.
-      await this.killSessionRaw(stagingName).catch(() => {});
-      throw err;
+      // Old is gone; staging may still exist — roll back (fail-closed), then surface the failure.
+      await this.rollbackOrphanSession(stagingName, err);
     }
 
     await this.publishCreatedSession(name, opts);
