@@ -896,6 +896,131 @@ describe('RunOrchestratorService (A2 wiring)', () => {
       expect(worker.state).toBe('reaped');
       expect(worker.ended_at).toBeTruthy();
     });
+
+    // B04 fix cycle 3 (validator V2, critical): the prior fix threaded a token through transitionRunToBlocked
+    // and its 4 EARLY callers inside startRunInner's own lexical body, but 5 further transitionRunToBlocked
+    // callers reached only through runEngineTail's post-drain machinery (handlePendingAfterDrain, the deploy
+    // gate, both final-test gates) still passed expectedGeneration undefined. handlePendingAfterDrain is the
+    // most reachable: on the cyclePlan/seedPlan detached path (no interview/planning spawn) a run can reach
+    // it with ZERO worker_runtimes rows — the one window where the row is genuinely FK-deletable. This drives
+    // the REAL production chain (runEngineTail -> drainDispatch -> handlePendingAfterDrain ->
+    // transitionRunToBlocked), not a reimplementation, with the stale token exactly as startRunInner would
+    // thread it, against a queue/DB-divergence classification (a durable pending run_tasks row the in-memory
+    // queue never claimed — reproduces "zero workers ever spawn" without needing full plan ingestion).
+    it('a stale continuation reaching handlePendingAfterDrain via runEngineTail cannot blocked-fail a recycled occupant with zero worker_runtimes rows', async () => {
+      const proj = projectSvc.createProject({ name: 'b04-pending-drain', directory: '/tmp/b04-pending-drain' });
+      const pid = proj.id;
+      const runDirA = path.join(os.tmpdir(), `helm-b04-pending-drain-${Date.now()}`);
+
+      const nativeRunId = artifacts.createRun(pid, 'b04pendingdrainA', path.join(runDirA, CANONICAL_CYCLE_ARTIFACTS.northStar), null);
+      const staleGeneration = (db.raw.prepare('SELECT generation FROM runs WHERE id = ?').get(nativeRunId) as any).generation;
+
+      // A has zero worker_runtimes children so its row deletes cleanly (FK-safe).
+      db.raw.prepare('DELETE FROM runs WHERE id = ?').run(nativeRunId);
+      expect((db.raw.prepare('SELECT COUNT(*) AS n FROM runs').get() as any).n).toBe(0);
+
+      const { allocateLifecycleGeneration } = await import('./lifecycle-cas.js');
+      const freshGeneration = allocateLifecycleGeneration(db.raw);
+      expect(freshGeneration).not.toBe(staleGeneration);
+      db.raw
+        .prepare(
+          `INSERT INTO runs (id, project_id, cycle_id, batch_id, north_star_ref, status, phase, generation)
+           VALUES (?,?,?,?,?,'active','executing',?)`
+        )
+        .run(nativeRunId, pid, null, 'b04-recycled-pending-drain', null, freshGeneration);
+      const newWorkerInfo = db.raw
+        .prepare(
+          `INSERT INTO worker_runtimes (project_id, role, provider, model, session, correlation_id, state, spawned_by, run_id, started_at)
+           VALUES (?,?,?,?,?,?,'running','b04-test',?, datetime('now'))`
+        )
+        .run(pid, 'implementer', 'grok', 'grok-4.5', 'helm-b04-pending-drain-new-occupant', 'b04-corr-pending-drain', nativeRunId);
+      const newWorkerId = Number(newWorkerInfo.lastInsertRowid);
+
+      // B's OWN durable run_tasks row (own in-progress work — run_tasks.run_id cascades with runs, so
+      // this must be created AFTER the recycle, against the new occupant's row) was never enqueued into
+      // the shared in-memory `queue` under this run id either — claimNextReady returns null immediately,
+      // drainDispatch's claim loop body never runs, and no NEW worker_runtimes row is spawned by this
+      // call. classifyDrainState sees an empty in-memory queue (all-complete) but the durable store still
+      // shows this row pending — the queue/DB-divergence fail-safe — driving handlePendingAfterDrain into
+      // its blocked branch with the STALE token, exactly reproducing "zero workers ever spawn" without
+      // needing full plan ingestion machinery.
+      const bTaskInfo = db.raw
+        .prepare(`INSERT INTO run_tasks (run_id, task_key, label, status) VALUES (?, 'T1', 'B-own in-progress task', 'pending')`)
+        .run(nativeRunId);
+      const bTaskId = Number(bTaskInfo.lastInsertRowid);
+
+      const fakeLoop = {} as any; // never touched: the claim loop body in drainDispatch never executes
+      await (orch as any).runEngineTail(nativeRunId, runDirA, 'b04pendingdrainA', proj, fakeLoop, queue, {
+        projectId: pid,
+        prompt: 'stale pending-drain continuation',
+        redTeamAgents: [],
+        effectiveProjectDir: proj.directory,
+        implementationSessionName: 'helm-ibrain-b04-pending-drain',
+        implementationBrainProvider: 'grok',
+        implementationBrainModel: 'grok-4.5',
+        expectedGeneration: staleGeneration,
+      });
+
+      const bAfter = db.raw.prepare('SELECT phase, status, generation FROM runs WHERE id = ?').get(nativeRunId) as any;
+      expect(bAfter.phase).not.toBe('blocked');
+      expect(bAfter.status).not.toBe('failed');
+      expect(bAfter.generation).toBe(freshGeneration);
+
+      const newWorkerAfter = db.raw.prepare('SELECT state, ended_at FROM worker_runtimes WHERE id = ?').get(newWorkerId) as any;
+      expect(newWorkerAfter.state).toBe('running');
+      expect(newWorkerAfter.ended_at).toBeNull();
+
+      // B's own in-progress task is untouched too — the stale continuation never got to mark anything.
+      const bTaskAfter = db.raw.prepare('SELECT status FROM run_tasks WHERE id = ?').get(bTaskId) as any;
+      expect(bTaskAfter.status).toBe('pending');
+    });
+
+    // Ideally-one-other coverage: the deploy-gate/final-test-gate legs share the same
+    // transitionRunToBlocked plumbing, threaded via a plain expectedGeneration parameter forward from
+    // each private method. doMaxFixItersVisiblePause is the simplest to drive directly (no filesystem
+    // plan-cache / deploy-config discovery needed) and proves that leg's wiring independently.
+    it('a stale continuation reaching doMaxFixItersVisiblePause cannot blocked-fail a recycled occupant', async () => {
+      const proj = projectSvc.createProject({ name: 'b04-maxfix', directory: '/tmp/b04-maxfix' });
+      const pid = proj.id;
+      const runDirA = path.join(os.tmpdir(), `helm-b04-maxfix-${Date.now()}`);
+
+      const nativeRunId = artifacts.createRun(pid, 'b04maxfixA', path.join(runDirA, CANONICAL_CYCLE_ARTIFACTS.northStar), null);
+      const staleGeneration = (db.raw.prepare('SELECT generation FROM runs WHERE id = ?').get(nativeRunId) as any).generation;
+
+      db.raw.prepare('DELETE FROM runs WHERE id = ?').run(nativeRunId);
+      expect((db.raw.prepare('SELECT COUNT(*) AS n FROM runs').get() as any).n).toBe(0);
+
+      const { allocateLifecycleGeneration } = await import('./lifecycle-cas.js');
+      const freshGeneration = allocateLifecycleGeneration(db.raw);
+      expect(freshGeneration).not.toBe(staleGeneration);
+      db.raw
+        .prepare(
+          `INSERT INTO runs (id, project_id, cycle_id, batch_id, north_star_ref, status, phase, generation)
+           VALUES (?,?,?,?,?,'active','executing',?)`
+        )
+        .run(nativeRunId, pid, null, 'b04-recycled-maxfix', null, freshGeneration);
+      const newWorkerInfo = db.raw
+        .prepare(
+          `INSERT INTO worker_runtimes (project_id, role, provider, model, session, correlation_id, state, spawned_by, run_id, started_at)
+           VALUES (?,?,?,?,?,?,'running','b04-test',?, datetime('now'))`
+        )
+        .run(pid, 'implementer', 'grok', 'grok-4.5', 'helm-b04-maxfix-new-occupant', 'b04-corr-maxfix', nativeRunId);
+      const newWorkerId = Number(newWorkerInfo.lastInsertRowid);
+
+      await (orch as any).doMaxFixItersVisiblePause(
+        nativeRunId, runDirA, 'b04maxfixA', path.join(runDirA, 'callbacks.md'), { verdict: 'FAIL' }, staleGeneration
+      );
+      await new Promise((r) => setTimeout(r, 100));
+
+      const bAfter = db.raw.prepare('SELECT phase, status, generation FROM runs WHERE id = ?').get(nativeRunId) as any;
+      expect(bAfter.phase).not.toBe('blocked');
+      expect(bAfter.status).not.toBe('failed');
+      expect(bAfter.generation).toBe(freshGeneration);
+
+      const newWorkerAfter = db.raw.prepare('SELECT state, ended_at FROM worker_runtimes WHERE id = ?').get(newWorkerId) as any;
+      expect(newWorkerAfter.state).toBe('running');
+      expect(newWorkerAfter.ended_at).toBeNull();
+    });
   });
 
   it('D-b: startRun enters interview phase, waits for NORTH-STAR-READY (no autonomous before), transitions planning->execute; plan per-task model/effort flows (D-b1 + D-b2)', async () => {

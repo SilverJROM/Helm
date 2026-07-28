@@ -573,12 +573,13 @@ export class RunOrchestratorService {
    * what awaiting_approval is — and getCycleRunState's runActive check already treats phase='blocked'
    * as inactive, so a fresh cyclePlan run can start the moment approveCycle flips the cycle.
    */
-  private async parkRunAwaitingApproval(runId: number, runDir: string, cycleId: number, project?: any): Promise<void> {
+  private async parkRunAwaitingApproval(runId: number, runDir: string, cycleId: number, project?: any, expectedGeneration?: number): Promise<void> {
     this.transitionRunToBlocked(
       runId,
       `pause_after_planning gate (R3.14): cycle ${cycleId} is awaiting_approval — implementation queue not started until approveCycle`,
       project,
-      'operator-pause'
+      'operator-pause',
+      expectedGeneration
     );
     try {
       await this.deps.artifacts.persistState(runDir, ['interview', 'planning', 'awaiting_approval'], 'paused', runId);
@@ -1283,7 +1284,7 @@ export class RunOrchestratorService {
       // park it here instead of falling into runEngineTail. approveCycle (POST /api/cycles/:id/approve)
       // starts a fresh cyclePlan run against the same plan.md once JROM approves.
       if (this.isCycleGateParked(planningDoneCycleId)) {
-        await this.parkRunAwaitingApproval(runId, runDir, planningDoneCycleId as number, project);
+        await this.parkRunAwaitingApproval(runId, runDir, planningDoneCycleId as number, project, runGenToken);
         return runId;
       }
     }
@@ -1334,7 +1335,7 @@ export class RunOrchestratorService {
 
     // B11-T03: extracted to drainDispatch for re-entrancy in final-tests→fix loop.
     // Behavior-preserving refactor (REINFORCEMENT 1): body identical to pre-B11-T03 while.
-    await this.drainDispatch(runId, runDir, batchId, project, loop, queue);
+    await this.drainDispatch(runId, runDir, batchId, project, loop, queue, expectedGeneration);
 
     // Leg D §4 (D3b) pending-after-drain: getNextReady()===null is NEVER completion. Classify the drain
     // result (cycle / deferred-block / failed-block / unknown-pending-stall / all-complete) as ONE terminal
@@ -1342,7 +1343,7 @@ export class RunOrchestratorService {
     // written, and we RETURN before final tests / run-final red-team / generic completion — a later generic
     // `complete` must not be written. Subsumes the old B10-T02 deadlock + B10-T05 parked guards (which set
     // phase=blocked but let downstream completion logic continue — the exact false-green this fixes).
-    if (await this.handlePendingAfterDrain(runId, runDir, batchId, queue)) {
+    if (await this.handlePendingAfterDrain(runId, runDir, batchId, queue, expectedGeneration)) {
       return runId;
     }
 
@@ -1360,16 +1361,16 @@ export class RunOrchestratorService {
         if (c && Number(c.final_tests_enabled) !== 0) {
           while (fixIters < MAX_FIX_ITERS) {
             fixIters++;
-            lastGateOutcome = await this.maybeRunFinalTestsGate({ runId, runDir, batchId, project, loop, queue });
+            lastGateOutcome = await this.maybeRunFinalTestsGate({ runId, runDir, batchId, project, loop, queue, expectedGeneration });
             if (!lastGateOutcome || !lastGateOutcome.injected) {
               break;
             }
             // Loop back: drain the newly injected issue fix task(s)
-            await this.drainDispatch(runId, runDir, batchId, project, loop, queue);
+            await this.drainDispatch(runId, runDir, batchId, project, loop, queue, expectedGeneration);
           }
           // REINFORCEMENT 2: MAX backstop must FAIL-SAFE VISIBLY — never let still-failing finals silently complete green.
           if (fixIters >= MAX_FIX_ITERS && lastGateOutcome && lastGateOutcome.verdict !== 'PASS') {
-            await this.doMaxFixItersVisiblePause(runId, runDir, batchId, path.join(runDir, 'callbacks.md'), lastGateOutcome);
+            await this.doMaxFixItersVisiblePause(runId, runDir, batchId, path.join(runDir, 'callbacks.md'), lastGateOutcome, expectedGeneration);
           }
         }
       }
@@ -1538,20 +1539,36 @@ export class RunOrchestratorService {
     // B04 fix cycle 2 (validator V1): this whole block executes inside the SAME fire-and-forget
     // continuation startRunDetached launches — gate the terminal UPDATE + both finalizers on the
     // captured generation exactly as the detached-start-failed catch does.
+    // B04 fix cycle 3 (validator V3): when gated, ALSO check changes and return before
+    // persistState/terminalizeCycleAtRunEnd/the finalizers — mirroring transitionRunToBlocked's own
+    // `if (changed.changes !== 1) return` and the detached-start-failed catch's `casApplied` gate.
+    // Previously the UPDATE gained the generation predicate but its result was discarded, so a stale
+    // continuation still fell through to terminalizeCycleAtRunEnd and flipped the RECYCLED occupant's
+    // cycle board to 'complete' even though the worker/brain finalizers below were correctly gated.
     const finalRunStatus = hadFailed ? 'failed' : 'complete';
     const finalPhase = hadFailed ? 'failed' : 'complete';
     const genGated = expectedGeneration != null && Number.isFinite(Number(expectedGeneration));
-    try {
-      if (genGated) {
-        this.deps.artifacts['db'].raw
+    if (genGated) {
+      let casApplied = false;
+      try {
+        const result = this.deps.artifacts['db'].raw
           .prepare(`UPDATE runs SET phase = ?, status = ?, ended_at = datetime('now') WHERE id = ? AND generation = ? AND phase NOT IN ('complete','failed','blocked')`)
-          .run(finalPhase, finalRunStatus, runId, expectedGeneration);
-      } else {
+          .run(finalPhase, finalRunStatus, runId, expectedGeneration) as { changes?: number };
+        casApplied = Number(result?.changes || 0) === 1;
+      } catch { /* casApplied stays false — treat as stale, do not fall through */ }
+      if (!casApplied) {
+        console.warn(
+          `[run-orchestrator] runEngineTail terminal for run ${runId} generation ${expectedGeneration} is stale/already-terminal — skipping persistState/cycle/worker/brain terminal bookkeeping`
+        );
+        return runId;
+      }
+    } else {
+      try {
         this.deps.artifacts['db'].raw
           .prepare(`UPDATE runs SET phase = ?, status = ?, ended_at = datetime('now') WHERE id = ? AND phase NOT IN ('complete','failed','blocked')`)
           .run(finalPhase, finalRunStatus, runId);
-      }
-    } catch {}
+      } catch {}
+    }
     try {
       await this.deps.artifacts.persistState(runDir, ['interview', 'planning', 'executing', finalPhase], finalRunStatus, runId);
     } catch {}
@@ -2080,7 +2097,16 @@ export class RunOrchestratorService {
    * Returns false only when there is genuinely no pending-after-drain block (normal completion may proceed;
    * end-of-run failed/deferred handling still applies).
    */
-  private async handlePendingAfterDrain(runId: number, runDir: string, batchId: string, queue: TaskQueueService = this.deps.queue): Promise<boolean> {
+  private async handlePendingAfterDrain(
+    runId: number,
+    runDir: string,
+    batchId: string,
+    queue: TaskQueueService = this.deps.queue,
+    /** B04 fix cycle 3 (validator V2, critical): captured runs.generation when reached via
+     * startRunDetached. Reachable with ZERO worker_runtimes rows on the cyclePlan/seedPlan path
+     * (no interview/planning spawn), the one window where the run row is genuinely FK-deletable. */
+    expectedGeneration?: number
+  ): Promise<boolean> {
     const db = this.deps.artifacts['db'].raw;
     const q: any = queue;
     const qState = q && typeof q.classifyDrainState === 'function'
@@ -2126,7 +2152,7 @@ export class RunOrchestratorService {
 
     // Blocked-run convention (matches every existing blocked-run UPDATE). Blocked dependents keep their
     // truthful `pending` status (we never mark them complete/failed).
-    this.transitionRunToBlocked(runId, `Pending-after-drain classifier: ${kind}. ${reason}`, undefined);
+    this.transitionRunToBlocked(runId, `Pending-after-drain classifier: ${kind}. ${reason}`, undefined, 'failure', expectedGeneration);
 
     const note = [
       `# Pending After Drain — RUN BLOCKED (Leg D §4 / D3b)`,
@@ -2181,8 +2207,10 @@ export class RunOrchestratorService {
       expected: string;
       northStarAnchors: string;
     };
+    /** B04 fix cycle 3 (validator V2): captured runs.generation when reached via startRunDetached. */
+    expectedGeneration?: number;
   }): Promise<void> {
-    const { runId, runDir, batchId, taskKey, project, loop } = params;
+    const { runId, runDir, batchId, taskKey, project, loop, expectedGeneration } = params;
 
     // Leg D §5: the deploy gate keys off run_tasks.batch (persisted normalized label), NOT the task_key
     // prefix. Resolve the just-completed task's durable batch; a task key with NO B#- prefix deploy-gates
@@ -2246,7 +2274,7 @@ This run will not advance past batch ${batchPrefix}.
       } catch {}
 
       // #52: missing deploy config is operator-recoverable (add dev_url/config), not a failure.
-      this.transitionRunToBlocked(runId, `Batch ${batchPrefix} deploy configuration is missing; operator configuration is required.`, project, 'operator-pause');
+      this.transitionRunToBlocked(runId, `Batch ${batchPrefix} deploy configuration is missing; operator configuration is required.`, project, 'operator-pause', expectedGeneration);
 
       // Emit a visible callback for the gate (helps watcher + artifacts)
       try {
@@ -2282,7 +2310,7 @@ This run will not advance past batch ${batchPrefix}.
       try {
         await fs.appendFile(cbPath, `\n[helm callback] implementer ${batchId} STATUS: BLOCKED — batch ${batchPrefix} deploy failed: ${deployRes.note}\n`, 'utf8');
       } catch {}
-      this.transitionRunToBlocked(runId, `Batch ${batchPrefix} deploy failed: ${deployRes.note}`, project);
+      this.transitionRunToBlocked(runId, `Batch ${batchPrefix} deploy failed: ${deployRes.note}`, project, 'failure', expectedGeneration);
       return;
     }
 
@@ -2360,7 +2388,7 @@ Use the exact JROM-clone standards: adversarial, verify against requirements con
       await fs.appendFile(cbPath, `\n[helm callback] validator ${batchId} STATUS: FAIL — B10-T06 batch ${batchPrefix} DEV UI-proof rejected; run blocked at batch boundary\n`, 'utf8');
     } catch {}
     try {
-      this.transitionRunToBlocked(runId, `Batch ${batchPrefix} DEV UI proof was rejected.`, project);
+      this.transitionRunToBlocked(runId, `Batch ${batchPrefix} DEV UI proof was rejected.`, project, 'failure', expectedGeneration);
       this.deps.artifacts.recordArtifact(runId, 'batch-deploy-proof-failed', `batch-${batchPrefix}-deploy-proof-failed.md`);
     } catch {}
   }
@@ -2376,7 +2404,9 @@ Use the exact JROM-clone standards: adversarial, verify against requirements con
     batchId: string,
     project: any,
     loop: OrchestratorLoop,
-    queue: TaskQueueService = this.deps.queue
+    queue: TaskQueueService = this.deps.queue,
+    /** B04 fix cycle 3 (validator V2): captured runs.generation when reached via startRunDetached. */
+    expectedGeneration?: number
   ): Promise<void> {
     let claim: TaskTerminalToken | null;
     while ((claim = queue.claimNextReady(runId)) != null) {
@@ -2479,6 +2509,7 @@ validation_criteria: ${validationCriteria}
               loop,
               nextTaskId,
               briefContract,
+              expectedGeneration,
             });
           }
         } else if (tres.finalStatus === 'DEFERRED') {
@@ -2527,8 +2558,10 @@ validation_criteria: ${validationCriteria}
     project: any;
     loop: OrchestratorLoop;
     queue?: TaskQueueService;
+    /** B04 fix cycle 3 (validator V2): captured runs.generation when reached via startRunDetached. */
+    expectedGeneration?: number;
   }): Promise<{ verdict: 'PASS' | 'FAIL' | 'RECURRENCE_PAUSE' | 'SKIPPED'; injected?: number }> {
-    const { runId, runDir, batchId, project } = params;
+    const { runId, runDir, batchId, project, expectedGeneration } = params;
     const queue = params.queue ?? this.deps.queue;
 
     // Load cycle final_tests_enabled (respect B11-T01). Default-on if no cycle row.
@@ -2588,7 +2621,7 @@ This run will not advance past Final Tests for this cycle.
 
       // #52: missing final-test config is an operator-recoverable PAUSE, not a failure. The run's tasks
       // all passed; it merely cannot run final tests until dev_url/smoke/e2e are configured.
-      this.transitionRunToBlocked(runId, 'Final-test configuration is missing; operator configuration is required.', project, 'operator-pause');
+      this.transitionRunToBlocked(runId, 'Final-test configuration is missing; operator configuration is required.', project, 'operator-pause', expectedGeneration);
 
       try {
         await fs.appendFile(cbPath, `\n[helm callback] implementer ${batchId} STATUS: BLOCKED — final tests paused (no smokeCmd / e2eCmd / devUrl)\n`, 'utf8');
@@ -2686,7 +2719,7 @@ This run will not advance past Final Tests for this cycle.
         const seen = await this.hasSeenFinalFailureSig(runDir, sig);
         if (seen) {
           // Primary terminator: same failure after escalation chain for the prior fix task → pause, no re-inject
-          await this.doFinalTestRecurrencePause(runId, runDir, batchId, sig, finalVerdict, cbPath);
+          await this.doFinalTestRecurrencePause(runId, runDir, batchId, sig, finalVerdict, cbPath, expectedGeneration);
           return { verdict: 'RECURRENCE_PAUSE' };
         }
         await this.recordSeenFinalFailureSig(runDir, sig);
@@ -2772,7 +2805,7 @@ This run will not advance past Final Tests for this cycle.
     } catch {}
   }
 
-  private async doFinalTestRecurrencePause(runId: number, runDir: string, batchId: string, sig: string, finalVerdict: any, cbPath: string): Promise<void> {
+  private async doFinalTestRecurrencePause(runId: number, runDir: string, batchId: string, sig: string, finalVerdict: any, cbPath: string, expectedGeneration?: number): Promise<void> {
     const pauseNote = `# Final Test Failure Recurred — Pause (B11-T03)
 
 Same failure signature detected after prior fix task (which exhausted B10-T04 repro + B10-T05 escalation chain).
@@ -2792,7 +2825,7 @@ Operator action required.
       this.deps.artifacts.recordArtifact(runId, 'final-test-recurrence-pause', 'final-test-recurrence-pause.md');
     } catch {}
 
-    this.transitionRunToBlocked(runId, `Final-test failure ${sig} recurred after the escalation chain; operator action is required.`);
+    this.transitionRunToBlocked(runId, `Final-test failure ${sig} recurred after the escalation chain; operator action is required.`, undefined, 'failure', expectedGeneration);
 
     try {
       await fs.appendFile(cbPath, `\n[helm callback] implementer ${batchId} STATUS: BLOCKED — final-test failure ${sig} recurred after escalation chain; paused (no infinite loop)\n`, 'utf8');
@@ -2801,7 +2834,7 @@ Operator action required.
     console.log(`[RunOrchestrator B11-T03] RECURRENCE PAUSE for sig ${sig} — final-test-recurrence-pause.md + phase=blocked`);
   }
 
-  private async doMaxFixItersVisiblePause(runId: number, runDir: string, batchId: string, cbPath: string, lastOutcome: any): Promise<void> {
+  private async doMaxFixItersVisiblePause(runId: number, runDir: string, batchId: string, cbPath: string, lastOutcome: any, expectedGeneration?: number): Promise<void> {
     const note = `# Max Fix Iterations Reached — Final Tests Still Failing (B11-T03)
 
 MAX_FIX_ITERS=3 backstop hit while final tests have not passed (distinct or non-converging failures).
@@ -2820,7 +2853,7 @@ Operator intervention required. Recurrence sig is primary; this is the visible h
       this.deps.artifacts.recordArtifact(runId, 'final-tests-max-fix-iters-reached', 'final-tests-max-fix-iters-reached.md');
     } catch {}
 
-    this.transitionRunToBlocked(runId, 'Final tests remain failing after the maximum automatic fix iterations; operator action is required.');
+    this.transitionRunToBlocked(runId, 'Final tests remain failing after the maximum automatic fix iterations; operator action is required.', undefined, 'failure', expectedGeneration);
 
     try {
       await fs.appendFile(cbPath, `\n[helm callback] implementer ${batchId} STATUS: BLOCKED — max fix iterations reached while final tests still failing; visible pause (no fake pass)\n`, 'utf8');
