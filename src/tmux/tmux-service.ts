@@ -470,6 +470,45 @@ export class TmuxService {
     }
   }
 
+  /**
+   * S08: fail-safe read of tmux `#{session_activity}`.
+   * Returns null (unknown) on any error, missing session, or malformed output.
+   * Unknown is intentionally safe-fail for the janitor (conservative over-reap behavior).
+   */
+  async sessionActivity(name: string): Promise<number | null> {
+    try {
+      this.ensureValidSessionName(name);
+      const { stdout } = await execFileAsync('tmux', ['display-message', '-p', '-t', name, '#{session_activity}']);
+      const raw = (stdout ?? '').trim();
+      if (!raw) return null;
+      const parsed = Number(raw);
+      if (!Number.isFinite(parsed) || parsed < 0 || Number.isNaN(parsed)) return null;
+      return parsed;
+    } catch (err) {
+      console.warn('[tmux] sessionActivity probe failed → treating as unknown', { name, err: String(err) });
+      return null;
+    }
+  }
+
+  /**
+   * S08: fail-safe read of tmux `#{session_attached}`.
+   * Returns null (unknown) on any error, missing session, or malformed output.
+   * Unknown is intentionally safe-fail for the janitor (attached status avoids unsafe idle evidence).
+   */
+  async sessionAttached(name: string): Promise<boolean | null> {
+    try {
+      this.ensureValidSessionName(name);
+      const { stdout } = await execFileAsync('tmux', ['display-message', '-p', '-t', name, '#{session_attached}']);
+      const raw = (stdout ?? '').trim();
+      if (raw === '1') return true;
+      if (raw === '0') return false;
+      return null;
+    } catch (err) {
+      console.warn('[tmux] sessionAttached probe failed → treating as unknown', { name, err: String(err) });
+      return null;
+    }
+  }
+
   async createPane(sessionTarget: string, cwd?: string): Promise<string> {
     // sessionTarget can be "session:window" or "session:window.pane"
     const args = ["split-window", "-t", sessionTarget];

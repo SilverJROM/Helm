@@ -158,4 +158,66 @@ describe('ST-R1/R2 @helm_child tmux ownership tag', () => {
     expect(probe!.args).toContain('@helm_child');
     expect(probe!.args).toContain('helm-probe');
   });
+
+  it('S08: sessionActivity reads display-message session_activity and parses integer activity', async () => {
+    cpMock.calls.length = 0;
+    cpMock.impl = async (_cmd: string, args: string[]) => {
+      if (args[0] === 'has-session') throw new Error('no such session');
+      if (args[0] === 'display-message') return { stdout: '1732713600\n', stderr: '' };
+      return { stdout: '', stderr: '' };
+    };
+    const tmux: any = new TmuxService();
+    await expect(tmux.sessionActivity('helm-activity-ok')).resolves.toBe(1732713600);
+    const probe = cpMock.calls.find((c) => c.args[0] === 'display-message');
+    expect(probe).toBeTruthy();
+    expect(probe!.args).toEqual(['display-message', '-p', '-t', 'helm-activity-ok', '#{session_activity}']);
+  });
+
+  it('S08: sessionActivity returns null on malformed output', async () => {
+    cpMock.impl = async () => ({ stdout: 'n/a', stderr: '' });
+    const tmux: any = new TmuxService();
+    await expect(tmux.sessionActivity('helm-activity-bad')).resolves.toBeNull();
+  });
+
+  it('S08: sessionActivity returns null when tmux has-session probe error (missing/gone)', async () => {
+    cpMock.impl = async () => { throw new Error('tmux: no such session'); };
+    const tmux: any = new TmuxService();
+    await expect(tmux.sessionActivity('helm-missing')).resolves.toBeNull();
+  });
+
+  it('S08: sessionAttached reads display-message session_attached and parses 1/0', async () => {
+    cpMock.calls.length = 0;
+    cpMock.impl = async () => ({ stdout: '1\n', stderr: '' });
+    const tmux: any = new TmuxService();
+    await expect(tmux.sessionAttached('helm-attached-ok')).resolves.toBe(true);
+    cpMock.impl = async () => ({ stdout: '0\n', stderr: '' });
+    await expect(tmux.sessionAttached('helm-attached-no')).resolves.toBe(false);
+    const probes = cpMock.calls.filter((c) => c.args[0] === 'display-message');
+    expect(probes).toHaveLength(2);
+    expect(probes.every((c) => c.args.includes('#{session_attached}'))).toBe(true);
+  });
+  it('S08: sessionAttached returns null on malformed output', async () => {
+    cpMock.impl = async () => ({ stdout: 'true', stderr: '' });
+    const tmux: any = new TmuxService();
+    await expect(tmux.sessionAttached('helm-attached-bad')).resolves.toBeNull();
+  });
+
+  it('S08: sessionActivity/Attached use display-message only (no mutating tmux calls)', async () => {
+    cpMock.calls.length = 0;
+    cpMock.impl = async () => ({ stdout: '0\n', stderr: '' });
+    const tmux: any = new TmuxService();
+    await tmux.sessionActivity('helm-safe');
+    await tmux.sessionAttached('helm-safe');
+    expect(cpMock.calls.every((c) => c.args[0] === 'display-message')).toBe(true);
+    expect(cpMock.calls.find((c) => c.args[0] === 'new-session')).toBeFalsy();
+    expect(cpMock.calls.find((c) => c.args[0] === 'kill-session')).toBeFalsy();
+    expect(cpMock.calls.find((c) => c.args[0] === 'send-keys')).toBeFalsy();
+  });
+
+  it('S08: invalid session name rejects before tmux call for activity/attached readers', async () => {
+    const tmux: any = new TmuxService();
+    await expect(tmux.sessionActivity('helm bad')).rejects.toThrow();
+    await expect(tmux.sessionAttached('helm bad')).rejects.toThrow();
+    expect(cpMock.calls).toEqual([]);
+  });
 });
