@@ -1,35 +1,40 @@
-# S09 changes — last_used_at on agent output (AC19)
+# S10 changes — observed idle helper (AC16/17/18, AC21 trigger, AC26)
 
 ## Root cause / objective
-E5 / AC19: `last_used_at` only refreshed on Helm **input** (`touchSession` from sendAndSubmit/sendCommand/sendEnter/sendKeys). `capturePane` intentionally did not touch (high-freq poll must not immortalize idle seats), so agent streaming output never bumped the TTL clock — a session could freeze ~2s after create while the agent was still writing.
+Idleness must be **observed** from DB + tmux facts (`max(last_used_at, session_activity)`), never from
+`last_used_at` alone. Attached seats are never candidates. `run_id IS NULL` is normal for chat seats and
+is not abandonment. Observation may only **trigger investigation** — never REAP (S11 owns decisions;
+S12 owns janitor wiring).
 
 ## Mechanism
-1. **Prior pane snapshot map** on `TmuxService` (`lastPaneSnapshots: Map<sessionName, strippedContent>`).
-2. **`observeAgentOutput(target, content)`** after a successful `capturePane`:
-   - ANSI-stripped compare (`stripAnsiForMatch`) so TUI colour flicker is not activity.
-   - First non-empty snapshot = **baseline only** (no touch).
-   - Identical subsequent content = **no touch** (no polling inflation).
-   - Real content delta = **`touchSession`** once → existing `onUse` → `sessionRegistry.touch`.
-   - Empty/failed captures invent no activity and do not reset the baseline.
-3. **`terminateSession`** deletes the prior snapshot so a recreated same-name session re-baselines.
-4. **Reaped never resurrected** — unchanged `SessionRegistryService.touch` (`WHERE status != 'reaped'`); proven end-to-end via onUse wiring in tests.
-5. **Helm input still touches** — existing send-path `touchSession` unchanged.
+1. **Pure** `observeSessionIdleness(facts)` in `session-observation.ts` — no tmux I/O, no DB writes.
+2. **effectiveActivityMs** = max of parseable `last_used_at` (fallback `created_at`) and S08
+   `session_activity` (epoch seconds → ms). Missing sides ignored, never coerced to 0.
+3. **Priority rules:**
+   - `attached === true` → `KEEP` (`attached_excluded`) — AC17
+   - `attached === null` → `KEEP` (`attached_unknown`) — fail-safe
+   - no usable activity → `KEEP` (`missing_activity_facts`)
+   - idle age < hours-scale threshold (default 4h) → `KEEP` (`within_idle_threshold`)
+   - else → `INVESTIGATE` (`hours_idle_anomaly`) — AC21/26
+4. **Return union** is only `KEEP | INVESTIGATE` — REAP is not representable.
+5. **`runId` is never authority** (AC18): null neither forces INVESTIGATE nor blocks a positive idle signal.
 
 ## Code changes
-- `src/tmux/tmux-service.ts` — `lastPaneSnapshots`, `observeAgentOutput`, hook in `capturePane`, clear on terminate; comment update on `touchSession`
-- `src/tmux/tmux-helm-child-tag.test.ts` — 7 S09 fake-pane / synthetic-registry tests
-- No `index.ts` rewire required (`onUse → touch` already present)
+- `src/services/session-observation.ts` — pure helper + timestamp normalizers + DEFAULT_IDLE_THRESHOLD_MS
+- `src/services/session-observation.test.ts` — table tests (stale/fresh cross, attached, null run, unknown,
+  hours-idle INVESTIGATE, no-REAP source guard, HELM_SESSION_JANITOR=0)
 
 ## Guardrails
 - `HELM_SESSION_JANITOR=0` unchanged in `.env` and `ecosystem.config.cjs`
-- Fake-exec / synthetic DB only; no live tmux; no live `data/helm.db` mutation from this suite
-- No S10 observation helper, no reaper decision changes, no flag flip
+- Pure/synthetic facts only; no live tmux; no live `data/helm.db` mutation
+- No janitor tick wiring, no S11 decision fn, no housekeeper spawn
 
 ## Out of scope
-- S10 `max(last_used_at, session_activity)` / attached exclusion
-- Janitor enable / shadow mode
-- Reaper decision wiring (S11/S12)
+- S11 pure `REAP | CONVERGE | KEEP` decision
+- S12 `sessionJanitorTick` / startup reconciliation wiring
+- S18 housekeeper dispatch / investigation table
+- Flag flip to enable janitor
 
 ## Test status
 - `npx tsc --noEmit -p tsconfig.json` → **exit 0**
-- `HELM_SESSION_JANITOR=0 npx vitest run src/tmux/ --poolOptions.forks.maxForks=2` → **55 passed** (24 in tmux-helm-child-tag including 7 new S09 cases)
+- `HELM_SESSION_JANITOR=0 npx vitest run src/services/session-observation.test.ts --poolOptions.forks.maxForks=2` → **16 passed**
