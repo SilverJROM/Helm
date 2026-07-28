@@ -5,7 +5,7 @@ import os from 'node:os';
 import Database from 'better-sqlite3';
 import { DatabaseService } from '../db/database.js';
 import { SCHEMA_VERSION } from '../db/schema.js';
-import { SessionRegistryService, deriveSessionKind } from './session-registry-service.js';
+import { SessionRegistryService, deriveSessionKind, deriveSessionOwner } from './session-registry-service.js';
 import { WorkerService } from './worker-service.js';
 
 function makeTempDb(): { db: DatabaseService; cleanup: () => void } {
@@ -139,8 +139,8 @@ describe('S04 helm_sessions.owner (AC1)', () => {
     }
   });
 
-  it('fresh DB: owner column present, SCHEMA_VERSION ≥ 101', () => {
-    expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(101);
+  it('fresh DB: owner column present, SCHEMA_VERSION ≥ 102', () => {
+    expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(102);
     const ver = (db.raw.prepare('SELECT version FROM schema_version').get() as any).version;
     expect(ver).toBe(SCHEMA_VERSION);
     const cols = db.raw.prepare('PRAGMA table_info(helm_sessions)').all().map((c: any) => c.name);
@@ -191,7 +191,7 @@ describe('S04 helm_sessions.owner (AC1)', () => {
     expect(reg.get('helm-w-cards-auth')!.owner).toBe('human');
   });
 
-  it('v100→v101 synthetic fixture: adds owner column, existing rows stay null, version=SCHEMA_VERSION', () => {
+  it('v100→SCHEMA_VERSION synthetic fixture: adds owner column; S07 backfills proven worker; CHECK holds', () => {
     const fixturePath = path.join(os.tmpdir(), `helm-s04-v100-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
     try {
       const raw = new Database(fixturePath);
@@ -219,8 +219,9 @@ describe('S04 helm_sessions.owner (AC1)', () => {
       expect(ver).toBe(SCHEMA_VERSION);
       const cols = migrated.raw.prepare('PRAGMA table_info(helm_sessions)').all().map((c: any) => c.name);
       expect(cols).toContain('owner');
+      // S07 v102: proven worker name+kind is backfilled to helm (no longer left null after full migrate).
       const pre = migrated.raw.prepare(`SELECT owner FROM helm_sessions WHERE name = 'helm-pre-s04'`).get() as any;
-      expect(pre.owner).toBeNull();
+      expect(pre.owner).toBe('helm');
       // CHECK still rejects bad values after upgrade.
       expect(() => {
         migrated.raw.prepare(
@@ -239,6 +240,166 @@ describe('S04 helm_sessions.owner (AC1)', () => {
       for (const suf of ['', '-wal', '-shm']) {
         try { fs.unlinkSync(fixturePath + suf); } catch {}
       }
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S07 / AC5 — fail-safe owner backfill (v102) + query-level Helm-owned exclusion.
+// Synthetic/copied fixtures only; HELM_SESSION_JANITOR=0; live data/helm.db mtime untouched.
+// ---------------------------------------------------------------------------
+describe('S07 owner backfill v102 + listHelmOwnedCandidates (AC5)', () => {
+  let liveMtimeBefore: number | null;
+
+  beforeEach(() => {
+    const livePath = path.join(process.cwd(), 'data', 'helm.db');
+    liveMtimeBefore = fs.existsSync(livePath) ? fs.statSync(livePath).mtimeMs : null;
+  });
+  afterEach(() => {
+    const livePath = path.join(process.cwd(), 'data', 'helm.db');
+    if (liveMtimeBefore != null && fs.existsSync(livePath)) {
+      expect(fs.statSync(livePath).mtimeMs).toBe(liveMtimeBefore);
+    }
+  });
+
+  it('deriveSessionOwner fail-safe table: proven human/helm only; ambiguous → legacy:unknown', () => {
+    const cases: Array<[string, string | null | undefined, string]> = [
+      // human
+      ['helm-discovery-cards', null, 'human'],
+      ['helm-discovery-cards', 'discovery', 'human'],
+      ['helm-chat-discovery-ab12cd', null, 'human'],
+      ['helm-chat-p3-discovery-ab12cd', 'other', 'human'],
+      ['helm-batch-A1-discovery-x1', null, 'human'],
+      // helm brains / workers / preflight / tests
+      ['helm-plancore-cards', null, 'helm'],
+      ['helm-ibrain-cards', 'ibrain', 'helm'],
+      ['helm-preflight-codex-abc', null, 'helm'],
+      ['helm-w-cards-7', null, 'helm'],
+      ['helm-batch-A1-implementer-abc123', null, 'helm'],
+      ['helm-batch-A2-validator-def', null, 'helm'],
+      ['helm-model-probe-test', null, 'helm'],
+      ['helm-weird-name', 'worker', 'helm'], // context: proven kind + helm- prefix
+      // ambiguous / non-helm → legacy
+      ['helm-weird-name', 'other', 'legacy:unknown'],
+      ['helm-weird-name', null, 'legacy:unknown'],
+      ['not-helm-session', 'worker', 'legacy:unknown'],
+      ['', null, 'legacy:unknown'],
+    ];
+    for (const [name, kind, expected] of cases) {
+      expect(deriveSessionOwner(name, kind)).toBe(expected);
+    }
+  });
+
+  it('v101→v102 reality-shaped fixture: backfills proven owners; ambiguous→legacy; counts preserved; idempotent', () => {
+    const fixturePath = path.join(os.tmpdir(), `helm-s07-v101-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+    const seed = [
+      { name: 'helm-discovery-proj-1', kind: 'discovery' },
+      { name: 'helm-chat-discovery-aa11bb', kind: 'other' },
+      { name: 'helm-w-cards-42', kind: 'worker' },
+      { name: 'helm-plancore-cards', kind: 'plancore' },
+      { name: 'helm-ibrain-cards', kind: 'ibrain' },
+      { name: 'helm-preflight-codex-xyz', kind: 'other' }, // pre-S06 misclassified as other; name still proven
+      { name: 'helm-ambiguous-seat', kind: 'other' },
+      { name: 'random-tmux-name', kind: null },
+    ] as const;
+
+    try {
+      const raw = new Database(fixturePath);
+      raw.exec(`
+        CREATE TABLE schema_version (version INTEGER PRIMARY KEY);
+        INSERT INTO schema_version (version) VALUES (101);
+        CREATE TABLE helm_sessions (
+          id INTEGER PRIMARY KEY,
+          name TEXT UNIQUE NOT NULL,
+          kind TEXT,
+          project_id INTEGER,
+          run_id INTEGER,
+          owner TEXT CHECK(owner IS NULL OR owner IN ('helm','human','legacy:unknown')),
+          status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','idle','reaped')),
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          last_used_at TEXT,
+          ended_at TEXT,
+          reason TEXT
+        );
+      `);
+      const ins = raw.prepare(
+        `INSERT INTO helm_sessions (name, kind, owner, status) VALUES (?, ?, NULL, 'active')`
+      );
+      for (const row of seed) ins.run(row.name, row.kind);
+      // Pre-set authority must not be rewritten by backfill.
+      raw.prepare(
+        `INSERT INTO helm_sessions (name, kind, owner, status) VALUES ('helm-w-already-human', 'worker', 'human', 'active')`
+      ).run();
+      const countBefore = (raw.prepare(`SELECT COUNT(*) AS c FROM helm_sessions`).get() as any).c;
+      raw.close();
+
+      const migrated = new DatabaseService(fixturePath);
+      const ver = (migrated.raw.prepare('SELECT version FROM schema_version').get() as any).version;
+      expect(ver).toBe(SCHEMA_VERSION);
+      expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(102);
+
+      const countAfter = (migrated.raw.prepare(`SELECT COUNT(*) AS c FROM helm_sessions`).get() as any).c;
+      expect(countAfter).toBe(countBefore);
+
+      const ownerOf = (name: string) =>
+        (migrated.raw.prepare(`SELECT owner FROM helm_sessions WHERE name = ?`).get(name) as any).owner;
+
+      expect(ownerOf('helm-discovery-proj-1')).toBe('human');
+      expect(ownerOf('helm-chat-discovery-aa11bb')).toBe('human');
+      expect(ownerOf('helm-w-cards-42')).toBe('helm');
+      expect(ownerOf('helm-plancore-cards')).toBe('helm');
+      expect(ownerOf('helm-ibrain-cards')).toBe('helm');
+      expect(ownerOf('helm-preflight-codex-xyz')).toBe('helm');
+      expect(ownerOf('helm-ambiguous-seat')).toBe('legacy:unknown');
+      expect(ownerOf('random-tmux-name')).toBe('legacy:unknown');
+      // Already-set owner preserved (WHERE owner IS NULL only).
+      expect(ownerOf('helm-w-already-human')).toBe('human');
+
+      // Null owners fully drained by backfill.
+      const stillNull = (migrated.raw.prepare(
+        `SELECT COUNT(*) AS c FROM helm_sessions WHERE owner IS NULL`
+      ).get() as any).c;
+      expect(stillNull).toBe(0);
+
+      migrated.close();
+
+      // Idempotent: second open leaves owners + version unchanged.
+      const again = new DatabaseService(fixturePath);
+      expect((again.raw.prepare('SELECT version FROM schema_version').get() as any).version).toBe(SCHEMA_VERSION);
+      const ownerOf2 = (name: string) =>
+        (again.raw.prepare(`SELECT owner FROM helm_sessions WHERE name = ?`).get(name) as any).owner;
+      expect(ownerOf2('helm-ambiguous-seat')).toBe('legacy:unknown');
+      expect(ownerOf2('helm-w-cards-42')).toBe('helm');
+      expect(ownerOf2('helm-w-already-human')).toBe('human');
+      again.close();
+    } finally {
+      for (const suf of ['', '-wal', '-shm']) {
+        try { fs.unlinkSync(fixturePath + suf); } catch {}
+      }
+    }
+  });
+
+  it('listHelmOwnedCandidates SQL-excludes human, legacy:unknown, and null', () => {
+    const t = makeTempDb();
+    try {
+      const reg = new SessionRegistryService(t.db);
+      reg.register('helm-w-helm-only', { owner: 'helm', kind: 'worker' });
+      reg.register('helm-discovery-human', { owner: 'human', kind: 'discovery' });
+      reg.register('helm-legacy-x', { owner: 'legacy:unknown', kind: 'other' });
+      // Force a null owner row past register() to prove SQL exclusion.
+      t.db.raw.prepare(
+        `INSERT INTO helm_sessions (name, kind, owner, status) VALUES ('helm-null-owner', 'other', NULL, 'active')`
+      ).run();
+
+      const all = reg.list();
+      expect(all.length).toBe(4);
+
+      const helmOnly = reg.listHelmOwnedCandidates();
+      expect(helmOnly.map((r) => r.name)).toEqual(['helm-w-helm-only']);
+      expect(helmOnly.every((r) => r.owner === 'helm')).toBe(true);
+      expect(helmOnly.some((r) => r.owner === 'human' || r.owner === 'legacy:unknown' || r.owner == null)).toBe(false);
+    } finally {
+      t.cleanup();
     }
   });
 });

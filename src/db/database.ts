@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import path from "node:path";
 import fs from "node:fs";
 import { SCHEMA_VERSION, SCHEMA_SQL, V89_IBRAIN_DEFINITION_MD, V89_KNOWN_CANONICAL_PLANCORE_HASHES, V89_PLANCORE_DEFINITION_MD, applyFreshDbExtras, applyB04CanonicalModelSeeds, applyB12bRoleTierSeeds, applyB17TeamTierSeeds, applyB1TeamsSeeds, applyB3AgentRoleCapabilitySeeds, applyB2HelmAgentSeeds, applyB09aCanonicalRosterSeeds, applyB09bPruneNonCanonicalAgents, applyB25OrphanModelHygiene, applyB25dDeleteUnknownProviderMasterRuntimes, applyB6AgentMemorySeeds, applyB11PanelistRetirement, seedRoutingRules } from "./schema.js";
+import { deriveSessionOwner } from "../services/session-registry-service.js";
 
 // Schema-data constants live in ./schema.ts. Migration logic stub here
 // ready for P1-2 to extend (per brief: seed schema_version to 1 only).
@@ -3313,6 +3314,27 @@ ALTER TABLE runs_new RENAME TO runs;
           }
         }
         this.db.prepare('UPDATE schema_version SET version = 101').run();
+      }
+
+      // v102 / S07 AC5: one-time fail-safe owner backfill (name + kind context).
+      // Only WHERE owner IS NULL; already-set authority is never rewritten. Remainder → legacy:unknown.
+      // Uses deriveSessionOwner (single source of truth). Janitor remains off.
+      if (current && current.version < 102) {
+        if (hasTable('helm_sessions')) {
+          const cols = this.db.prepare('PRAGMA table_info(helm_sessions)').all() as any[];
+          if (cols.some((c) => c.name === 'owner')) {
+            const nullRows = this.db
+              .prepare(`SELECT name, kind FROM helm_sessions WHERE owner IS NULL`)
+              .all() as Array<{ name: string; kind: string | null }>;
+            const setOwner = this.db.prepare(
+              `UPDATE helm_sessions SET owner = ? WHERE name = ? AND owner IS NULL`
+            );
+            for (const row of nullRows) {
+              setOwner.run(deriveSessionOwner(row.name, row.kind), row.name);
+            }
+          }
+        }
+        this.db.prepare('UPDATE schema_version SET version = 102').run();
       }
     }
   }

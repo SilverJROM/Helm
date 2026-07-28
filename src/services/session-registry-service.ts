@@ -17,7 +17,7 @@ export interface HelmSessionRow {
   kind: string | null;
   project_id: number | null;
   run_id: number | null;
-  /** Null only for pre-S07 rows; new registers should pass owner. S05 refuses create without it. */
+  /** S07 backfills pre-existing nulls; new registers must pass owner (S05 refuses create without it). */
   owner: SessionOwner | null;
   status: HelmSessionStatus;
   created_at: string;
@@ -76,6 +76,57 @@ export function deriveSessionKind(name: string): string {
   // helm-w-<slug>-<id> (WorkerService) — worker sessions.
   if (/^helm-w-/.test(n)) return 'worker';
   return 'other';
+}
+
+/** Proven Helm seat kinds (S05 create paths + derived agent roles). Fail-safe: not in set ⇒ not helm via kind alone. */
+const PROVEN_HELM_KINDS = new Set<string>([
+  'plancore',
+  'ibrain',
+  'preflight',
+  'implementer',
+  'validator',
+  'planner',
+  'red-team',
+  'deliberation',
+  'coord',
+  'panelist',
+  'worker',
+  'test',
+  'routine-implementer',
+]);
+
+/**
+ * S07 / AC5: fail-safe owner from name + optional kind context.
+ * Only proven human or helm shapes get binary authority; every remainder is the closed
+ * legacy sentinel `legacy:unknown` (never reaped by automatic paths — excluded at the query).
+ * Prefer under-attribution: ambiguous names never become helm.
+ */
+export function deriveSessionOwner(name: string, kind?: string | null): SessionOwner {
+  const n = (name ?? '').trim();
+  const k = (kind ?? '').trim() || null;
+
+  // Human first — chat/discovery seats must never be over-attributed as helm.
+  if (/^helm-discovery-/.test(n) || /^helm-chat-/.test(n)) return 'human';
+  if (k === 'discovery') return 'human';
+
+  // Proven helm by name shape (mirrors S05 product create paths + deriveSessionKind agent seats).
+  if (/^helm-plancore-/.test(n)) return 'helm';
+  if (/^helm-ibrain-/.test(n)) return 'helm';
+  if (/^helm-preflight-/.test(n)) return 'helm';
+  if (/^helm-w-/.test(n)) return 'helm';
+  if (/^helm-.*-test(-|$)/.test(n) || (/-test$/.test(n) && n.startsWith('helm-'))) return 'helm';
+  const roleMatch = n.match(
+    /^helm-.*?-(implementer|validator|plancore|ibrain|discovery|planner|red-team|deliberation|coord|panelist|routine-implementer|w)-/
+  );
+  if (roleMatch) {
+    if (roleMatch[1] === 'discovery') return 'human';
+    return 'helm';
+  }
+
+  // Context assist: proven kind already stored + helm- prefix (never invent authority for non-helm names).
+  if (n.startsWith('helm-') && k && PROVEN_HELM_KINDS.has(k)) return 'helm';
+
+  return 'legacy:unknown';
 }
 
 export class SessionRegistryService {
@@ -157,6 +208,17 @@ WHERE name = ?
 
   list(): HelmSessionRow[] {
     return this.db.prepare(`SELECT * FROM helm_sessions ORDER BY id DESC`).all() as HelmSessionRow[];
+  }
+
+  /**
+   * S07 / AC5: query-level Helm-owned candidate selection.
+   * SQL filter only — never returns human, legacy:unknown, or null owner rows.
+   * Downstream janitor/housekeeper paths must use this (or equivalent owner='helm' SQL), not JS post-filter.
+   */
+  listHelmOwnedCandidates(): HelmSessionRow[] {
+    return this.db.prepare(
+      `SELECT * FROM helm_sessions WHERE owner = 'helm' ORDER BY id DESC`
+    ).all() as HelmSessionRow[];
   }
 
   get(name: string): HelmSessionRow | undefined {
