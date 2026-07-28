@@ -80,23 +80,23 @@ describe('Leg D: TaskQueueService earliest-open-batch admission barrier', () => 
     q.enqueue(runId, 10, [], false, 'B1'); // B1, no dep
 
     const order: number[] = [];
-    let n = q.getNextReady(runId);
+    let n = q.claimNextReady(runId);
     // First: only B1 may dispatch; within B1, 10 (dep-free) before 11 (dep 10). 20 (B2) is barred.
-    expect(n).toBe(10);
+    expect(n!.taskId).toBe(10);
     // While 10 is in-flight, nothing else is ready (one-in-flight)
-    expect(q.getNextReady(runId)).toBeNull();
-    order.push(n!); q.markComplete(n!, runId);
+    expect(q.claimNextReady(runId)).toBeNull();
+    order.push(n!.taskId); q.markComplete(n!);
 
-    n = q.getNextReady(runId);
-    expect(n).toBe(11); // B1 sibling now dep-satisfied — still no B2
-    order.push(n!); q.markComplete(n!, runId);
+    n = q.claimNextReady(runId);
+    expect(n!.taskId).toBe(11); // B1 sibling now dep-satisfied — still no B2
+    order.push(n!.taskId); q.markComplete(n!);
 
-    n = q.getNextReady(runId);
-    expect(n).toBe(20); // B1 fully complete → B2 opens
-    order.push(n!); q.markComplete(n!, runId);
+    n = q.claimNextReady(runId);
+    expect(n!.taskId).toBe(20); // B1 fully complete → B2 opens
+    order.push(n!.taskId); q.markComplete(n!);
 
     expect(order).toEqual([10, 11, 20]);
-    expect(q.getNextReady(runId)).toBeNull();
+    expect(q.claimNextReady(runId)).toBeNull();
   });
 
   it('B2 vs B10 numeric ordering (B2 dispatches before B10)', () => {
@@ -104,10 +104,10 @@ describe('Leg D: TaskQueueService earliest-open-batch admission barrier', () => 
     const runId = 2;
     q.enqueue(runId, 100, [], false, 'B10'); // enqueued first but sorts LAST
     q.enqueue(runId, 2, [], false, 'B2');
-    const first = q.getNextReady(runId);
-    expect(first).toBe(2); // B2 < B10
-    q.markComplete(2, runId);
-    expect(q.getNextReady(runId)).toBe(100);
+    const first = q.claimNextReady(runId);
+    expect(first!.taskId).toBe(2); // B2 < B10
+    q.markComplete(first!);
+    expect(q.claimNextReady(runId)!.taskId).toBe(100);
   });
 
   it('single-batch (all default) plan behaves exactly as before — no barrier beyond deps', () => {
@@ -116,12 +116,12 @@ describe('Leg D: TaskQueueService earliest-open-batch admission barrier', () => 
     q.enqueue(runId, 1, []);
     q.enqueue(runId, 2, [1]);
     q.enqueue(runId, 3, []);
-    const first = q.getNextReady(runId);
-    expect([1, 3]).toContain(first); // both dep-free, insertion order → 1
-    expect(first).toBe(1);
-    q.markComplete(1, runId);
+    const first = q.claimNextReady(runId);
+    expect([1, 3]).toContain(first!.taskId); // both dep-free, insertion order → 1
+    expect(first!.taskId).toBe(1);
+    q.markComplete(first!);
     // 2 and 3 both ready; insertion order → 2
-    expect(q.getNextReady(runId)).toBe(2);
+    expect(q.claimNextReady(runId)!.taskId).toBe(2);
   });
 });
 
@@ -134,20 +134,20 @@ describe('Leg D: failed/deferred batch semantics + classifyDrainState', () => {
     q.enqueue(runId, 11, [], false, 'B1');
     q.enqueue(runId, 20, [], false, 'B2');
 
-    const first = q.getNextReady(runId);
-    expect([10, 11]).toContain(first); // B1 only
-    q.markFailed(first!, runId);        // 10 fails
-    const second = q.getNextReady(runId);
-    expect(second).toBe(11);            // independent B1 sibling still drains
-    q.markComplete(11, runId);
+    const first = q.claimNextReady(runId);
+    expect([10, 11]).toContain(first!.taskId); // B1 only
+    q.markFailed(first!);        // 10 fails
+    const second = q.claimNextReady(runId);
+    expect(second!.taskId).toBe(11);            // independent B1 sibling still drains
+    q.markComplete(second!);
 
-    // B1 now has a failed task → B2 must NOT open. getNextReady == null.
-    expect(q.getNextReady(runId)).toBeNull();
+    // B1 now has a failed task → B2 must NOT open. claimNextReady == null.
+    expect(q.claimNextReady(runId)).toBeNull();
 
     const cls = q.classifyDrainState(runId);
     expect(cls.kind).toBe('failed-block');
     expect(cls.pendingTaskIds).toContain(20);   // B2 task is the pending, never-dispatched work
-    expect(cls.blockerTaskIds).toContain(first); // the failed B1 task is the blocker
+    expect(cls.blockerTaskIds).toContain(first!.taskId); // the failed B1 task is the blocker
   });
 
   it('a deferred earlier-batch task blocks later batches; classifier = deferred-block (precedence over failed)', () => {
@@ -155,10 +155,10 @@ describe('Leg D: failed/deferred batch semantics + classifyDrainState', () => {
     const runId = 5;
     q.enqueue(runId, 10, [], false, 'B1');
     q.enqueue(runId, 20, [], false, 'B2');
-    const first = q.getNextReady(runId);
-    expect(first).toBe(10);
-    q.markDeferred(10, runId);
-    expect(q.getNextReady(runId)).toBeNull(); // B2 barred by deferred B1
+    const first = q.claimNextReady(runId);
+    expect(first!.taskId).toBe(10);
+    q.markDeferred(first!);
+    expect(q.claimNextReady(runId)).toBeNull(); // B2 barred by deferred B1
     const cls = q.classifyDrainState(runId);
     expect(cls.kind).toBe('deferred-block');
     expect(cls.pendingTaskIds).toContain(20);
@@ -171,11 +171,11 @@ describe('Leg D: failed/deferred batch semantics + classifyDrainState', () => {
     q.enqueue(runId, 1, []);       // fails
     q.enqueue(runId, 2, [1]);      // dependent — stays pending
     q.enqueue(runId, 3, []);       // independent — completes
-    q.markFailed(1, runId);
-    const r = q.getNextReady(runId);
-    expect(r).toBe(3);             // independent drains
-    q.markComplete(3, runId);
-    expect(q.getNextReady(runId)).toBeNull();
+    q.markFailed(q.freezeTerminalToken(runId, 1)!);
+    const r = q.claimNextReady(runId);
+    expect(r!.taskId).toBe(3);             // independent drains
+    q.markComplete(r!);
+    expect(q.claimNextReady(runId)).toBeNull();
     const cls = q.classifyDrainState(runId);
     expect(cls.kind).toBe('failed-block');
     expect(cls.pendingTaskIds).toContain(2);
@@ -187,8 +187,8 @@ describe('Leg D: failed/deferred batch semantics + classifyDrainState', () => {
     const runId = 7;
     q.enqueue(runId, 1, []);
     q.enqueue(runId, 2, [1]);
-    q.markDeferred(1, runId);
-    expect(q.getNextReady(runId)).toBeNull();
+    q.markDeferred(q.freezeTerminalToken(runId, 1)!);
+    expect(q.claimNextReady(runId)).toBeNull();
     const cls = q.classifyDrainState(runId);
     expect(cls.kind).toBe('deferred-block');
     expect(cls.blockerTaskIds).toContain(1);
@@ -199,7 +199,7 @@ describe('Leg D: failed/deferred batch semantics + classifyDrainState', () => {
     const runId = 8;
     q.enqueue(runId, 1, [2]);
     q.enqueue(runId, 2, [1]);
-    expect(q.getNextReady(runId)).toBeNull();
+    expect(q.claimNextReady(runId)).toBeNull();
     expect(q.classifyDrainState(runId).kind).toBe('cycle');
   });
 
@@ -208,8 +208,8 @@ describe('Leg D: failed/deferred batch semantics + classifyDrainState', () => {
     const runId = 9;
     q.enqueue(runId, 1, [], false, 'B1');
     q.enqueue(runId, 2, [], false, 'B2');
-    q.markComplete(1, runId);
-    q.markComplete(2, runId);
+    q.markComplete(q.freezeTerminalToken(runId, 1)!);
+    q.markComplete(q.freezeTerminalToken(runId, 2)!);
     expect(q.classifyDrainState(runId).kind).toBe('all-complete');
   });
 });
@@ -220,7 +220,7 @@ describe('Leg D: dynamic-task batch resolution', () => {
     const runId = 10;
     q.enqueue(runId, 1, [], false, 'B1');
     q.enqueue(runId, 2, [], false, 'B2');
-    q.getNextReady(runId); // 1 in-flight (B1)
+    q.claimNextReady(runId); // 1 in-flight (B1)
     q.enqueueTask(runId, 99, true); // injected mid-B1, no explicit batch
     expect(q.batchOfTask(99)).toBe('B1');
   });
@@ -359,6 +359,30 @@ describe('B03/AC7: durable task terminal CAS (run_id + status + generation)', ()
       db.raw.prepare('SELECT status FROM run_tasks WHERE id = ?').get(tDefer)
     ).toEqual({ status: 'deferred' });
     expect(q.classifyDrainState(runId).kind).toBe('all-complete');
+  });
+
+  it('C1-R2: numeric late-recapture (taskId, runId) is unavailable; mark* is token-only', () => {
+    // Redteam R2: mark*(staleTaskId, R) after getNextReady discarded identity must not exist.
+    const q = new TaskQueueService(artifacts);
+    const runId = artifacts.createRun(null, 'b03-c1-r2');
+    const taskId = artifacts.recordTask(runId, 'T-r2', 'no-numeric-mark', 'B1');
+    q.enqueue(runId, taskId, [], false, 'B1');
+    const tokenA = q.claimNextReady(runId)!;
+
+    // Compile/runtime: mark* arity is 1 (token only). Numeric (taskId, runId) is not a valid call.
+    expect(q.markFailed.length).toBe(1);
+    expect(q.markComplete.length).toBe(1);
+    expect(q.markDeferred.length).toBe(1);
+    // getNextReady removed — claimNextReady is the only claim API.
+    expect((q as any).getNextReady).toBeUndefined();
+    // Calling mark* with a number must not be accepted as a taskId (token shape required).
+    expect(q.markFailed(taskId as any)).toBe(false);
+    expect(q.markFailed({ taskId, runId } as any)).toBe(false); // missing runGeneration
+    // Held claim token still works.
+    expect(q.markComplete(tokenA)).toBe(true);
+    expect(
+      db.raw.prepare('SELECT status FROM run_tasks WHERE id = ?').get(taskId)
+    ).toEqual({ status: 'complete' });
   });
 
   it('C1 production-path: A claim held through clearRun+B reuses ids; A markFailed leaves B durable+mem intact', () => {

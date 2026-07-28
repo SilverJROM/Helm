@@ -307,8 +307,8 @@ describe.sequential('A6 R3.14 pause_after_planning gate', () => {
     // Stick inFlight: claim a task without markComplete — the live unknown-pending-stall pattern.
     const poisonTask = artifacts.recordTask(poisonId, 'POISON', 'stuck inFlight', 'B1');
     queue.enqueue(poisonId, poisonTask, [], false, 'B1');
-    expect(queue.getNextReady(poisonId)).toBe(poisonTask);
-    expect(queue.getNextReady(poisonId)).toBeNull(); // strictly one-in-flight stuck
+    expect(queue.claimNextReady(poisonId)!.taskId).toBe(poisonTask);
+    expect(queue.claimNextReady(poisonId)).toBeNull(); // strictly one-in-flight stuck
     expect(getRunAbort(poisonId)?.reason).toContain('A6 live evidence');
     db.raw.prepare('DELETE FROM runs WHERE id = ?').run(poisonId); // cascade tasks; queue state remains
 

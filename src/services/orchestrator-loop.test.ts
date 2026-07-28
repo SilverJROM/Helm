@@ -414,9 +414,10 @@ describe('orchestrator-loop B6 queue (DSP8) + TaskQueueService (USE_FAKE_TMUX)',
     q.enqueue(rid, tDep, [t2]);
 
     // 1. exactly one active
-    expect(q.getNextReady(rid)).toBe(t1);
+    const c1 = q.claimNextReady(rid);
+    expect(c1!.taskId).toBe(t1);
     expect(q.isInFlight(rid)).toBe(true);
-    expect(q.getNextReady(rid)).toBeNull(); // strictly one
+    expect(q.claimNextReady(rid)).toBeNull(); // strictly one
 
     // inject while t1 "in flight"
     q.enqueue(rid, tU, [], true); // URGENT after in-flight
@@ -424,23 +425,26 @@ describe('orchestrator-loop B6 queue (DSP8) + TaskQueueService (USE_FAKE_TMUX)',
     q.enqueue(rid, tDepF, [tF]);
 
     // complete t1 -> next should be urgent (after in-flight at time of inject)
-    q.markComplete(t1, rid);
-    expect(q.getNextReady(rid)).toBe(tU); // urgent jumped after the (now done) in-flight
-    q.markComplete(tU, rid);
+    q.markComplete(c1!);
+    const cU = q.claimNextReady(rid);
+    expect(cU!.taskId).toBe(tU); // urgent jumped after the (now done) in-flight
+    q.markComplete(cU!);
 
     // now normal t2
-    expect(q.getNextReady(rid)).toBe(t2);
-    q.markComplete(t2, rid);
+    const c2 = q.claimNextReady(rid);
+    expect(c2!.taskId).toBe(t2);
+    q.markComplete(c2!);
 
     // dep now ready
-    expect(q.getNextReady(rid)).toBe(tDep);
-    q.markComplete(tDep, rid);
+    const cDep = q.claimNextReady(rid);
+    expect(cDep!.taskId).toBe(tDep);
+    q.markComplete(cDep!);
 
     // 2+3. failed blocks its dependents (tDepF depends on tF)
     // enqueue tF already done above, now fail it
-    q.markFailed(tF, rid);
+    q.markFailed(q.freezeTerminalToken(rid, tF)!);
     expect(q.isBlockedByFailure(tDepF)).toBe(true);
-    expect(q.getNextReady(rid)).toBeNull(); // blocked by failure dep
+    expect(q.claimNextReady(rid)).toBeNull(); // blocked by failure dep
 
     // cleanup
     dbs.close();
@@ -456,28 +460,29 @@ describe('orchestrator-loop B6 queue (DSP8) + TaskQueueService (USE_FAKE_TMUX)',
     q.enqueue(rid, 3, [1, 2]);
     q.enqueue(rid, 4, []);      // parallel indep
 
-    expect(q.getNextReady(rid)).toBe(1); q.markComplete(1, rid);
+    const cStart = q.claimNextReady(rid);
+    expect(cStart!.taskId).toBe(1); q.markComplete(cStart!);
     // after 1: 2 and 4 ready. Prove one-at-a-time + 3 waits for 2.
-    let n: number | null = q.getNextReady(rid)!;
-    expect([2, 4]).toContain(n);
-    const first = n;
-    q.markComplete(n, rid);
+    let n = q.claimNextReady(rid)!;
+    expect([2, 4]).toContain(n.taskId);
+    const first = n.taskId;
+    q.markComplete(n);
 
-    n = q.getNextReady(rid)!;
+    n = q.claimNextReady(rid)!;
     if (first === 2) {
-      expect(n).toBe(3); // 3 now unblocked
+      expect(n.taskId).toBe(3); // 3 now unblocked
     } else {
-      expect(n).toBe(2);
-      q.markComplete(2, rid);
-      n = q.getNextReady(rid)!;
-      expect(n).toBe(3);
+      expect(n.taskId).toBe(2);
+      q.markComplete(n);
+      n = q.claimNextReady(rid)!;
+      expect(n.taskId).toBe(3);
     }
-    q.markComplete(3, rid);
+    q.markComplete(n);
 
     // remaining (4 if not taken)
-    n = q.getNextReady(rid);
-    if (n !== null) q.markComplete(n, rid);
-    expect(q.getNextReady(rid)).toBeNull();
+    const rest = q.claimNextReady(rid);
+    if (rest !== null) q.markComplete(rest);
+    expect(q.claimNextReady(rid)).toBeNull();
   });
 
   // B10-T02: cycle detection (real cycle must surface as deadlock reason, not silent null==done)
@@ -491,11 +496,11 @@ describe('orchestrator-loop B6 queue (DSP8) + TaskQueueService (USE_FAKE_TMUX)',
     expect(q.getDeadlockReason(rid)).toBeNull();
 
     // simulate progress until blocked legitimately by failure
-    q.markComplete(10, rid);
-    q.markComplete(11, rid);
-    q.markFailed(12, rid);  // 12 failed, any dependents would be blocked by failed (legit)
+    q.markComplete(q.freezeTerminalToken(rid, 10)!);
+    q.markComplete(q.freezeTerminalToken(rid, 11)!);
+    q.markFailed(q.freezeTerminalToken(rid, 12)!);  // 12 failed, any dependents would be blocked by failed (legit)
     // no more ready, pending none in this case
-    expect(q.getNextReady(rid)).toBeNull();
+    expect(q.claimNextReady(rid)).toBeNull();
     expect(q.getDeadlockReason(rid)).toBeNull();  // not a cycle
 
     // Now a real cycle case
@@ -503,7 +508,7 @@ describe('orchestrator-loop B6 queue (DSP8) + TaskQueueService (USE_FAKE_TMUX)',
     q.enqueue(rid2, 20, [21]);
     q.enqueue(rid2, 21, [20]);
     // no one can ever start
-    expect(q.getNextReady(rid2)).toBeNull();
+    expect(q.claimNextReady(rid2)).toBeNull();
     const reason = q.getDeadlockReason(rid2);
     expect(reason).toMatch(/deadlock.*cycle/);
     expect(reason).toMatch(/20,21|21,20/);
@@ -1595,16 +1600,17 @@ describe('orchestrator-loop B8 escalation ladder (USE_FAKE_TMUX)', () => {
     q.enqueue(99, 2, [1]);
     q.enqueue(99, 3, [2]);
     q.enqueue(99, 4, [1]);
-    expect(q.getNextReady(99)).toBe(1);
-    q.markComplete(1, 99);
-    expect(q.getNextReady(99)).toBe(2);
+    const c99a = q.claimNextReady(99);
+    expect(c99a!.taskId).toBe(1);
+    q.markComplete(c99a!);
+    expect(q.claimNextReady(99)!.taskId).toBe(2);
     // fail variant
     const q2 = new TaskQueueService();
     q2.enqueue(99, 1, []);
     q2.enqueue(99, 2, [1]);
     q2.enqueue(99, 4, [1]);
-    q2.markFailed(1, 99);
-    expect(q2.getNextReady(99)).toBeNull(); // 2 and 4 blocked
+    q2.markFailed(q2.freezeTerminalToken(99, 1)!);
+    expect(q2.claimNextReady(99)).toBeNull(); // 2 and 4 blocked
   });
 
   it('projcore-emit-status.sh accepts red-team VERDICT-READY and validator PASS (d)', async () => {

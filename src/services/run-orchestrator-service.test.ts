@@ -807,11 +807,11 @@ describe('RunOrchestratorService (A2 wiring)', () => {
       q.enqueue(runId, 10, []); // independent
       q.enqueue(runId, 11, [12]);
       q.enqueue(runId, 12, []);
-      q.markDeferred(12, runId);
-      let next = q.getNextReady(runId);
-      expect(next).toBe(10); // continues independent
-      q.markComplete(10, runId);
-      next = q.getNextReady(runId);
+      q.markDeferred(q.freezeTerminalToken(runId, 12)!);
+      let next = q.claimNextReady(runId);
+      expect(next!.taskId).toBe(10); // continues independent
+      q.markComplete(next!);
+      next = q.claimNextReady(runId);
       expect(next).toBe(null);
       const reason = q.getParkedBlockReason(runId);
       expect(reason).not.toBeNull();
@@ -1429,7 +1429,7 @@ describe('E-phase (E1 mid-run inject/redirect at boundary; E2 checkin+stale->run
     // simulate in-flight
     // @ts-ignore test access
     q['inFlight'][1] = 10;
-    expect(q.getNextReady(1)).toBeNull(); // blocked by in-flight
+    expect(q.claimNextReady(1)).toBeNull(); // blocked by in-flight
 
     // inject mid (simulates API during task)
     const art = { recordTask: () => 99, 'db': { raw: { prepare: () => ({ run: () => {}, get: () => null }) } } } as any;
@@ -1439,8 +1439,8 @@ describe('E-phase (E1 mid-run inject/redirect at boundary; E2 checkin+stale->run
     q['queues'][1] = q['queues'][1].filter((id: number) => id !== 10);
     // @ts-ignore
     q['inFlight'][1] = null;
-    const next = q.getNextReady(1);
-    expect(next).toBe(99); // drained at boundary after prior
+    const next = q.claimNextReady(1);
+    expect(next!.taskId).toBe(99); // drained at boundary after prior
   });
 
   it('E1: redirect/re-brief updates pending + requeues at boundary (urgent)', () => {
@@ -1450,7 +1450,7 @@ describe('E-phase (E1 mid-run inject/redirect at boundary; E2 checkin+stale->run
     // simulate redirect
     q.requeueForRedirect(1, 42);
     q['inFlight'][1] = null;
-    expect(q.getNextReady(1)).toBe(42);
+    expect(q.claimNextReady(1)!.taskId).toBe(42);
   });
 
   it('E3: new run/task writers use getTaskArtifactRoot under <proj>/helm_tasks/<list>/<task> (prompts + final + changes stub)', async () => {
@@ -1591,9 +1591,9 @@ describe('E-phase (E1 mid-run inject/redirect at boundary; E2 checkin+stale->run
       const t2 = dbs2.raw.prepare("INSERT INTO run_tasks (run_id, task_key, label, batch, status) VALUES (?,?,?,?, 'complete')").run(rid, 'B10T6-T02', 'closer', 'B10').lastInsertRowid as number;
 
       q2.enqueue(rid, t1, [], false, 'B10');
-      q2.markComplete(t1, rid);
+      q2.markComplete(q2.freezeTerminalToken(rid, t1)!);
       q2.enqueue(rid, t2, [], false, 'B10');
-      q2.markComplete(t2, rid);
+      q2.markComplete(q2.freezeTerminalToken(rid, t2)!);
 
       const fakeCalls: any[] = [];
       const fakeR = { async runDeploy(pd: string, cmd: string, url: string) { fakeCalls.push({projectDir: pd, deployCmd: cmd, devUrl: url}); return {success: true, note: 'ok'}; } };
@@ -1729,7 +1729,7 @@ describe('E-phase (E1 mid-run inject/redirect at boundary; E2 checkin+stale->run
       const t2 = dbs2.raw.prepare("INSERT INTO run_tasks (run_id, task_key, label, status) VALUES (?,?,?, 'pending')").run(rid, 'B11T2-T02', 'closer').lastInsertRowid as number;
 
       q2.enqueue(rid, t1, []);
-      q2.markComplete(t1, rid);
+      q2.markComplete(q2.freezeTerminalToken(rid, t1)!);
       q2.enqueue(rid, t2, []);
 
       const fakeCalls: any[] = [];
@@ -1944,7 +1944,7 @@ describe('E-phase (E1 mid-run inject/redirect at boundary; E2 checkin+stale->run
       // seed one completed so anyCompleted etc ok
       const t1 = dbs.raw.prepare("INSERT INTO run_tasks (run_id, task_key, label, status) VALUES (?,?,?, 'complete')").run(rid, 'T1', 'seed').lastInsertRowid as number;
       q.enqueue(rid, t1, []);
-      q.markComplete(t1, rid);
+      q.markComplete(q.freezeTerminalToken(rid, t1)!);
 
       const fakeCalls: any[] = [];
       const fakeFinalR = {

@@ -301,7 +301,7 @@ export class TaskQueueService {
     if (status === 'deferred') this.deferredTasks.add(taskId);
   }
 
-  /** Read-only ready check used by recovery preflight; unlike getNextReady it does not claim inFlight. */
+  /** Read-only ready check used by recovery preflight; unlike claimNextReady it does not claim inFlight. */
   peekNextReady(runId: number): number | null {
     if (this.inFlight[runId]) return null;
     const earliest = this.earliestOpenBatch(runId);
@@ -314,21 +314,8 @@ export class TaskQueueService {
     return null;
   }
 
-  /**
-   * Leg D admission barrier. At each one-in-flight boundary, only pending tasks from the EARLIEST batch
-   * (by the natural-order comparator) that still has any non-complete task may be considered ready. Within
-   * that batch, current insertion order + explicit-dep behavior is retained; failed/deferred siblings are
-   * skipped (independent siblings drain). A later batch stays closed until every earlier-batch task is
-   * complete. Single-batch (all-'default') plans behave exactly as before (earliest open batch == the only
-   * batch, so every task is eligible).
-   *
-   * Prefer claimNextReady for production paths that later call mark* — it returns the immutable
-   * TaskTerminalToken that must ride the async continuation (B03 C1).
-   */
-  getNextReady(runId: number): number | null {
-    const token = this.claimNextReady(runId);
-    return token ? token.taskId : null;
-  }
+  // B03 C1-R2: getNextReady(number-only) removed — it claimed while discarding the immutable token,
+  // enabling mark*(taskId, runId) late recapture. Use claimNextReady and carry the token to mark*.
 
   /**
    * Earliest batch (numeric-aware natural order) with any NON-complete task (pending/working/failed/
@@ -356,41 +343,12 @@ export class TaskQueueService {
   }
 
   /**
-   * Resolve mark* argument to an immutable token.
-   * - Primary: pass the TaskTerminalToken from claimNextReady (production / async).
-   * - Legacy sync: (taskId, runId) freezes generation NOW from enqueue maps — only safe on the
-   *   same-lifecycle sync path; after clearRun/recycle this adopts the NEW occupant (C1). Production
-   *   drain paths must pass the claim-time token object through await.
-   */
-  private resolveMarkToken(
-    tokenOrTaskId: TaskTerminalToken | number,
-    runId?: number
-  ): TaskTerminalToken | null {
-    if (
-      tokenOrTaskId != null &&
-      typeof tokenOrTaskId === 'object' &&
-      typeof (tokenOrTaskId as TaskTerminalToken).taskId === 'number' &&
-      typeof (tokenOrTaskId as TaskTerminalToken).runId === 'number' &&
-      typeof (tokenOrTaskId as TaskTerminalToken).runGeneration === 'number'
-    ) {
-      return tokenOrTaskId as TaskTerminalToken;
-    }
-    if (typeof tokenOrTaskId === 'number' && runId != null) {
-      return this.freezeTerminalToken(runId, tokenOrTaskId);
-    }
-    return null;
-  }
-
-  /**
-   * B03 / AC7: terminal mark using an immutable claim/dispatch token (preferred).
-   * Never re-reads generation from a mutable taskId map when a token object is supplied.
+   * B03 / AC7 / C1-R2: terminal mark accepts ONLY a claim-time TaskTerminalToken.
+   * No (taskId, runId) overload — that path re-froze generation from mutable maps after recycle.
+   * Never re-reads generation from a taskId map at write time.
    * Returns false when the fence rejects (caller must not retry with a refreshed token).
    */
-  markComplete(token: TaskTerminalToken): boolean;
-  /** @deprecated sync tests only — freezes generation at call time; unsafe across async recycle. */
-  markComplete(taskId: number, runId: number): boolean;
-  markComplete(tokenOrTaskId: TaskTerminalToken | number, runId?: number): boolean {
-    const token = this.resolveMarkToken(tokenOrTaskId, runId);
+  markComplete(token: TaskTerminalToken): boolean {
     if (!token || !Number.isFinite(token.runGeneration)) {
       console.warn(`[TaskQueueService] markComplete fail-closed — missing token/runGeneration`);
       return false;
@@ -400,11 +358,7 @@ export class TaskQueueService {
     return true;
   }
 
-  markFailed(token: TaskTerminalToken): boolean;
-  /** @deprecated sync tests only — freezes generation at call time; unsafe across async recycle. */
-  markFailed(taskId: number, runId: number): boolean;
-  markFailed(tokenOrTaskId: TaskTerminalToken | number, runId?: number): boolean {
-    const token = this.resolveMarkToken(tokenOrTaskId, runId);
+  markFailed(token: TaskTerminalToken): boolean {
     if (!token || !Number.isFinite(token.runGeneration)) {
       console.warn(`[TaskQueueService] markFailed fail-closed — missing token/runGeneration`);
       return false;
@@ -414,11 +368,7 @@ export class TaskQueueService {
     return true;
   }
 
-  markDeferred(token: TaskTerminalToken): boolean;
-  /** @deprecated sync tests only — freezes generation at call time; unsafe across async recycle. */
-  markDeferred(taskId: number, runId: number): boolean;
-  markDeferred(tokenOrTaskId: TaskTerminalToken | number, runId?: number): boolean {
-    const token = this.resolveMarkToken(tokenOrTaskId, runId);
+  markDeferred(token: TaskTerminalToken): boolean {
     if (!token || !Number.isFinite(token.runGeneration)) {
       console.warn(`[TaskQueueService] markDeferred fail-closed — missing token/runGeneration`);
       return false;
