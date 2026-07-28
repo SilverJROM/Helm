@@ -67,6 +67,7 @@ export function deriveSessionKind(name: string): string {
   if (/^helm-plancore-/.test(n)) return 'plancore';
   if (/^helm-ibrain-/.test(n)) return 'ibrain';
   if (/^helm-discovery-/.test(n)) return 'discovery';
+  if (/^helm-preflight-/.test(n)) return 'preflight';
   if (/^helm-.*-test(-|$)/.test(n) || /-test$/.test(n) && n.startsWith('helm-')) return 'test';
   // helm-<batch>-<role>-<suffix>: role is the segment after the batch id.
   // batch ids can themselves contain a dash (e.g. batch-A1), so match the KNOWN roles.

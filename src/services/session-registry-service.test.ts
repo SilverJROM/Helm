@@ -44,17 +44,25 @@ describe('SL-R1/R2 SessionRegistryService', () => {
   });
 
   it('kind derivation covers canonical phase brains and treats retired names as other', () => {
-    expect(deriveSessionKind('helm-plancore-cards')).toBe('plancore');
-    expect(deriveSessionKind('helm-ibrain-cards')).toBe('ibrain');
-    expect(deriveSessionKind('helm-discovery-cards')).toBe('discovery');
-    expect(deriveSessionKind('helm-projcore-cards')).toBe('other');
-    expect(deriveSessionKind('helm-pm-cards')).toBe('other');
-    expect(deriveSessionKind('helm-p5b-test-xyz')).toBe('test');
-    expect(deriveSessionKind('helm-w-cards-42')).toBe('worker');
-    expect(deriveSessionKind('helm-batch-A1-validator-deadbe')).toBe('validator');
-    expect(deriveSessionKind('helm-something-random')).toBe('other');
+    const cases: Array<[string, string]> = [
+      ['helm-plancore-cards', 'plancore'],
+      ['helm-ibrain-cards', 'ibrain'],
+      ['helm-discovery-cards', 'discovery'],
+      ['helm-projcore-cards', 'other'],
+      ['helm-pm-cards', 'other'],
+      ['helm-preflight-seat-binary', 'preflight'],
+      ['helm-p5b-test-xyz', 'test'],
+      ['helm-w-cards-42', 'worker'],
+      ['helm-batch-A1-validator-deadbe', 'validator'],
+      ['helm-something-random', 'other'],
+      ['03_impl_grokbuild_rscf', 'other'],
+    ];
+
+    for (const [name, expected] of cases) {
+      expect(deriveSessionKind(name)).toBe(expected);
+    }
+
     // non-helm names still classify but the janitor never touches them (guardrail is name-prefix).
-    expect(deriveSessionKind('03_impl_grokbuild_rscf')).toBe('other');
   });
 
   it('markIdle then markReaped transition (idle → reaped, ended_at set)', () => {
