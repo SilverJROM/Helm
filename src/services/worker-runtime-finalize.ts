@@ -3,9 +3,16 @@
  * Single choke for transitioning seats to a terminal state with non-NULL ended_at.
  * Idempotent: no-op when already done|failed|reaped.
  *
- * S02: on first successful terminal transition, assert helm_sessions idle via injected
- * markIdle (SessionRegistryService.markIdle) so the janitor later sees ownership truth.
+ * S02 + B02 AC6: on first successful terminal transition, assert helm_sessions idle via
+ * injected CAS markIdle (SessionRegistryService.markIdle) so the janitor later sees ownership
+ * truth. Capture is one-shot at the finalize boundary (id/name/owner/status/generation);
+ * stale token must not be refreshed and retried.
  */
+
+import {
+  sessionStatusTokenFromRow,
+  type SessionStatusToken,
+} from './lifecycle-cas.js';
 
 export type WorkerTerminalState = 'done' | 'failed' | 'reaped';
 
@@ -20,8 +27,8 @@ export type FinalizeDb = {
   transaction?: <T>(fn: () => T) => () => T;
 };
 
-/** Injected registry-idle assertion (reuse SessionRegistryService.markIdle — no SQL dup). */
-export type FinalizeMarkIdle = (session: string, reason?: string) => void;
+/** Injected registry-idle assertion — B02: full CAS token, not name-only. */
+export type FinalizeMarkIdle = (token: SessionStatusToken, reason?: string) => void;
 
 let markIdleHook: FinalizeMarkIdle | null = null;
 
@@ -41,12 +48,20 @@ export function getWorkerRuntimeFinalizeMarkIdle(): FinalizeMarkIdle | null {
 function assertRegistryIdle(db: FinalizeDb, id: number, reason: string): void {
   if (!markIdleHook) return;
   try {
-    const row = db.prepare(`SELECT session FROM worker_runtimes WHERE id=?`).get(id) as
-      | { session?: string | null }
+    // Capture session token at the finalize decision boundary (one shot — no refresh/retry).
+    const row = db
+      .prepare(
+        `SELECT s.id AS id, s.name AS name, s.owner AS owner, s.status AS status, s.generation AS generation
+         FROM worker_runtimes wr
+         JOIN helm_sessions s ON s.name = wr.session
+         WHERE wr.id = ?`
+      )
+      .get(id) as
+      | { id: number; name: string; owner: string | null; status: string; generation: number }
       | undefined;
-    const session = String(row?.session ?? '').trim();
-    if (!session) return;
-    markIdleHook(session, reason);
+    if (!row?.name) return;
+    const token = sessionStatusTokenFromRow(row);
+    markIdleHook(token, reason);
   } catch {
     /* best-effort: never fail the worker_runtimes terminal write */
   }

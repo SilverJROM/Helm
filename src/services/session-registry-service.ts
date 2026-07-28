@@ -1,5 +1,13 @@
 import type { DatabaseService } from '../db/database.js';
-import { allocateLifecycleGeneration } from './lifecycle-cas.js';
+import {
+  allocateLifecycleGeneration,
+  sessionStatusTokenFromRow,
+  type SessionStatusCasResult,
+  type SessionStatusToken,
+} from './lifecycle-cas.js';
+
+export type { SessionStatusCasResult, SessionStatusToken };
+export { sessionStatusTokenFromRow };
 
 // SL-R1/R2 (session-lifecycle): registry of EVERY tmux session Helm creates.
 // Wired into the single TmuxService.createSession/terminateSession choke point (see src/index.ts),
@@ -192,36 +200,53 @@ WHERE name = ? AND status != 'reaped'
 `).run(name);
   }
 
-  /** SL-R2: work done, awaiting cleanup (janitor's target). No-op if row absent. */
-  markIdle(name: string, reason?: string): void {
-    if (!name) return;
-    this.db.prepare(`
+  /**
+   * SL-R2 / B02 AC6: work done, awaiting cleanup (janitor's target).
+   * Full CAS predicates — id, name, owner, expected status, generation. Zero rows ⇒ stale.
+   * Callers must not refresh a rejected token and retry.
+   */
+  markIdle(token: SessionStatusToken, reason?: string): SessionStatusCasResult {
+    if (!token?.name) return { applied: false, stale: true };
+    // Preserve pre-B02 invariant: never resurrect a reaped lifecycle (old SQL had status != 'reaped').
+    // A token captured against a reaped row is treated as stale, not an active→idle transition.
+    if (token.expectedStatus === 'reaped') return { applied: false, stale: true };
+    const info = this.db.prepare(`
 UPDATE helm_sessions SET status = 'idle', last_used_at = datetime('now'), reason = ?
-WHERE name = ? AND status != 'reaped'
-`).run(reason ?? null, name);
-  }
-
-  /** SL-R2: session terminated/closed. Sets ended_at. No-op if row absent. */
-  markReaped(name: string, reason?: string): void {
-    if (!name) return;
-    this.db.prepare(`
-UPDATE helm_sessions SET status = 'reaped', ended_at = datetime('now'), reason = COALESCE(?, reason)
-WHERE name = ?
-`).run(reason ?? null, name);
+WHERE id = ? AND name = ? AND owner = ? AND status = ? AND generation = ?
+  AND status != 'reaped'
+`).run(reason ?? null, token.id, token.name, token.owner, token.expectedStatus, token.generation);
+    return Number(info.changes) === 1 ? { applied: true } : { applied: false, stale: true };
   }
 
   /**
-   * S14a / V2: atomic claim for human manual close.
-   * Marks reaped only when the row is still human-owned and not yet reaped.
-   * Returns true iff this caller won the claim (changes === 1). Losers must re-read.
+   * SL-R2 / B02 AC6: session terminated/closed. Sets ended_at.
+   * Full CAS predicates — id, name, owner, expected status, generation. Zero rows ⇒ stale.
    */
-  tryClaimHumanClose(name: string, reason?: string): boolean {
-    if (!name) return false;
+  markReaped(token: SessionStatusToken, reason?: string): SessionStatusCasResult {
+    if (!token?.name) return { applied: false, stale: true };
+    const info = this.db.prepare(`
+UPDATE helm_sessions SET status = 'reaped', ended_at = datetime('now'), reason = COALESCE(?, reason)
+WHERE id = ? AND name = ? AND owner = ? AND status = ? AND generation = ?
+`).run(reason ?? null, token.id, token.name, token.owner, token.expectedStatus, token.generation);
+    return Number(info.changes) === 1 ? { applied: true } : { applied: false, stale: true };
+  }
+
+  /**
+   * S14a / V2 + B02 AC6: atomic claim for human manual close.
+   * Marks reaped only when the full captured token still matches (incl. owner=human at capture).
+   * Returns true iff this caller won the claim (changes === 1). Losers must not refresh-and-retry
+   * the same logical close with a freshly read token to force success.
+   */
+  tryClaimHumanClose(token: SessionStatusToken, reason?: string): boolean {
+    if (!token?.name) return false;
+    // Owner must be human at capture; still predicate on token.owner so a forged token cannot widen.
+    if (token.owner !== 'human') return false;
+    if (token.expectedStatus === 'reaped') return false;
     const info = this.db.prepare(`
 UPDATE helm_sessions
 SET status = 'reaped', ended_at = datetime('now'), reason = COALESCE(?, reason)
-WHERE name = ? AND status != 'reaped' AND owner = 'human'
-`).run(reason ?? null, name);
+WHERE id = ? AND name = ? AND owner = ? AND status = ? AND generation = ?
+`).run(reason ?? null, token.id, token.name, token.owner, token.expectedStatus, token.generation);
     return Number(info.changes) === 1;
   }
 

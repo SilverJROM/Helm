@@ -60,9 +60,28 @@ export function assertValidSessionOwner(owner: unknown): asserts owner is TmuxSe
   }
 }
 
+/** B02: optional CAS token carried through terminate so markReaped predicates the snapshot lifecycle. */
+export interface TmuxTerminateOpts {
+  /**
+   * Captured session status token (id/name/owner/expectedStatus/generation). When present, the
+   * registry onTerminate hook must CAS-reap with this token — never re-read to force success.
+   */
+  sessionToken?: {
+    id: number;
+    name: string;
+    owner: 'helm' | 'human' | 'legacy:unknown';
+    expectedStatus: 'active' | 'idle' | 'reaped';
+    generation: number;
+  };
+}
+
 export interface TmuxSessionRegistryHook {
   onCreate(name: string, opts?: TmuxSessionCreateOpts): void;
-  onTerminate(name: string): void;
+  /**
+   * B02: second arg is the optional CAS token from terminateSession. Absent token ⇒ hook may do
+   * one capture via get(name) at the terminate boundary (not a retry loop).
+   */
+  onTerminate(name: string, token?: TmuxTerminateOpts['sessionToken']): void;
   // SL-R2/R4: fired on ACTIVE INPUT to a session (sendKeys). Refreshes last_used_at so the janitor's
   // TTL means "idle for TTL" not "alive for TTL" — keeps actively-used standalone sessions alive.
   onUse(name: string): void;
@@ -585,13 +604,18 @@ export class TmuxService {
     return last?.target || sessionTarget;
   }
 
-  async terminateSession(sessionName: string): Promise<void> {
+  async terminateSession(sessionName: string, opts?: TmuxTerminateOpts): Promise<void> {
     this.ensureValidSessionName(sessionName);
     await execFileAsync("tmux", ["kill-session", "-t", sessionName]);
     // S09: drop prior pane snapshot so a recreated same-name session re-baselines (no stale delta).
     this.lastPaneSnapshots.delete(sessionName);
-    // SL-R1/R2: mark reaped centrally on terminate. Best-effort — never mask a real kill.
-    try { this.registryHook.onTerminate(sessionName); } catch (err) { console.warn('[tmux] registry onTerminate failed', { sessionName, err: String(err) }); }
+    // SL-R1/R2 + B02: mark reaped centrally on terminate with optional CAS token.
+    // Best-effort — never mask a real kill.
+    try {
+      this.registryHook.onTerminate(sessionName, opts?.sessionToken);
+    } catch (err) {
+      console.warn('[tmux] registry onTerminate failed', { sessionName, err: String(err) });
+    }
   }
 
   async terminatePane(target: string): Promise<void> {

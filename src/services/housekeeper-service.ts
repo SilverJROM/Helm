@@ -8,7 +8,11 @@ import {
   observeSessionIdleness,
   type SessionObservationResult,
 } from './session-observation.js';
-import type { HelmSessionRow, SessionRegistryService } from './session-registry-service.js';
+import {
+  sessionStatusTokenFromRow,
+  type HelmSessionRow,
+  type SessionRegistryService,
+} from './session-registry-service.js';
 
 export const HOUSEKEEPER_PANE_TAIL_MAX_CHARS = 4000;
 export const HOUSEKEEPER_ENVELOPE_MAX_CHARS = 8000;
@@ -266,7 +270,9 @@ export class HousekeeperService {
            WHERE id = ? AND status NOT IN ('applied_done', 'needs_human')`
         )
         .run(verdict, evidence, rationale, id);
-      this.sessionRegistry.markIdle(row.session_name, 'housekeeper-done');
+      // B02 AC6: CAS markIdle with the session row captured at owner recheck (one-shot token).
+      // Full investigation-token persistence is B11 — here we only make the status write CAS-only.
+      this.sessionRegistry.markIdle(sessionStatusTokenFromRow(session), 'housekeeper-done');
     })();
     return { ok: true, outcome: 'applied_done', investigationId: id, sessionName: row.session_name };
   }

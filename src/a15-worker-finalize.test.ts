@@ -12,7 +12,11 @@ import {
 } from './services/worker-runtime-finalize.js';
 import { ProjectService } from './services/project-service.js';
 import { RunArtifactService } from './services/run-artifact-service.js';
-import { SessionRegistryService, deriveSessionKind } from './services/session-registry-service.js';
+import {
+  SessionRegistryService,
+  deriveSessionKind,
+  sessionStatusTokenFromRow,
+} from './services/session-registry-service.js';
 
 /**
  * A15 / R4.16–R4.17 — finalize-to-reaped / truthful live.
@@ -172,7 +176,7 @@ describe.sequential('S02 finalizeWorkerRuntimeRow markIdle propagation', () => {
     runId = artifacts.createRun(projectId, `s02-b-${Date.now()}`, path.join(projDir, 'ns.md'), null);
     reg = new SessionRegistryService(db);
     configureWorkerRuntimeFinalize({
-      markIdle: (name, reason) => reg.markIdle(name, reason),
+      markIdle: (token, reason) => reg.markIdle(token, reason),
     });
   });
 
@@ -220,7 +224,7 @@ describe.sequential('S02 finalizeWorkerRuntimeRow markIdle propagation', () => {
   it('(2) session already reaped stays reaped', () => {
     const session = 'helm-w-s02-already-reaped';
     reg.register(session, { owner: 'helm',  projectId, runId, kind: 'worker' });
-    reg.markReaped(session, 'prior-terminate');
+    reg.markReaped(sessionStatusTokenFromRow(reg.get(session)!), 'prior-terminate');
     expect(reg.get(session)!.status).toBe('reaped');
 
     const id = insertRunning(session);
@@ -303,7 +307,7 @@ describe.sequential('S03 brain completion assertion (finalizeBrainSessionRow)', 
     runId = artifacts.createRun(projectId, `s03-b-${Date.now()}`, path.join(projDir, 'ns.md'), null);
     reg = new SessionRegistryService(db);
     configureWorkerRuntimeFinalize({
-      markIdle: (name, reason) => reg.markIdle(name, reason),
+      markIdle: (token, reason) => reg.markIdle(token, reason),
     });
   });
 

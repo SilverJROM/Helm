@@ -5,7 +5,12 @@ import os from 'node:os';
 import Database from 'better-sqlite3';
 import { DatabaseService } from '../db/database.js';
 import { SCHEMA_VERSION } from '../db/schema.js';
-import { SessionRegistryService, deriveSessionKind, deriveSessionOwner } from './session-registry-service.js';
+import {
+  SessionRegistryService,
+  deriveSessionKind,
+  deriveSessionOwner,
+  sessionStatusTokenFromRow,
+} from './session-registry-service.js';
 import { WorkerService } from './worker-service.js';
 import { loadConfig } from '../config/config.js';
 
@@ -68,9 +73,11 @@ describe('SL-R1/R2 SessionRegistryService', () => {
 
   it('markIdle then markReaped transition (idle → reaped, ended_at set)', () => {
     reg.register('helm-w-cards-7', { owner: 'helm' });
-    reg.markIdle('helm-w-cards-7', 'run-terminal');
+    const activeTok = sessionStatusTokenFromRow(reg.get('helm-w-cards-7')!);
+    expect(reg.markIdle(activeTok, 'run-terminal')).toEqual({ applied: true });
     expect(reg.get('helm-w-cards-7')!.status).toBe('idle');
-    reg.markReaped('helm-w-cards-7', 'janitor-ttl');
+    const idleTok = sessionStatusTokenFromRow(reg.get('helm-w-cards-7')!);
+    expect(reg.markReaped(idleTok, 'janitor-ttl')).toEqual({ applied: true });
     const row = reg.get('helm-w-cards-7')!;
     expect(row.status).toBe('reaped');
     expect(row.ended_at).toBeTruthy();
@@ -79,7 +86,7 @@ describe('SL-R1/R2 SessionRegistryService', () => {
 
   it('register is last-wins (re-create resets a reaped row to active)', () => {
     reg.register('helm-w-cards-9', { owner: 'helm' });
-    reg.markReaped('helm-w-cards-9');
+    reg.markReaped(sessionStatusTokenFromRow(reg.get('helm-w-cards-9')!));
     expect(reg.get('helm-w-cards-9')!.status).toBe('reaped');
     reg.register('helm-w-cards-9', { owner: 'helm' });
     const row = reg.get('helm-w-cards-9')!;
@@ -178,7 +185,7 @@ describe('S04 helm_sessions.owner (AC1)', () => {
   it('recreated-name upsert keeps authority when owner re-asserted; omit throws (S05)', () => {
     reg.register('helm-w-cards-auth', { owner: 'helm', projectId: 1, runId: 10 });
     expect(reg.get('helm-w-cards-auth')!.owner).toBe('helm');
-    reg.markReaped('helm-w-cards-auth', 'test-reap');
+    reg.markReaped(sessionStatusTokenFromRow(reg.get('helm-w-cards-auth')!), 'test-reap');
     // S05: re-register without owner refuses (no silent null authority).
     expect(() => reg.register('helm-w-cards-auth', { projectId: 1, runId: 11 } as any)).toThrow(/owner required/);
     // Re-register with explicit owner resets to active + keeps/sets authority.
@@ -695,7 +702,7 @@ describe('S12 session reconciler (WorkerService.sessionJanitorTick)', () => {
       "SELECT (last_used_at > datetime('now', '-60 seconds')) AS ok FROM helm_sessions WHERE name = 'helm-plancore-touch'"
     ).get() as any;
     expect(fresh.ok).toBe(1);
-    reg.markReaped('helm-plancore-touch');
+    reg.markReaped(sessionStatusTokenFromRow(reg.get('helm-plancore-touch')!));
     reg.touch('helm-plancore-touch');
     expect(reg.get('helm-plancore-touch')!.status).toBe('reaped');
   });
@@ -705,7 +712,13 @@ describe('S12 session reconciler (WorkerService.sessionJanitorTick)', () => {
     const tmux = new (TmuxService as any)();
     tmux.setRegistryHook({
       onCreate: (n: string) => reg.register(n, { owner: 'helm' }),
-      onTerminate: (n: string) => reg.markReaped(n),
+      onTerminate: (n: string, token?: any) => {
+        if (token) reg.markReaped(token);
+        else {
+          const row = reg.get(n);
+          if (row) reg.markReaped(sessionStatusTokenFromRow(row));
+        }
+      },
       onUse: (n: string) => reg.touch(n),
     });
 
@@ -1000,5 +1013,69 @@ describe('B01 AC23 tripwire: HELM_SESSION_JANITOR standing default', () => {
 
     const eco = fs.readFileSync(path.resolve(__dirname, '../../ecosystem.config.cjs'), 'utf8');
     expect(eco).toMatch(/HELM_SESSION_JANITOR:\s*["']0["']/);
+  });
+});
+
+describe('B02 AC6 session status CAS (markIdle / markReaped predicates)', () => {
+  let db: DatabaseService;
+  let cleanup: () => void;
+  let reg: SessionRegistryService;
+
+  beforeEach(() => {
+    const t = makeTempDb();
+    db = t.db;
+    cleanup = t.cleanup;
+    reg = new SessionRegistryService(db);
+  });
+  afterEach(() => cleanup());
+
+  it('changed owner → markIdle CAS affects 0 rows; status unchanged', () => {
+    const row = reg.register('helm-w-cas-owner', { owner: 'helm' })!;
+    const token = sessionStatusTokenFromRow(row);
+    // World moves: owner flips under the captured token.
+    db.raw.prepare(`UPDATE helm_sessions SET owner = 'human' WHERE id = ?`).run(row.id);
+    const result = reg.markIdle(token, 'should-stale');
+    expect(result).toEqual({ applied: false, stale: true });
+    const after = reg.get('helm-w-cas-owner')!;
+    expect(after.status).toBe('active');
+    expect(after.owner).toBe('human');
+    expect(after.reason).toBeNull();
+  });
+
+  it('changed generation (re-register) → markIdle CAS affects 0 rows', () => {
+    const first = reg.register('helm-w-cas-gen', { owner: 'helm' })!;
+    const staleToken = sessionStatusTokenFromRow(first);
+    const second = reg.register('helm-w-cas-gen', { owner: 'helm' })!;
+    expect(second.generation).toBeGreaterThan(first.generation);
+    expect(second.id).toBe(first.id);
+
+    const result = reg.markIdle(staleToken, 'stale-gen');
+    expect(result).toEqual({ applied: false, stale: true });
+    const after = reg.get('helm-w-cas-gen')!;
+    expect(after.status).toBe('active');
+    expect(after.generation).toBe(second.generation);
+    expect(after.reason).toBeNull();
+  });
+
+  it('current token transitions once; duplicate/stale token is rejected', () => {
+    const row = reg.register('helm-w-cas-once', { owner: 'helm' })!;
+    const token = sessionStatusTokenFromRow(row);
+
+    const first = reg.markIdle(token, 'first-idle');
+    expect(first).toEqual({ applied: true });
+    expect(reg.get('helm-w-cas-once')!.status).toBe('idle');
+    expect(reg.get('helm-w-cas-once')!.reason).toBe('first-idle');
+
+    // Same token (expectedStatus still 'active') is now stale — cannot force success.
+    const dup = reg.markIdle(token, 'retry-stale');
+    expect(dup).toEqual({ applied: false, stale: true });
+    expect(reg.get('helm-w-cas-once')!.reason).toBe('first-idle');
+
+    // Fresh token for idle → reaped once; then same reaped token rejected.
+    const idleTok = sessionStatusTokenFromRow(reg.get('helm-w-cas-once')!);
+    expect(reg.markReaped(idleTok, 'reap-1')).toEqual({ applied: true });
+    expect(reg.get('helm-w-cas-once')!.status).toBe('reaped');
+    expect(reg.markReaped(idleTok, 'reap-retry')).toEqual({ applied: false, stale: true });
+    expect(reg.get('helm-w-cas-once')!.reason).toBe('reap-1');
   });
 });

@@ -17,6 +17,73 @@ export interface LifecycleToken {
   generation: number;
 }
 
+/** Session status values that participate in CAS status writers (AC6 / B02). */
+export type SessionCasStatus = 'active' | 'idle' | 'reaped';
+
+/** Decision authority values stored on helm_sessions.owner (S04). */
+export type SessionCasOwner = 'helm' | 'human' | 'legacy:unknown';
+
+/**
+ * B02 / AC6: full session status CAS token. Captured at the authoritative read/dispatch
+ * boundary; required unchanged at every status-mutating write. Name-only status writes are a
+ * defect. A rejected write (`applied: false`) must not be retried with a freshly re-read token.
+ */
+export interface SessionStatusToken extends LifecycleToken {
+  name: string;
+  owner: SessionCasOwner;
+  expectedStatus: SessionCasStatus;
+}
+
+/**
+ * Result of a session status CAS write. `stale` means zero rows matched the full predicate
+ * set — the world moved; the caller must abort/KEEP, not refresh the token and retry.
+ */
+export type SessionStatusCasResult =
+  | { applied: true }
+  | { applied: false; stale: true };
+
+const VALID_CAS_OWNERS = new Set<SessionCasOwner>(['helm', 'human', 'legacy:unknown']);
+const VALID_CAS_STATUSES = new Set<SessionCasStatus>(['active', 'idle', 'reaped']);
+
+/**
+ * Build a SessionStatusToken from a registry row (or equivalent SELECT). Throws if owner/status
+ * are missing or outside the closed sets — callers must not invent authority.
+ */
+export function sessionStatusTokenFromRow(row: {
+  id: number;
+  name: string;
+  owner: string | null | undefined;
+  status: string;
+  generation: number;
+}): SessionStatusToken {
+  const owner = row.owner as SessionCasOwner;
+  const expectedStatus = row.status as SessionCasStatus;
+  if (typeof row.id !== 'number' || !Number.isFinite(row.id)) {
+    throw new Error(`sessionStatusTokenFromRow: invalid id ${String(row.id)}`);
+  }
+  if (typeof row.name !== 'string' || !row.name) {
+    throw new Error('sessionStatusTokenFromRow: name required');
+  }
+  if (!VALID_CAS_OWNERS.has(owner)) {
+    throw new Error(
+      `sessionStatusTokenFromRow: invalid owner ${row.owner === undefined || row.owner === null ? String(row.owner) : JSON.stringify(row.owner)}`
+    );
+  }
+  if (!VALID_CAS_STATUSES.has(expectedStatus)) {
+    throw new Error(`sessionStatusTokenFromRow: invalid status ${JSON.stringify(row.status)}`);
+  }
+  if (typeof row.generation !== 'number' || !Number.isFinite(row.generation) || row.generation < 0) {
+    throw new Error(`sessionStatusTokenFromRow: invalid generation ${String(row.generation)}`);
+  }
+  return {
+    id: row.id,
+    name: row.name,
+    owner,
+    expectedStatus,
+    generation: row.generation,
+  };
+}
+
 /**
  * Structural rather than nominal on purpose: both the raw better-sqlite3 handle and the
  * `DatabaseService` wrapper satisfy this (the wrapper delegates `prepare`/`transaction` to its own

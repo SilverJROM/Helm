@@ -426,9 +426,9 @@ describe('S18a/S18b housekeeper dispatch/apply', () => {
 
     const originalMarkIdle = reg.markIdle.bind(reg);
     let markIdleCalls = 0;
-    reg.markIdle = ((name: string, reason?: string) => {
+    reg.markIdle = ((token, reason?) => {
       markIdleCalls += 1;
-      originalMarkIdle(name, reason);
+      return originalMarkIdle(token, reason);
     }) as SessionRegistryService['markIdle'];
 
     const first = svc.applyCallback(dispatched.investigationId, {

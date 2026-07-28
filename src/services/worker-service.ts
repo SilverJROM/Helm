@@ -10,7 +10,7 @@ import { PROVIDERS } from '../config/providers.js';
 import { resolveHelmSandboxBin, makeWriteFencePolicy, makeStrictReadProfileEnv } from '../security/landlock-sandbox.js';
 import { startGovernedDocGuard, type GovernedDocGuardHandle } from './doc-path-guard.js';
 import { applyEnvelopeIsolation } from './envelope-isolation.js';
-import type { SessionRegistryService } from './session-registry-service.js';
+import { sessionStatusTokenFromRow, type SessionRegistryService } from './session-registry-service.js';
 import { HelmIdentityService } from './helm-identity-service.js';
 import { finalizeWorkerRuntimeRow, finalizeSessionGoneWorkers } from './worker-runtime-finalize.js';
 import { decideSessionReconcile } from './session-reconcile-decision.js';
@@ -382,8 +382,9 @@ VALUES (?,?,?,?,?,?,?,?,datetime('now'), ?)
 
     // Candidate rows: anything not already reaped. Decision + rails evaluate each.
     // (Registry membership guardrail: we only iterate helm_sessions rows.)
+    // B02: include generation so markReaped CAS can use the snapshot token (no re-read).
     const rows = this.db.prepare(
-      "SELECT id, name, run_id, status, owner, created_at, last_used_at FROM helm_sessions WHERE status != 'reaped'"
+      "SELECT id, name, run_id, status, owner, generation, created_at, last_used_at FROM helm_sessions WHERE status != 'reaped'"
     ).all() as any[];
 
     for (const row of rows) {
@@ -415,7 +416,11 @@ VALUES (?,?,?,?,?,?,?,?,datetime('now'), ?)
           continue;
         }
         try {
-          this.sessionRegistry.markReaped(row.name, `reconcile:${decision.reason}`);
+          // B02: CAS markReaped from janitor snapshot token (no name-only write).
+          this.sessionRegistry.markReaped(
+            sessionStatusTokenFromRow(row),
+            `reconcile:${decision.reason}`
+          );
         } catch (err) {
           console.warn('[session-janitor] markReaped(CONVERGE) failed', { name: row.name, err: String(err) });
         }
@@ -467,18 +472,20 @@ VALUES (?,?,?,?,?,?,?,?,datetime('now'), ?)
         continue;
       }
       // A failed kill with session still live/unknown leaves the row retryable (level-triggered).
+      // B02: carry snapshot CAS token through terminate + markReaped (no name-only write).
+      const reapToken = sessionStatusTokenFromRow(row);
       try {
-        await this.tmux.terminateSession(row.name);
+        await this.tmux.terminateSession(row.name, { sessionToken: reapToken });
         try {
-          this.sessionRegistry.markReaped(row.name, `reconcile:${decision.reason}`);
+          this.sessionRegistry.markReaped(reapToken, `reconcile:${decision.reason}`);
         } catch {}
       } catch (err) {
         console.warn('[session-janitor] terminateSession failed (best-effort)', { name: row.name, err: String(err) });
         const afterExists = await this.probeSessionExistsForReconcile(String(row.name));
         if (afterExists === false) {
-          // Race: session gone despite throw — converge record only.
+          // Race: session gone despite throw — converge record only (same snapshot token).
           try {
-            this.sessionRegistry.markReaped(row.name, 'reconcile:session_gone');
+            this.sessionRegistry.markReaped(reapToken, 'reconcile:session_gone');
           } catch {}
         }
         // else still live or unknown → leave eligible for next tick (no false reaped).

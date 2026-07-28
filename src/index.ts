@@ -37,7 +37,8 @@ import { createScopedChatSidPre } from "./services/delivery-channel.js";
 import { MasterRuntimeService } from "./services/master-runtime-service.js";
 import { WorkerService } from "./services/worker-service.js";
 import { HelmIdentityService, requireActiveNativeProject } from "./services/helm-identity-service.js";
-import { SessionRegistryService } from "./services/session-registry-service.js";
+import { SessionRegistryService, sessionStatusTokenFromRow } from "./services/session-registry-service.js";
+import type { SessionStatusToken } from "./services/lifecycle-cas.js";
 import { SessionCloseService } from "./services/session-close-service.js";
 import { registerSessionCloseRoutes } from "./api/routes/session-close-routes.js";
 import { HousekeeperService } from "./services/housekeeper-service.js";
@@ -307,16 +308,27 @@ async function main(): Promise<void> {
       onCreate: (name: string, opts?: { projectId?: number | null; runId?: number | null; kind?: string; owner?: 'helm' | 'human' | 'legacy:unknown' }) => {
         try { sessionRegistry.register(name, opts as any); } catch {}
       },
-      onTerminate: (name: string) => { try { sessionRegistry.markReaped(name); } catch {} },
+      // B02 AC6: prefer caller-supplied CAS token; else one capture at terminate boundary (no retry).
+      onTerminate: (name: string, token?: SessionStatusToken) => {
+        try {
+          if (token) {
+            sessionRegistry.markReaped(token);
+            return;
+          }
+          const row = sessionRegistry.get(name);
+          if (!row) return;
+          sessionRegistry.markReaped(sessionStatusTokenFromRow(row));
+        } catch {}
+      },
       // SL-R2/R4: active-input refreshes last_used_at so the TTL means "idle for TTL" (in-use sessions kept).
       onUse: (name: string) => { try { sessionRegistry.touch(name); } catch {} }
     });
   }
-  // S02: wire markIdle into shared worker_runtimes finalizer (no SQL dup — reuses SessionRegistryService).
+  // S02 + B02: wire CAS markIdle into shared worker_runtimes finalizer (no SQL dup).
   // First successful terminal transition asserts helm_sessions idle so the janitor later sees ownership truth.
   configureWorkerRuntimeFinalize({
-    markIdle: (name, reason) => {
-      try { sessionRegistry.markIdle(name, reason); } catch {}
+    markIdle: (token, reason) => {
+      try { sessionRegistry.markIdle(token, reason); } catch {}
     },
   });
   const modelValidationService = new ModelValidationService(db, undefined, {}, tmuxService);

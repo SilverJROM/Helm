@@ -2423,7 +2423,7 @@ describe('S02 reapLiveRunWorkers routes through finalizeWorkerRuntimeRow + regis
     const { SessionRegistryService } = await import('./session-registry-service.js');
     reg = new SessionRegistryService(dbs);
     WorkerRuntimeFinalize.configureWorkerRuntimeFinalize({
-      markIdle: (name, reason) => reg.markIdle(name, reason),
+      markIdle: (token, reason) => reg.markIdle(token, reason),
     });
 
     transport = new FakeTransport();
@@ -2478,7 +2478,8 @@ describe('S02 reapLiveRunWorkers routes through finalizeWorkerRuntimeRow + regis
   it('(5b) reapLiveRunWorkers leaves already-reaped registry reaped', async () => {
     const session = 'helm-w-s02-boundary-reaped';
     reg.register(session, { owner: 'helm',  projectId, runId, kind: 'worker' });
-    reg.markReaped(session, 'prior-terminate');
+    const { sessionStatusTokenFromRow } = await import('./session-registry-service.js');
+    reg.markReaped(sessionStatusTokenFromRow(reg.get(session)!), 'prior-terminate');
 
     dbs.raw
       .prepare(

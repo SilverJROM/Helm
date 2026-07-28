@@ -3,11 +3,22 @@
 // V2: atomic tryClaimHumanClose so concurrent closes yield exactly one terminate.
 // HARD SAFETY: callers must inject fake tmux in tests; never target live sessions from tests.
 
-import type { SessionRegistryService } from './session-registry-service.js';
+import { sessionStatusTokenFromRow, type SessionRegistryService } from './session-registry-service.js';
 
 /** Minimal tmux surface used by human close (inject fake in tests). */
 export interface SessionCloseTmux {
-  terminateSession(name: string): Promise<void>;
+  terminateSession(
+    name: string,
+    opts?: {
+      sessionToken?: {
+        id: number;
+        name: string;
+        owner: 'helm' | 'human' | 'legacy:unknown';
+        expectedStatus: 'active' | 'idle' | 'reaped';
+        generation: number;
+      };
+    }
+  ): Promise<void>;
   sessionHasHelmChildTag(name: string): Promise<boolean>;
 }
 
@@ -121,8 +132,10 @@ export class SessionCloseService {
       return { ok: true, closed: name, alreadyReaped: true };
     }
 
-    // V2: atomic claim — only one concurrent closer wins; losers re-read.
-    const claimed = this.registry.tryClaimHumanClose(name, 'human-close');
+    // V2 + B02: atomic CAS claim from the post-tag fresh row — full token, no name-only write.
+    // Losers must not refresh-and-retry the same logical close to force success.
+    const claimToken = sessionStatusTokenFromRow(fresh);
+    const claimed = this.registry.tryClaimHumanClose(claimToken, 'human-close');
     if (!claimed) {
       const after = this.registry.get(name);
       if (after?.status === 'reaped') {
@@ -147,8 +160,9 @@ export class SessionCloseService {
     }
 
     // Claim won: targeted terminate (fake tmux in tests). Best-effort — row already converged.
+    // Pass claim token so onTerminate does not re-read a different lifecycle.
     try {
-      await this.tmux.terminateSession(name);
+      await this.tmux.terminateSession(name, { sessionToken: claimToken });
     } catch (err) {
       console.warn('[session-close] terminateSession failed after claim (registry already reaped)', {
         name,

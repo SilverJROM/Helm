@@ -408,14 +408,21 @@ describe('ST-R1/R2 @helm_child tmux ownership tag', () => {
     `);
     const reg = new SessionRegistryService(db as any);
     reg.register('helm-chat-s09reap', { owner: 'human', kind: 'discovery' });
-    reg.markReaped('helm-chat-s09reap', 'test-reap');
+    const { sessionStatusTokenFromRow } = await import('../services/session-registry-service.js');
+    reg.markReaped(sessionStatusTokenFromRow(reg.get('helm-chat-s09reap')!), 'test-reap');
     expect(reg.get('helm-chat-s09reap')!.status).toBe('reaped');
     const endedAt = reg.get('helm-chat-s09reap')!.ended_at;
     const lastUsed = reg.get('helm-chat-s09reap')!.last_used_at;
 
     const tmux: any = new TmuxService({
       onCreate: (n: string) => reg.register(n, { owner: 'helm' }),
-      onTerminate: (n: string) => reg.markReaped(n),
+      onTerminate: (n: string, token?: any) => {
+        if (token) reg.markReaped(token);
+        else {
+          const row = reg.get(n);
+          if (row) reg.markReaped(sessionStatusTokenFromRow(row));
+        }
+      },
       onUse: (n: string) => reg.touch(n),
     });
     let frame = 'before\n';
