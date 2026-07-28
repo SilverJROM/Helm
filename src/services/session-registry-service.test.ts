@@ -405,29 +405,40 @@ describe('S07 owner backfill v102 + listHelmOwnedCandidates (AC5)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// SL-R3/R4 janitor tests — spy tmux to assert terminate calls without real tmux.
+// S12 — assertion-based session reconciler (WorkerService.sessionJanitorTick).
+// Synthetic DB + fake tmux only. HELM_SESSION_JANITOR tests may enable the path in-process;
+// deploy stays 0. No live tmux. No data/helm.db mutation.
 // ---------------------------------------------------------------------------
-describe('SL-R3/R4 session janitor (WorkerService.sessionJanitorTick)', () => {
+describe('S12 session reconciler (WorkerService.sessionJanitorTick)', () => {
   let db: DatabaseService;
   let cleanup: () => void;
   let reg: SessionRegistryService;
   let terminated: string[];
   let tmuxSpy: any;
   let ws: WorkerService;
+  /** Map of session name → existence tri-state (default true = live). */
+  let existsMap: Map<string, boolean | null>;
 
-  // Build a helm_sessions row with created_at/last_used_at offset by N seconds in the past.
-  function seedSession(name: string, opts: { status?: string; runId?: number | null; ageSecs?: number } = {}) {
+  function seedSession(
+    name: string,
+    opts: {
+      status?: string;
+      runId?: number | null;
+      ageSecs?: number;
+      owner?: string | null;
+    } = {}
+  ) {
     const status = opts.status ?? 'active';
-    const runId = opts.runId ?? null;
+    const runId = opts.runId === undefined ? null : opts.runId;
     const ageSecs = opts.ageSecs ?? 0;
+    const owner = opts.owner === undefined ? 'helm' : opts.owner;
     db.prepare(
-      `INSERT INTO helm_sessions (name, kind, project_id, run_id, status, created_at, last_used_at)
-       VALUES (?, 'test', 1, ?, ?, datetime('now', ?), datetime('now', ?))`
-    ).run(name, runId, status, `-${ageSecs} seconds`, `-${ageSecs} seconds`);
+      `INSERT INTO helm_sessions (name, kind, project_id, run_id, owner, status, created_at, last_used_at)
+       VALUES (?, 'test', 1, ?, ?, ?, datetime('now', ?), datetime('now', ?))`
+    ).run(name, runId, owner, status, `-${ageSecs} seconds`, `-${ageSecs} seconds`);
   }
 
   function seedRun(status: string, phase: string): number {
-    // project_id NULL (nullable FK) — the janitor only reads runs.status/phase, not the project.
     const info = db.prepare(
       `INSERT INTO runs (project_id, status, phase, started_at) VALUES (NULL, ?, ?, datetime('now'))`
     ).run(status, phase);
@@ -447,15 +458,18 @@ describe('SL-R3/R4 session janitor (WorkerService.sessionJanitorTick)', () => {
     cleanup = t.cleanup;
     reg = new SessionRegistryService(db);
     terminated = [];
+    existsMap = new Map();
     tmuxSpy = {
-      terminateSession: async (name: string) => { terminated.push(name); },
-      // ST-R2: janitor gates its kill on this. Default TRUE so every pre-existing janitor test still reaps
-      // exactly as before; individual tests override it to false to exercise the untagged/error fail-safe.
+      terminateSession: async (name: string) => {
+        terminated.push(name);
+      },
       sessionHasHelmChildTag: async (_name: string) => true,
+      // S12: tri-state existence for decideSessionReconcile (default live).
+      sessionExistsTriState: async (name: string) =>
+        existsMap.has(name) ? existsMap.get(name)! : true,
     };
-    // Only the janitor path is exercised — other WorkerService deps are unused here.
     ws = new WorkerService(db, {} as any, tmuxSpy as any, {} as any, {} as any, undefined, reg);
-    // Force janitor on + a tiny TTL floor via env (default 20min; we age rows past it explicitly).
+    // Enable janitor for synthetic path only. Deploy flag remains 0 (asserted below).
     delete process.env.HELM_SESSION_JANITOR;
     delete process.env.HELM_SESSION_TTL_MS;
   });
@@ -465,94 +479,163 @@ describe('SL-R3/R4 session janitor (WorkerService.sessionJanitorTick)', () => {
     delete process.env.HELM_SESSION_TTL_MS;
   });
 
-  it('reaps a done (idle) + past-TTL registered helm- session (terminate called + status reaped)', async () => {
-    // idle + aged 21min (past default 20min TTL) + no live worker.
-    seedSession('helm-w-cards-1', { status: 'idle', ageSecs: 21 * 60 });
+  it('REAP: helm + idle assertion + live + tagged → terminate once + markReaped', async () => {
+    seedSession('helm-w-cards-1', { status: 'idle' });
     await ws.sessionJanitorTick();
-    expect(terminated).toContain('helm-w-cards-1');
+    expect(terminated).toEqual(['helm-w-cards-1']);
     expect(reg.get('helm-w-cards-1')!.status).toBe('reaped');
-    expect(reg.get('helm-w-cards-1')!.reason).toBe('janitor-ttl');
+    expect(reg.get('helm-w-cards-1')!.reason).toBe('reconcile:asserted_complete_live');
   });
 
-  it('reaps a session whose mapped run is terminal + past TTL', async () => {
-    const runId = seedRun('complete', 'complete');
-    seedSession('helm-batch-A1-implementer-x', { status: 'active', runId, ageSecs: 25 * 60 });
-    await ws.sessionJanitorTick();
-    expect(terminated).toContain('helm-batch-A1-implementer-x');
-    expect(reg.get('helm-batch-A1-implementer-x')!.status).toBe('reaped');
-  });
-
-  it('SKIPS a session whose mapped run is ACTIVE (never reap a running worker)', async () => {
-    const runId = seedRun('active', 'executing');
-    seedSession('helm-batch-A1-implementer-active', { status: 'active', runId, ageSecs: 30 * 60 });
+  it('KEEP: unasserted active stays even when aged far past any legacy TTL', async () => {
+    seedSession('helm-w-cards-stale-active', { status: 'active', ageSecs: 10 * 60 * 60 });
     await ws.sessionJanitorTick();
     expect(terminated).toEqual([]);
-    expect(reg.get('helm-batch-A1-implementer-active')!.status).toBe('active');
+    expect(reg.get('helm-w-cards-stale-active')!.status).toBe('active');
   });
 
-  it('SKIPS a session with a LIVE worker_runtime even if idle + aged', async () => {
-    seedSession('helm-w-cards-live', { status: 'idle', ageSecs: 30 * 60 });
+  it('KEEP: human-owned idle is never auto-reaped', async () => {
+    seedSession('helm-discovery-chat', { status: 'idle', owner: 'human', ageSecs: 10 * 60 * 60 });
+    await ws.sessionJanitorTick();
+    expect(terminated).toEqual([]);
+    expect(reg.get('helm-discovery-chat')!.status).toBe('idle');
+  });
+
+  it('KEEP: legacy:unknown idle is never auto-reaped', async () => {
+    seedSession('helm-legacy-seat', { status: 'idle', owner: 'legacy:unknown', ageSecs: 10 * 60 * 60 });
+    await ws.sessionJanitorTick();
+    expect(terminated).toEqual([]);
+    expect(reg.get('helm-legacy-seat')!.status).toBe('idle');
+  });
+
+  it('KEEP: null owner is never auto-reaped', async () => {
+    seedSession('helm-null-owner', { status: 'idle', owner: null, ageSecs: 10 * 60 * 60 });
+    await ws.sessionJanitorTick();
+    expect(terminated).toEqual([]);
+    expect(reg.get('helm-null-owner')!.status).toBe('idle');
+  });
+
+  it('KEEP: live worker_runtime vetoes REAP even when idle+live', async () => {
+    seedSession('helm-w-cards-live', { status: 'idle' });
     seedLiveWorker('helm-w-cards-live', null);
     await ws.sessionJanitorTick();
     expect(terminated).toEqual([]);
     expect(reg.get('helm-w-cards-live')!.status).toBe('idle');
   });
 
-  it('SKIPS a within-TTL session (idle but too fresh)', async () => {
-    seedSession('helm-w-cards-fresh', { status: 'idle', ageSecs: 60 }); // 1min < 20min
+  it('KEEP: non-terminal mapped run vetoes REAP even when idle+live', async () => {
+    const runId = seedRun('active', 'executing');
+    seedSession('helm-batch-A1-implementer-active', { status: 'idle', runId });
     await ws.sessionJanitorTick();
     expect(terminated).toEqual([]);
-    expect(reg.get('helm-w-cards-fresh')!.status).toBe('idle');
+    expect(reg.get('helm-batch-A1-implementer-active')!.status).toBe('idle');
   });
 
-  it('NEVER terminates a non-helm-named session even if registered/idle/aged (SL-R4 prefix guard)', async () => {
+  it('REAP still works when run is terminal + idle (run status is not kill authority, only veto)', async () => {
+    const runId = seedRun('complete', 'complete');
+    seedSession('helm-batch-A1-implementer-done', { status: 'idle', runId });
+    await ws.sessionJanitorTick();
+    expect(terminated).toEqual(['helm-batch-A1-implementer-done']);
+    expect(reg.get('helm-batch-A1-implementer-done')!.status).toBe('reaped');
+  });
+
+  it('F3 DELETED: run_id null + active is NOT reaped (no orphan/TTL kill path)', async () => {
+    seedSession('helm-batch-A1-implementer-noRun', { status: 'active', runId: null, ageSecs: 25 * 60 });
+    await ws.sessionJanitorTick();
+    expect(terminated).toEqual([]);
+    expect(reg.get('helm-batch-A1-implementer-noRun')!.status).toBe('active');
+  });
+
+  it('TTL retired: fresh idle (would have been within-TTL keep under legacy) IS reaped when asserted', async () => {
+    // Proof that TTL is no longer authority — idle assertion alone is enough when live.
+    seedSession('helm-w-cards-fresh-idle', { status: 'idle', ageSecs: 30 });
+    await ws.sessionJanitorTick();
+    expect(terminated).toEqual(['helm-w-cards-fresh-idle']);
+    expect(reg.get('helm-w-cards-fresh-idle')!.status).toBe('reaped');
+  });
+
+  it('NEVER terminates a non-helm-named session even if registered/idle (prefix guard)', async () => {
     seedSession('03_impl_grokbuild_rscf', { status: 'idle', ageSecs: 60 * 60 });
     seedSession('01_impl_something', { status: 'idle', ageSecs: 60 * 60 });
     await ws.sessionJanitorTick();
     expect(terminated).toEqual([]);
-    // rows remain untouched (not reaped)
     expect(reg.get('03_impl_grokbuild_rscf')!.status).toBe('idle');
   });
 
-  it('NEVER terminates an UNregistered session (janitor only iterates registry rows)', async () => {
-    // A live tmux session exists (helm-orphan-live) but is NOT in helm_sessions → janitor cannot see it.
-    seedSession('helm-w-cards-2', { status: 'idle', ageSecs: 25 * 60 });
+  it('NEVER terminates an unregistered session (registry membership)', async () => {
+    seedSession('helm-w-cards-2', { status: 'idle' });
     await ws.sessionJanitorTick();
-    expect(terminated).toEqual(['helm-w-cards-2']); // only the registered one; the phantom is never a target
+    expect(terminated).toEqual(['helm-w-cards-2']);
+    // Phantom helm-orphan-live is not in registry → never a terminate target
+    expect(terminated).not.toContain('helm-orphan-live');
   });
 
   it('HELM_SESSION_JANITOR=0 disables the sweep entirely', async () => {
     process.env.HELM_SESSION_JANITOR = '0';
-    seedSession('helm-w-cards-disabled', { status: 'idle', ageSecs: 30 * 60 });
+    seedSession('helm-w-cards-disabled', { status: 'idle' });
     await ws.sessionJanitorTick();
     expect(terminated).toEqual([]);
+    expect(reg.get('helm-w-cards-disabled')!.status).toBe('idle');
   });
 
-  it('startup sweep reaps a terminal-run orphan past TTL', async () => {
-    const runId = seedRun('failed', 'failed');
-    seedSession('helm-batch-A1-validator-orphan', { status: 'active', runId, ageSecs: 40 * 60 });
+  it('CONVERGE: sessionExists=false → markReaped with zero kill (AC14)', async () => {
+    seedSession('helm-w-cards-gone', { status: 'active' });
+    existsMap.set('helm-w-cards-gone', false);
+    await ws.sessionJanitorTick();
+    expect(terminated).toEqual([]);
+    expect(reg.get('helm-w-cards-gone')!.status).toBe('reaped');
+    expect(reg.get('helm-w-cards-gone')!.reason).toBe('reconcile:session_gone');
+  });
+
+  it('CONVERGE: gone + idle also converges without kill', async () => {
+    seedSession('helm-w-cards-gone-idle', { status: 'idle' });
+    existsMap.set('helm-w-cards-gone-idle', false);
+    await ws.sessionJanitorTick();
+    expect(terminated).toEqual([]);
+    expect(reg.get('helm-w-cards-gone-idle')!.status).toBe('reaped');
+  });
+
+  it('KEEP: sessionExists=null (unknown probe) never kills or converges', async () => {
+    seedSession('helm-w-cards-unknown', { status: 'idle' });
+    existsMap.set('helm-w-cards-unknown', null);
+    await ws.sessionJanitorTick();
+    expect(terminated).toEqual([]);
+    expect(reg.get('helm-w-cards-unknown')!.status).toBe('idle');
+  });
+
+  it('idempotent: second tick after REAP does not re-terminate', async () => {
+    seedSession('helm-w-cards-idem', { status: 'idle' });
+    await ws.sessionJanitorTick();
+    expect(terminated).toEqual(['helm-w-cards-idem']);
+    await ws.sessionJanitorTick();
+    expect(terminated).toEqual(['helm-w-cards-idem']); // still exactly one
+    expect(reg.get('helm-w-cards-idem')!.status).toBe('reaped');
+  });
+
+  it('idempotent: second tick after CONVERGE is a no-op', async () => {
+    seedSession('helm-w-cards-conv-idem', { status: 'active' });
+    existsMap.set('helm-w-cards-conv-idem', false);
+    await ws.sessionJanitorTick();
+    expect(terminated).toEqual([]);
+    expect(reg.get('helm-w-cards-conv-idem')!.status).toBe('reaped');
+    await ws.sessionJanitorTick();
+    expect(terminated).toEqual([]);
+    expect(reg.get('helm-w-cards-conv-idem')!.status).toBe('reaped');
+  });
+
+  it('startup sweep has parity with tick (REAP asserted live)', async () => {
+    seedSession('helm-batch-A1-validator-startup', { status: 'idle' });
     await ws.sweepOrphanSessionsAtStartup();
-    expect(terminated).toContain('helm-batch-A1-validator-orphan');
-    expect(reg.get('helm-batch-A1-validator-orphan')!.status).toBe('reaped');
+    expect(terminated).toEqual(['helm-batch-A1-validator-startup']);
+    expect(reg.get('helm-batch-A1-validator-startup')!.status).toBe('reaped');
   });
 
-  it('reaps a GENUINELY-IDLE orphan with NO run mapping (run_id null, last_used_at stale past TTL)', async () => {
-    // The leaked-test-session case: no run, no live worker, no recent use → last_used_at is stale.
-    // This is the primary cleanup goal and must still work.
-    seedSession('helm-batch-A1-implementer-noRun', { status: 'active', runId: null, ageSecs: 25 * 60 });
-    await ws.sessionJanitorTick();
-    expect(terminated).toContain('helm-batch-A1-implementer-noRun');
-  });
-
-  it('does NOT reap an IN-USE standalone session (active, run_id null, touched within TTL)', async () => {
-    // Simulates an actively-used persistent planning session created long ago (past TTL).
-    // but recently USED (touched). last_used_at is fresh → TTL means "idle for TTL" → kept alive.
-    // Regression guard for the SL-R2/R4 over-reach the gate caught.
-    seedSession('helm-plancore-cards', { status: 'active', runId: null, ageSecs: 60 * 60 }); // created 60min ago
-    reg.touch('helm-plancore-cards'); // used just now → last_used_at = now
-    await ws.sessionJanitorTick();
+  it('startup sweep CONVERGE parity (gone → zero kill)', async () => {
+    seedSession('helm-batch-A1-gone-startup', { status: 'active' });
+    existsMap.set('helm-batch-A1-gone-startup', false);
+    await ws.sweepOrphanSessionsAtStartup();
     expect(terminated).toEqual([]);
-    expect(reg.get('helm-plancore-cards')!.status).toBe('active');
+    expect(reg.get('helm-batch-A1-gone-startup')!.status).toBe('reaped');
   });
 
   it('registry.touch refreshes last_used_at (and does not resurrect a reaped row)', () => {
@@ -561,22 +644,16 @@ describe('SL-R3/R4 session janitor (WorkerService.sessionJanitorTick)', () => {
     reg.touch('helm-plancore-touch');
     const after = reg.get('helm-plancore-touch')!.last_used_at;
     expect(after).not.toBe(before);
-    // last_used_at is now ~now (much fresher than the 60min-old created_at)
     const fresh = db.prepare(
       "SELECT (last_used_at > datetime('now', '-60 seconds')) AS ok FROM helm_sessions WHERE name = 'helm-plancore-touch'"
     ).get() as any;
     expect(fresh.ok).toBe(1);
-    // touch is a no-op on a reaped row (never resurrect a closed session)
     reg.markReaped('helm-plancore-touch');
     reg.touch('helm-plancore-touch');
     expect(reg.get('helm-plancore-touch')!.status).toBe('reaped');
   });
 
-  it('onUse via active-input send methods (sendAndSubmit/sendCommand/sendEnter/sendKeys) flows through to touch', async () => {
-    // Assert the TmuxService active-input → onUse → touch wiring refreshes last_used_at. All of Helm's
-    // active-input paths funnel through the private touchSession(target) helper, so exercising it with a
-    // pane target (session:window.pane → bare session name) proves the exact call each send method makes.
-    // (The real send methods shell out to tmux; touchSession is the pure, tmux-free unit under test.)
+  it('onUse via active-input send methods flows through to touch', async () => {
     const { TmuxService } = await import('../tmux/tmux-service.js');
     const tmux = new (TmuxService as any)();
     tmux.setRegistryHook({
@@ -585,89 +662,75 @@ describe('SL-R3/R4 session janitor (WorkerService.sessionJanitorTick)', () => {
       onUse: (n: string) => reg.touch(n),
     });
 
-    // 1) chat/message submission path (sendAndSubmit) — THE important one.
     seedSession('helm-chat-onuse', { status: 'active', runId: null, ageSecs: 60 * 60 });
     const beforeChat = reg.get('helm-chat-onuse')!.last_used_at;
-    (tmux as any).touchSession('helm-chat-onuse:0.0'); // exactly what sendAndSubmit fires
+    (tmux as any).touchSession('helm-chat-onuse:0.0');
     expect(reg.get('helm-chat-onuse')!.last_used_at).not.toBe(beforeChat);
-    // refreshed to ~now (much fresher than the 60min-old created_at)
-    const fresh = db.prepare(
-      "SELECT (last_used_at > datetime('now', '-60 seconds')) AS ok FROM helm_sessions WHERE name = 'helm-chat-onuse'"
-    ).get() as any;
-    expect(fresh.ok).toBe(1);
 
-    // 2) the same helper is what sendCommand/sendEnter/sendKeys also call (bare-name extraction).
     seedSession('helm-cmd-onuse', { status: 'active', runId: null, ageSecs: 60 * 60 });
     const beforeCmd = reg.get('helm-cmd-onuse')!.last_used_at;
-    (tmux as any).touchSession('helm-cmd-onuse'); // bare session target (no :window.pane)
+    (tmux as any).touchSession('helm-cmd-onuse');
     expect(reg.get('helm-cmd-onuse')!.last_used_at).not.toBe(beforeCmd);
   });
 
-  it('an actively-CHATTING session (touched via sendAndSubmit path) survives past the creation TTL', async () => {
-    // End-to-end of the iter-2 fix: a chat session created >TTL ago but kept in active use (each message
-    // → sendAndSubmit → touch) is NOT reaped. Mirrors the in-use planning-session chat path.
+  it('unasserted in-use chat (active, run_id null) is never reaped', async () => {
     seedSession('helm-batch-A1-implementer-chat', { status: 'active', runId: null, ageSecs: 90 * 60 });
-    reg.touch('helm-batch-A1-implementer-chat'); // a chat message just landed
+    reg.touch('helm-batch-A1-implementer-chat');
     await ws.sessionJanitorTick();
     expect(terminated).toEqual([]);
     expect(reg.get('helm-batch-A1-implementer-chat')!.status).toBe('active');
   });
 
-  // ---------------------------------------------------------------------------
-  // ST-R2/R5 — @helm_child tag gate: the janitor kills ONLY Helm-tagged sessions.
-  // ---------------------------------------------------------------------------
-  it('ST-R2 CORE GUARD: a registry+helm-prefix+past-TTL+no-worker session MISSING @helm_child is NEVER reaped', async () => {
-    // The exact fatal scenario: a session that passes EVERY legacy guard (registered, helm- prefixed,
-    // idle, past TTL, no live worker, terminal/no run) but is NOT Helm-tagged (someone else's session, or
-    // an untagged pre-existing one) must never be terminated. This is the regression guard for the
-    // whole-tmux-server death.
-    tmuxSpy.sessionHasHelmChildTag = async (_name: string) => false; // not Helm's → must be skipped
-    seedSession('helm-w-cards-untagged', { status: 'idle', ageSecs: 30 * 60 });
+  // ST-R2 — @helm_child tag gate (REAP path only)
+  it('ST-R2: missing @helm_child → NEVER terminate (KEEP idle)', async () => {
+    tmuxSpy.sessionHasHelmChildTag = async (_name: string) => false;
+    seedSession('helm-w-cards-untagged', { status: 'idle' });
     await ws.sessionJanitorTick();
-    expect(terminated).toEqual([]);                                  // NEVER killed
-    expect(reg.get('helm-w-cards-untagged')!.status).toBe('idle');   // left intact (safe default: continue)
+    expect(terminated).toEqual([]);
+    expect(reg.get('helm-w-cards-untagged')!.status).toBe('idle');
   });
 
-  it('ST-R2 happy path: a fully-tagged idle + past-TTL session is STILL reaped', async () => {
-    tmuxSpy.sessionHasHelmChildTag = async (_name: string) => true;  // Helm-tagged → reapable
-    seedSession('helm-w-cards-tagged', { status: 'idle', ageSecs: 30 * 60 });
-    await ws.sessionJanitorTick();
-    expect(terminated).toContain('helm-w-cards-tagged');
-    expect(reg.get('helm-w-cards-tagged')!.status).toBe('reaped');
-  });
-
-  it('ST-R2 fail-safe: a tag probe that ERRORS is treated as untagged → session NOT reaped', async () => {
-    // sessionHasHelmChildTag itself is fail-safe (returns false on tmux error), but assert the janitor
-    // honours a false/throwing probe here too: uncertainty must never escalate to a kill.
-    tmuxSpy.sessionHasHelmChildTag = async (_name: string) => { throw new Error('tmux show-options: no such session'); };
-    seedSession('helm-w-cards-probeerr', { status: 'idle', ageSecs: 30 * 60 });
-    await expect(ws.sessionJanitorTick()).resolves.toBeUndefined();   // tick does not blow up
-    expect(terminated).toEqual([]);                                   // never killed on probe error
+  it('ST-R2: tag probe throw → NEVER terminate', async () => {
+    tmuxSpy.sessionHasHelmChildTag = async (_name: string) => {
+      throw new Error('tmux show-options: no such session');
+    };
+    seedSession('helm-w-cards-probeerr', { status: 'idle' });
+    await expect(ws.sessionJanitorTick()).resolves.toBeUndefined();
+    expect(terminated).toEqual([]);
     expect(reg.get('helm-w-cards-probeerr')!.status).toBe('idle');
   });
 
-  it('ST-R2 NO-SPILLOVER name-collision: an untagged session that merely SHARES a helm- name is never killed', async () => {
-    // A user/other-tool session that happens to be named like a Helm session (helm-ish prefix) and got
-    // into the registry: it is idle + past-TTL + no worker (would reap under legacy guards) but carries NO
-    // @helm_child tag → the janitor must NOT terminate it. Name similarity can never be a kill trigger;
-    // only the positive Helm-applied tag can.
-    tmuxSpy.sessionHasHelmChildTag = async (name: string) =>
-      name === 'helm-real-worker'; // ONLY the genuine Helm session is tagged
-    seedSession('helm-real-worker', { status: 'idle', ageSecs: 30 * 60 });   // Helm's own → tagged
-    seedSession('helm-user-lookalike', { status: 'idle', ageSecs: 30 * 60 }); // collision → untagged
+  it('ST-R2: only tagged peer is reaped on name-collision', async () => {
+    tmuxSpy.sessionHasHelmChildTag = async (name: string) => name === 'helm-real-worker';
+    seedSession('helm-real-worker', { status: 'idle' });
+    seedSession('helm-user-lookalike', { status: 'idle' });
     await ws.sessionJanitorTick();
-    expect(terminated).toEqual(['helm-real-worker']);                 // ONLY the tagged one
-    expect(terminated).not.toContain('helm-user-lookalike');          // the look-alike is safe
-    expect(reg.get('helm-user-lookalike')!.status).toBe('idle');      // untouched
+    expect(terminated).toEqual(['helm-real-worker']);
+    expect(terminated).not.toContain('helm-user-lookalike');
+    expect(reg.get('helm-user-lookalike')!.status).toBe('idle');
   });
 
-  it('ST-R2 NO-SPILLOVER sanity: a session NOT in the registry is never even a candidate', async () => {
-    // The loop only SELECTs helm_sessions rows, so a live tmux session absent from the registry can never
-    // be evaluated — let alone killed — regardless of its name or tag. Belt-and-suspenders over the tag gate.
-    tmuxSpy.sessionHasHelmChildTag = async (_name: string) => true;   // even if it WERE tagged...
-    seedSession('helm-registered-tagged', { status: 'idle', ageSecs: 30 * 60 });
-    await ws.sessionJanitorTick();
-    expect(terminated).toEqual(['helm-registered-tagged']);           // only the registered row; nothing else
+  it('HARD SAFETY: deploy HELM_SESSION_JANITOR remains 0', () => {
+    const root = path.resolve(__dirname, '../..');
+    const env = fs.readFileSync(path.join(root, '.env'), 'utf8');
+    const eco = fs.readFileSync(path.join(root, 'ecosystem.config.cjs'), 'utf8');
+    expect(env).toMatch(/HELM_SESSION_JANITOR\s*=\s*0/);
+    expect(eco).toMatch(/HELM_SESSION_JANITOR:\s*["']0["']/);
   });
 
+  it('source: tick does not use TTL/age kill authority', () => {
+    const src = fs.readFileSync(
+      path.resolve(__dirname, 'worker-service.ts'),
+      'utf8'
+    );
+    // Janitor tick body must not consult HELM_SESSION_TTL_MS or datetime aged checks for kill.
+    const tickStart = src.indexOf('async sessionJanitorTick');
+    const tickEnd = src.indexOf('async sweepOrphanSessionsAtStartup');
+    expect(tickStart).toBeGreaterThan(-1);
+    expect(tickEnd).toBeGreaterThan(tickStart);
+    const tickBody = src.slice(tickStart, tickEnd);
+    expect(tickBody).not.toMatch(/HELM_SESSION_TTL_MS/);
+    expect(tickBody).not.toMatch(/pastTtl|ttlSecs|ttlMs/);
+    expect(tickBody).toMatch(/decideSessionReconcile/);
+  });
 });

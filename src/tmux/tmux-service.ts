@@ -191,6 +191,37 @@ export class TmuxService {
     }
   }
 
+  /**
+   * S12: fail-safe existence for the reconciler decision (true | false | null).
+   * true = live, false = provably gone, null = unknown (KEEP — never over-CONVERGE).
+   * Boolean sessionExists collapses error→false and must not feed decideSessionReconcile alone.
+   */
+  async sessionExistsTriState(name: string): Promise<boolean | null> {
+    try {
+      this.ensureValidSessionName(name);
+    } catch {
+      return null;
+    }
+    try {
+      await execFileAsync('tmux', ['has-session', '-t', name]);
+      return true;
+    } catch (err: any) {
+      const msg = String(err?.stderr ?? err?.message ?? err);
+      // Known "gone" signals from tmux has-session (exit 1 when missing / no server).
+      if (
+        /no server running/i.test(msg) ||
+        /can'?t find session/i.test(msg) ||
+        /no such session/i.test(msg) ||
+        /session not found/i.test(msg) ||
+        err?.code === 1
+      ) {
+        return false;
+      }
+      console.warn('[tmux] sessionExistsTriState probe unknown → null', { name, err: String(err) });
+      return null;
+    }
+  }
+
   async sendCommand(
     target: string,
     command: string,
