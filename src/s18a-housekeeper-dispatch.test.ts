@@ -256,6 +256,12 @@ describe('S18a/S18b housekeeper dispatch/apply', () => {
     const envelope = JSON.parse(inv.envelope_json);
     expect(envelope.session.owner).toBe('helm');
     expect(envelope.session.status).toBe('active');
+    expect(envelope.probe).toMatchObject({
+      pane_capture: 'ok',
+      pane_capture_error: null,
+      facts_obtainable: true,
+      facts_present: true,
+    });
     expect(envelope.run_facts).toHaveLength(1);
     expect(envelope.task_facts).toHaveLength(1);
     expect(envelope.callback_facts).toHaveLength(1);
@@ -339,11 +345,19 @@ describe('S18a/S18b housekeeper dispatch/apply', () => {
   });
 
   it('apply done persists evidence/rationale and only marks helm session idle; zero terminate/reap', async () => {
-    seedSession('helm-w-apply-done', { owner: 'helm', status: 'active' });
+    const runId = seedRunFacts();
+    seedSession('helm-w-apply-done', { owner: 'helm', status: 'active', runId });
     const svc = makeService(snap({ spark: { headroom: 42, depleted: false, worst_bucket: 58 } }));
     const dispatched = await svc.dispatchOnce({ nowMs: Date.now() });
     expect(dispatched.outcome).toBe('dispatched');
     if (dispatched.outcome !== 'dispatched') return;
+
+    const envelope = JSON.parse(svc.getInvestigation(dispatched.investigationId).envelope_json);
+    expect(envelope.probe).toMatchObject({
+      pane_capture: 'ok',
+      facts_obtainable: true,
+      facts_present: true,
+    });
 
     const applied = svc.applyCallback(dispatched.investigationId, {
       verdict: 'done',
@@ -364,7 +378,8 @@ describe('S18a/S18b housekeeper dispatch/apply', () => {
   });
 
   it('apply done writes audit evidence before markIdle and fail-closes if audit write fails', async () => {
-    seedSession('helm-w-audit-first', { owner: 'helm', status: 'active' });
+    const runId = seedRunFacts();
+    seedSession('helm-w-audit-first', { owner: 'helm', status: 'active', runId });
     const svc = makeService(snap({ spark: { headroom: 42, depleted: false, worst_bucket: 58 } }));
     const dispatched = await svc.dispatchOnce({ nowMs: Date.now() });
     expect(dispatched.outcome).toBe('dispatched');
@@ -396,7 +411,8 @@ describe('S18a/S18b housekeeper dispatch/apply', () => {
   });
 
   it('apply done refuses empty evidence/rationale and does not mark idle', async () => {
-    seedSession('helm-w-empty-proof', { owner: 'helm', status: 'active' });
+    const runId = seedRunFacts();
+    seedSession('helm-w-empty-proof', { owner: 'helm', status: 'active', runId });
     const svc = makeService(snap({ spark: { headroom: 42, depleted: false, worst_bucket: 58 } }));
     const dispatched = await svc.dispatchOnce({ nowMs: Date.now() });
     expect(dispatched.outcome).toBe('dispatched');
@@ -418,7 +434,8 @@ describe('S18a/S18b housekeeper dispatch/apply', () => {
   });
 
   it('apply done is terminal/idempotent and rejects conflicting later verdicts without another markIdle', async () => {
-    seedSession('helm-w-idempotent-done', { owner: 'helm', status: 'active' });
+    const runId = seedRunFacts();
+    seedSession('helm-w-idempotent-done', { owner: 'helm', status: 'active', runId });
     const svc = makeService(snap({ spark: { headroom: 42, depleted: false, worst_bucket: 58 } }));
     const dispatched = await svc.dispatchOnce({ nowMs: Date.now() });
     expect(dispatched.outcome).toBe('dispatched');
@@ -483,8 +500,110 @@ describe('S18a/S18b housekeeper dispatch/apply', () => {
     expect(transport.reapCalls).toEqual([]);
   });
 
+  it('B10 AC13/AC15: capture throw + done with non-empty prose is rejected; session stays active', async () => {
+    const runId = seedRunFacts();
+    seedSession('helm-w-capture-throw', { owner: 'helm', status: 'active', runId });
+    tmux.capturePane = async (name: string) => {
+      tmux.captures.push(name);
+      throw new Error('forced capturePane failure for B10');
+    };
+    const svc = makeService(snap({ spark: { headroom: 42, depleted: false, worst_bucket: 58 } }));
+    const dispatched = await svc.dispatchOnce({ nowMs: Date.now() });
+    expect(dispatched.outcome).toBe('dispatched');
+    if (dispatched.outcome !== 'dispatched') return;
+
+    const invBefore = svc.getInvestigation(dispatched.investigationId);
+    const envelope = JSON.parse(invBefore.envelope_json);
+    expect(envelope.probe.pane_capture).toBe('failed');
+    expect(String(envelope.probe.pane_capture_error || '')).toMatch(/forced capturePane failure/);
+    expect(envelope.pane_tail).toBe('');
+
+    const rejected = svc.applyCallback(dispatched.investigationId, {
+      verdict: 'done',
+      evidence: 'pane showed completed prompt and no active generation',
+      rationale: 'plausible prose must not override failed probe',
+    });
+
+    expect(rejected).toMatchObject({
+      ok: false,
+      outcome: 'invalid_callback_proof',
+    });
+    expect(String((rejected as any).error || '')).toMatch(/probe insufficient/i);
+    const inv = svc.getInvestigation(dispatched.investigationId);
+    expect(inv.status).toBe('dispatched');
+    expect(inv.callback_verdict).toBeNull();
+    expect(reg.get('helm-w-capture-throw')!.status).toBe('active');
+    expect(tmux.terminateCalls).toEqual([]);
+    expect(transport.reapCalls).toEqual([]);
+  });
+
+  it('B10 AC13: null run_id ⇒ empty/unobtainable facts ⇒ done ineligible', async () => {
+    seedSession('helm-w-null-run', { owner: 'helm', status: 'active', runId: null });
+    const svc = makeService(snap({ spark: { headroom: 42, depleted: false, worst_bucket: 58 } }));
+    const dispatched = await svc.dispatchOnce({ nowMs: Date.now() });
+    expect(dispatched.outcome).toBe('dispatched');
+    if (dispatched.outcome !== 'dispatched') return;
+
+    const envelope = JSON.parse(svc.getInvestigation(dispatched.investigationId).envelope_json);
+    expect(envelope.session.run_id).toBeNull();
+    expect(envelope.probe).toMatchObject({
+      pane_capture: 'ok',
+      facts_obtainable: false,
+      facts_present: false,
+    });
+    expect(envelope.run_facts).toEqual([]);
+    expect(envelope.task_facts).toEqual([]);
+    expect(envelope.callback_facts).toEqual([]);
+
+    const rejected = svc.applyCallback(dispatched.investigationId, {
+      verdict: 'done',
+      evidence: 'pane showed completed prompt and no active generation',
+      rationale: 'null run_id must not allow done',
+    });
+
+    expect(rejected).toMatchObject({ ok: false, outcome: 'invalid_callback_proof' });
+    expect(String((rejected as any).error || '')).toMatch(/probe insufficient/i);
+    const inv = svc.getInvestigation(dispatched.investigationId);
+    expect(inv.status).toBe('dispatched');
+    expect(inv.callback_verdict).toBeNull();
+    expect(reg.get('helm-w-null-run')!.status).toBe('active');
+    expect(tmux.terminateCalls).toEqual([]);
+    expect(transport.reapCalls).toEqual([]);
+  });
+
+  it('B10 AC13: needs-human still accepted under insufficient probe (capture throw)', async () => {
+    seedSession('helm-w-probe-needs-human', { owner: 'helm', status: 'active', runId: null });
+    tmux.capturePane = async (name: string) => {
+      tmux.captures.push(name);
+      throw new Error('forced capture throw under needs-human path');
+    };
+    const svc = makeService(snap({ spark: { headroom: 42, depleted: false, worst_bucket: 58 } }));
+    const dispatched = await svc.dispatchOnce({ nowMs: Date.now() });
+    expect(dispatched.outcome).toBe('dispatched');
+    if (dispatched.outcome !== 'dispatched') return;
+
+    const envelope = JSON.parse(svc.getInvestigation(dispatched.investigationId).envelope_json);
+    expect(envelope.probe.pane_capture).toBe('failed');
+    expect(envelope.probe.facts_obtainable).toBe(false);
+
+    const applied = svc.applyCallback(dispatched.investigationId, {
+      verdict: 'needs-human',
+      evidence: 'capture failed and no run facts; operator must decide',
+      rationale: 'insufficient probe keeps as needs-human',
+    });
+
+    expect(applied).toMatchObject({ ok: true, outcome: 'needs_human' });
+    const inv = svc.getInvestigation(dispatched.investigationId);
+    expect(inv.status).toBe('needs_human');
+    expect(inv.callback_verdict).toBe('needs-human');
+    expect(reg.get('helm-w-probe-needs-human')!.status).toBe('active');
+    expect(tmux.terminateCalls).toEqual([]);
+    expect(transport.reapCalls).toEqual([]);
+  });
+
   it('apply rejects uncertainty/other verdicts and re-checks owner=helm before markIdle', async () => {
-    seedSession('helm-w-owner-flip', { owner: 'helm', status: 'active' });
+    const runId = seedRunFacts();
+    seedSession('helm-w-owner-flip', { owner: 'helm', status: 'active', runId });
     const svc = makeService(snap({ spark: { headroom: 42, depleted: false, worst_bucket: 58 } }));
     const dispatched = await svc.dispatchOnce({ nowMs: Date.now() });
     expect(dispatched.outcome).toBe('dispatched');

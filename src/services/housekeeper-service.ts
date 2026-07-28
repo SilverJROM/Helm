@@ -65,6 +65,20 @@ export type HousekeeperApplyResult =
   | { ok: false; outcome: 'owner_recheck_failed'; investigationId: number; sessionName: string; owner: string | null; error: string }
   | { ok: false; outcome: 'terminal_conflict'; investigationId: number; sessionName: string; existingVerdict: string | null; error: string };
 
+/** Explicit bounded-probe outcomes persisted on the investigation envelope (B10 / AC13). */
+export type HousekeeperPaneCaptureOutcome = 'ok' | 'empty' | 'failed';
+
+export interface HousekeeperProbeOutcomes {
+  /** throw → failed; whitespace-only capture → empty; non-empty → ok */
+  pane_capture: HousekeeperPaneCaptureOutcome;
+  /** short error text when pane_capture === 'failed'; else null */
+  pane_capture_error: string | null;
+  /** false iff session.run_id is null (facts load skipped / unobtainable) */
+  facts_obtainable: boolean;
+  /** true if any run/task/callback row or last_dispatch was loaded */
+  facts_present: boolean;
+}
+
 export interface HousekeeperEnvelope {
   schema_version: 1;
   route: 'housekeeper-investigation';
@@ -83,6 +97,8 @@ export interface HousekeeperEnvelope {
   observation: SessionObservationResult;
   pane_tail: string;
   pane_tail_provenance: string;
+  /** Mechanical probe sufficiency — apply derives done eligibility from this only (AC13/AC15). */
+  probe: HousekeeperProbeOutcomes;
   callback_facts: unknown[];
   run_facts: unknown[];
   task_facts: unknown[];
@@ -106,21 +122,29 @@ export class HousekeeperService {
     if (!candidate) return { ok: true, outcome: 'no_candidate', reason: 'no_active_helm_anomaly' };
 
     const usage = await this.usageSelector.select();
-    const paneTail = boundText(
-      await this.tmux.capturePane(candidate.row.name, 200).catch(() => ''),
-      HOUSEKEEPER_PANE_TAIL_MAX_CHARS,
-    );
+    const paneProbe = await this.capturePaneProbe(candidate.row.name);
+    const paneTail = boundText(paneProbe.paneTail, HOUSEKEEPER_PANE_TAIL_MAX_CHARS);
     const paneTailProvenance =
       opts.paneTailProvenance ??
       'runtime tmux capturePane tail; tests use src/test-fixtures/panes/discovery-finished-turn-20260727.txt captured from a real agent turn';
     const evidence = this.loadDurableEvidence(candidate.row.run_id);
     const stateSignature = buildStateSignature(candidate.row, candidate.observation);
+    const probe = buildProbeOutcomes({
+      paneCapture: paneProbe.outcome,
+      paneCaptureError: paneProbe.error,
+      runId: candidate.row.run_id,
+      callbackFacts: evidence.callbackFacts,
+      runFacts: evidence.runFacts,
+      taskFacts: evidence.taskFacts,
+      lastDispatch: evidence.lastDispatch,
+    });
 
     const envelope = buildHousekeeperEnvelope({
       row: candidate.row,
       observation: candidate.observation,
       paneTail,
       paneTailProvenance,
+      probe,
       callbackFacts: evidence.callbackFacts,
       runFacts: evidence.runFacts,
       taskFacts: evidence.taskFacts,
@@ -225,6 +249,18 @@ export class HousekeeperService {
         investigationId: id,
         sessionName: row.session_name,
         error: 'done callback requires non-empty evidence and rationale',
+      };
+    }
+
+    // B10 / AC13+AC15: keep-bias in apply — done only when stored envelope probe is sufficient.
+    // needs-human is never gated by probe sufficiency.
+    if (verdict === 'done' && !isDoneEligibleFromStoredEnvelope(row.envelope_json)) {
+      return {
+        ok: false,
+        outcome: 'invalid_callback_proof',
+        investigationId: id,
+        sessionName: row.session_name,
+        error: 'done ineligible: bounded probe insufficient (failed/empty capture, null run_id, or absent facts)',
       };
     }
 
@@ -415,6 +451,79 @@ export class HousekeeperService {
       .get(runId) ?? null;
     return { callbackFacts, runFacts, taskFacts, lastDispatch };
   }
+
+  /**
+   * Bounded pane probe: never collapses throw → empty without recording outcome.
+   * Failed/empty still allow dispatch; only apply of `done` is gated (B10).
+   */
+  private async capturePaneProbe(sessionName: string): Promise<{
+    paneTail: string;
+    outcome: HousekeeperPaneCaptureOutcome;
+    error: string | null;
+  }> {
+    try {
+      const raw = await this.tmux.capturePane(sessionName, 200);
+      const paneTail = String(raw ?? '');
+      if (paneTail.trim().length === 0) {
+        return { paneTail: '', outcome: 'empty', error: null };
+      }
+      return { paneTail, outcome: 'ok', error: null };
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return {
+        paneTail: '',
+        outcome: 'failed',
+        error: boundText(msg || 'capturePane threw', 200),
+      };
+    }
+  }
+}
+
+function buildProbeOutcomes(params: {
+  paneCapture: HousekeeperPaneCaptureOutcome;
+  paneCaptureError: string | null;
+  runId: number | null;
+  callbackFacts: unknown[];
+  runFacts: unknown[];
+  taskFacts: unknown[];
+  lastDispatch: unknown | null;
+}): HousekeeperProbeOutcomes {
+  const factsObtainable = params.runId != null;
+  const factsPresent =
+    params.runFacts.length > 0 ||
+    params.taskFacts.length > 0 ||
+    params.callbackFacts.length > 0 ||
+    params.lastDispatch != null;
+  return {
+    pane_capture: params.paneCapture,
+    pane_capture_error: params.paneCapture === 'failed' ? params.paneCaptureError : null,
+    facts_obtainable: factsObtainable,
+    facts_present: factsPresent,
+  };
+}
+
+/** AC13: done only when pane ok AND facts obtainable AND facts present. */
+export function isDoneEligibleFromEnvelope(envelope: HousekeeperEnvelope): boolean {
+  const probe = envelope?.probe;
+  if (!probe) return false;
+  return (
+    probe.pane_capture === 'ok' &&
+    probe.facts_obtainable === true &&
+    probe.facts_present === true
+  );
+}
+
+function isDoneEligibleFromStoredEnvelope(envelopeJson: unknown): boolean {
+  try {
+    const parsed =
+      typeof envelopeJson === 'string'
+        ? (JSON.parse(envelopeJson) as HousekeeperEnvelope)
+        : (envelopeJson as HousekeeperEnvelope);
+    if (!parsed || typeof parsed !== 'object') return false;
+    return isDoneEligibleFromEnvelope(parsed);
+  } catch {
+    return false;
+  }
 }
 
 function buildHousekeeperEnvelope(params: {
@@ -422,6 +531,7 @@ function buildHousekeeperEnvelope(params: {
   observation: SessionObservationResult;
   paneTail: string;
   paneTailProvenance: string;
+  probe: HousekeeperProbeOutcomes;
   callbackFacts: unknown[];
   runFacts: unknown[];
   taskFacts: unknown[];
@@ -451,6 +561,7 @@ function buildHousekeeperEnvelope(params: {
     observation: params.observation,
     pane_tail: params.paneTail,
     pane_tail_provenance: params.paneTailProvenance,
+    probe: params.probe,
     callback_facts: params.callbackFacts,
     run_facts: params.runFacts,
     task_facts: params.taskFacts,
