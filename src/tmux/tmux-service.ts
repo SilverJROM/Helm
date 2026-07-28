@@ -81,6 +81,10 @@ export class TmuxService {
   // SL-R1: no-op by default; the real registry is injected in src/index.ts on the shared instance.
   private registryHook: TmuxSessionRegistryHook;
 
+  // S09 / AC19: last ANSI-stripped pane snapshot per bare session name. Used so capturePane can
+  // refresh last_used_at only on real agent-output deltas — identical high-freq polls must not touch.
+  private lastPaneSnapshots = new Map<string, string>();
+
   constructor(registryHook?: TmuxSessionRegistryHook) {
     this.registryHook = registryHook ?? NOOP_REGISTRY_HOOK;
   }
@@ -92,11 +96,36 @@ export class TmuxService {
 
   // SL-R2/R4: active-input signal. Fired from EVERY method by which Helm actively drives a session
   // (sendAndSubmit — the chat/message path, sendCommand, sendEnter, sendKeys) so last_used_at is
-  // refreshed and the janitor's TTL means "idle for TTL", not "alive for TTL". NOT fired from
-  // capturePane (that's high-freq polling — an idle-but-monitored session must still be reapable).
-  // Bare session name (target may be session:window.pane). Best-effort — never break a send.
+  // refreshed and the janitor's TTL means "idle for TTL", not "alive for TTL".
+  // S09 / AC19: also fired from capturePane ONLY when newly observed agent output differs from the
+  // prior pane snapshot — repeated capture polling with identical content must NOT manufacture activity
+  // (idle-but-monitored sessions must stay reapable). Bare session name (target may be session:window.pane).
+  // Best-effort — never break a send/capture.
   private touchSession(target: string): void {
     try { this.registryHook.onUse((target ?? "").split(":")[0]); } catch (err) { console.warn('[tmux] registry onUse failed', { target, err: String(err) }); }
+  }
+
+  /**
+   * S09 / AC19: observe agent output from a capture result.
+   * - First non-empty snapshot for a session = baseline only (no touch).
+   * - Identical subsequent content = no touch (no polling inflation).
+   * - Real content delta = touchSession once (last_used_at refresh via onUse).
+   * - Empty/failed captures invent no activity and do not reset the baseline.
+   * Compare on ANSI-stripped text so TUI colour flicker is not treated as output.
+   */
+  private observeAgentOutput(target: string, paneContent: string): void {
+    const name = (target ?? "").split(":")[0];
+    if (!name) return;
+    const stripped = stripAnsiForMatch(paneContent);
+    if (!stripped) return;
+    const prior = this.lastPaneSnapshots.get(name);
+    if (prior === undefined) {
+      this.lastPaneSnapshots.set(name, stripped);
+      return;
+    }
+    if (prior === stripped) return;
+    this.lastPaneSnapshots.set(name, stripped);
+    this.touchSession(name);
   }
 
   async listPanes(): Promise<TmuxPane[]> {
@@ -528,6 +557,8 @@ export class TmuxService {
   async terminateSession(sessionName: string): Promise<void> {
     this.ensureValidSessionName(sessionName);
     await execFileAsync("tmux", ["kill-session", "-t", sessionName]);
+    // S09: drop prior pane snapshot so a recreated same-name session re-baselines (no stale delta).
+    this.lastPaneSnapshots.delete(sessionName);
     // SL-R1/R2: mark reaped centrally on terminate. Best-effort — never mask a real kill.
     try { this.registryHook.onTerminate(sessionName); } catch (err) { console.warn('[tmux] registry onTerminate failed', { sessionName, err: String(err) }); }
   }
@@ -551,7 +582,13 @@ export class TmuxService {
         `-${safeLines}`
       ]);
       // Convert \n to \r\n for xterm.js
-      return stdout.replace(/\n/g, "\r\n");
+      const content = stdout.replace(/\n/g, "\r\n");
+      // S09 / AC19: bump last_used_at only when agent output differs from prior snapshot.
+      // Best-effort — never mask a successful capture if the registry hook throws.
+      try { this.observeAgentOutput(target, content); } catch (err) {
+        console.warn('[tmux] observeAgentOutput failed', { target, err: String(err) });
+      }
+      return content;
     } catch (err) {
       console.warn('[tmux] capturePane failed', { err: String(err) });
       return "";

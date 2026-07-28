@@ -220,4 +220,155 @@ describe('ST-R1/R2 @helm_child tmux ownership tag', () => {
     await expect(tmux.sessionAttached('helm bad')).resolves.toBeNull();
     expect(cpMock.calls).toEqual([]);
   });
+
+  // ---------------------------------------------------------------------------
+  // S09 / AC19 — last_used_at on agent output (prior-pane-snapshot delta only)
+  // ---------------------------------------------------------------------------
+
+  it('S09: identical capture polls do not touch (no polling inflation)', async () => {
+    const uses: string[] = [];
+    const tmux: any = new TmuxService({
+      onCreate: () => {},
+      onTerminate: () => {},
+      onUse: (n: string) => { uses.push(n); },
+    });
+    cpMock.impl = async () => ({ stdout: '❯ idle prompt\n', stderr: '' });
+    await tmux.capturePane('helm-chat-s09a:0.0');
+    await tmux.capturePane('helm-chat-s09a:0.0');
+    await tmux.capturePane('helm-chat-s09a:0.0');
+    // First capture baselines; two identical polls must not manufacture activity.
+    expect(uses).toEqual([]);
+  });
+
+  it('S09: real output delta touches once; subsequent identical polls do not', async () => {
+    const uses: string[] = [];
+    const tmux: any = new TmuxService({
+      onCreate: () => {},
+      onTerminate: () => {},
+      onUse: (n: string) => { uses.push(n); },
+    });
+    let frame = 'frame-A\n';
+    cpMock.impl = async () => ({ stdout: frame, stderr: '' });
+    await tmux.capturePane('helm-chat-s09b'); // baseline A → no touch
+    frame = 'frame-B\n';
+    await tmux.capturePane('helm-chat-s09b'); // A→B → touch once
+    await tmux.capturePane('helm-chat-s09b'); // B→B → no touch
+    expect(uses).toEqual(['helm-chat-s09b']);
+  });
+
+  it('S09: successive distinct outputs each touch once (A→B→C → 2 onUse)', async () => {
+    const uses: string[] = [];
+    const tmux: any = new TmuxService({
+      onCreate: () => {},
+      onTerminate: () => {},
+      onUse: (n: string) => { uses.push(n); },
+    });
+    let frame = 'A\n';
+    cpMock.impl = async () => ({ stdout: frame, stderr: '' });
+    await tmux.capturePane('helm-w-s09c:0.0');
+    frame = 'B\n';
+    await tmux.capturePane('helm-w-s09c:0.0');
+    frame = 'C\n';
+    await tmux.capturePane('helm-w-s09c:0.0');
+    expect(uses).toEqual(['helm-w-s09c', 'helm-w-s09c']);
+  });
+
+  it('S09: ANSI-only flicker is not treated as agent output (stripped compare)', async () => {
+    const uses: string[] = [];
+    const tmux: any = new TmuxService({
+      onCreate: () => {},
+      onTerminate: () => {},
+      onUse: (n: string) => { uses.push(n); },
+    });
+    let frame = 'hello world\n';
+    cpMock.impl = async () => ({ stdout: frame, stderr: '' });
+    await tmux.capturePane('helm-chat-s09ansi');
+    // Same text, different colour codes — must not touch.
+    frame = '\x1b[32mhello world\x1b[0m\n';
+    await tmux.capturePane('helm-chat-s09ansi');
+    await tmux.capturePane('helm-chat-s09ansi');
+    expect(uses).toEqual([]);
+  });
+
+  it('S09: Helm active-input still touches (send path independent of capture)', async () => {
+    const uses: string[] = [];
+    const tmux: any = new TmuxService({
+      onCreate: () => {},
+      onTerminate: () => {},
+      onUse: (n: string) => { uses.push(n); },
+    });
+    // touchSession is what sendAndSubmit/sendCommand/sendEnter/sendKeys call.
+    tmux.touchSession('helm-chat-input:0.0');
+    expect(uses).toEqual(['helm-chat-input']);
+  });
+
+  it('S09: empty/failed capture does not invent activity or re-baseline', async () => {
+    const uses: string[] = [];
+    const tmux: any = new TmuxService({
+      onCreate: () => {},
+      onTerminate: () => {},
+      onUse: (n: string) => { uses.push(n); },
+    });
+    let frame = 'stable\n';
+    cpMock.impl = async () => ({ stdout: frame, stderr: '' });
+    await tmux.capturePane('helm-chat-s09empty'); // baseline
+    frame = 'changed\n';
+    await tmux.capturePane('helm-chat-s09empty'); // delta → 1 touch
+    expect(uses).toEqual(['helm-chat-s09empty']);
+    // Failed capture returns "" — must not touch and must not erase prior.
+    cpMock.impl = async () => { throw new Error('tmux: no such pane'); };
+    await expect(tmux.capturePane('helm-chat-s09empty')).resolves.toBe('');
+    expect(uses).toEqual(['helm-chat-s09empty']);
+    // Same content as last good snapshot still no extra touch after failed capture.
+    frame = 'changed\n';
+    cpMock.impl = async () => ({ stdout: frame, stderr: '' });
+    await tmux.capturePane('helm-chat-s09empty');
+    expect(uses).toEqual(['helm-chat-s09empty']);
+  });
+
+  it('S09: output delta via onUse→touch does not resurrect a reaped registry row', async () => {
+    // Synthetic DB only — mirrors index.ts onUse → sessionRegistry.touch wiring.
+    const Database = (await import('better-sqlite3')).default;
+    const { SessionRegistryService } = await import('../services/session-registry-service.js');
+    const db = new Database(':memory:');
+    db.exec(`
+      CREATE TABLE helm_sessions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL UNIQUE,
+        kind TEXT,
+        project_id INTEGER,
+        run_id INTEGER,
+        owner TEXT,
+        status TEXT NOT NULL DEFAULT 'active',
+        created_at TEXT NOT NULL,
+        last_used_at TEXT,
+        ended_at TEXT,
+        reason TEXT
+      );
+    `);
+    const reg = new SessionRegistryService(db as any);
+    reg.register('helm-chat-s09reap', { owner: 'human', kind: 'discovery' });
+    reg.markReaped('helm-chat-s09reap', 'test-reap');
+    expect(reg.get('helm-chat-s09reap')!.status).toBe('reaped');
+    const endedAt = reg.get('helm-chat-s09reap')!.ended_at;
+    const lastUsed = reg.get('helm-chat-s09reap')!.last_used_at;
+
+    const tmux: any = new TmuxService({
+      onCreate: (n: string) => reg.register(n, { owner: 'helm' }),
+      onTerminate: (n: string) => reg.markReaped(n),
+      onUse: (n: string) => reg.touch(n),
+    });
+    let frame = 'before\n';
+    cpMock.impl = async () => ({ stdout: frame, stderr: '' });
+    await tmux.capturePane('helm-chat-s09reap'); // baseline
+    frame = 'after-agent-output\n';
+    await tmux.capturePane('helm-chat-s09reap'); // would touch if not reaped
+
+    const row = reg.get('helm-chat-s09reap')!;
+    expect(row.status).toBe('reaped');
+    expect(row.ended_at).toBe(endedAt);
+    // touch is a no-op on reaped — last_used_at must not advance / resurrect.
+    expect(row.last_used_at).toBe(lastUsed);
+    db.close();
+  });
 });
