@@ -273,18 +273,31 @@ export class RunOrchestratorService {
   // (status=paused) — both set phase=blocked, but a run that merely halted for missing config or a
   // grok relogin is NOT failed, and recording it as such contradicted its own completion summary and
   // false-alarmed status-keyed monitoring. Default 'failure' preserves every existing caller verbatim.
+  /**
+   * @param expectedGeneration B04 fix cycle 2 (validator V1): when the caller reached this from a
+   *   detached startRunDetached continuation, its captured runs.generation. Gates this method's own
+   *   terminal UPDATE plus its finalizeRunWorkerRuntimes/assertImplementationBrainComplete calls so a
+   *   stale continuation cannot blocked-fail a recycled occupant of the same numeric id. Omitted by
+   *   callers with no captured token (unchanged pre-B04 behavior).
+   */
   private transitionRunToBlocked(
     runId: number,
     message: string,
     project?: any,
-    kind: 'failure' | 'operator-pause' = 'failure'
+    kind: 'failure' | 'operator-pause' = 'failure',
+    expectedGeneration?: number
   ): void {
     const db = this.deps.artifacts['db'].raw;
     const status = kind === 'operator-pause' ? 'paused' : 'failed';
+    const gated = expectedGeneration != null && Number.isFinite(Number(expectedGeneration));
     try {
-      const changed = db.prepare(
-        "UPDATE runs SET phase = 'blocked', status = ?, ended_at = datetime('now') WHERE id = ? AND phase NOT IN ('complete','failed','blocked','paused')"
-      ).run(status, runId);
+      const changed = gated
+        ? db.prepare(
+            "UPDATE runs SET phase = 'blocked', status = ?, ended_at = datetime('now') WHERE id = ? AND generation = ? AND phase NOT IN ('complete','failed','blocked','paused')"
+          ).run(status, runId, expectedGeneration)
+        : db.prepare(
+            "UPDATE runs SET phase = 'blocked', status = ?, ended_at = datetime('now') WHERE id = ? AND phase NOT IN ('complete','failed','blocked','paused')"
+          ).run(status, runId);
       if (changed.changes !== 1) return;
       const run: any = db.prepare(
         'SELECT r.batch_id, p.name AS project_name FROM runs r LEFT JOIN projects p ON p.id = r.project_id WHERE r.id = ?'
@@ -309,13 +322,14 @@ export class RunOrchestratorService {
               );
         void (async () => {
           try {
-            await this.finalizeRunWorkerRuntimes(runId, 'run-blocked-failure');
+            await this.finalizeRunWorkerRuntimes(runId, 'run-blocked-failure', expectedGeneration);
             if (Number.isFinite(projId)) {
               this.assertImplementationBrainComplete({
                 projectId: projId,
                 runId,
                 reason: 'run-blocked-failure',
                 state: 'failed',
+                expectedGeneration,
               });
             }
           } catch { /* best-effort terminal bookkeeping */ }
@@ -621,10 +635,26 @@ export class RunOrchestratorService {
     // precreatedRunId after an external stop (or a recycled-id race before createRun was fixed)
     // must not inherit a stale abort at pre-execution / task-boundary. Same for process-local queue
     // state (stuck inFlight → getNextReady always null → unknown-pending-stall with zero attempts).
+    // B04 fix cycle 2 (validator V1): startRunDetached fires startRun fire-and-forget — when entered
+    // through it, EVERY terminal path below (transitionRunToBlocked, planning-done-yield, the
+    // run-complete/run-failed terminal block) executes inside that SAME detached continuation and is
+    // equally exposed to a project-delete-then-recycle race as the detached-start-failed catch B04
+    // originally gated. Re-read runs.generation for the precreated id here — same synchronous tick as
+    // startRunDetached's own capture (no await has run yet), so this cannot observe a later recycle —
+    // and thread it through every such path.
+    let runGenToken: number | undefined;
     if (input.precreatedRunId != null && Number.isFinite(Number(input.precreatedRunId))) {
       const rid = Number(input.precreatedRunId);
       clearRunAbort(rid);
       try { this.deps.queue.clearRun(rid); } catch { /* never block start */ }
+      try {
+        const row = this.deps.artifacts['db'].raw
+          .prepare('SELECT generation FROM runs WHERE id = ?')
+          .get(rid) as { generation: number } | undefined;
+        if (row && typeof row.generation === 'number' && Number.isFinite(row.generation)) {
+          runGenToken = row.generation;
+        }
+      } catch { /* leave undefined — downstream calls degrade to their pre-B04 unguarded behavior */ }
     }
 
     // B-ISO1 (sol wiring review fix #4): resolve the RUN-SCOPED strict read policy ONCE, at run start,
@@ -807,7 +837,7 @@ export class RunOrchestratorService {
       if (e instanceof ResolveStallError) {
         if (input.precreatedRunId != null) {
           try {
-            this.transitionRunToBlocked(input.precreatedRunId, `Resolve-time role collision requires corrected role bindings: ${e.message}`, project);
+            this.transitionRunToBlocked(input.precreatedRunId, `Resolve-time role collision requires corrected role bindings: ${e.message}`, project, 'failure', runGenToken);
             const reason = `# I7 Resolve-Time Stall (B15x)\n\n${e.message}\n\nOperator action required: adjust role bindings / redteam roster so resolved_impl ∉ {val} ∪ redteam_panel, then re-run.`;
             await fs.writeFile(path.join(runDir, 'i7-resolve-stall.md'), reason, 'utf8');
             this.deps.artifacts.recordArtifact(input.precreatedRunId, 'i7-resolve-stall', 'i7-resolve-stall.md');
@@ -836,7 +866,7 @@ export class RunOrchestratorService {
       const invalid = async (reason: string): Promise<Error> => {
         if (input.precreatedRunId != null) {
           try {
-            this.transitionRunToBlocked(input.precreatedRunId, `Cycle-plan workspace validation failed: ${reason}`, project);
+            this.transitionRunToBlocked(input.precreatedRunId, `Cycle-plan workspace validation failed: ${reason}`, project, 'failure', runGenToken);
             await fs.writeFile(path.join(runDir, 'cycle-workspace-invalid.md'), `# Cycle-plan run refused (CYCLE-BUILDDIR fail-closed)\n\n${reason}\n\nA cyclePlan run must build in a valid, active, contained cycle workspace; there is NO fallback to the registered project root.`, 'utf8');
             this.deps.artifacts.recordArtifact(input.precreatedRunId, 'cycle-workspace-invalid', 'cycle-workspace-invalid.md');
           } catch { /* best-effort surface */ }
@@ -967,7 +997,7 @@ export class RunOrchestratorService {
       } catch (e: any) {
         if (input.precreatedRunId != null) {
           try {
-            this.transitionRunToBlocked(input.precreatedRunId, `Seat-binary pre-flight failed: ${e?.message || e}`, project);
+            this.transitionRunToBlocked(input.precreatedRunId, `Seat-binary pre-flight failed: ${e?.message || e}`, project, 'failure', runGenToken);
             const reason = `# Seat-binary pre-flight refused this run (A1a)\n\n${e?.message || e}\n\nA rostered model's launch CLI is not on the seat shell's PATH (the "binary vanished" failure mode). Operator action: reinstall/repair the missing CLI on the seat PATH (verify with \`command -v <bin>\` in a fresh tmux shell), then re-run.`;
             await fs.writeFile(path.join(runDir, 'seat-binary-preflight.md'), reason, 'utf8');
             this.deps.artifacts.recordArtifact(input.precreatedRunId, 'seat-binary-preflight', 'seat-binary-preflight.md');
@@ -1186,7 +1216,7 @@ export class RunOrchestratorService {
         try { await this.deps.artifacts.persistState(runDir, ['interview', 'planning', 'blocked'], 'blocked', runId); } catch {}
         // transitionRunToBlocked also terminalizes the cycle board + finalizes worker_runtimes seat
         // ledger (kind='failure' path) — no need to duplicate those calls here.
-        this.transitionRunToBlocked(runId, reason, project);
+        this.transitionRunToBlocked(runId, reason, project, 'failure', runGenToken);
         return runId;
       }
     }
@@ -1229,7 +1259,7 @@ export class RunOrchestratorService {
     try { await this.deps.transport.reap(`${planningSessionName}:0.0`, 'planning-done-yield-to-algo'); } catch {}
     // A15: tmux reap alone left worker_runtimes state=running/ended_at NULL (A1 insert, never finalize).
     // Finalize ALL non-terminal seats for this run at planning-done yield (plancore + partner).
-    await this.finalizeRunWorkerRuntimes(runId, 'planning-done-yield-to-algo');
+    await this.finalizeRunWorkerRuntimes(runId, 'planning-done-yield-to-algo', runGenToken);
 
     // A5 / R3.13: production finishPlanning at planning-done. Only on the real planning path
     // (not cyclePlan / seedPlan skip paths — those never ran planning). Resolves cycle id from
@@ -1271,6 +1301,7 @@ export class RunOrchestratorService {
       implementationSessionName,
       implementationBrainProvider: implementationSeat.agent.provider,
       implementationBrainModel: implementationSeat.agent.model,
+      expectedGeneration: runGenToken,
     });
   }
 
@@ -1291,11 +1322,14 @@ export class RunOrchestratorService {
       implementationSessionName: string;
       implementationBrainProvider: string;
       implementationBrainModel: string;
+      /** B04 fix cycle 2 (validator V1): captured runs.generation when reached via startRunDetached. */
+      expectedGeneration?: number;
     }
   ): Promise<number> {
     const {
       projectId, prompt, redTeamAgents, runStrictAllow, effectiveProjectDir,
-      implementationSessionName, implementationBrainProvider, implementationBrainModel
+      implementationSessionName, implementationBrainProvider, implementationBrainModel,
+      expectedGeneration
     } = context;
 
     // B11-T03: extracted to drainDispatch for re-entrancy in final-tests→fix loop.
@@ -1501,16 +1535,30 @@ export class RunOrchestratorService {
     } catch (e:any) { /* non fatal */ }
 
     // Terminal: preserve failed/deferred signals; do not generic-overwrite
+    // B04 fix cycle 2 (validator V1): this whole block executes inside the SAME fire-and-forget
+    // continuation startRunDetached launches — gate the terminal UPDATE + both finalizers on the
+    // captured generation exactly as the detached-start-failed catch does.
     const finalRunStatus = hadFailed ? 'failed' : 'complete';
     const finalPhase = hadFailed ? 'failed' : 'complete';
-    try { this.deps.artifacts['db'].raw.prepare(`UPDATE runs SET phase = ?, status = ?, ended_at = datetime('now') WHERE id = ? AND phase NOT IN ('complete','failed','blocked')`).run(finalPhase, finalRunStatus, runId); } catch {}
+    const genGated = expectedGeneration != null && Number.isFinite(Number(expectedGeneration));
+    try {
+      if (genGated) {
+        this.deps.artifacts['db'].raw
+          .prepare(`UPDATE runs SET phase = ?, status = ?, ended_at = datetime('now') WHERE id = ? AND generation = ? AND phase NOT IN ('complete','failed','blocked')`)
+          .run(finalPhase, finalRunStatus, runId, expectedGeneration);
+      } else {
+        this.deps.artifacts['db'].raw
+          .prepare(`UPDATE runs SET phase = ?, status = ?, ended_at = datetime('now') WHERE id = ? AND phase NOT IN ('complete','failed','blocked')`)
+          .run(finalPhase, finalRunStatus, runId);
+      }
+    } catch {}
     try {
       await this.deps.artifacts.persistState(runDir, ['interview', 'planning', 'executing', finalPhase], finalRunStatus, runId);
     } catch {}
     // A7 / R3.15: success or task-failed completion advances the cycle board to terminal `complete`.
     this.terminalizeCycleAtRunEnd({ runId });
     // A15: seat ledger clean on run terminal (success or task-failed).
-    await this.finalizeRunWorkerRuntimes(runId, hadFailed ? 'run-failed' : 'run-complete');
+    await this.finalizeRunWorkerRuntimes(runId, hadFailed ? 'run-failed' : 'run-complete', expectedGeneration);
 
     // S03 / AC24: ibrain completion assertion at true run terminal ONLY.
     // finalizeBrainSessionRow → finalizeWorkerRuntimeRow → S02 markIdle. No tmux reap (D-a3 below).
@@ -1522,6 +1570,7 @@ export class RunOrchestratorService {
       state: hadFailed ? 'failed' : 'done',
       provider: implementationBrainProvider,
       model: implementationBrainModel,
+      expectedGeneration,
     });
 
     // D-a3: do NOT reap on completion (was silent reap). Instead set the close-confirm state

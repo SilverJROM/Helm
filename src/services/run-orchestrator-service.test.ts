@@ -812,6 +812,90 @@ describe('RunOrchestratorService (A2 wiring)', () => {
 
       startRunSpy.mockRestore();
     });
+
+    // B04 fix cycle 2 (validator V1): finalizeRunWorkerRuntimes was gated at only 1 of 5 production
+    // call sites — the other 4 (run-blocked-failure, planning-done-yield, run-complete/failed,
+    // run-stopped) run inside the SAME fire-and-forget startRunDetached continuation and were
+    // measured reaping a recycled occupant's live worker. transitionRunToBlocked's own terminal
+    // UPDATE was also ungated. This drives the real (unmocked) production transitionRunToBlocked —
+    // now generation-aware — with the exact captured token a stale continuation would carry, against
+    // a run id already recycled by a new occupant with a live worker.
+    it('a stale continuation driving transitionRunToBlocked cannot blocked-fail a recycled occupant nor reap its live workers', async () => {
+      const proj = projectSvc.createProject({ name: 'b04-blocked-collision', directory: '/tmp/b04-blocked-collision' });
+      const pid = proj.id;
+
+      // Native lifecycle A: runId=R, generation=G — precreated exactly as startRunDetached does
+      // (createRun, no background startRun kicked off; this test drives transitionRunToBlocked
+      // directly to isolate the fixed method from the rest of startRunInner's machinery).
+      const runDirA = path.join(os.tmpdir(), `helm-b04-blocked-a-${Date.now()}`);
+      const nativeRunId = artifacts.createRun(pid, 'b04blockedA', path.join(runDirA, CANONICAL_CYCLE_ARTIFACTS.northStar), null);
+      const staleGeneration = (db.raw.prepare('SELECT generation FROM runs WHERE id = ?').get(nativeRunId) as any).generation;
+
+      // A has no live worker yet (FK-safe delete), matching the validator's premise: the window is
+      // widest exactly where a run is still starting/pre-planning.
+      db.raw.prepare('DELETE FROM runs WHERE id = ?').run(nativeRunId);
+      expect((db.raw.prepare('SELECT COUNT(*) AS n FROM runs').get() as any).n).toBe(0);
+
+      const { allocateLifecycleGeneration } = await import('./lifecycle-cas.js');
+      const freshGeneration = allocateLifecycleGeneration(db.raw);
+      expect(freshGeneration).not.toBe(staleGeneration);
+      db.raw
+        .prepare(
+          `INSERT INTO runs (id, project_id, cycle_id, batch_id, north_star_ref, status, phase, generation)
+           VALUES (?,?,?,?,?,'active','executing',?)`
+        )
+        .run(nativeRunId, pid, null, 'b04-recycled-blocked-batch', null, freshGeneration);
+      const newWorkerInfo = db.raw
+        .prepare(
+          `INSERT INTO worker_runtimes (project_id, role, provider, model, session, correlation_id, state, spawned_by, run_id, started_at)
+           VALUES (?,?,?,?,?,?,'running','b04-test',?, datetime('now'))`
+        )
+        .run(pid, 'implementer', 'grok', 'grok-4.5', 'helm-b04-blocked-new-occupant', 'b04-corr-blocked', nativeRunId);
+      const newWorkerId = Number(newWorkerInfo.lastInsertRowid);
+
+      // A's stale continuation finally reaches a blocked-transition (e.g. resolve-time collision,
+      // seat-binary preflight, zero-tasks-ingested — all thread runGenToken captured at A's own
+      // dispatch boundary). Call the real, now generation-aware production method directly.
+      (orch as any).transitionRunToBlocked(nativeRunId, 'stale continuation reached this late', proj, 'failure', staleGeneration);
+      await new Promise((r) => setTimeout(r, 100)); // let the internal finalize/brain-assert IIFE settle
+
+      const bAfter = db.raw.prepare('SELECT phase, status, generation FROM runs WHERE id = ?').get(nativeRunId) as any;
+      expect(bAfter.phase).not.toBe('blocked');
+      expect(bAfter.status).not.toBe('failed');
+      expect(bAfter.generation).toBe(freshGeneration);
+
+      const newWorkerAfter = db.raw.prepare('SELECT state, ended_at FROM worker_runtimes WHERE id = ?').get(newWorkerId) as any;
+      expect(newWorkerAfter.state).toBe('running');
+      expect(newWorkerAfter.ended_at).toBeNull();
+      expect(fakeT.reapCalls.some((c) => c.handle.startsWith('helm-b04-blocked-new-occupant'))).toBe(false);
+    });
+
+    it('current generation transitionRunToBlocked still blocked-fails and reaps once (regression: the gate does not break the live path)', async () => {
+      const proj = projectSvc.createProject({ name: 'b04-blocked-current', directory: '/tmp/b04-blocked-current' });
+      const pid = proj.id;
+      const runDirA = path.join(os.tmpdir(), `helm-b04-blocked-current-${Date.now()}`);
+      const runId = artifacts.createRun(pid, 'b04blockedcurrent', path.join(runDirA, CANONICAL_CYCLE_ARTIFACTS.northStar), null);
+      const currentGeneration = (db.raw.prepare('SELECT generation FROM runs WHERE id = ?').get(runId) as any).generation;
+
+      const workerInfo = db.raw
+        .prepare(
+          `INSERT INTO worker_runtimes (project_id, role, provider, model, session, correlation_id, state, spawned_by, run_id, started_at)
+           VALUES (?,?,?,?,?,?,'running','b04-test',?, datetime('now'))`
+        )
+        .run(pid, 'implementer', 'grok', 'grok-4.5', 'helm-b04-blocked-current-worker', 'b04-corr-blocked-current', runId);
+      const workerId = Number(workerInfo.lastInsertRowid);
+
+      (orch as any).transitionRunToBlocked(runId, 'current-generation blocked transition', proj, 'failure', currentGeneration);
+      await new Promise((r) => setTimeout(r, 100));
+
+      const after = db.raw.prepare('SELECT phase, status FROM runs WHERE id = ?').get(runId) as any;
+      expect(after.phase).toBe('blocked');
+      expect(after.status).toBe('failed');
+
+      const worker = db.raw.prepare('SELECT state, ended_at FROM worker_runtimes WHERE id = ?').get(workerId) as any;
+      expect(worker.state).toBe('reaped');
+      expect(worker.ended_at).toBeTruthy();
+    });
   });
 
   it('D-b: startRun enters interview phase, waits for NORTH-STAR-READY (no autonomous before), transitions planning->execute; plan per-task model/effort flows (D-b1 + D-b2)', async () => {
