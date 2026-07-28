@@ -1,5 +1,6 @@
 // S14a — targeted human manual close (AC9/10/11 replacement mechanism).
-// owner='human' only. Pre-terminate recheck: registry row + helm- prefix + @helm_child.
+// owner='human' only. Pre-terminate recheck AFTER @helm_child await, immediately before claim/terminate.
+// V2: atomic tryClaimHumanClose so concurrent closes yield exactly one terminate.
 // HARD SAFETY: callers must inject fake tmux in tests; never target live sessions from tests.
 
 import type { SessionRegistryService } from './session-registry-service.js';
@@ -30,8 +31,14 @@ function isValidSessionName(name: string): boolean {
 /**
  * Close a human-owned Helm session: targeted terminate + idempotent registry converge.
  * Refuse helm/legacy/null/missing/tag-failed/non-helm/invalid. Already-reaped is idempotent success.
+ *
+ * Concurrency: per-name in-flight map + atomic tryClaimHumanClose so two concurrent callers
+ * produce exactly one terminate.
  */
 export class SessionCloseService {
+  /** In-flight closes keyed by session name (serialize concurrent double-close). */
+  private readonly inFlight = new Map<string, Promise<SessionCloseResult>>();
+
   constructor(
     private readonly registry: SessionRegistryService,
     private readonly tmux: SessionCloseTmux
@@ -47,6 +54,17 @@ export class SessionCloseService {
       return { ok: false, reason: 'non_helm_name', error: 'session name must start with helm-' };
     }
 
+    const existing = this.inFlight.get(name);
+    if (existing) return existing;
+
+    const run = this.closeHumanSessionOnce(name).finally(() => {
+      this.inFlight.delete(name);
+    });
+    this.inFlight.set(name, run);
+    return run;
+  }
+
+  private async closeHumanSessionOnce(name: string): Promise<SessionCloseResult> {
     const row = this.registry.get(name);
     if (!row) {
       return { ok: false, reason: 'missing', error: 'session not found in registry' };
@@ -64,7 +82,27 @@ export class SessionCloseService {
       return { ok: true, closed: name, alreadyReaped: true };
     }
 
-    // Immediate pre-terminate recheck (TOCTOU belt).
+    // Tag probe is the await window (real tmux show-options). Fail-safe on error.
+    let helmTagged = false;
+    try {
+      helmTagged = await this.tmux.sessionHasHelmChildTag(name);
+    } catch (err) {
+      helmTagged = false;
+      console.warn('[session-close] @helm_child probe failed → treating as NOT-Helm (fail-safe)', {
+        name,
+        err: String(err),
+      });
+    }
+    if (!helmTagged) {
+      return {
+        ok: false,
+        reason: 'tag_failed',
+        error: 'session missing positive @helm_child tag; refuse close',
+      };
+    }
+
+    // V1: re-check registry AFTER tag await, immediately before claim/terminate.
+    // Re-assert present + helm- prefix + owner=human + not reaped.
     const fresh = this.registry.get(name);
     if (!fresh) {
       return { ok: false, reason: 'missing', error: 'session not found in registry' };
@@ -83,26 +121,39 @@ export class SessionCloseService {
       return { ok: true, closed: name, alreadyReaped: true };
     }
 
-    let helmTagged = false;
-    try {
-      helmTagged = await this.tmux.sessionHasHelmChildTag(name);
-    } catch {
-      helmTagged = false;
-    }
-    if (!helmTagged) {
+    // V2: atomic claim — only one concurrent closer wins; losers re-read.
+    const claimed = this.registry.tryClaimHumanClose(name, 'human-close');
+    if (!claimed) {
+      const after = this.registry.get(name);
+      if (after?.status === 'reaped') {
+        return { ok: true, closed: name, alreadyReaped: true };
+      }
+      if (!after) {
+        return { ok: false, reason: 'missing', error: 'session not found in registry' };
+      }
+      if (after.owner !== 'human') {
+        return {
+          ok: false,
+          reason: 'not_human',
+          error: `only human-owned sessions may be closed manually (owner=${after.owner ?? 'null'})`,
+        };
+      }
+      // Unexpected active human without claim — fail closed without terminate.
       return {
         ok: false,
-        reason: 'tag_failed',
-        error: 'session missing positive @helm_child tag; refuse close',
+        reason: 'not_human',
+        error: 'close claim lost; refuse terminate',
       };
     }
 
-    // Targeted terminate (fake tmux only in tests). Then converge registry.
-    await this.tmux.terminateSession(name);
+    // Claim won: targeted terminate (fake tmux in tests). Best-effort — row already converged.
     try {
-      this.registry.markReaped(name, 'human-close');
-    } catch {
-      /* best-effort; real TmuxService may also fire onTerminate → markReaped */
+      await this.tmux.terminateSession(name);
+    } catch (err) {
+      console.warn('[session-close] terminateSession failed after claim (registry already reaped)', {
+        name,
+        err: String(err),
+      });
     }
     return { ok: true, closed: name };
   }

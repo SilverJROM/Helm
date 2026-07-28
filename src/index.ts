@@ -38,11 +38,8 @@ import { MasterRuntimeService } from "./services/master-runtime-service.js";
 import { WorkerService } from "./services/worker-service.js";
 import { HelmIdentityService, requireActiveNativeProject } from "./services/helm-identity-service.js";
 import { SessionRegistryService } from "./services/session-registry-service.js";
-import {
-  SessionCloseService,
-  projectSessionListRow,
-  sessionCloseHttpStatus,
-} from "./services/session-close-service.js";
+import { SessionCloseService } from "./services/session-close-service.js";
+import { registerSessionCloseRoutes } from "./api/routes/session-close-routes.js";
 import { configureWorkerRuntimeFinalize } from "./services/worker-runtime-finalize.js";
 import { UsageGatewayService } from "./services/usage-gateway-service.js";
 import { ModelService } from "./services/model-service.js";
@@ -128,6 +125,8 @@ class FakeTmuxService {
   async terminateSession(_name: string) { }
   async terminatePane(_target: string) { }
   async forceKillPane(_target: string) { }
+  // S14a V4: human-close tag gate under USE_FAKE_TMUX=1 — treat fake sessions as Helm-created.
+  async sessionHasHelmChildTag(_name: string) { return true; }
   async capturePane(target: string, _lines = 200) { return this.panes.get(target) ?? this.basePane(); }
   async waitForReady(_target: string, _signal = '❯', _timeoutMs = 30000) { return true; }
 
@@ -1068,30 +1067,14 @@ async function main(): Promise<void> {
     return { sessions: await chatSessionService.listActiveSessions() };
   });
 
-  // SL-R1 / S14a: guarded read of the session-lifecycle registry (owner + status for manual close UI).
-  app.get('/api/sessions', { preHandler: [authMiddleware, requireOwnerPre] }, async () => {
-    const sessions = sessionRegistry.list().map((s) => projectSessionListRow(s));
-    return { sessions };
+  // S14a: GET /api/sessions (+owner) + POST /api/sessions/:name/close (human-only). Extracted for inject tests.
+  registerSessionCloseRoutes(app, {
+    sessionRegistry,
+    sessionCloseService,
+    authMiddleware,
+    requireOwnerPre,
+    requireLocalLaunchPre,
   });
-
-  // S14a: targeted human-only manual close (AC9/10/11 replacement). owner='human' only.
-  // Pre-terminate recheck: registry row + helm- prefix + positive @helm_child. Fake tmux in tests only.
-  app.post('/api/sessions/:name/close', { preHandler: [authMiddleware, requireOwnerPre, requireLocalLaunchPre] }, async (request: any, reply: any) => {
-    const name = String(request.params?.name ?? '');
-    try {
-      const result = await sessionCloseService.closeHumanSession(name);
-      if (!result.ok) {
-        return reply.code(sessionCloseHttpStatus(result.reason)).send({
-          error: result.error,
-          reason: result.reason,
-        });
-      }
-      return { ok: true, closed: result.closed, already_reaped: !!result.alreadyReaped };
-    } catch (e: any) {
-      return reply.code(500).send({ error: e?.message || 'close failed' });
-    }
-  });
-
 
   app.post('/api/agents/:agentId/chat-session', { preHandler: [authMiddleware, requireOwnerPre, requireLocalLaunchPre] }, async (request: any, reply: any) => {
     const agentId = Number(request.params.agentId);

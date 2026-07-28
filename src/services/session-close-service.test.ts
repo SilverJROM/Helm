@@ -1,5 +1,6 @@
-// S14a — human session close API service tests.
+// S14a — human session close API service tests (V1/V2 mechanism + refusals).
 // Synthetic DB + fake tmux only. HELM_SESSION_JANITOR stays 0. Never live kill-session.
+// HTTP layer covered by src/api/routes/session-close-routes.test.ts (app.inject).
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -36,7 +37,7 @@ describe('S14a SessionCloseService (human manual close)', () => {
   let cleanup: () => void;
   let reg: SessionRegistryService;
   let terminated: string[];
-  let tagMap: Map<string, boolean | 'throw'>;
+  let tagMap: Map<string, boolean | 'throw' | (() => void | Promise<void>)>;
   let tmux: SessionCloseTmux;
   let svc: SessionCloseService;
 
@@ -67,6 +68,10 @@ describe('S14a SessionCloseService (human manual close)', () => {
       },
       sessionHasHelmChildTag: async (name: string) => {
         const v = tagMap.has(name) ? tagMap.get(name)! : true;
+        if (typeof v === 'function') {
+          await v();
+          return true;
+        }
         if (v === 'throw') throw new Error('probe failed');
         return v === true;
       },
@@ -139,7 +144,6 @@ describe('S14a SessionCloseService (human manual close)', () => {
   });
 
   it('non-helm- name refuse → zero terminate', async () => {
-    // Row could exist theoretically; name gate fires first after charset check.
     seed('other-session-x', { owner: 'human' });
     const r = await svc.closeHumanSession('other-session-x');
     expect(r.ok).toBe(false);
@@ -161,8 +165,43 @@ describe('S14a SessionCloseService (human manual close)', () => {
     expect(terminated).toEqual(['helm-chat-dup']);
     const r2 = await svc.closeHumanSession('helm-chat-dup');
     expect(r2).toEqual({ ok: true, closed: 'helm-chat-dup', alreadyReaped: true });
-    expect(terminated).toEqual(['helm-chat-dup']); // still exactly one
+    expect(terminated).toEqual(['helm-chat-dup']);
     expect(reg.get('helm-chat-dup')!.status).toBe('reaped');
+  });
+
+  // V1: recheck after tag await must observe mid-probe owner flip.
+  it('V1: mid-await owner flip to helm → zero terminate', async () => {
+    seed('helm-chat-probe-a');
+    tagMap.set('helm-chat-probe-a', async () => {
+      // Mutate during the await window (simulates recreate with owner=helm).
+      db.prepare(`UPDATE helm_sessions SET owner = 'helm' WHERE name = ?`).run('helm-chat-probe-a');
+    });
+    const r = await svc.closeHumanSession('helm-chat-probe-a');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe('not_human');
+    expect(terminated).toEqual([]);
+    expect(reg.get('helm-chat-probe-a')!.owner).toBe('helm');
+    expect(reg.get('helm-chat-probe-a')!.status).toBe('active');
+  });
+
+  // V2: concurrent double-close → exactly one terminate.
+  it('V2: Promise.all two callers → exactly one terminate', async () => {
+    seed('helm-chat-probe-b');
+    // Slow tag so both enter the path before either claims.
+    tagMap.set('helm-chat-probe-b', async () => {
+      await new Promise((r) => setTimeout(r, 30));
+    });
+    const [a, b] = await Promise.all([
+      svc.closeHumanSession('helm-chat-probe-b'),
+      svc.closeHumanSession('helm-chat-probe-b'),
+    ]);
+    expect(a.ok).toBe(true);
+    expect(b.ok).toBe(true);
+    expect(terminated).toEqual(['helm-chat-probe-b']);
+    expect(reg.get('helm-chat-probe-b')!.status).toBe('reaped');
+    // At most one is the primary closer; the other may be alreadyReaped or same promise result.
+    const reapedFlags = [a, b].map((r) => (r.ok ? !!r.alreadyReaped : null));
+    expect(reapedFlags.filter((x) => x === false || x === true).length).toBe(2);
   });
 
   it('projectSessionListRow includes owner + status', () => {
@@ -174,8 +213,6 @@ describe('S14a SessionCloseService (human manual close)', () => {
       owner: 'human',
       status: 'active',
     });
-    expect(projected).toHaveProperty('owner');
-    expect(projected).toHaveProperty('status');
   });
 
   it('sessionCloseHttpStatus maps refuse reasons', () => {
@@ -184,24 +221,6 @@ describe('S14a SessionCloseService (human manual close)', () => {
     expect(sessionCloseHttpStatus('non_helm_name')).toBe(400);
     expect(sessionCloseHttpStatus('not_human')).toBe(403);
     expect(sessionCloseHttpStatus('tag_failed')).toBe(403);
-  });
-
-  it('route source: GET includes owner; POST close uses auth + human close service', () => {
-    const indexSrc = fs.readFileSync(path.join(__dirname, '../index.ts'), 'utf8');
-    // GET /api/sessions projects via projectSessionListRow (includes owner + status)
-    expect(indexSrc).toMatch(/app\.get\(\s*['"]\/api\/sessions['"]/);
-    expect(indexSrc).toMatch(/projectSessionListRow/);
-    // POST close route authenticated + owner + local-launch (terminate-capable)
-    expect(indexSrc).toMatch(
-      /app\.post\(\s*['"]\/api\/sessions\/:name\/close['"]\s*,\s*\{\s*preHandler:\s*\[\s*authMiddleware\s*,\s*requireOwnerPre\s*,\s*requireLocalLaunchPre/
-    );
-    expect(indexSrc).toMatch(/sessionCloseService\.closeHumanSession/);
-    // auth required on both
-    const getBlock = indexSrc.match(
-      /app\.get\(\s*['"]\/api\/sessions['"][\s\S]{0,200}/
-    )?.[0];
-    expect(getBlock).toMatch(/authMiddleware/);
-    expect(getBlock).toMatch(/requireOwnerPre/);
   });
 
   it('HELM_SESSION_JANITOR remains 0 in deployed config', () => {

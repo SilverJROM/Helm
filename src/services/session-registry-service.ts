@@ -193,6 +193,21 @@ WHERE name = ?
 `).run(reason ?? null, name);
   }
 
+  /**
+   * S14a / V2: atomic claim for human manual close.
+   * Marks reaped only when the row is still human-owned and not yet reaped.
+   * Returns true iff this caller won the claim (changes === 1). Losers must re-read.
+   */
+  tryClaimHumanClose(name: string, reason?: string): boolean {
+    if (!name) return false;
+    const info = this.db.prepare(`
+UPDATE helm_sessions
+SET status = 'reaped', ended_at = datetime('now'), reason = COALESCE(?, reason)
+WHERE name = ? AND status != 'reaped' AND owner = 'human'
+`).run(reason ?? null, name);
+    return Number(info.changes) === 1;
+  }
+
   /** SL-R2: enrich a row with late-known context (run_id/project_id/kind). Only fills nulls / overrides given. */
   enrich(name: string, opts: EnrichOpts = {}): void {
     if (!name) return;
