@@ -29,7 +29,7 @@ import { AgentAssignmentService } from "./services/agent-assignment-service.js";
 import { PhaseStaffingService } from "./services/phase-staffing.js";
 import { ToolkitService } from "./services/toolkit-service.js";
 import { MasterModelService } from "./services/master-model-service.js";
-import { TmuxService } from "./tmux/tmux-service.js";
+import { TmuxService, SessionNameCollisionError } from "./tmux/tmux-service.js";
 import { AgentEventsService } from "./services/agent-events-service.js";
 import { parseCallbacksMd, toRunChatMessages, mergeChatMessages, CallbackTsCache, tsToMs } from "./services/run-chat-merge.js";
 import { ProviderResolverService } from "./services/provider-resolver-service.js";
@@ -1148,6 +1148,15 @@ async function main(): Promise<void> {
       // tmux_session + spawn_model surfaced so the UI can show them + JROM can `tmux attach -t <name>`.
       return { session_id: result.sessionId, tmux_session: result.tmuxSession, spawn_model: result.spawnModel };
     } catch (e: any) {
+      // B09 / AC12: preserve B08 typed collision as a stable 409 refusal (not a generic 500).
+      if (e?.code === 'SESSION_NAME_COLLISION' || e instanceof SessionNameCollisionError || e?.name === 'SessionNameCollisionError') {
+        return reply.code(409).send({
+          error: String(e.message || 'session name collision refused'),
+          code: 'SESSION_NAME_COLLISION',
+          reason: e.reason ?? 'exists_unknown',
+          session_name: e.sessionName ?? null,
+        });
+      }
       if (e.message?.includes('not validated')) return reply.code(409).send({ error: e.message });
       return reply.code(500).send({ error: e.message });
     }
@@ -1370,6 +1379,15 @@ async function main(): Promise<void> {
       const result = await chatSessionService.create(agentId, body.model_id, pid, { projectFenceDir: project.directory, activeCycle });
       return { session_id: result.sessionId, tmux_session: result.tmuxSession, spawn_model: result.spawnModel, project_dir: project.directory };
     } catch (e: any) {
+      // B09 / AC12: preserve B08 typed collision as a stable 409 refusal (not a generic 500).
+      if (e?.code === 'SESSION_NAME_COLLISION' || e instanceof SessionNameCollisionError || e?.name === 'SessionNameCollisionError') {
+        return reply.code(409).send({
+          error: String(e.message || 'session name collision refused'),
+          code: 'SESSION_NAME_COLLISION',
+          reason: e.reason ?? 'exists_unknown',
+          session_name: e.sessionName ?? null,
+        });
+      }
       if (e.message?.includes('not validated')) return reply.code(409).send({ error: e.message });
       return reply.code(500).send({ error: e.message });
     }

@@ -1843,13 +1843,17 @@ function App() {
       const body = ccWsCycleId ? { cycle_id: ccWsCycleId } : {};
       const r = await authedFetch(`/api/projects/${pid}/agent-chat/${aid}`, { method: 'POST', body: JSON.stringify(body), allowStatuses: [409] });
       const d = await r.json();
-      if (r.status === 409 && d.session_id) {
+      if (r.status === 409 && d.session_id && d.code !== 'SESSION_NAME_COLLISION') {
         // Agent already live (e.g. a Studio session) — attach instead of double-spawning.
+        // B09: collision 409 has code SESSION_NAME_COLLISION and no attachable session_id path.
         const next = { sid: d.session_id, agentId: aid, tmux: d.tmux_session || null };
         ccSetSession(pid, next);
         ccAttachStream(pid, aid, d.session_id);
         return next;
       } else if (!r.ok) {
+        if (d && d.code === 'SESSION_NAME_COLLISION') {
+          throw new Error(d.error || ('session name collision refused (' + (d.reason || 'unknown') + ')'));
+        }
         throw new Error(d.error || ('session start failed (' + r.status + ')'));
       } else {
         const next = { sid: d.session_id, agentId: aid, tmux: d.tmux_session || null };
@@ -3270,12 +3274,21 @@ function App() {
     const body = (!isHelmAgent && chatSpawnModelOverride)
       ? JSON.stringify({ model_id: chatSpawnModelOverride })
       : undefined;
+    // B09 / AC12: allow 409 so collision body reaches setChatErr (not global "fetch fail").
     const r = await authedFetch(`/api/agents/${agentId}/chat-session`, {
       method: 'POST',
+      allowStatuses: [409],
       ...(body ? { headers: { 'Content-Type': 'application/json' }, body } : {})
     });
-    if (!r.ok) { const d = await r.json(); throw new Error(d.error || r.status); }
-    const { session_id, tmux_session, spawn_model } = await r.json();
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      // Busy-attach is project-chat only; Studio has no session_id attach path on this POST.
+      if (d && d.code === 'SESSION_NAME_COLLISION') {
+        throw new Error(d.error || ('session name collision refused (' + (d.reason || 'unknown') + ')'));
+      }
+      throw new Error(d.error || r.status);
+    }
+    const { session_id, tmux_session, spawn_model } = d;
     setChatSid(session_id);
     setChatTmuxSession(tmux_session || null);
     setChatActualSpawnModel(spawn_model || '');
@@ -6981,7 +6994,7 @@ function App() {
           </div>
         </div>
 
-        ${ccErr && html`<div style="color:#f85149;font-size:11px;padding:4px 8px;border-top:1px solid var(--border);">${ccErr}</div>`}
+        ${ccErr && html`<div data-testid="cc-session-err" style="color:#f85149;font-size:11px;padding:4px 8px;border-top:1px solid var(--border);">${ccErr}</div>`}
         ${!pid ? html`<div class="inline-note" style="padding:3px 6px;font-size:10px;">Select project in left sidebar (or open idle) to load chat + live terminal feed. 3-way above controls panes.</div>` : null}
       </div>
     </div>`;
