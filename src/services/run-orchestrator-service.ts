@@ -2516,6 +2516,20 @@ validation_criteria: ${validationCriteria}
 `;
       const fullImplBrief = base.replace('<!-- PROJCORE-STATUS-CONTRACT v2 -->', `<!-- PROJCORE-STATUS-CONTRACT v2 -->${taskBody}`).trim();
 
+      // B04 fix cycle 5 (validator R4): re-check ownership immediately before loop.runTask. The
+      // awaited loadPlanFromRunDir above is a window where the run row can be deleted and recycled by
+      // a new occupant between the pre-claim fence (top of this loop) and here — the claimed
+      // terminalToken stays structurally valid (a real, frozen token), so dispatching now would
+      // execute THIS continuation's own stale project/plan/runDir/brief against the numeric task id
+      // the new occupant now owns. Do not runTask and do not mark* — leave the new occupant's queue
+      // slot untouched; only its own continuation may claim and complete it.
+      if (!ownsCurrentGeneration()) {
+        console.warn(
+          `[run-orchestrator] drainDispatch aborted for run ${runId} task ${nextTaskId} — generation ${expectedGeneration} no longer current after plan load (stale continuation); loop.runTask skipped`
+        );
+        break;
+      }
+
       try {
         const tres = await loop.runTask({
           brief: fullImplBrief,

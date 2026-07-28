@@ -1085,6 +1085,86 @@ describe('RunOrchestratorService (A2 wiring)', () => {
       const bTaskFinal = db.raw.prepare('SELECT status FROM run_tasks WHERE id = ?').get(bTaskId) as any;
       expect(bTaskFinal.status).toBe('complete');
     });
+
+    // B04 fix cycle 5 (validator R4): the fix-cycle-4 fence checks generation only at the TOP of the
+    // claim loop, before queue.claimNextReady. A passes that check fairly (its own row, its own
+    // generation, at that instant) and claims its OWN task A1. The claimed terminalToken stays
+    // structurally valid even after the row is deleted out from under it — nothing invalidates a
+    // frozen token. Between the claim and loop.runTask, drainDispatch awaits
+    // parser.loadPlanFromRunDir(runDir); if the recycle happens DURING that await, A resumes holding
+    // a token whose numeric taskId now belongs to B, and would call loop.runTask with A's own (wrong)
+    // project/plan/runDir/brief context against B's task — the redteam's exact repro. This drives the
+    // REAL drainDispatch with a spied loadPlanFromRunDir that performs the recycle itself (mid-await,
+    // not before A ever claims), reproducing the precise timing the validator's disposable probe used.
+    it('a stale continuation recycled DURING the post-claim plan-load await cannot invoke loop.runTask against the new occupant\'s task', async () => {
+      const proj = projectSvc.createProject({ name: 'b04-r4-postclaim', directory: '/tmp/b04-r4-postclaim' });
+      const pid = proj.id;
+      const runDirA = path.join(os.tmpdir(), `helm-b04-r4-postclaim-${Date.now()}`);
+      await fs.mkdir(runDirA, { recursive: true });
+
+      // Native A: runId=R, generation=G1. A's OWN task A1 is enqueued so the pre-claim fence passes
+      // fairly and A genuinely claims its own (at that instant, legitimate) token.
+      const nativeRunId = artifacts.createRun(pid, 'b04r4postclaimA', path.join(runDirA, CANONICAL_CYCLE_ARTIFACTS.northStar), null);
+      const staleGeneration = (db.raw.prepare('SELECT generation FROM runs WHERE id = ?').get(nativeRunId) as any).generation;
+      const aTaskInfo = db.raw
+        .prepare(`INSERT INTO run_tasks (run_id, task_key, label, status) VALUES (?, 'T1', 'A own task', 'pending')`)
+        .run(nativeRunId);
+      const aTaskId = Number(aTaskInfo.lastInsertRowid);
+      queue.clearRun(nativeRunId);
+      queue.enqueue(nativeRunId, aTaskId, [], false, 'default', staleGeneration);
+
+      const { allocateLifecycleGeneration } = await import('./lifecycle-cas.js');
+      let freshGeneration = -1;
+      let bTaskId = -1;
+
+      // The recycle happens INSIDE the awaited plan-load call — after A has already claimed A1 (the
+      // claim happens synchronously at the top of the loop, before this await), matching the
+      // validator's exact reproduction timing.
+      const loadPlanSpy = vi.spyOn(parser, 'loadPlanFromRunDir').mockImplementation(async () => {
+        db.raw.prepare('DELETE FROM run_tasks WHERE id = ?').run(aTaskId); // A's own row, FK-safe cleanup
+        db.raw.prepare('DELETE FROM runs WHERE id = ?').run(nativeRunId);
+        freshGeneration = allocateLifecycleGeneration(db.raw);
+        expect(freshGeneration).not.toBe(staleGeneration);
+        db.raw
+          .prepare(
+            `INSERT INTO runs (id, project_id, cycle_id, batch_id, north_star_ref, status, phase, generation)
+             VALUES (?,?,?,?,?,'active','executing',?)`
+          )
+          .run(nativeRunId, pid, null, 'b04-recycled-r4-postclaim', null, freshGeneration);
+        const bTaskInfo = db.raw
+          .prepare(`INSERT INTO run_tasks (run_id, task_key, label, status) VALUES (?, 'T1', 'B own task', 'pending')`)
+          .run(nativeRunId);
+        bTaskId = Number(bTaskInfo.lastInsertRowid);
+        queue.clearRun(nativeRunId);
+        queue.enqueue(nativeRunId, bTaskId, [], false, 'default', freshGeneration);
+        return { tasks: [] } as any;
+      });
+
+      const runTaskSpy = vi.fn().mockResolvedValue({ finalStatus: 'PASS' });
+      const fakeLoop = { runTask: runTaskSpy } as any;
+
+      try {
+        await (orch as any).drainDispatch(nativeRunId, runDirA, 'b04r4postclaimA', proj, fakeLoop, queue, staleGeneration);
+
+        // The stale continuation must never have invoked loop.runTask — not with A1's identity, and
+        // certainly not against B's recycled task id.
+        expect(runTaskSpy).not.toHaveBeenCalled();
+
+        // B's task remains pending and legitimately claimable by B's own continuation.
+        expect(bTaskId).toBeGreaterThan(0);
+        const bTaskAfter = db.raw.prepare('SELECT status FROM run_tasks WHERE id = ?').get(bTaskId) as any;
+        expect(bTaskAfter.status).toBe('pending');
+        const token = queue.claimNextReady(nativeRunId);
+        expect(token).not.toBeNull();
+        expect(token!.taskId).toBe(bTaskId);
+        expect(token!.runGeneration).toBe(freshGeneration);
+        expect(queue.markComplete(token!)).toBe(true);
+        const bTaskFinal = db.raw.prepare('SELECT status FROM run_tasks WHERE id = ?').get(bTaskId) as any;
+        expect(bTaskFinal.status).toBe('complete');
+      } finally {
+        loadPlanSpy.mockRestore();
+      }
+    });
   });
 
   it('D-b: startRun enters interview phase, waits for NORTH-STAR-READY (no autonomous before), transitions planning->execute; plan per-task model/effort flows (D-b1 + D-b2)', async () => {
