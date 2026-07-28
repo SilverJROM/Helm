@@ -1,5 +1,35 @@
 # [batch-DEBT-F3] Exact-tuple residual identity (not reason substring)
 
+# S18b send-back 2/7 — housekeeper callback apply safety
+
+## User Report
+Implementer L3 codex55 S18b SEND-BACK attempt 2/7. Base FAIL commit af88456 branch s18b-housekeeper-apply.
+Read plan/janitor-consent-redesign/validation/S18b-validation.md fully.
+
+BLOCKING only:
+V1: Record investigation callback verdict/evidence/rationale BEFORE markIdle. If audit write fails, do not mutate session. Prefer transaction or write-then-mutate with fail-closed.
+V2: Refuse done when evidence/rationale empty/malformed — keep-biased (needs-human or refuse), zero markIdle.
+V3: Idempotent apply — if investigation already terminal (applied_done/needs_human), no-op second done (no second markIdle); reject conflicting later verdict overwrites.
+
+Add focused synthetic tests for all three.
+HARD SAFETY: HELM_SESSION_JANITOR=0; zero terminate; no reap; markIdle only on valid done.
+Commit; append:
+[projcore callback] impl S18b STATUS: DONE — COMPLETE | send-back 2/7 | commit=<hash>; V1-V3; ...
+
+## Mechanism
+`HousekeeperService.applyCallback()` had no terminal-state guard, accepted empty `done` proof, and called `markIdle()` before the investigation audit update. The fix validates `done` proof before mutation, treats `applied_done`/`needs_human` as immutable terminal states, and writes the `applied_done` audit row inside a SQLite transaction before calling `markIdle()`.
+
+## Files
+- `src/services/housekeeper-service.ts`: fail-closed proof validation, terminal idempotency/conflict handling, audit-before-idle transaction.
+- `src/s18a-housekeeper-dispatch.test.ts`: focused synthetic regressions for V1 audit write failure, V2 empty proof refusal, and V3 duplicate/conflicting callback idempotency.
+
+## Verify
+- `HELM_SESSION_JANITOR=0 npx vitest run src/s18a-housekeeper-dispatch.test.ts` → 14/14 pass.
+- `npm run typecheck` → pass.
+- `HELM_SESSION_JANITOR=0 npx vitest run src/s15-housekeeper-seed.test.ts src/s17-house-usage-selector.test.ts src/s18a-housekeeper-dispatch.test.ts` → 28/28 pass.
+- `git diff --check 687797b..HEAD` → pass.
+- Safety: synthetic tests assert zero terminate/reap; `markIdle` occurs only once for the first valid `done`.
+
 ## Mechanism
 B25c residual carve-outs keyed on `reason.includes('projcore')` (substring ≠ identity).
 Live orphan was deleted in B25d (v77); DEBT-F3 permanently replaces the disease with:

@@ -363,6 +363,104 @@ describe('S18a/S18b housekeeper dispatch/apply', () => {
     expect(transport.reapCalls).toEqual([]);
   });
 
+  it('apply done writes audit evidence before markIdle and fail-closes if audit write fails', async () => {
+    seedSession('helm-w-audit-first', { owner: 'helm', status: 'active' });
+    const svc = makeService(snap({ spark: { headroom: 42, depleted: false, worst_bucket: 58 } }));
+    const dispatched = await svc.dispatchOnce({ nowMs: Date.now() });
+    expect(dispatched.outcome).toBe('dispatched');
+    if (dispatched.outcome !== 'dispatched') return;
+
+    db.exec(`
+      CREATE TRIGGER force_housekeeper_audit_write_failure
+      BEFORE UPDATE OF callback_verdict, callback_evidence, callback_rationale, status ON housekeeper_investigations
+      WHEN NEW.id = ${dispatched.investigationId} AND NEW.status = 'applied_done'
+      BEGIN
+        SELECT RAISE(ABORT, 'forced audit write failure');
+      END;
+    `);
+
+    expect(() => svc.applyCallback(dispatched.investigationId, {
+      verdict: 'done',
+      evidence: 'pane showed completed prompt and no active generation',
+      rationale: 'safe to mark idle only',
+    })).toThrow(/forced audit write failure/);
+
+    const inv = svc.getInvestigation(dispatched.investigationId);
+    expect(inv.status).toBe('dispatched');
+    expect(inv.callback_verdict).toBeNull();
+    expect(inv.callback_evidence).toBeNull();
+    expect(inv.callback_rationale).toBeNull();
+    expect(reg.get('helm-w-audit-first')!.status).toBe('active');
+    expect(tmux.terminateCalls).toEqual([]);
+    expect(transport.reapCalls).toEqual([]);
+  });
+
+  it('apply done refuses empty evidence/rationale and does not mark idle', async () => {
+    seedSession('helm-w-empty-proof', { owner: 'helm', status: 'active' });
+    const svc = makeService(snap({ spark: { headroom: 42, depleted: false, worst_bucket: 58 } }));
+    const dispatched = await svc.dispatchOnce({ nowMs: Date.now() });
+    expect(dispatched.outcome).toBe('dispatched');
+    if (dispatched.outcome !== 'dispatched') return;
+
+    const rejected = svc.applyCallback(dispatched.investigationId, {
+      verdict: 'done',
+      evidence: '',
+      rationale: '   ',
+    });
+
+    expect(rejected).toMatchObject({ ok: false, outcome: 'invalid_callback_proof' });
+    const inv = svc.getInvestigation(dispatched.investigationId);
+    expect(inv.status).toBe('dispatched');
+    expect(inv.callback_verdict).toBeNull();
+    expect(reg.get('helm-w-empty-proof')!.status).toBe('active');
+    expect(tmux.terminateCalls).toEqual([]);
+    expect(transport.reapCalls).toEqual([]);
+  });
+
+  it('apply done is terminal/idempotent and rejects conflicting later verdicts without another markIdle', async () => {
+    seedSession('helm-w-idempotent-done', { owner: 'helm', status: 'active' });
+    const svc = makeService(snap({ spark: { headroom: 42, depleted: false, worst_bucket: 58 } }));
+    const dispatched = await svc.dispatchOnce({ nowMs: Date.now() });
+    expect(dispatched.outcome).toBe('dispatched');
+    if (dispatched.outcome !== 'dispatched') return;
+
+    const originalMarkIdle = reg.markIdle.bind(reg);
+    let markIdleCalls = 0;
+    reg.markIdle = ((name: string, reason?: string) => {
+      markIdleCalls += 1;
+      originalMarkIdle(name, reason);
+    }) as SessionRegistryService['markIdle'];
+
+    const first = svc.applyCallback(dispatched.investigationId, {
+      verdict: 'done',
+      evidence: 'pane showed completed prompt and no active generation',
+      rationale: 'safe to mark idle only',
+    });
+    const duplicate = svc.applyCallback(dispatched.investigationId, {
+      verdict: 'done',
+      evidence: 'different duplicate evidence must not overwrite terminal audit',
+      rationale: 'different duplicate rationale must not call mark idle again',
+    });
+    const conflict = svc.applyCallback(dispatched.investigationId, {
+      verdict: 'needs-human',
+      evidence: 'conflicting later callback',
+      rationale: 'must not overwrite applied done',
+    });
+
+    expect(first).toMatchObject({ ok: true, outcome: 'applied_done' });
+    expect(duplicate).toMatchObject({ ok: true, outcome: 'applied_done' });
+    expect(conflict).toMatchObject({ ok: false, outcome: 'terminal_conflict' });
+    expect(markIdleCalls).toBe(1);
+    const inv = svc.getInvestigation(dispatched.investigationId);
+    expect(inv.status).toBe('applied_done');
+    expect(inv.callback_verdict).toBe('done');
+    expect(inv.callback_evidence).toBe('pane showed completed prompt and no active generation');
+    expect(inv.callback_rationale).toBe('safe to mark idle only');
+    expect(reg.get('helm-w-idempotent-done')!.status).toBe('idle');
+    expect(tmux.terminateCalls).toEqual([]);
+    expect(transport.reapCalls).toEqual([]);
+  });
+
   it('apply needs-human persists uncertainty without marking idle', async () => {
     seedSession('helm-w-needs-human', { owner: 'helm', status: 'active' });
     const svc = makeService(snap({ spark: { headroom: 42, depleted: false, worst_bucket: 58 } }));

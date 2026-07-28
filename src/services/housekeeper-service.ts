@@ -56,8 +56,10 @@ export type HousekeeperApplyResult =
   | { ok: true; outcome: 'applied_done'; investigationId: number; sessionName: string }
   | { ok: true; outcome: 'needs_human'; investigationId: number; sessionName: string }
   | { ok: false; outcome: 'invalid_verdict'; error: string }
+  | { ok: false; outcome: 'invalid_callback_proof'; investigationId: number; sessionName: string; error: string }
   | { ok: false; outcome: 'not_found'; error: string }
-  | { ok: false; outcome: 'owner_recheck_failed'; investigationId: number; sessionName: string; owner: string | null; error: string };
+  | { ok: false; outcome: 'owner_recheck_failed'; investigationId: number; sessionName: string; owner: string | null; error: string }
+  | { ok: false; outcome: 'terminal_conflict'; investigationId: number; sessionName: string; existingVerdict: string | null; error: string };
 
 export interface HousekeeperEnvelope {
   schema_version: 1;
@@ -195,9 +197,34 @@ export class HousekeeperService {
     const row = this.getInvestigation(id);
     if (!row) return { ok: false, outcome: 'not_found', error: 'housekeeper investigation not found' };
 
-    const session = this.sessionRegistry.get(row.session_name);
     const evidence = boundText(input.evidence, 4000);
     const rationale = boundText(input.rationale, 4000);
+    const terminal = normalizeTerminalInvestigationStatus(row.status);
+    if (terminal) {
+      if (terminal.verdict === verdict) {
+        return { ok: true, outcome: terminal.outcome, investigationId: id, sessionName: row.session_name };
+      }
+      return {
+        ok: false,
+        outcome: 'terminal_conflict',
+        investigationId: id,
+        sessionName: row.session_name,
+        existingVerdict: row.callback_verdict ?? terminal.verdict,
+        error: 'housekeeper investigation is already terminal',
+      };
+    }
+
+    if (verdict === 'done' && (!isCallbackProofText(evidence) || !isCallbackProofText(rationale))) {
+      return {
+        ok: false,
+        outcome: 'invalid_callback_proof',
+        investigationId: id,
+        sessionName: row.session_name,
+        error: 'done callback requires non-empty evidence and rationale',
+      };
+    }
+
+    const session = this.sessionRegistry.get(row.session_name);
 
     if (!session || session.owner !== 'helm') {
       this.db
@@ -230,15 +257,17 @@ export class HousekeeperService {
       return { ok: true, outcome: 'needs_human', investigationId: id, sessionName: row.session_name };
     }
 
-    this.sessionRegistry.markIdle(row.session_name, 'housekeeper-done');
-    this.db
-      .prepare(
-        `UPDATE housekeeper_investigations
-         SET callback_verdict = ?, callback_evidence = ?, callback_rationale = ?,
-             status = 'applied_done', apply_error = NULL, applied_at = datetime('now')
-         WHERE id = ?`
-      )
-      .run(verdict, evidence, rationale, id);
+    this.db.raw.transaction(() => {
+      this.db
+        .prepare(
+          `UPDATE housekeeper_investigations
+           SET callback_verdict = ?, callback_evidence = ?, callback_rationale = ?,
+               status = 'applied_done', apply_error = NULL, applied_at = datetime('now')
+           WHERE id = ? AND status NOT IN ('applied_done', 'needs_human')`
+        )
+        .run(verdict, evidence, rationale, id);
+      this.sessionRegistry.markIdle(row.session_name, 'housekeeper-done');
+    })();
     return { ok: true, outcome: 'applied_done', investigationId: id, sessionName: row.session_name };
   }
 
@@ -428,6 +457,16 @@ function normalizeHousekeeperVerdict(raw: string): 'done' | 'needs-human' | null
   if (verdict === 'done') return 'done';
   if (verdict === 'needs-human') return 'needs-human';
   return null;
+}
+
+function normalizeTerminalInvestigationStatus(status: string): { outcome: 'applied_done'; verdict: 'done' } | { outcome: 'needs_human'; verdict: 'needs-human' } | null {
+  if (status === 'applied_done') return { outcome: 'applied_done', verdict: 'done' };
+  if (status === 'needs_human') return { outcome: 'needs_human', verdict: 'needs-human' };
+  return null;
+}
+
+function isCallbackProofText(value: string): boolean {
+  return value.trim().length > 0;
 }
 
 function buildStateSignature(row: HelmSessionRow, observation: SessionObservationResult): string {
