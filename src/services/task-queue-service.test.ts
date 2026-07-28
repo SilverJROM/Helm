@@ -1,9 +1,21 @@
 // Leg D (batch barrier) — TaskQueueService unit tests: numeric-aware batch comparator, earliest-open-
 // batch admission barrier, failed/deferred-batch semantics, structured drain-state classifier, and
 // dynamic-task batch resolution (inject inherit / redirect preserve / new batch after last).
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { TaskQueueService } from './task-queue-service.js';
 import { compareBatchLabels, resolveTaskBatches, DEFAULT_BATCH } from './execution-plan-parser.js';
+import { DatabaseService } from '../db/database.js';
+import { RunArtifactService } from './run-artifact-service.js';
+import { allocateLifecycleGeneration, advanceLifecycleSeqAtLeast } from './lifecycle-cas.js';
+import {
+  RunIngestService,
+  RUN_REGISTER_ENVELOPE,
+  computeRunRegisterPayloadHash,
+} from './run-ingest-service.js';
 
 describe('Leg D: numeric-aware batch comparator (compareBatchLabels)', () => {
   const lt = (a: string, b: string) => expect(compareBatchLabels(a, b)).toBeLessThan(0);
@@ -286,5 +298,222 @@ describe('A6b-L3: clearRun generation guard (recycled runId/taskId poisoning a n
     q.markFailed(1, runId);
     expect(q.isBlockedByFailure(2)).toBe(true); // the mark applied — 2 is blocked by failed prereq 1
     expect(q.classifyDrainState(runId).kind).toBe('failed-block');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B03 / AC7 — durable TaskQueue terminal CAS on run_id + expected status + runs.generation
+// ---------------------------------------------------------------------------
+describe('B03/AC7: durable task terminal CAS (run_id + status + generation)', () => {
+  let dbPath: string;
+  let db: DatabaseService;
+  let artifacts: RunArtifactService;
+  let cleanup: () => void;
+
+  beforeEach(() => {
+    dbPath = path.join(os.tmpdir(), `helm-b03-tq-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+    db = new DatabaseService(dbPath);
+    artifacts = new RunArtifactService(db);
+    cleanup = () => {
+      try { db.close(); } catch { /* ignore */ }
+      for (const suf of ['', '-wal', '-shm']) {
+        try { fs.unlinkSync(dbPath + suf); } catch { /* ignore */ }
+      }
+    };
+  });
+  afterEach(() => cleanup());
+
+  it('createRun allocates a nonzero lifecycle generation (not default 0)', () => {
+    const runId = artifacts.createRun(null, 'b03-gen');
+    const row = db.raw.prepare('SELECT generation FROM runs WHERE id = ?').get(runId) as { generation: number };
+    expect(row.generation).toBeGreaterThan(0);
+    const runId2 = artifacts.createRun(null, 'b03-gen-2');
+    const row2 = db.raw.prepare('SELECT generation FROM runs WHERE id = ?').get(runId2) as { generation: number };
+    expect(row2.generation).toBeGreaterThan(row.generation);
+  });
+
+  it('current lifecycle complete/fail/defer still advance durable + in-mem', () => {
+    const q = new TaskQueueService(artifacts);
+    const runId = artifacts.createRun(null, 'b03-happy');
+    const tComplete = artifacts.recordTask(runId, 'T-c', 'complete-me', 'B1');
+    const tFail = artifacts.recordTask(runId, 'T-f', 'fail-me', 'B1');
+    const tDefer = artifacts.recordTask(runId, 'T-d', 'defer-me', 'B1');
+    q.enqueue(runId, tComplete, [], false, 'B1');
+    q.enqueue(runId, tFail, [], false, 'B1');
+    q.enqueue(runId, tDefer, [], false, 'B1');
+
+    q.markComplete(tComplete, runId);
+    q.markFailed(tFail, runId);
+    q.markDeferred(tDefer, runId);
+
+    expect(
+      db.raw.prepare('SELECT status FROM run_tasks WHERE id = ?').get(tComplete)
+    ).toEqual({ status: 'complete' });
+    expect(
+      db.raw.prepare('SELECT status FROM run_tasks WHERE id = ?').get(tFail)
+    ).toEqual({ status: 'failed' });
+    expect(
+      db.raw.prepare('SELECT status FROM run_tasks WHERE id = ?').get(tDefer)
+    ).toEqual({ status: 'deferred' });
+    expect(q.classifyDrainState(runId).kind).toBe('all-complete');
+  });
+
+  it('recycled (taskId, runId) rejects prior lifecycle durable write (stale generation)', () => {
+    const q = new TaskQueueService(artifacts);
+    const runId = artifacts.createRun(null, 'b03-recycle');
+    const taskId = artifacts.recordTask(runId, 'T1', 'recycle-me', 'B1');
+    const genA = (
+      db.raw.prepare('SELECT generation FROM runs WHERE id = ?').get(runId) as { generation: number }
+    ).generation;
+    q.enqueue(runId, taskId, [], false, 'B1', genA);
+    expect(q.getNextReady(runId)).toBe(taskId);
+
+    // Simulate a new occupant of the same numeric (runId, taskId): bump durable generation while
+    // the prior occupant still holds the old captured token (process-local clear + re-enqueue).
+    db.raw.prepare('UPDATE runs SET generation = ? WHERE id = ?').run(genA + 1000, runId);
+    q.clearRun(runId);
+    q.enqueue(runId, taskId, [], false, 'B1', genA + 1000); // current lifecycle
+    expect(q.getNextReady(runId)).toBe(taskId);
+
+    // Prior lifecycle late write: inject the stale generation onto a shadow call path by enqueueing
+    // under genA into a separate queue instance that still has the old token (same shape as a
+    // process that never saw clearRun — force taskRunGeneration by re-binding via enqueue on a
+    // fresh service that never cleared, using genA).
+    const staleQ = new TaskQueueService(artifacts);
+    staleQ.enqueue(runId, taskId, [], false, 'B1', genA);
+    staleQ.markFailed(taskId, runId);
+
+    // Durable row still pending/working for the current occupant; stale must not terminalize it.
+    const row = db.raw.prepare('SELECT status FROM run_tasks WHERE id = ?').get(taskId) as { status: string };
+    expect(row.status).toBe('pending');
+    // Current occupant can still complete with its own gen.
+    q.markComplete(taskId, runId);
+    expect(
+      db.raw.prepare('SELECT status FROM run_tasks WHERE id = ?').get(taskId)
+    ).toEqual({ status: 'complete' });
+  });
+
+  it('SQL predicates include run_id + expected non-terminal status + runs.generation (not WHERE id=? only)', () => {
+    const q = new TaskQueueService(artifacts);
+    const runId = artifacts.createRun(null, 'b03-sql');
+    const taskId = artifacts.recordTask(runId, 'T-sql', 'sql-fence', 'B1');
+    const gen = (
+      db.raw.prepare('SELECT generation FROM runs WHERE id = ?').get(runId) as { generation: number }
+    ).generation;
+    q.enqueue(runId, taskId, [], false, 'B1', gen);
+
+    // Wrong run_id → 0 rows even with correct task id + generation
+    const wrongRun = db.raw
+      .prepare(
+        `UPDATE run_tasks
+         SET status = 'complete', updated_at = datetime('now')
+         WHERE id = ?
+           AND run_id = ?
+           AND status IN ('pending', 'working')
+           AND EXISTS (SELECT 1 FROM runs r WHERE r.id = run_tasks.run_id AND r.generation = ?)`
+      )
+      .run(taskId, runId + 99999, gen) as { changes: number };
+    expect(wrongRun.changes).toBe(0);
+
+    // Wrong generation → 0 rows
+    const wrongGen = db.raw
+      .prepare(
+        `UPDATE run_tasks
+         SET status = 'failed', updated_at = datetime('now')
+         WHERE id = ?
+           AND run_id = ?
+           AND status IN ('pending', 'working')
+           AND EXISTS (SELECT 1 FROM runs r WHERE r.id = run_tasks.run_id AND r.generation = ?)`
+      )
+      .run(taskId, runId, gen + 1) as { changes: number };
+    expect(wrongGen.changes).toBe(0);
+
+    // Already terminal → expected status fence rejects (second complete is stale)
+    q.markComplete(taskId, runId);
+    const replay = db.raw
+      .prepare(
+        `UPDATE run_tasks
+         SET status = 'complete', updated_at = datetime('now')
+         WHERE id = ?
+           AND run_id = ?
+           AND status IN ('pending', 'working')
+           AND EXISTS (SELECT 1 FROM runs r WHERE r.id = run_tasks.run_id AND r.generation = ?)`
+      )
+      .run(taskId, runId, gen) as { changes: number };
+    expect(replay.changes).toBe(0);
+    expect(
+      db.raw.prepare('SELECT status FROM run_tasks WHERE id = ?').get(taskId)
+    ).toEqual({ status: 'complete' });
+  });
+
+  it('stale durable CAS does not mutate in-memory queue state', () => {
+    const q = new TaskQueueService(artifacts);
+    const runId = artifacts.createRun(null, 'b03-mem');
+    const taskId = artifacts.recordTask(runId, 'T-mem', 'mem-fence', 'B1');
+    const gen = (
+      db.raw.prepare('SELECT generation FROM runs WHERE id = ?').get(runId) as { generation: number }
+    ).generation;
+    q.enqueue(runId, taskId, [], false, 'B1', gen);
+    expect(q.getNextReady(runId)).toBe(taskId);
+
+    // Force mismatch: durable gen moved under the captured token
+    db.raw.prepare('UPDATE runs SET generation = ? WHERE id = ?').run(gen + 7, runId);
+    q.markFailed(taskId, runId);
+
+    expect(q.isBlockedByFailure(taskId)).toBe(false);
+    expect(q.isInFlight(runId)).toBe(true);
+    expect(
+      db.raw.prepare('SELECT status FROM run_tasks WHERE id = ?').get(taskId)
+    ).toEqual({ status: 'pending' });
+  });
+
+  it('B01 residual C1: ingest free-gen advances lifecycle_seq so next native alloc is above it', () => {
+    db.raw
+      .prepare(
+        "INSERT INTO projects (id, name, directory, status, active) VALUES (1, 'Helm-B03', '/tmp/b03', 'active', 1)"
+      )
+      .run();
+    // Drain a couple of native allocs first so seq is live.
+    allocateLifecycleGeneration(db.raw);
+    const before = db.raw
+      .prepare(`SELECT next FROM lifecycle_seq WHERE name = 'global'`)
+      .get() as { next: number };
+
+    const freeGen = before.next + 50; // caller-supplied gen well above current counter
+    const hashes = {
+      ready: createHash('sha256').update('r').digest('hex'),
+      plan: createHash('sha256').update('p').digest('hex'),
+      queue: createHash('sha256').update('q').digest('hex'),
+      topology: createHash('sha256').update('t').digest('hex'),
+    };
+    const fields = {
+      event_id: 'b03-c1-event',
+      external_run_id: 'ext-b03-c1',
+      generation: freeGen,
+      hashes,
+    };
+    const payload_hash = computeRunRegisterPayloadHash(1, fields);
+    const service = new RunIngestService(db);
+    const result = service.register(1, {
+      envelope: RUN_REGISTER_ENVELOPE,
+      ...fields,
+      payload_hash,
+    });
+    expect(result.httpStatus).toBe(201);
+
+    const after = db.raw
+      .prepare(`SELECT next FROM lifecycle_seq WHERE name = 'global'`)
+      .get() as { next: number };
+    expect(after.next).toBeGreaterThanOrEqual(freeGen + 1);
+
+    const nextNative = allocateLifecycleGeneration(db.raw);
+    expect(nextNative).toBeGreaterThanOrEqual(freeGen + 1);
+
+    // Helper is idempotent when already above
+    advanceLifecycleSeqAtLeast(db.raw, freeGen + 1);
+    const still = db.raw
+      .prepare(`SELECT next FROM lifecycle_seq WHERE name = 'global'`)
+      .get() as { next: number };
+    expect(still.next).toBeGreaterThanOrEqual(freeGen + 1);
   });
 });

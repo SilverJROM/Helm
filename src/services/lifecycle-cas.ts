@@ -92,8 +92,11 @@ export function sessionStatusTokenFromRow(row: {
  * parameters in a way a fixed wrapper method can't structurally satisfy).
  */
 interface LifecycleDb {
-  prepare(sql: string): { run(): unknown; get(): unknown };
-  transaction(fn: () => number): () => number;
+  prepare(sql: string): {
+    run(...params: unknown[]): unknown;
+    get(...params: unknown[]): unknown;
+  };
+  transaction<T>(fn: () => T): () => T;
 }
 
 /**
@@ -114,4 +117,24 @@ export function allocateLifecycleGeneration(db: LifecycleDb): number {
     return row.allocated;
   });
   return allocate();
+}
+
+/**
+ * B03 / B01 residual C1: after an ingest row lands with a caller-supplied generation, raise the
+ * shared counter so a later native `allocateLifecycleGeneration` cannot re-issue that value (or
+ * any lower one). Does not rewrite ingest identity — only advances `lifecycle_seq.next` to
+ * `max(next, minNext)`. Safe inside an outer transaction (better-sqlite3 nested savepoint).
+ */
+export function advanceLifecycleSeqAtLeast(db: LifecycleDb, minNext: number): void {
+  if (!Number.isFinite(minNext) || minNext < 1) return;
+  const floor = Math.floor(minNext);
+  const advance = db.transaction((): void => {
+    db.prepare(
+      `INSERT INTO lifecycle_seq (name, next) VALUES ('global', 1) ON CONFLICT(name) DO NOTHING`
+    ).run();
+    db.prepare(
+      `UPDATE lifecycle_seq SET next = MAX(next, ?) WHERE name = 'global'`
+    ).run(floor);
+  });
+  advance();
 }

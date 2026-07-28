@@ -57,14 +57,87 @@ export class TaskQueueService {
   // instead of silently corrupting the current one's in-flight task as failed/complete/deferred (which
   // manifests as getNextReady/classifyDrainState seeing a task wrongly terminal — a queue/DB divergence
   // reported as `unknown-pending-stall` with zero attempts, even though the current occupant never ran).
-  private runEpoch: Record<number, number> = {}; // runId -> generation, bumped every clearRun
+  private runEpoch: Record<number, number> = {}; // runId -> process-local epoch, bumped every clearRun
   private taskEpoch: Record<number, number> = {}; // taskId -> the runEpoch it was enqueued under
+  // B03 / AC7: durable run generation captured at enqueue (from runs.generation / explicit arg). Never
+  // re-read at mark* time — late SELECT would accept the new occupant's gen and defeat the fence.
+  private taskRunGeneration: Record<number, number | undefined> = {};
 
   constructor(private readonly artifacts?: RunArtifactService) {}
 
   /** True when taskId was enqueued under a since-superseded generation of runId (a stale/prior occupant). */
   private isStaleWrite(runId: number, taskId: number): boolean {
     return (this.taskEpoch[taskId] ?? 0) !== (this.runEpoch[runId] || 0);
+  }
+
+  /**
+   * Capture runs.generation for this task at the enqueue/claim boundary. Explicit arg wins; otherwise
+   * SELECT from runs when a durable artifacts handle is present. Missing capture → no durable terminal
+   * write (never fall back to WHERE id=? only).
+   */
+  private captureRunGeneration(runId: number, explicit?: number): number | undefined {
+    if (explicit != null && Number.isFinite(explicit) && explicit >= 0) return Number(explicit);
+    if (!this.artifacts) return undefined;
+    try {
+      const row = this.artifacts['db'].raw
+        .prepare('SELECT generation FROM runs WHERE id = ?')
+        .get(runId) as { generation: number } | undefined;
+      if (row && typeof row.generation === 'number' && Number.isFinite(row.generation)) {
+        return row.generation;
+      }
+    } catch {
+      /* missing row / closed db — leave undefined */
+    }
+    return undefined;
+  }
+
+  /**
+   * B03 / AC7: durable terminal CAS. Requires task id + run_id + expected non-terminal status +
+   * captured runs.generation. Returns true when the durable write applied (or there is no artifacts
+   * handle so only in-mem will run). Returns false when the world moved — caller must NOT mutate in-mem.
+   */
+  private applyTerminalDurable(
+    taskId: number,
+    runId: number,
+    terminal: 'complete' | 'failed' | 'deferred'
+  ): boolean {
+    if (!this.artifacts) return true;
+    const generation = this.taskRunGeneration[taskId];
+    if (generation == null) {
+      console.warn(
+        `[TaskQueueService] durable mark ${terminal}(${taskId}, ${runId}) skipped — no run generation captured at enqueue`
+      );
+      // No id-only fallback. In-mem may still apply under the process-local epoch guard.
+      return true;
+    }
+    try {
+      const result = this.artifacts['db'].raw
+        .prepare(
+          `UPDATE run_tasks
+           SET status = ?, updated_at = datetime('now')
+           WHERE id = ?
+             AND run_id = ?
+             AND status IN ('pending', 'working')
+             AND EXISTS (
+               SELECT 1 FROM runs r
+               WHERE r.id = run_tasks.run_id AND r.generation = ?
+             )`
+        )
+        .run(terminal, taskId, runId, generation) as { changes: number };
+      if (!result || result.changes === 0) {
+        console.warn(
+          `[TaskQueueService] stale durable mark ${terminal}(${taskId}, ${runId}, gen=${generation}) ignored — 0 rows (run_id/status/generation fence)`
+        );
+        return false;
+      }
+      return true;
+    } catch (err) {
+      console.warn(
+        `[TaskQueueService] durable mark ${terminal}(${taskId}, ${runId}) failed:`,
+        err instanceof Error ? err.message : err
+      );
+      return false;
+    }
   }
 
   /** Rebuild one durable run on this shared service without disturbing other active runs. */
@@ -74,6 +147,7 @@ export class TaskQueueService {
       delete this.deps[taskId];
       delete this.batchOf[taskId];
       delete this.taskEpoch[taskId];
+      delete this.taskRunGeneration[taskId];
       this.failedTasks.delete(taskId);
       this.deferredTasks.delete(taskId);
       this.completedTasks.delete(taskId);
@@ -90,10 +164,22 @@ export class TaskQueueService {
     return s === '' ? DEFAULT_BATCH : s;
   }
 
-  enqueue(runId: number, taskId: number, depTaskIds: number[] = [], urgent = false, batch: string = DEFAULT_BATCH): void {
+  /**
+   * @param runGeneration optional durable `runs.generation` captured by the caller (preferred when
+   *   already known from createRun). When omitted and artifacts is set, SELECT generation FROM runs.
+   */
+  enqueue(
+    runId: number,
+    taskId: number,
+    depTaskIds: number[] = [],
+    urgent = false,
+    batch: string = DEFAULT_BATCH,
+    runGeneration?: number
+  ): void {
     if (!this.queues[runId]) this.queues[runId] = [];
     if (!this.allTasks[runId]) this.allTasks[runId] = [];
     this.taskEpoch[taskId] = this.runEpoch[runId] || 0;
+    this.taskRunGeneration[taskId] = this.captureRunGeneration(runId, runGeneration);
     this.deps[taskId] = [...(depTaskIds || [])];
     this.batchOf[taskId] = this.normBatch(batch);
     if (!this.allTasks[runId].includes(taskId)) this.allTasks[runId].push(taskId);
@@ -188,6 +274,10 @@ export class TaskQueueService {
       console.warn(`[TaskQueueService] stale markComplete(${taskId}, ${runId}) ignored — runId was recycled since this task's generation (a prior occupant's late write)`);
       return;
     }
+    // B03 / AC7: durable CAS before in-mem. Stale durable fence must not corrupt the live queue.
+    if (runId != null && this.artifacts) {
+      if (!this.applyTerminalDurable(taskId, runId, 'complete')) return;
+    }
     this.completedTasks.add(taskId);
     if (runId && this.inFlight[runId] === taskId) {
       this.inFlight[runId] = null;
@@ -196,13 +286,6 @@ export class TaskQueueService {
     if (runId && this.queues[runId]) {
       this.queues[runId] = this.queues[runId].filter((id) => id !== taskId);
     }
-    if (this.artifacts) {
-      try {
-        this.artifacts['db'].raw
-          .prepare("UPDATE run_tasks SET status='complete', updated_at=datetime('now') WHERE id=?")
-          .run(taskId);
-      } catch {}
-    }
   }
 
   markFailed(taskId: number, runId?: number): void {
@@ -210,16 +293,12 @@ export class TaskQueueService {
       console.warn(`[TaskQueueService] stale markFailed(${taskId}, ${runId}) ignored — runId was recycled since this task's generation (a prior occupant's late write)`);
       return;
     }
+    if (runId != null && this.artifacts) {
+      if (!this.applyTerminalDurable(taskId, runId, 'failed')) return;
+    }
     this.failedTasks.add(taskId);
     if (runId && this.inFlight[runId] === taskId) {
       this.inFlight[runId] = null;
-    }
-    if (this.artifacts) {
-      try {
-        this.artifacts['db'].raw
-          .prepare("UPDATE run_tasks SET status='failed', updated_at=datetime('now') WHERE id=?")
-          .run(taskId);
-      } catch {}
     }
   }
 
@@ -228,6 +307,9 @@ export class TaskQueueService {
       console.warn(`[TaskQueueService] stale markDeferred(${taskId}, ${runId}) ignored — runId was recycled since this task's generation (a prior occupant's late write)`);
       return;
     }
+    if (runId != null && this.artifacts) {
+      if (!this.applyTerminalDurable(taskId, runId, 'deferred')) return;
+    }
     this.deferredTasks.add(taskId);
     if (runId && this.inFlight[runId] === taskId) {
       this.inFlight[runId] = null;
@@ -235,13 +317,6 @@ export class TaskQueueService {
     // remove from queue (defensive)
     if (runId && this.queues[runId]) {
       this.queues[runId] = this.queues[runId].filter((id) => id !== taskId);
-    }
-    if (this.artifacts) {
-      try {
-        this.artifacts['db'].raw
-          .prepare("UPDATE run_tasks SET status='deferred', updated_at=datetime('now') WHERE id=?")
-          .run(taskId);
-      } catch {}
     }
   }
 
@@ -311,9 +386,17 @@ export class TaskQueueService {
   // New tasks created via recordTask + enqueue here; redirect updates status/label then enqueue.
   // Leg D: batch resolves to the supplied value, else the task's already-persisted batch (re-enqueue),
   // else the active batch (injection inherits the batch it lands in).
-  enqueueTask(runId: number, taskId: number, urgent = false, batch?: string): void {
+  enqueueTask(runId: number, taskId: number, urgent = false, batch?: string, runGeneration?: number): void {
     const resolved = batch ?? this.batchOf[taskId] ?? this.activeBatch(runId);
-    this.enqueue(runId, taskId, [], urgent, resolved);
+    // Preserve a previously captured durable generation on re-enqueue when the caller omits it
+    // (redirect/inject mid-run — same run occupant).
+    const gen =
+      runGeneration !== undefined
+        ? runGeneration
+        : this.taskRunGeneration[taskId] !== undefined
+          ? this.taskRunGeneration[taskId]
+          : undefined;
+    this.enqueue(runId, taskId, [], urgent, resolved, gen);
   }
 
   // Allow re-adding a task id to the active queue for redirect (defensive clear prior dupes of this id).
@@ -324,7 +407,8 @@ export class TaskQueueService {
     }
     const existingDeps = this.deps[taskId] || [];
     const existingBatch = this.batchOf[taskId] ?? DEFAULT_BATCH;
-    this.enqueue(runId, taskId, existingDeps, true, existingBatch);
+    const existingGen = this.taskRunGeneration[taskId];
+    this.enqueue(runId, taskId, existingDeps, true, existingBatch, existingGen);
   }
 
   /**

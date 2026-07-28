@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { DatabaseService } from '../db/database.js';
+import { advanceLifecycleSeqAtLeast } from './lifecycle-cas.js';
 
 export const RUN_REGISTER_ENVELOPE = 'helm.run-ingest/v1';
 
@@ -272,6 +273,11 @@ export class RunIngestService {
       } catch {
         throw new RunIngestConflictError('run identity already registered');
       }
+
+      // B03 / B01 residual C1: ingest free-gen lives in the same runs.generation namespace as native
+      // allocator gens. Raise lifecycle_seq so a later native allocate cannot re-issue this value.
+      // Does not rewrite the ingest identity triple (D01 UNIQUE contract).
+      advanceLifecycleSeqAtLeast(this.db.raw, envelope.generation + 1);
 
       this.db.prepare(
         `INSERT INTO run_events (run_id, event_type, payload_json) VALUES (?, 'REGISTERED', ?)`
