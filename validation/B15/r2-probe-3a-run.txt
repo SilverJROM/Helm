@@ -1,0 +1,15 @@
+probe dir: /tmp/helm-b15r2-4IwquG
+
+rows committed and visible: 501 (seed + 500)
+
+--- main-file mtime (the PRE-fix guard) ---
+before = 1785269513722.4104
+after  = 1785269513722.4104
+OLD GUARD DETECTS THE WRITE: false   <-- FALSE NEGATIVE (val §7.2)
+
+--- main + -wal + -shm (the SHIPPED fix1 guard) ---
+before = {"main":1785269513722.4104,"wal":1785269513725.4104,"shm":1785269513725.4104}
+after  = {"main":1785269513722.4104,"wal":1785269513729.4104,"shm":1785269513729.4104}
+NEW GUARD DETECTS THE WRITE: true
+
+RESULT: PASS — old guard blind, new guard red

@@ -1,0 +1,346 @@
+/**
+ * B14 R3 VALIDATOR PROBES — temporary, removed after execution.
+ *
+ * Gaps left open by the fix2 shipped tests (create-session-safe-replace.test.ts:347/403) and by both
+ * R3 redteams (static-only):
+ *   P1 — C4: CAS-refusal + rollback kill SUCCEEDS → must preserve SessionNameCollisionError identity
+ *            so index.ts:1124/:1355 still answer 409. This is the regression R2 warned fix2 could cause.
+ *   P2 — C3: the terminate-throws branch (tmux-service.ts:728-730), which NO shipped test covers.
+ *   P3 — C5: staging probe UNKNOWN (null) → must still fail closed with AggregateError.
+ *   P4 — C6: kill fails but staging probe PROVES GONE → must rethrow bare cause (no over-escalation),
+ *            i.e. 409 still preserved on the benign race.
+ *
+ * Fake-exec only. No live tmux. HELM_SESSION_JANITOR=0.
+ */
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { promisify } from 'node:util';
+import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+import { DatabaseService } from '../db/database.js';
+import {
+  SessionRegistryService,
+  sessionStatusTokenFromRow,
+} from '../services/session-registry-service.js';
+
+const cpMock = {
+  calls: [] as Array<{ cmd: string; args: string[] }>,
+  impl: async (_cmd: string, _args: string[]): Promise<{ stdout: string; stderr: string }> => ({
+    stdout: '',
+    stderr: '',
+  }),
+};
+
+vi.mock('node:child_process', async (importActual) => {
+  const actual = await importActual<typeof import('node:child_process')>();
+  const execFile: any = (...a: any[]) => {
+    const cb = a[a.length - 1];
+    cpMock.impl(a[0], a[1]).then((r) => cb(null, r.stdout, r.stderr), (e: any) => cb(e));
+    return {};
+  };
+  execFile[promisify.custom] = (cmd: string, args: string[]) => {
+    cpMock.calls.push({ cmd, args });
+    return cpMock.impl(cmd, args);
+  };
+  return { ...actual, execFile };
+});
+
+import { TmuxService, SessionNameCollisionError } from './tmux-service.js';
+
+/** The EXACT predicate from src/index.ts:1124 and :1355 (B09/AC12 collision → 409). */
+function indexCollisionDispatch(e: any): boolean {
+  return (
+    e?.code === 'SESSION_NAME_COLLISION' ||
+    e instanceof SessionNameCollisionError ||
+    e?.name === 'SessionNameCollisionError'
+  );
+}
+
+function killSessionCalls() {
+  return cpMock.calls.filter((c) => c.args[0] === 'kill-session');
+}
+function killsOf(name: string) {
+  return killSessionCalls().filter((c) => {
+    const ti = c.args.indexOf('-t');
+    return ti >= 0 && c.args[ti + 1] === name;
+  });
+}
+
+describe('B14 R3 validator probes', () => {
+  let db: DatabaseService;
+  let cleanup: () => void;
+  let reg: SessionRegistryService;
+  let tmux: TmuxService;
+  let createdNames: string[];
+
+  beforeEach(() => {
+    const dbPath = path.join(
+      os.tmpdir(),
+      `helm-b14-r3-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
+    );
+    db = new DatabaseService(dbPath);
+    cleanup = () => {
+      try {
+        db.close();
+      } catch {}
+      for (const suf of ['', '-wal', '-shm']) {
+        try {
+          fs.unlinkSync(dbPath + suf);
+        } catch {}
+      }
+    };
+    reg = new SessionRegistryService(db);
+    createdNames = [];
+    cpMock.calls.length = 0;
+    cpMock.impl = async () => ({ stdout: '', stderr: '' });
+
+    tmux = new TmuxService({
+      onCreate: (n, opts) => {
+        createdNames.push(n);
+        const row = reg.register(n, {
+          owner: (opts?.owner as any) || 'helm',
+          kind: opts?.kind,
+          projectId: opts?.projectId,
+          runId: opts?.runId,
+        });
+        return row ? sessionStatusTokenFromRow(row) : undefined;
+      },
+      onTerminate: (_n, token) => {
+        if (!token) return false;
+        return reg.markReaped(token).applied === true;
+      },
+      onUse: () => {},
+      onLookup: (n) => reg.get(n) ?? undefined,
+    });
+  });
+
+  afterEach(() => cleanup());
+
+  /**
+   * P1 (C4) — the 409 regression R2 flagged as fix2's likeliest self-inflicted wound.
+   * CAS refuses, and the staging rollback kill SUCCEEDS (the common case). fix2 must surface the
+   * ORIGINAL SessionNameCollisionError, not an AggregateError, or index.ts turns a retry-able 409
+   * into a 500.
+   */
+  it('P1: CAS-refusal + rollback kill SUCCEEDS → SessionNameCollisionError identity intact → index 409 dispatch still fires', async () => {
+    const name = 'helm-w-r3-p1';
+    const row = reg.register(name, { owner: 'helm', kind: 'worker' })!;
+    reg.markIdle(sessionStatusTokenFromRow(row), 'completed');
+
+    let stagingName = '';
+    const killed = new Set<string>();
+    cpMock.impl = async (_cmd: string, args: string[]) => {
+      const sub = args[0];
+      const target = args[args.indexOf('-t') + 1];
+      if (sub === 'has-session') {
+        if (killed.has(target)) {
+          const e: any = new Error(`can't find session: ${target}`);
+          e.stderr = `can't find session: ${target}`;
+          throw e;
+        }
+        return { stdout: '', stderr: '' };
+      }
+      if (sub === 'show-options' && args.includes('@helm_child')) return { stdout: '1\n', stderr: '' };
+      if (sub === 'new-session') {
+        stagingName = args[args.indexOf('-s') + 1];
+        return { stdout: '', stderr: '' };
+      }
+      if (sub === 'set-option' && args.includes('@helm_child')) {
+        // idle→active flip on the same row → exactStatusOnly CAS refuses (closed === false).
+        db.prepare(`UPDATE helm_sessions SET status = 'active' WHERE name = ?`).run(name);
+        return { stdout: '', stderr: '' };
+      }
+      if (sub === 'kill-session') {
+        killed.add(target); // rollback kill SUCCEEDS here
+        return { stdout: '', stderr: '' };
+      }
+      return { stdout: '', stderr: '' };
+    };
+
+    const err: any = await tmux.createSession(name, '/tmp', { owner: 'helm' }).catch((e: any) => e);
+
+    console.log('[P1] ctor              =', err?.constructor?.name);
+    console.log('[P1] name              =', err?.name);
+    console.log('[P1] code              =', err?.code);
+    console.log('[P1] reason            =', err?.reason);
+    console.log('[P1] sessionName       =', err?.sessionName);
+    console.log('[P1] isAggregateError  =', err instanceof AggregateError);
+    console.log('[P1] index 409 dispatch=', indexCollisionDispatch(err));
+
+    expect(err).toBeInstanceOf(SessionNameCollisionError);
+    expect(err).not.toBeInstanceOf(AggregateError);
+    expect(err.code).toBe('SESSION_NAME_COLLISION');
+    expect(err.name).toBe('SessionNameCollisionError');
+    expect(err.reason).toBe('replace_refused');
+    expect(err.sessionName).toBe(name);
+    // The contract index.ts depends on:
+    expect(indexCollisionDispatch(err)).toBe(true);
+
+    // Rollback actually happened, on staging only — no orphan, final name untouched.
+    expect(killsOf(stagingName).length).toBe(1);
+    expect(killsOf(name)).toEqual([]);
+    expect(createdNames).toEqual([]);
+  });
+
+  /**
+   * P2 (C3) — the terminate-throws branch (tmux-service.ts:728-730). No shipped test covers it;
+   * redteam-sol explicitly noted the gap and reasoned it safe by inspection. Verify by execution.
+   * CAS applies, then killSessionRaw(old) throws → terminateSession throws → catch → staging
+   * rollback kill also fails → must be a visible AggregateError, not the bare terminate error.
+   */
+  it('P2: terminate-THROWS branch + staging rollback kill fails → AggregateError, staging orphan provably survives', async () => {
+    const name = 'helm-w-r3-p2';
+    const row = reg.register(name, { owner: 'helm', kind: 'worker' })!;
+    reg.markIdle(sessionStatusTokenFromRow(row), 'completed');
+
+    let stagingName = '';
+    cpMock.impl = async (_cmd: string, args: string[]) => {
+      const sub = args[0];
+      if (sub === 'has-session') return { stdout: '', stderr: '' }; // everything stays live
+      if (sub === 'show-options' && args.includes('@helm_child')) return { stdout: '1\n', stderr: '' };
+      if (sub === 'new-session') {
+        stagingName = args[args.indexOf('-s') + 1];
+        return { stdout: '', stderr: '' };
+      }
+      if (sub === 'set-option' && args.includes('@helm_child')) return { stdout: '', stderr: '' };
+      if (sub === 'kill-session') {
+        // BOTH the authorized close of old AND the staging rollback kill fail.
+        throw new Error(`kill-session boom (${args[args.indexOf('-t') + 1]})`);
+      }
+      return { stdout: '', stderr: '' };
+    };
+
+    const err: any = await tmux.createSession(name, '/tmp', { owner: 'helm' }).catch((e: any) => e);
+    const inner = (err?.errors ?? []).map((e: any) => String(e?.message ?? e));
+
+    console.log('[P2] ctor            =', err?.constructor?.name);
+    console.log('[P2] isAggregateError=', err instanceof AggregateError);
+    console.log('[P2] inner           =', inner);
+    console.log('[P2] message         =', String(err?.message));
+
+    expect(err).toBeInstanceOf(AggregateError);
+    // both the original terminate failure and the rollback-kill failure are carried
+    expect(inner.length).toBe(2);
+    expect(inner.some((m: string) => /kill-session boom/.test(m))).toBe(true);
+    expect(String(err.message)).toMatch(/may still be LIVE/i);
+    expect(String(err.message)).toContain(stagingName);
+
+    // the orphan is real and still tagged
+    await expect(tmux.sessionExistsTriState(stagingName)).resolves.toBe(true);
+    await expect(tmux.sessionHasHelmChildTag(stagingName)).resolves.toBe(true);
+    expect(createdNames).toEqual([]);
+  });
+
+  /**
+   * P3 (C5) — fail-closed on AMBIGUITY. Shipped fix2 tests only exercise the probe===true shape.
+   * Here the rollback kill fails and the follow-up probe is UNKNOWN (generic error, not a recognized
+   * missing-session string) → triState null. Fail-closed requires AggregateError, not a bare rethrow.
+   */
+  it('P3: staging rollback kill fails + existence UNKNOWN (null probe) → still AggregateError (fail-closed on ambiguity)', async () => {
+    const name = 'helm-w-r3-p3';
+    const row = reg.register(name, { owner: 'helm', kind: 'worker' })!;
+    reg.markIdle(sessionStatusTokenFromRow(row), 'completed');
+
+    let stagingName = '';
+    let stagingKillAttempted = false;
+    cpMock.impl = async (_cmd: string, args: string[]) => {
+      const sub = args[0];
+      const target = args[args.indexOf('-t') + 1];
+      if (sub === 'has-session') {
+        if (stagingKillAttempted && target === stagingName) {
+          // Ambiguous failure: NOT one of the recognized "provably gone" strings → null.
+          const e: any = new Error('connect ECONNREFUSED /tmp/tmux-1000/default');
+          e.code = 1;
+          e.stderr = 'error connecting to /tmp/tmux-1000/default (No such file or directory)';
+          throw e;
+        }
+        return { stdout: '', stderr: '' };
+      }
+      if (sub === 'show-options' && args.includes('@helm_child')) return { stdout: '1\n', stderr: '' };
+      if (sub === 'new-session') {
+        stagingName = args[args.indexOf('-s') + 1];
+        return { stdout: '', stderr: '' };
+      }
+      if (sub === 'set-option' && args.includes('@helm_child')) {
+        db.prepare(`UPDATE helm_sessions SET status = 'active' WHERE name = ?`).run(name);
+        return { stdout: '', stderr: '' };
+      }
+      if (sub === 'kill-session') {
+        if (target === stagingName) stagingKillAttempted = true;
+        throw new Error('kill-session boom (staging rollback fails)');
+      }
+      return { stdout: '', stderr: '' };
+    };
+
+    const err: any = await tmux.createSession(name, '/tmp', { owner: 'helm' }).catch((e: any) => e);
+
+    console.log('[P3] ctor            =', err?.constructor?.name);
+    console.log('[P3] isAggregateError=', err instanceof AggregateError);
+    console.log('[P3] probe result    =', await tmux.sessionExistsTriState(stagingName));
+    console.log('[P3] message         =', String(err?.message));
+
+    // unknown must be treated as "may still be live", NOT as a clean teardown
+    await expect(tmux.sessionExistsTriState(stagingName)).resolves.toBe(null);
+    expect(err).toBeInstanceOf(AggregateError);
+    expect(err).not.toBeInstanceOf(SessionNameCollisionError);
+    expect(String(err.message)).toMatch(/may still be LIVE/i);
+    expect(createdNames).toEqual([]);
+  });
+
+  /**
+   * P4 (C6) — the complement of P3: no OVER-escalation. Rollback kill fails, but the follow-up probe
+   * PROVES the staging session is gone (benign race). fix2 must rethrow the bare original cause so the
+   * 409 path is preserved — escalating this to AggregateError would break collision handling for a
+   * case where nothing actually leaked.
+   */
+  it('P4: rollback kill fails but staging probe PROVES GONE → bare SessionNameCollisionError (no over-escalation, 409 preserved)', async () => {
+    const name = 'helm-w-r3-p4';
+    const row = reg.register(name, { owner: 'helm', kind: 'worker' })!;
+    reg.markIdle(sessionStatusTokenFromRow(row), 'completed');
+
+    let stagingName = '';
+    let stagingKillAttempted = false;
+    cpMock.impl = async (_cmd: string, args: string[]) => {
+      const sub = args[0];
+      const target = args[args.indexOf('-t') + 1];
+      if (sub === 'has-session') {
+        if (stagingKillAttempted && target === stagingName) {
+          const e: any = new Error(`can't find session: ${target}`);
+          e.code = 1;
+          e.stderr = `can't find session: ${target}`;
+          throw e; // recognized → provably gone → false
+        }
+        return { stdout: '', stderr: '' };
+      }
+      if (sub === 'show-options' && args.includes('@helm_child')) return { stdout: '1\n', stderr: '' };
+      if (sub === 'new-session') {
+        stagingName = args[args.indexOf('-s') + 1];
+        return { stdout: '', stderr: '' };
+      }
+      if (sub === 'set-option' && args.includes('@helm_child')) {
+        db.prepare(`UPDATE helm_sessions SET status = 'active' WHERE name = ?`).run(name);
+        return { stdout: '', stderr: '' };
+      }
+      if (sub === 'kill-session') {
+        if (target === stagingName) stagingKillAttempted = true;
+        throw new Error('kill-session boom (but session already died)');
+      }
+      return { stdout: '', stderr: '' };
+    };
+
+    const err: any = await tmux.createSession(name, '/tmp', { owner: 'helm' }).catch((e: any) => e);
+
+    console.log('[P4] ctor              =', err?.constructor?.name);
+    console.log('[P4] isAggregateError  =', err instanceof AggregateError);
+    console.log('[P4] reason            =', err?.reason);
+    console.log('[P4] probe result      =', await tmux.sessionExistsTriState(stagingName));
+    console.log('[P4] index 409 dispatch=', indexCollisionDispatch(err));
+
+    await expect(tmux.sessionExistsTriState(stagingName)).resolves.toBe(false);
+    expect(err).toBeInstanceOf(SessionNameCollisionError);
+    expect(err).not.toBeInstanceOf(AggregateError);
+    expect(err.reason).toBe('replace_refused');
+    expect(indexCollisionDispatch(err)).toBe(true);
+    expect(createdNames).toEqual([]);
+  });
+});
