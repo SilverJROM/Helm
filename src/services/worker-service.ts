@@ -385,20 +385,7 @@ VALUES (?,?,?,?,?,?,?,?,datetime('now'), ?)
       for (const w of ageCandidates) {
         // Keep-biased when no session name (cannot observe activity).
         if (!w.session) continue;
-        let sessionActivity: number | null = null;
-        try {
-          const tmux = this.tmux as TmuxService & {
-            sessionActivity?: (n: string) => Promise<number | null>;
-          };
-          if (typeof tmux.sessionActivity === 'function') {
-            sessionActivity = await tmux.sessionActivity(w.session);
-          } else {
-            // No activity reader → treat as unknown (keep).
-            sessionActivity = null;
-          }
-        } catch {
-          sessionActivity = null;
-        }
+        const sessionActivity = await this.readSessionActivityForGate(w.session);
         const { gate } = gateWorkerTimeoutByActivity({
           sessionActivity,
           thresholdMs: timeoutMs,
@@ -408,9 +395,12 @@ VALUES (?,?,?,?,?,?,?,?,datetime('now'), ?)
         // Known stale activity only — existing targeted timeout path (reapWorker body unchanged).
         await this.reapWorker(w.id, 'timeout');
       }
-      // E2: additional checkin enforcement pass: for each active worker, if role has checkin_ms and
-      // elapsed since started > checkin_ms (simple proxy for missed progress check-in), reap as checkin-stale -> will mark run_task failed
-      const actives = this.db.prepare("SELECT id, role FROM worker_runtimes WHERE state IN ('launching','running')").all() as any[];
+      // B13 / AC18 (amended, D-B13-checkin-premise.md): elapsed-since-started_at is a
+      // **candidate selector only** — mirrors B12's AC17 gate on the timeout pass above,
+      // via the same gateWorkerTimeoutByActivity helper (no recorded check-in; no schema change).
+      const actives = this.db.prepare(
+        "SELECT id, role, session FROM worker_runtimes WHERE state IN ('launching','running')"
+      ).all() as { id: number; role: string; session: string | null }[];
       for (const w of actives) {
         const ci = this.getRoleCheckinMs(w.role);
         if (ci && ci > 0) {
@@ -418,6 +408,15 @@ VALUES (?,?,?,?,?,?,?,?,datetime('now'), ?)
           if (row && row.started_at) {
             const started = Date.parse(row.started_at.replace(' ', 'T') + 'Z') || Date.now();
             if (Date.now() - started > ci) {
+              // Keep-biased when no session name (cannot observe activity).
+              if (!w.session) continue;
+              const sessionActivity = await this.readSessionActivityForGate(w.session);
+              const { gate } = gateWorkerTimeoutByActivity({
+                sessionActivity,
+                thresholdMs: ci,
+              });
+              // Recent or unknown activity vetoes checkin-missed termination.
+              if (gate !== 'STALE_ALLOW_TIMEOUT') continue;
               await this.reapWorker(w.id, 'checkin-missed');
             }
           }
@@ -676,6 +675,23 @@ VALUES (?,?,?,?,?,?,?,?,datetime('now'), ?)
     const def = defs.find((d: any) => d.role === role);
     if (def && def.agent) return { source: 'default', agent: def.agent };
     return null;
+  }
+
+  // B12/B13: shared activity read for both the timeout and checkin-missed reap gates.
+  // Keep-biased: missing session, missing reader, or a read failure all resolve to unknown
+  // (never fabricate staleness) — gateWorkerTimeoutByActivity treats null as KEEP_UNKNOWN.
+  private async readSessionActivityForGate(session: string): Promise<number | null> {
+    try {
+      const tmux = this.tmux as TmuxService & {
+        sessionActivity?: (n: string) => Promise<number | null>;
+      };
+      if (typeof tmux.sessionActivity === 'function') {
+        return await tmux.sessionActivity(session);
+      }
+      return null;
+    } catch {
+      return null;
+    }
   }
 
   // E2: lookup persisted role_capabilities.checkin_ms for enforcement

@@ -2039,7 +2039,10 @@ describe('E-phase (E1 mid-run inject/redirect at boundary; E2 checkin+stale->run
     dbs.raw.prepare("INSERT OR IGNORE INTO role_capabilities (role, allowed_statuses, terminal_statuses, checkin_ms) VALUES ('implementer','[]','[]', 1000)").run();
     const arts = new RunArtifactService(dbs);
     // minimal worker svc for spawn + mark (tmux stubs succeed, assignment provides agent)
-    const tmuxStub = { createSession: async ()=>'s', sendCommand:async()=>true, sendAndSubmit:async()=>true, waitForReady:async()=>true, getPanePid:async()=>123, terminateSession:async()=>{}, capturePane: async()=> '❯ ready\n> ready\n', sendKeys:async()=>true, sendEnter:async()=>true };
+    // B13/AC18: checkin-missed now also requires known-stale tmux session_activity (not
+    // elapsed-since-started_at alone) — report activity as stale as started_at so this test's
+    // own "stale/checkin-missed" premise still reaches the reap it asserts on.
+    const tmuxStub = { createSession: async ()=>'s', sendCommand:async()=>true, sendAndSubmit:async()=>true, waitForReady:async()=>true, getPanePid:async()=>123, terminateSession:async()=>{}, capturePane: async()=> '❯ ready\n> ready\n', sendKeys:async()=>true, sendEnter:async()=>true, sessionActivity: async ()=> Math.floor((Date.now() - 5*60*1000)/1000) };
     const assignStub = { resolveProjectRole: () => ({ agent: {id: 99, provider:'grok', model:'grok-4.5', default_effort:'medium'} }) };
     const WorkerSvc = (await import('./worker-service.js')).WorkerService;
     const worker = new WorkerSvc(dbs as any, { recordEvent: () => {} } as any, tmuxStub as any, { resolveAgentLaunchSpec: ()=>({launch_cmd:'echo'}) } as any, assignStub as any );
