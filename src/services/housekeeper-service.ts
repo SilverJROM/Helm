@@ -267,8 +267,8 @@ export class HousekeeperService {
       };
     }
 
-    // B10b / AC14: done requires evidence citing terminal-support facts in the persisted envelope.
-    // Any-atom identity cite (task key alone) is not enough; needs-human is never gated.
+    // B10b / AC14: done requires evidence citing terminal-support for the same task identity.
+    // Global status:done from another task cannot free-ride; needs-human is never gated.
     if (verdict === 'done' && !evidenceCitesStoredEnvelope(evidence, row.envelope_json)) {
       this.db
         .prepare(
@@ -283,7 +283,7 @@ export class HousekeeperService {
         outcome: 'invalid_callback_proof',
         investigationId: id,
         sessionName: row.session_name,
-        error: `${HOUSEKEEPER_APPLY_ERROR_EVIDENCE_NOT_IN_ENVELOPE}: claimed completion is not supported by terminal facts in stored envelope`,
+        error: `${HOUSEKEEPER_APPLY_ERROR_EVIDENCE_NOT_IN_ENVELOPE}: claimed completion is not supported by same-task terminal facts in stored envelope`,
       };
     }
 
@@ -453,7 +453,8 @@ export class HousekeeperService {
       .all(runId) as any[];
     const callbackFacts = this.db
       .prepare(
-        `SELECT c.id, c.role, c.state, c.raw_line, c.received_at, d.role AS dispatch_role
+        `SELECT c.id, c.role, c.state, c.raw_line, c.received_at, d.role AS dispatch_role,
+                rt.task_key, rt.label AS task_label
          FROM callbacks c
          JOIN dispatches d ON d.id = c.dispatch_id
          JOIN task_attempts ta ON ta.id = d.attempt_id
@@ -550,6 +551,7 @@ function isDoneEligibleFromStoredEnvelope(envelopeJson: unknown): boolean {
 }
 
 const EVIDENCE_CITE_PANE_WINDOW = 24;
+const EVIDENCE_IDENTITY_MIN = 2;
 
 /** Status values that can support a done/completion claim (case-folded). */
 const TERMINAL_SUPPORT_STATUSES = new Set([
@@ -562,6 +564,13 @@ const TERMINAL_SUPPORT_STATUSES = new Set([
   'finished',
 ]);
 
+export interface TerminalSupportUnit {
+  /** Task identities this terminal fact belongs to (task_key, label). */
+  identities: string[];
+  /** Distinctive terminal phrases bound to those identities (status: done, raw_line, …). */
+  supportPhrases: string[];
+}
+
 function normalizeCiteText(value: string): string {
   return String(value ?? '')
     .toLowerCase()
@@ -573,48 +582,89 @@ function isTerminalSupportStatus(raw: string): boolean {
   return TERMINAL_SUPPORT_STATUSES.has(normalizeCiteText(raw));
 }
 
+function addIdentity(into: Set<string>, raw: unknown): void {
+  if (typeof raw !== 'string' && typeof raw !== 'number') return;
+  const n = normalizeCiteText(String(raw));
+  if (n.length >= EVIDENCE_IDENTITY_MIN) into.add(n);
+}
+
+function addSupportPhrase(into: Set<string>, raw: string, minLen = 8): void {
+  const n = normalizeCiteText(raw);
+  if (n.length >= minLen) into.add(n);
+}
+
+function addStatusSupportPhrase(into: Set<string>, status: string): void {
+  if (!isTerminalSupportStatus(status)) return;
+  addSupportPhrase(into, `status: ${normalizeCiteText(status)}`, 8);
+}
+
 /**
- * Terminal-support atoms only — identity atoms (task key, label) are intentionally excluded.
- * Prefer distinctive `status: <terminal>` phrases and terminal callback raw lines so bare
- * English words like "completed" / "done" in fabricated prose cannot free-ride.
+ * Collect terminal-support units bound to task identity.
+ * Generic global status:done atoms are not emitted — prevents cross-task replay (B10b fix2).
  */
-export function collectTerminalSupportAtoms(envelope: HousekeeperEnvelope): string[] {
-  const atoms = new Set<string>();
-  const addPhrase = (raw: string, minLen = 8) => {
-    const n = normalizeCiteText(raw);
-    if (n.length >= minLen) atoms.add(n);
-  };
-  const addStatusPhrase = (status: string) => {
-    if (!isTerminalSupportStatus(status)) return;
-    addPhrase(`status: ${normalizeCiteText(status)}`, 8);
+export function collectTerminalSupportUnits(envelope: HousekeeperEnvelope): TerminalSupportUnit[] {
+  const units: TerminalSupportUnit[] = [];
+
+  const pushUnit = (identities: Set<string>, supportPhrases: Set<string>) => {
+    if (identities.size === 0 || supportPhrases.size === 0) return;
+    units.push({
+      identities: [...identities],
+      supportPhrases: [...supportPhrases],
+    });
   };
 
-  const considerRow = (row: unknown): void => {
-    if (!row || typeof row !== 'object') return;
+  for (const row of envelope?.task_facts ?? []) {
+    if (!row || typeof row !== 'object') continue;
     const r = row as Record<string, unknown>;
-    if (typeof r.state === 'string') addStatusPhrase(r.state);
-    if (typeof r.status === 'string') addStatusPhrase(r.status);
-    if (typeof r.raw_line === 'string') {
-      const raw = r.raw_line;
-      const m = String(raw).match(/status:\s*([a-z0-9_-]+)/i);
-      if (m && isTerminalSupportStatus(m[1])) {
-        addStatusPhrase(m[1]);
-        addPhrase(raw, 12);
-      }
-    }
-  };
-
-  for (const row of envelope?.callback_facts ?? []) considerRow(row);
-  for (const row of envelope?.run_facts ?? []) considerRow(row);
-  for (const row of envelope?.task_facts ?? []) considerRow(row);
-  considerRow(envelope?.last_dispatch);
-
-  // Pane: only explicit STATUS: <terminal> tokens already present in the capture.
-  const pane = String(envelope?.pane_tail ?? '');
-  for (const m of pane.matchAll(/status:\s*([a-z0-9_-]+)/gi)) {
-    if (isTerminalSupportStatus(m[1])) addStatusPhrase(m[1]);
+    if (typeof r.status !== 'string' || !isTerminalSupportStatus(r.status)) continue;
+    const identities = new Set<string>();
+    const support = new Set<string>();
+    addIdentity(identities, r.task_key);
+    addIdentity(identities, r.label);
+    addStatusSupportPhrase(support, r.status);
+    pushUnit(identities, support);
   }
 
+  for (const row of envelope?.callback_facts ?? []) {
+    if (!row || typeof row !== 'object') continue;
+    const r = row as Record<string, unknown>;
+    const support = new Set<string>();
+    let terminal = false;
+    if (typeof r.state === 'string' && isTerminalSupportStatus(r.state)) {
+      terminal = true;
+      addStatusSupportPhrase(support, r.state);
+    }
+    if (typeof r.raw_line === 'string') {
+      const m = String(r.raw_line).match(/status:\s*([a-z0-9_-]+)/i);
+      if (m && isTerminalSupportStatus(m[1])) {
+        terminal = true;
+        addStatusSupportPhrase(support, m[1]);
+        addSupportPhrase(support, r.raw_line, 12);
+      }
+    }
+    if (!terminal) continue;
+    const identities = new Set<string>();
+    addIdentity(identities, r.task_key);
+    addIdentity(identities, r.task_label);
+    addIdentity(identities, r.label);
+    // Fallback: impl <taskKey> STATUS: from raw_line when join fields absent.
+    if (typeof r.raw_line === 'string') {
+      const impl = String(r.raw_line).match(/\bimpl\s+([a-z0-9_./:-]+)\s+status:/i);
+      if (impl) addIdentity(identities, impl[1]);
+    }
+    pushUnit(identities, support);
+  }
+
+  return units;
+}
+
+/** Flatten unit phrases for diagnostics/tests (not used by the apply gate). */
+export function collectTerminalSupportAtoms(envelope: HousekeeperEnvelope): string[] {
+  const atoms = new Set<string>();
+  for (const u of collectTerminalSupportUnits(envelope)) {
+    for (const p of u.supportPhrases) atoms.add(p);
+    for (const id of u.identities) atoms.add(id);
+  }
   return [...atoms];
 }
 
@@ -634,16 +684,21 @@ function claimIncludesCiteAtom(claim: string, atom: string): boolean {
 }
 
 /**
- * AC14: done evidence must cite terminal-support facts from the persisted envelope.
- * Any-atom identity cite (task key / label alone) is insufficient; empty terminal set fails closed.
+ * AC14: done evidence must cite terminal-support for the **same task identity**.
+ * Global status:done from an unrelated historical task cannot free-ride (fix2).
+ * Empty terminal units fail closed (fix1: WORKING-only envelope).
  */
 export function evidenceCitesEnvelope(evidence: string, envelope: HousekeeperEnvelope): boolean {
   if (!envelope || typeof envelope !== 'object') return false;
   const claim = normalizeCiteText(evidence);
   if (!claim) return false;
-  const atoms = collectTerminalSupportAtoms(envelope);
-  if (atoms.length === 0) return false;
-  return atoms.some((atom) => claimIncludesCiteAtom(claim, atom));
+  const units = collectTerminalSupportUnits(envelope);
+  if (units.length === 0) return false;
+  return units.some(
+    (u) =>
+      u.identities.some((id) => claimIncludesCiteAtom(claim, id)) &&
+      u.supportPhrases.some((p) => claimIncludesCiteAtom(claim, p)),
+  );
 }
 
 function evidenceCitesStoredEnvelope(evidence: string, envelopeJson: unknown): boolean {

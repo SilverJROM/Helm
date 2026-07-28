@@ -33,14 +33,20 @@ const FABRICATED_DONE_EVIDENCE =
   'pane showed completed prompt and no active generation; fabricated clean shutdown observed';
 
 /**
- * Redteam CRITICAL probe: real task-key atom + fabricated completion while envelope is WORKING.
+ * Redteam fix1 probe: real task-key atom + fabricated completion while envelope is WORKING.
  */
 const REDTEAM_FABRICATED_COMPLETION_EVIDENCE =
   'S18a completed successfully; no active generation observed; all work is done and the seat can be marked idle. This is intentionally fabricated because the persisted envelope only says WORKING and INTERVIEWING.';
 
 /**
- * Evidence citing terminal-support phrases present in terminal seed facts (status: done / completed).
- * Identity-only cites (task key alone) are intentionally insufficient under AC14 fix1.
+ * Redteam fix2 probe: names current S18a + generic status:done borrowed from older S17 terminal row.
+ */
+const REDTEAM_CROSS_TASK_REPLAY_EVIDENCE =
+  'S18a completed successfully; the current task is done and the active session can be marked idle. Persisted evidence says status: done.';
+
+/**
+ * Evidence citing terminal-support phrases present in terminal seed facts (status: done / complete).
+ * Must bind identity + terminal phrase for the same task (AC14 fix2).
  */
 const CITING_DONE_EVIDENCE =
   'callback STATUS: DONE for S18a; task housekeeper facts status: complete';
@@ -125,6 +131,59 @@ describe('S18a/S18b housekeeper dispatch/apply', () => {
       `INSERT INTO callbacks (dispatch_id, role, state, raw_line, source)
        VALUES (?, 'implementer', ?, ?, 'file')`
     ).run(Number(dispatch.lastInsertRowid), callbackState, callbackLine);
+    return runId;
+  }
+
+  /** Older S17 complete/DONE + latest S18a working/WORKING on the same run (R2 mixed history). */
+  function seedMixedHistoryRun(): number {
+    const run = db.prepare(`INSERT INTO runs (project_id, status, phase) VALUES (NULL, 'active', 'executing')`).run();
+    const runId = Number(run.lastInsertRowid);
+
+    const insertTask = (opts: {
+      taskKey: string;
+      label: string;
+      batch: string;
+      taskStatus: string;
+      attemptStatus: string;
+      callbackState: string;
+      callbackLine: string;
+    }) => {
+      const task = db.prepare(
+        `INSERT INTO run_tasks (run_id, task_key, label, batch, status, attempts_count)
+         VALUES (?, ?, ?, ?, ?, 1)`
+      ).run(runId, opts.taskKey, opts.label, opts.batch, opts.taskStatus);
+      const attempt = db.prepare(
+        `INSERT INTO task_attempts (task_id, attempt_num, status) VALUES (?, 1, ?)`
+      ).run(Number(task.lastInsertRowid), opts.attemptStatus);
+      const dispatch = db.prepare(
+        `INSERT INTO dispatches (attempt_id, role, brief_path, transport_handle)
+         VALUES (?, 'implementer', ?, 'fake-worker')`
+      ).run(Number(attempt.lastInsertRowid), `prompts/${opts.taskKey}.md`);
+      db.prepare(
+        `INSERT INTO callbacks (dispatch_id, role, state, raw_line, source)
+         VALUES (?, 'implementer', ?, ?, 'file')`
+      ).run(Number(dispatch.lastInsertRowid), opts.callbackState, opts.callbackLine);
+    };
+
+    // Older terminal history first (lower id), then current working task (higher id / ORDER BY id DESC).
+    insertTask({
+      taskKey: 'S17',
+      label: 'prior-batch-complete',
+      batch: 'S17',
+      taskStatus: 'complete',
+      attemptStatus: 'complete',
+      callbackState: 'DONE',
+      callbackLine: '[helm callback] impl S17 STATUS: DONE',
+    });
+    insertTask({
+      taskKey: 'S18a',
+      label: 'housekeeper facts',
+      batch: 'S18a',
+      taskStatus: 'working',
+      attemptStatus: 'working',
+      callbackState: 'WORKING',
+      callbackLine: '[helm callback] impl S18a STATUS: WORKING',
+    });
     return runId;
   }
 
@@ -761,6 +820,44 @@ describe('S18a/S18b housekeeper dispatch/apply', () => {
     expect(inv.apply_error).toBe(HOUSEKEEPER_APPLY_ERROR_EVIDENCE_NOT_IN_ENVELOPE);
     expect(inv.callback_evidence).toBe(REDTEAM_FABRICATED_COMPLETION_EVIDENCE);
     expect(reg.get('helm-w-b10b-redteam-any-atom')!.status).toBe('active');
+    expect(tmux.terminateCalls).toEqual([]);
+    expect(transport.reapCalls).toEqual([]);
+  });
+
+  it('B10b AC14 fix2: mixed S17 DONE + S18a WORKING rejects S18a claim replaying status:done', async () => {
+    // Redteam R2 CRITICAL: global status:done from older S17 authenticated fabricated S18a completion.
+    const runId = seedMixedHistoryRun();
+    seedSession('helm-w-b10b-cross-task', { owner: 'helm', status: 'active', runId });
+    const svc = makeService(snap({ spark: { headroom: 42, depleted: false, worst_bucket: 58 } }));
+    const dispatched = await svc.dispatchOnce({ nowMs: Date.now() });
+    expect(dispatched.outcome).toBe('dispatched');
+    if (dispatched.outcome !== 'dispatched') return;
+
+    const envelope = JSON.parse(svc.getInvestigation(dispatched.investigationId).envelope_json);
+    expect(envelope.pane_tail).toContain('INTERVIEWING');
+    expect(JSON.stringify(envelope.task_facts)).toContain('S17');
+    expect(JSON.stringify(envelope.task_facts)).toContain('S18a');
+    expect(JSON.stringify(envelope.callback_facts)).toMatch(/STATUS: DONE/i);
+    expect(JSON.stringify(envelope.callback_facts)).toMatch(/STATUS: WORKING/i);
+    // Callback facts carry task identity for unit binding.
+    expect(JSON.stringify(envelope.callback_facts)).toMatch(/task_key/i);
+    expect(REDTEAM_CROSS_TASK_REPLAY_EVIDENCE).toContain('S18a');
+    expect(REDTEAM_CROSS_TASK_REPLAY_EVIDENCE.toLowerCase()).toContain('status: done');
+    expect(REDTEAM_CROSS_TASK_REPLAY_EVIDENCE).not.toContain('S17');
+
+    const rejected = svc.applyCallback(dispatched.investigationId, {
+      verdict: 'done',
+      evidence: REDTEAM_CROSS_TASK_REPLAY_EVIDENCE,
+      rationale: 'must not replay older task terminal atoms onto current working task',
+    });
+
+    expect(rejected).toMatchObject({ ok: false, outcome: 'invalid_callback_proof' });
+    expect(String((rejected as any).error || '')).toContain(HOUSEKEEPER_APPLY_ERROR_EVIDENCE_NOT_IN_ENVELOPE);
+    const inv = svc.getInvestigation(dispatched.investigationId);
+    expect(inv.status).toBe('apply_rejected');
+    expect(inv.apply_error).toBe(HOUSEKEEPER_APPLY_ERROR_EVIDENCE_NOT_IN_ENVELOPE);
+    expect(inv.callback_evidence).toBe(REDTEAM_CROSS_TASK_REPLAY_EVIDENCE);
+    expect(reg.get('helm-w-b10b-cross-task')!.status).toBe('active');
     expect(tmux.terminateCalls).toEqual([]);
     expect(transport.reapCalls).toEqual([]);
   });
