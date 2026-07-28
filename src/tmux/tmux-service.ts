@@ -48,6 +48,11 @@ export type TmuxSessionStatusToken = {
   owner: 'helm' | 'human' | 'legacy:unknown';
   expectedStatus: 'active' | 'idle' | 'reaped';
   generation: number;
+  /**
+   * B05 / B08 fix1 C2: when true, markReaped requires CURRENT status === expectedStatus
+   * (idle snapshot cannot claim a same-gen flip to active during staging).
+   */
+  exactStatusOnly?: boolean;
 };
 
 /**
@@ -670,6 +675,8 @@ export class TmuxService {
     }
 
     // Capture old CAS token at decision boundary before any mutation (idle path only).
+    // B08 fix1 C2: exactStatusOnly fences idle completion at the destructive CAS — an idle→active
+    // flip during staging must not still claim/kill the old lifecycle.
     let oldToken: TmuxSessionStatusToken | undefined;
     if (status === 'idle') {
       try {
@@ -679,6 +686,7 @@ export class TmuxService {
           owner: 'helm',
           expectedStatus: 'idle',
           generation: row.generation,
+          exactStatusOnly: true,
         };
       } catch {
         throw new SessionNameCollisionError(
@@ -690,11 +698,13 @@ export class TmuxService {
     }
 
     // Stage under a unique name FIRST so a create failure never touches the old lifecycle (AC11).
+    // B08 fix1 C1: staging requires a successful @helm_child tag — incomplete stage must not close old.
     const stagingName = this.makeStagingSessionName(name);
     try {
-      await this.spawnTaggedSession(stagingName, cwd);
+      await this.spawnTaggedSession(stagingName, cwd, { requireHelmChildTag: true });
     } catch (err) {
-      // Staging failed — old session and registry must remain untouched.
+      // Staging failed (new-session or strict tag) — old session and registry must remain untouched.
+      // Orphan staging teardown (if new-session succeeded) is handled inside spawnTaggedSession.
       throw err;
     }
 
@@ -756,18 +766,34 @@ export class TmuxService {
 
   /**
    * ST-R1: new-session + @helm_child tag. No registry write (caller publishes under the final name).
+   *
+   * B08 fix1 C1: `requireHelmChildTag: true` (staging replace path) fail-closes if the tag cannot
+   * be set — tears down the just-created session and throws so callers never treat incomplete
+   * staging as authority to close the old lifecycle. Default (fresh create) keeps best-effort
+   * tag so ST-R1 "set-option swallowed" behavior is preserved for the gone-session path.
    */
-  private async spawnTaggedSession(sessionName: string, cwd?: string): Promise<void> {
+  private async spawnTaggedSession(
+    sessionName: string,
+    cwd?: string,
+    opts?: { requireHelmChildTag?: boolean }
+  ): Promise<void> {
     const args = ['new-session', '-d', '-s', sessionName];
     if (cwd) {
       args.push('-c', cwd);
     }
     await execFileAsync('tmux', args);
-    // ST-R1: positive Helm ownership tag on every session Helm creates. Best-effort — a set-option
-    // failure must never break/throw the create (swallowed + logged).
-    await execFileAsync('tmux', ['set-option', '-t', sessionName, '@helm_child', '1']).catch((err) => {
+
+    try {
+      await execFileAsync('tmux', ['set-option', '-t', sessionName, '@helm_child', '1']);
+    } catch (err) {
+      if (opts?.requireHelmChildTag) {
+        // Incomplete staging: remove orphan staging session; rethrow so old lifecycle is not closed.
+        await this.killSessionRaw(sessionName).catch(() => {});
+        throw err;
+      }
+      // Fresh-create path: best-effort tag (ST-R1) — never break create on set-option failure.
       console.warn('[tmux] set @helm_child failed (best-effort)', { name: sessionName, err: String(err) });
-    });
+    }
   }
 
   /**

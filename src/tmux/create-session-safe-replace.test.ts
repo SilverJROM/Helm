@@ -80,7 +80,14 @@ function renameSessionCalls(): Array<{ cmd: string; args: string[] }> {
 }
 
 /** Live session: has-session succeeds; @helm_child show-options returns tag when asked. */
-function liveTaggedImpl(opts?: { failNewSession?: boolean; helmChild?: string | null }) {
+function liveTaggedImpl(opts?: {
+  failNewSession?: boolean;
+  /** B08 fix1 C1: fail set-option after new-session (incomplete staging tag). */
+  failSetOption?: boolean;
+  /** Optional hook after a successful staging set-option (for C2 idle→active flip). */
+  afterStagingTagged?: () => void;
+  helmChild?: string | null;
+}) {
   const helmChild = opts?.helmChild === undefined ? '1' : opts.helmChild;
   return async (_cmd: string, args: string[]) => {
     const sub = args[0];
@@ -110,7 +117,18 @@ function liveTaggedImpl(opts?: { failNewSession?: boolean; helmChild?: string | 
       }
       return { stdout: '', stderr: '' };
     }
-    // set-option, kill-session, rename-session
+    if (sub === 'set-option' && args.includes('@helm_child')) {
+      if (opts?.failSetOption) {
+        throw new Error('forced staging set-option @helm_child failure');
+      }
+      // Staging tag applied — allow tests to mutate registry before terminateSession.
+      const target = args[args.indexOf('-t') + 1];
+      if (typeof target === 'string' && target.includes('-stg-') && opts?.afterStagingTagged) {
+        opts.afterStagingTagged();
+      }
+      return { stdout: '', stderr: '' };
+    }
+    // kill-session, rename-session
     return { stdout: '', stderr: '' };
   };
 }
@@ -242,6 +260,88 @@ describe('B08 AC9–11 createSession safe same-name replace', () => {
     expect(after.owner).toBe('helm');
     // onCreate must not have published a replacement under the final name.
     expect(createdNames).toEqual([]);
+  });
+
+  it('fix1 C1: forced staging set-option tag failure → zero kill of old; staging torn down; registry intact', async () => {
+    const name = 'helm-w-b08-tagfail';
+    const row = reg.register(name, { owner: 'helm', kind: 'worker' })!;
+    const tok = sessionStatusTokenFromRow(row);
+    reg.markIdle(tok, 'completed');
+    const genBefore = reg.get(name)!.generation;
+    const idBefore = reg.get(name)!.id;
+
+    cpMock.impl = liveTaggedImpl({ failSetOption: true });
+
+    await expect(tmux.createSession(name, '/tmp', { owner: 'helm' })).rejects.toThrow(
+      /forced staging set-option @helm_child failure/
+    );
+
+    // Old final name must never be killed — incomplete staging does not authorize close.
+    const killsOfFinal = killSessionCalls().filter((c) => {
+      const ti = c.args.indexOf('-t');
+      return ti >= 0 && c.args[ti + 1] === name;
+    });
+    expect(killsOfFinal).toEqual([]);
+
+    // Orphan staging torn down (kill of -stg- name after new-session succeeded).
+    const stagingKills = killSessionCalls().filter((c) => {
+      const ti = c.args.indexOf('-t');
+      const t = ti >= 0 ? c.args[ti + 1] : '';
+      return typeof t === 'string' && t.startsWith(`${name}-stg-`);
+    });
+    expect(stagingKills.length).toBeGreaterThanOrEqual(1);
+
+    // Staging new-session did run (otherwise there would be no orphan to clean).
+    expect(newSessionCalls().length).toBe(1);
+    expect(renameSessionCalls()).toEqual([]);
+
+    const after = reg.get(name)!;
+    expect(after.id).toBe(idBefore);
+    expect(after.status).toBe('idle');
+    expect(after.generation).toBe(genBefore);
+    expect(after.owner).toBe('helm');
+    expect(createdNames).toEqual([]);
+  });
+
+  it('fix1 C2: idle→active during staging → exactStatusOnly aborts kill of old; staging cleaned', async () => {
+    const name = 'helm-w-b08-idleflip';
+    const row = reg.register(name, { owner: 'helm', kind: 'worker' })!;
+    const tok = sessionStatusTokenFromRow(row);
+    reg.markIdle(tok, 'completed');
+    expect(reg.get(name)!.status).toBe('idle');
+    const genBefore = reg.get(name)!.generation;
+
+    cpMock.impl = liveTaggedImpl({
+      afterStagingTagged: () => {
+        // Same id/name/owner/generation, only status flips — without exactStatusOnly the idle
+        // token would still claim via status IN ('active','idle').
+        db.prepare(`UPDATE helm_sessions SET status = 'active' WHERE name = ?`).run(name);
+      },
+    });
+
+    await expect(tmux.createSession(name, '/tmp', { owner: 'helm' })).rejects.toMatchObject({
+      reason: 'replace_refused',
+    });
+
+    const killsOfFinal = killSessionCalls().filter((c) => {
+      const ti = c.args.indexOf('-t');
+      return ti >= 0 && c.args[ti + 1] === name;
+    });
+    expect(killsOfFinal).toEqual([]);
+
+    // Staging cleaned after CAS refuse.
+    const stagingKills = killSessionCalls().filter((c) => {
+      const ti = c.args.indexOf('-t');
+      const t = ti >= 0 ? c.args[ti + 1] : '';
+      return typeof t === 'string' && t.startsWith(`${name}-stg-`);
+    });
+    expect(stagingKills.length).toBeGreaterThanOrEqual(1);
+
+    const after = reg.get(name)!;
+    expect(after.status).toBe('active'); // flipped, not reaped
+    expect(after.generation).toBe(genBefore);
+    expect(createdNames).toEqual([]);
+    expect(renameSessionCalls()).toEqual([]);
   });
 
   it('T3: eligible completed Helm → terminateSession CAS + rename + one new generation', async () => {
