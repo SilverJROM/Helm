@@ -13,6 +13,7 @@ import {
 } from './session-registry-service.js';
 import { WorkerService } from './worker-service.js';
 import { loadConfig } from '../config/config.js';
+import { TmuxService } from '../tmux/tmux-service.js';
 
 function makeTempDb(): { db: DatabaseService; cleanup: () => void } {
   const dbPath = path.join(os.tmpdir(), `helm-slr-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
@@ -857,6 +858,133 @@ describe('S12 session reconciler (WorkerService.sessionJanitorTick)', () => {
     expect(tickBody).not.toMatch(/HELM_SESSION_TTL_MS/);
     expect(tickBody).not.toMatch(/pastTtl|ttlSecs|ttlMs/);
     expect(tickBody).toMatch(/decideSessionReconcile/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B05 / AC5 (janitor-audit-remediation) — janitor final CAS immediately before terminate.
+// Every S12 test above drives a bare tmuxSpy.terminateSession stub that ignores
+// opts.sessionToken and always "succeeds" — it never exercises the production
+// TmuxService+registryHook CAS the janitor actually depends on. These tests wire a
+// REAL TmuxService (only killSessionRaw + the 3 tri-state probes stubbed, no shell-out)
+// + REAL SessionRegistryService + the REAL onCreate/onTerminate hook (mirrors
+// terminate-cas-order.test.ts) into a REAL WorkerService, and inject the race inside
+// the janitor's LAST async probe — sessionHasHelmChildTag, which runs immediately
+// before reapToken/terminateSession — so the CAS claim is proven against a genuine
+// concurrent re-registration, not just a JS-level decision.
+// ---------------------------------------------------------------------------
+describe('B05 AC5: janitor final CAS immediately before terminate (real TmuxService+registry)', () => {
+  class RaceTmux extends TmuxService {
+    kills: string[] = [];
+    existsMap = new Map<string, boolean | null>();
+    attachedMap = new Map<string, boolean | null>();
+    /** Fires once per candidate row, immediately before the janitor's final claim. */
+    onTagProbe?: (name: string) => void;
+    protected async killSessionRaw(sessionName: string): Promise<void> {
+      this.kills.push(sessionName);
+    }
+    async sessionExistsTriState(name: string): Promise<boolean | null> {
+      return this.existsMap.has(name) ? this.existsMap.get(name)! : true;
+    }
+    async sessionAttached(name: string): Promise<boolean | null> {
+      return this.attachedMap.has(name) ? this.attachedMap.get(name)! : false;
+    }
+    async sessionHasHelmChildTag(name: string): Promise<boolean> {
+      this.onTagProbe?.(name);
+      return true;
+    }
+  }
+
+  let db: DatabaseService;
+  let cleanup: () => void;
+  let reg: SessionRegistryService;
+  let tmux: RaceTmux;
+  let ws: WorkerService;
+  let janitorModeBefore: string | undefined;
+
+  beforeEach(() => {
+    const t = makeTempDb();
+    db = t.db;
+    cleanup = t.cleanup;
+    reg = new SessionRegistryService(db);
+    janitorModeBefore = process.env.HELM_SESSION_JANITOR;
+    process.env.HELM_SESSION_JANITOR = 'on';
+    tmux = new RaceTmux({
+      onCreate: (n: string, opts?: any) => {
+        const row = reg.register(n, {
+          owner: opts?.owner || 'helm',
+          kind: opts?.kind,
+          projectId: opts?.projectId,
+          runId: opts?.runId,
+        });
+        return row ? sessionStatusTokenFromRow(row) : undefined;
+      },
+      onTerminate: (_n: string, token?: any) => {
+        if (!token) return false;
+        return reg.markReaped(token).applied === true;
+      },
+      onUse: () => {},
+    });
+    ws = new WorkerService(db, {} as any, tmux, {} as any, {} as any, undefined, reg);
+  });
+
+  afterEach(() => {
+    cleanup();
+    if (janitorModeBefore === undefined) delete process.env.HELM_SESSION_JANITOR;
+    else process.env.HELM_SESSION_JANITOR = janitorModeBefore;
+  });
+
+  it('re-register as human/active between snapshot and claim → zero kill-session, replacement untouched', async () => {
+    const created = reg.register('helm-w-b05-race-human', { owner: 'helm' })!;
+    reg.markIdle(sessionStatusTokenFromRow(created));
+
+    // Race injected inside the janitor's own last async probe, immediately before it
+    // builds reapToken and calls terminateSession — same name, id preserved, owner flips
+    // to human and a fresh generation is allocated (exactly a real concurrent re-register).
+    tmux.onTagProbe = (name) => {
+      if (name === 'helm-w-b05-race-human') {
+        reg.register(name, { owner: 'human' });
+      }
+    };
+
+    await ws.sessionJanitorTick();
+
+    expect(tmux.kills).toEqual([]);
+    const after = reg.get('helm-w-b05-race-human')!;
+    expect(after.owner).toBe('human');
+    expect(after.status).toBe('active');
+    expect(after.generation).toBeGreaterThan(created.generation);
+  });
+
+  it('generation-only replacement (owner still helm) between snapshot and claim → zero kill-session', async () => {
+    const created = reg.register('helm-w-b05-race-gen', { owner: 'helm' })!;
+    reg.markIdle(sessionStatusTokenFromRow(created));
+
+    tmux.onTagProbe = (name) => {
+      if (name === 'helm-w-b05-race-gen') {
+        reg.register(name, { owner: 'helm' }); // same owner, id preserved, fresh generation only
+      }
+    };
+
+    await ws.sessionJanitorTick();
+
+    expect(tmux.kills).toEqual([]);
+    const after = reg.get('helm-w-b05-race-gen')!;
+    expect(after.owner).toBe('helm');
+    expect(after.status).toBe('active'); // register() reset — never the stale idle target
+    expect(after.generation).toBeGreaterThan(created.generation);
+  });
+
+  it('unchanged Helm idle lifecycle → claims once and performs exactly one targeted kill-session', async () => {
+    const created = reg.register('helm-w-b05-race-none', { owner: 'helm' })!;
+    reg.markIdle(sessionStatusTokenFromRow(created));
+
+    await ws.sessionJanitorTick();
+
+    expect(tmux.kills).toEqual(['helm-w-b05-race-none']);
+    const after = reg.get('helm-w-b05-race-none')!;
+    expect(after.status).toBe('reaped');
+    expect(after.generation).toBe(created.generation);
   });
 });
 
