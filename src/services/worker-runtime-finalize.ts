@@ -260,12 +260,17 @@ export function finalizeBrainSessionRow(
 }
 
 /**
- * A15 session-gone pass: any launching|running row whose session is missing from tmux
- * is finalized to reaped/session-gone. Returns count finalized.
+ * A15 session-gone pass, B06/F-01: any launching|running row whose session is PROVABLY gone
+ * from tmux is finalized to reaped/session-gone. Consumes a TRI-STATE existence probe
+ * (true = live | false = provably gone | null = unknown), matching S12's decideSessionReconcile
+ * fail-safe bias. Finalizes ONLY on an explicit `false`. `null` (malformed output, socket error,
+ * permission error) and a thrown probe both remain UNKNOWN and must never terminalize a worker or
+ * reach the registry-idle writer (assertRegistryIdle inside finalizeWorkerRuntimeRow) — an UNKNOWN
+ * read is not evidence of completion. Returns count finalized.
  */
 export async function finalizeSessionGoneWorkers(
   db: FinalizeDb,
-  sessionExists: (name: string) => boolean | Promise<boolean>
+  sessionExists: (name: string) => boolean | null | Promise<boolean | null>
 ): Promise<number> {
   let rows: any[] = [];
   try {
@@ -282,16 +287,17 @@ export async function finalizeSessionGoneWorkers(
   for (const r of rows) {
     const sess = String(r.session || '').trim();
     if (!sess) continue;
-    let alive = true;
+    let exists: boolean | null;
     try {
-      alive = !!(await sessionExists(sess));
+      exists = await sessionExists(sess);
     } catch {
-      // Probe failure: do not finalize (fail-safe keep).
+      // Thrown probe: UNKNOWN — fail-safe keep, never finalize.
       continue;
     }
-    if (!alive) {
+    if (exists === false) {
       if (finalizeWorkerRuntimeRow(db, Number(r.id), 'reaped', 'session-gone')) n += 1;
     }
+    // exists === true (live) or exists === null (UNKNOWN) → keep, no assertion.
   }
   return n;
 }

@@ -18,6 +18,7 @@ import {
   deriveSessionKind,
   sessionStatusTokenFromRow,
 } from './services/session-registry-service.js';
+import { WorkerService } from './services/worker-service.js';
 
 /**
  * A15 / R4.16–R4.17 — finalize-to-reaped / truthful live.
@@ -536,5 +537,125 @@ describe.sequential('S03 brain completion assertion (finalizeBrainSessionRow)', 
     expect(changed).toBe(true);
     expect(reg.get(session)!.status).toBe('idle');
     expect(reg.get(session)!.reason).toBe('detached-start-failed');
+  });
+});
+
+/**
+ * B06 / F-01 (AC1, AC2) — finalizeSessionGoneWorkers must consume a TRI-STATE existence probe
+ * (true | false | null) and finalize ONLY on an explicit `false`. A thrown probe and an explicit
+ * `null` both remain UNKNOWN and must never terminalize a worker or reach the registry-idle
+ * writer. Synthetic DB only; no live tmux; HELM_SESSION_JANITOR stays 0 (default/unset).
+ */
+describe.sequential('B06 tri-state gone-worker pass preserves UNKNOWN', () => {
+  let db: DatabaseService;
+  let tmpDb: string;
+  let projectId: number;
+  let runId: number;
+  let projDir: string;
+  let reg: SessionRegistryService;
+
+  beforeEach(() => {
+    tmpDb = path.join(os.tmpdir(), `helm-b06-tristate-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+    db = new DatabaseService(tmpDb);
+    projDir = fs.mkdtempSync(path.join(os.tmpdir(), 'helm-b06-proj-'));
+    const projects = new ProjectService(db);
+    const proj = projects.createProject({ name: 'b06-tristate', directory: projDir });
+    projectId = proj.id;
+    const artifacts = new RunArtifactService(db);
+    runId = artifacts.createRun(projectId, `b06-b-${Date.now()}`, path.join(projDir, 'ns.md'), null);
+    reg = new SessionRegistryService(db);
+    configureWorkerRuntimeFinalize({
+      markIdle: (token, reason) => reg.markIdle(token, reason),
+    });
+  });
+
+  afterEach(() => {
+    configureWorkerRuntimeFinalize({ markIdle: null });
+    try {
+      db.close();
+    } catch {}
+    try {
+      fs.rmSync(tmpDb, { force: true });
+    } catch {}
+    try {
+      fs.rmSync(projDir, { recursive: true, force: true });
+    } catch {}
+  });
+
+  function insertRunning(session: string): number {
+    const info = db.raw
+      .prepare(
+        `INSERT INTO worker_runtimes (project_id, role, provider, model, session, correlation_id, state, spawned_by, run_id, started_at)
+         VALUES (?,?,?,?,?,?,'running','b06-test',?, datetime('now'))`
+      )
+      .run(projectId, 'implementer', 'grok', 'grok-4.5', session, 'b06-corr', runId);
+    return Number(info.lastInsertRowid);
+  }
+
+  it('(AC1) forced tri-state probe throw → runtime stays running, registry stays active', async () => {
+    const session = 'helm-b06-throw-unknown';
+    reg.register(session, { owner: 'helm', projectId, runId, kind: 'worker' });
+    const id = insertRunning(session);
+
+    const n = await finalizeSessionGoneWorkers(db.raw, async () => {
+      throw new Error('tmux socket/permission error');
+    });
+
+    expect(n).toBe(0);
+    const row = db.raw.prepare('SELECT state, ended_at FROM worker_runtimes WHERE id = ?').get(id) as any;
+    expect(row.state).toBe('running');
+    expect(row.ended_at).toBeNull();
+    expect(reg.get(session)!.status).toBe('active');
+  });
+
+  it('(AC2) explicit null (UNKNOWN) does not call markIdle or terminalize', async () => {
+    const session = 'helm-b06-null-unknown';
+    reg.register(session, { owner: 'helm', projectId, runId, kind: 'worker' });
+    const id = insertRunning(session);
+
+    const n = await finalizeSessionGoneWorkers(db.raw, async () => null);
+
+    expect(n).toBe(0);
+    const row = db.raw.prepare('SELECT state, ended_at FROM worker_runtimes WHERE id = ?').get(id) as any;
+    expect(row.state).toBe('running');
+    expect(row.ended_at).toBeNull();
+    expect(reg.get(session)!.status).toBe('active');
+  });
+
+  it('explicit false (proven gone) retains the proven-gone convergence path', async () => {
+    const session = 'helm-b06-proven-gone';
+    reg.register(session, { owner: 'helm', projectId, runId, kind: 'worker' });
+    const id = insertRunning(session);
+
+    const n = await finalizeSessionGoneWorkers(db.raw, async () => false);
+
+    expect(n).toBe(1);
+    const row = db.raw
+      .prepare('SELECT state, exit_reason, ended_at FROM worker_runtimes WHERE id = ?')
+      .get(id) as any;
+    expect(row.state).toBe('reaped');
+    expect(row.exit_reason).toBe('session-gone');
+    expect(row.ended_at).toBeTruthy();
+    const sess = reg.get(session)!;
+    expect(sess.status).toBe('idle');
+    expect(sess.reason).toBe('session-gone');
+  });
+
+  it('production call site (WorkerService._reapTick) consumes the tri-state probe, not the collapsing boolean', async () => {
+    const session = 'helm-b06-callsite-unknown';
+    const id = insertRunning(session);
+
+    // Boolean sessionExists says "gone" (false) — under the OLD wiring this would finalize.
+    // Tri-state says UNKNOWN (null) — the fixed call site must prefer this and keep.
+    const fakeTmux = {
+      sessionExists: async () => false,
+      sessionExistsTriState: async () => null,
+    };
+    const worker = new WorkerService(db, {} as any, fakeTmux as any, {} as any, {} as any);
+    await (worker as any)._reapTick(1800000);
+
+    const row = db.raw.prepare('SELECT state, ended_at FROM worker_runtimes WHERE id = ?').get(id) as any;
+    expect(row.state).toBe('running');
+    expect(row.ended_at).toBeNull();
   });
 });

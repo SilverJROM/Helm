@@ -367,7 +367,10 @@ VALUES (?,?,?,?,?,?,?,?,datetime('now'), ?)
       // running/ended_at NULL without waiting for WORKER_TIMEOUT (~30min). Explicit finalize,
       // not "hope the generic age janitor".
       try {
-        await finalizeSessionGoneWorkers(this.db.raw, (name) => this.tmux.sessionExists(name));
+        // B06/F-01: tri-state probe — an UNKNOWN existence read must never assert completion.
+        // Reuses the same S12 tri-state+fallback wiring as the reconciler (not the boolean
+        // tmux.sessionExists, which collapses socket/permission errors into a false positive).
+        await finalizeSessionGoneWorkers(this.db.raw, (name) => this.probeSessionExistsForReconcile(name));
       } catch { /* best-effort */ }
 
       // H1: compare in a SINGLE time format. started_at is SQLite datetime('now') ("YYYY-MM-DD
