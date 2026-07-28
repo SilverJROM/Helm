@@ -18,6 +18,7 @@ import {
 import { HelmIdentityService } from './helm-identity-service.js';
 import { finalizeWorkerRuntimeRow, finalizeSessionGoneWorkers } from './worker-runtime-finalize.js';
 import { decideSessionReconcile } from './session-reconcile-decision.js';
+import { gateWorkerTimeoutByActivity } from './session-observation.js';
 
 export class WorkerService {
   private reaperInterval: NodeJS.Timeout | null = null;
@@ -373,12 +374,38 @@ VALUES (?,?,?,?,?,?,?,?,datetime('now'), ?)
         await finalizeSessionGoneWorkers(this.db.raw, (name) => this.probeSessionExistsForReconcile(name));
       } catch { /* best-effort */ }
 
+      // B12 / AC17: started_at age is a **candidate selector only** — not sufficient kill evidence.
       // H1: compare in a SINGLE time format. started_at is SQLite datetime('now') ("YYYY-MM-DD
       // HH:MM:SS", space). A JS toISOString() cutoff (with 'T') would sort lexicographically
       // wrong (space < 'T'), false-reaping fresh same-day workers. Use SQLite datetime arithmetic.
       const secs = Math.max(1, Math.floor(timeoutMs / 1000));
-      const stale = this.db.prepare("SELECT id FROM worker_runtimes WHERE state IN ('launching','running') AND started_at < datetime('now', ?)").all(`-${secs} seconds`) as any[];
-      for (const w of stale) {
+      const ageCandidates = this.db.prepare(
+        "SELECT id, session FROM worker_runtimes WHERE state IN ('launching','running') AND started_at < datetime('now', ?)"
+      ).all(`-${secs} seconds`) as { id: number; session: string | null }[];
+      for (const w of ageCandidates) {
+        // Keep-biased when no session name (cannot observe activity).
+        if (!w.session) continue;
+        let sessionActivity: number | null = null;
+        try {
+          const tmux = this.tmux as TmuxService & {
+            sessionActivity?: (n: string) => Promise<number | null>;
+          };
+          if (typeof tmux.sessionActivity === 'function') {
+            sessionActivity = await tmux.sessionActivity(w.session);
+          } else {
+            // No activity reader → treat as unknown (keep).
+            sessionActivity = null;
+          }
+        } catch {
+          sessionActivity = null;
+        }
+        const { gate } = gateWorkerTimeoutByActivity({
+          sessionActivity,
+          thresholdMs: timeoutMs,
+        });
+        // Recent or unknown activity vetoes timeout termination.
+        if (gate !== 'STALE_ALLOW_TIMEOUT') continue;
+        // Known stale activity only — existing targeted timeout path (reapWorker body unchanged).
         await this.reapWorker(w.id, 'timeout');
       }
       // E2: additional checkin enforcement pass: for each active worker, if role has checkin_ms and

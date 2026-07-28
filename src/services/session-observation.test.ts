@@ -8,6 +8,7 @@ import path from 'node:path';
 import {
   DEFAULT_IDLE_THRESHOLD_MS,
   effectiveActivityMs,
+  gateWorkerTimeoutByActivity,
   observeSessionIdleness,
   parseRegistryTimestampMs,
   sessionActivityToMs,
@@ -260,3 +261,38 @@ describe('S10 session-observation pure helper (AC16/17/18)', () => {
     }
   });
 });
+
+describe('B12 gateWorkerTimeoutByActivity (pure AC17 adapter)', () => {
+  const THRESH = 60_000;
+
+  it('recent activity → KEEP_RECENT', () => {
+    const r = gateWorkerTimeoutByActivity({
+      sessionActivity: epochSecAgo(10_000),
+      thresholdMs: THRESH,
+      nowMs: NOW,
+    });
+    expect(r.gate).toBe('KEEP_RECENT');
+    expect(r.idleAgeMs).toBeLessThan(THRESH);
+  });
+
+  it('null activity → KEEP_UNKNOWN', () => {
+    const r = gateWorkerTimeoutByActivity({
+      sessionActivity: null,
+      thresholdMs: THRESH,
+      nowMs: NOW,
+    });
+    expect(r.gate).toBe('KEEP_UNKNOWN');
+    expect(r.idleAgeMs).toBeNull();
+  });
+
+  it('known stale activity → STALE_ALLOW_TIMEOUT', () => {
+    const r = gateWorkerTimeoutByActivity({
+      sessionActivity: epochSecAgo(THRESH + 5_000),
+      thresholdMs: THRESH,
+      nowMs: NOW,
+    });
+    expect(r.gate).toBe('STALE_ALLOW_TIMEOUT');
+    expect(r.idleAgeMs).toBeGreaterThanOrEqual(THRESH);
+  });
+});
+

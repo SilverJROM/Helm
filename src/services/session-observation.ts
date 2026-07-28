@@ -79,6 +79,51 @@ export function sessionActivityToMs(sessionActivity: number | null | undefined):
 }
 
 /**
+ * B12 / AC17 — pure activity gate for the worker **timeout** pass only.
+ * Age (started_at) is a candidate selector elsewhere; this never invents kill authority from
+ * missing facts. Keep-biased on unknown. Does not use INVESTIGATE/attached/4h seat semantics.
+ * Observation-only: the worker timeout path decides whether to call the existing terminator.
+ */
+export type WorkerTimeoutActivityGate = 'KEEP_RECENT' | 'KEEP_UNKNOWN' | 'STALE_ALLOW_TIMEOUT';
+
+export interface WorkerTimeoutActivityFacts {
+  /** tmux #{session_activity} unix epoch seconds (S08), or null = unknown. */
+  sessionActivity: number | null;
+  /** Same threshold as WORKER_TIMEOUT_MS / _reapTick timeoutMs. */
+  thresholdMs: number;
+  nowMs?: number;
+}
+
+export interface WorkerTimeoutActivityResult {
+  gate: WorkerTimeoutActivityGate;
+  /** now - activity when known; null when unknown. */
+  idleAgeMs: number | null;
+  effectiveActivityMs: number | null;
+}
+
+/**
+ * Gate timeout reaping by observed tmux session_activity only.
+ * - null / unusable activity → KEEP_UNKNOWN
+ * - idleAge < threshold → KEEP_RECENT
+ * - idleAge >= threshold → STALE_ALLOW_TIMEOUT (caller may invoke existing timeout path)
+ */
+export function gateWorkerTimeoutByActivity(
+  facts: WorkerTimeoutActivityFacts
+): WorkerTimeoutActivityResult {
+  const nowMs = facts.nowMs ?? Date.now();
+  const threshold = facts.thresholdMs;
+  const effective = sessionActivityToMs(facts.sessionActivity);
+  if (effective == null || !Number.isFinite(threshold) || threshold <= 0) {
+    return { gate: 'KEEP_UNKNOWN', idleAgeMs: null, effectiveActivityMs: effective };
+  }
+  const idleAgeMs = Math.max(0, nowMs - effective);
+  if (idleAgeMs < threshold) {
+    return { gate: 'KEEP_RECENT', idleAgeMs, effectiveActivityMs: effective };
+  }
+  return { gate: 'STALE_ALLOW_TIMEOUT', idleAgeMs, effectiveActivityMs: effective };
+}
+
+/**
  * Effective activity = max of known last_used_at (or created_at) and session_activity.
  * Missing sides are ignored, never coerced to 0 (would fabricate ancient idle).
  */
