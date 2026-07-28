@@ -37,9 +37,12 @@ export type TextSubmissionState = "held" | "submitted" | "indeterminate";
 // registry keep working, and TmuxService never hard-depends on the DB.
 // A2 (R4.16): onCreate may carry projectId/runId/kind so helm_sessions rows land linked at create
 // time (planning seats via RealTransport; workers may still enrich later for late-known context).
-// S04 / AC1: owner (helm|human|legacy:unknown) threaded here.
+// S04 / AC1: owner (helm|human|legacy:unknown) threaded on stored rows / CAS tokens.
 // S05 / AC2: owner REQUIRED pre-spawn — createSession refuses missing/invalid before any tmux mutation.
+// B15b / AC21: legacy:unknown is migration-only — create accepts only helm|human (stored set unchanged).
 export type TmuxSessionOwner = 'helm' | 'human' | 'legacy:unknown';
+/** Create-time authority only — closed migration sentinel is not creatable. */
+export type TmuxSessionCreateOwner = 'helm' | 'human';
 
 /** B02: CAS token shape carried from create/register through terminate. */
 export type TmuxSessionStatusToken = {
@@ -78,8 +81,11 @@ export interface TmuxSessionCreateOpts {
   projectId?: number | null;
   runId?: number | null;
   kind?: string;
-  /** Decision authority. Required at create (S05 pre-spawn refusal). */
-  owner: TmuxSessionOwner;
+  /**
+   * Decision authority. Required at create (S05 pre-spawn refusal).
+   * B15b / AC21: helm|human only — legacy:unknown is closed (migration-only).
+   */
+  owner: TmuxSessionCreateOwner;
   /**
    * B02 C1 fix cycle 2: when set, createSession fills `token` with the register() CAS identity
    * returned by onCreate. Callers MUST retain that token for later terminate/markReaped — never
@@ -88,13 +94,20 @@ export interface TmuxSessionCreateOpts {
   sessionTokenOut?: { token?: TmuxSessionStatusToken };
 }
 
-const VALID_SESSION_OWNERS = new Set<string>(['helm', 'human', 'legacy:unknown']);
+/** Stored contract (3 members) — existing rows, CAS tokens, migration backfill. Not used at create. */
+export const VALID_STORED_SESSION_OWNERS = new Set<string>(['helm', 'human', 'legacy:unknown']);
+/** B15b / AC21: new create accepts only binary authority. */
+export const VALID_CREATE_SESSION_OWNERS = new Set<string>(['helm', 'human']);
 
-/** S05: fail-closed owner check shared by createSession (pre-spawn) and register (defensive). */
-export function assertValidSessionOwner(owner: unknown): asserts owner is TmuxSessionOwner {
-  if (typeof owner !== 'string' || !VALID_SESSION_OWNERS.has(owner)) {
+/**
+ * S05 + B15b / AC21: fail-closed create-time owner check (pre-spawn).
+ * Accepts helm|human only; legacy:unknown is refused (closed migration-only sentinel).
+ * Stored 3-member set remains VALID_STORED_SESSION_OWNERS (read/CAS/migration).
+ */
+export function assertValidSessionOwner(owner: unknown): asserts owner is TmuxSessionCreateOwner {
+  if (typeof owner !== 'string' || !VALID_CREATE_SESSION_OWNERS.has(owner)) {
     throw new Error(
-      `session owner required (helm|human|legacy:unknown); got ${owner === undefined || owner === null ? String(owner) : JSON.stringify(owner)}`
+      `session owner required (helm|human); got ${owner === undefined || owner === null ? String(owner) : JSON.stringify(owner)}`
     );
   }
 }

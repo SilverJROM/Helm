@@ -121,6 +121,15 @@ describe('ST-R1/R2 @helm_child tmux ownership tag', () => {
     expect(cpMock.calls).toEqual([]);
   });
 
+  // B15b / AC21: legacy:unknown is migration-only — create refuses pre-spawn (zero tmux).
+  it('B15b/AC21: legacy:unknown owner rejects before any tmux command', async () => {
+    const tmux: any = new TmuxService();
+    await expect(
+      tmux.createSession('helm-w-legacy', undefined, { owner: 'legacy:unknown' as any })
+    ).rejects.toThrow(/owner required/);
+    expect(cpMock.calls).toEqual([]);
+  });
+
   it('S05: valid helm owner reaches new-session (register still receives owner)', async () => {
     cpMock.impl = async (_cmd: string, args: string[]) => {
       if (args[0] === 'has-session') throw new Error('no such session');

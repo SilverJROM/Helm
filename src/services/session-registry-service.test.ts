@@ -181,10 +181,19 @@ describe('S04 helm_sessions.owner (AC1)', () => {
     expect(reg.get('helm-w-no-owner')).toBeFalsy();
   });
 
-  it('owner round-trip: helm | human | legacy:unknown', () => {
+  // B15b / AC21: register() create path refuses closed migration sentinel.
+  it('B15b/AC21: register() with legacy:unknown throws and writes no row', () => {
+    expect(() => reg.register('helm-legacy-create', { owner: 'legacy:unknown' as any })).toThrow(/owner required/);
+    expect(reg.get('helm-legacy-create')).toBeFalsy();
+  });
+
+  it('owner round-trip: helm | human create; stored legacy:unknown still readable', () => {
     reg.register('helm-w-owner-helm', { owner: 'helm', kind: 'worker' });
     reg.register('helm-discovery-owner-human', { owner: 'human', kind: 'discovery' });
-    reg.register('helm-legacy-seat', { owner: 'legacy:unknown', kind: 'other' });
+    // Stored sentinel is migration-only — seed via SQL, not register().
+    db.raw.prepare(
+      `INSERT INTO helm_sessions (name, kind, owner, status, generation) VALUES ('helm-legacy-seat', 'other', 'legacy:unknown', 'active', 1)`
+    ).run();
     expect(reg.get('helm-w-owner-helm')!.owner).toBe('helm');
     expect(reg.get('helm-discovery-owner-human')!.owner).toBe('human');
     expect(reg.get('helm-legacy-seat')!.owner).toBe('legacy:unknown');
@@ -407,7 +416,10 @@ describe('S07 owner backfill v102 + listHelmOwnedCandidates (AC5)', () => {
       const reg = new SessionRegistryService(t.db);
       reg.register('helm-w-helm-only', { owner: 'helm', kind: 'worker' });
       reg.register('helm-discovery-human', { owner: 'human', kind: 'discovery' });
-      reg.register('helm-legacy-x', { owner: 'legacy:unknown', kind: 'other' });
+      // B15b: stored legacy rows are migration-seeded (register refuses legacy:unknown).
+      t.db.raw.prepare(
+        `INSERT INTO helm_sessions (name, kind, owner, status, generation) VALUES ('helm-legacy-x', 'other', 'legacy:unknown', 'active', 1)`
+      ).run();
 
       const all = reg.list();
       expect(all.length).toBe(3);
@@ -416,6 +428,8 @@ describe('S07 owner backfill v102 + listHelmOwnedCandidates (AC5)', () => {
       expect(helmOnly.map((r) => r.name)).toEqual(['helm-w-helm-only']);
       expect(helmOnly.every((r) => r.owner === 'helm')).toBe(true);
       expect(helmOnly.some((r) => r.owner === 'human' || r.owner === 'legacy:unknown')).toBe(false);
+      // Stored sentinel still readable and still excluded from helm-owned selection.
+      expect(reg.get('helm-legacy-x')!.owner).toBe('legacy:unknown');
     } finally {
       t.cleanup();
     }

@@ -37,12 +37,16 @@ export interface HelmSessionRow {
   reason: string | null;
 }
 
+/** B15b / AC21: register/create authority — helm|human only (legacy:unknown is migration-only). */
+export type SessionCreateOwner = 'helm' | 'human';
+
 export interface RegisterOpts {
   /**
    * S04: storage contract. S05: required for direct register() — throw if missing/invalid.
    * Create paths already refuse pre-spawn in TmuxService.createSession (F2).
+   * B15b / AC21: helm|human only — legacy:unknown is closed (migration/stored only).
    */
-  owner: SessionOwner;
+  owner: SessionCreateOwner;
   kind?: string;
   projectId?: number | null;
   runId?: number | null;
@@ -55,12 +59,20 @@ export interface EnrichOpts {
   runId?: number | null;
 }
 
-const VALID_OWNERS = new Set<SessionOwner>(['helm', 'human', 'legacy:unknown']);
+/** Stored contract (3 members) — rows, deriveSessionOwner, DB CHECK, migration backfill. */
+export const VALID_STORED_OWNERS = new Set<SessionOwner>(['helm', 'human', 'legacy:unknown']);
+/** B15b / AC21: new register/create accepts only binary authority. */
+export const VALID_CREATE_OWNERS = new Set<SessionCreateOwner>(['helm', 'human']);
 
-function assertRegisterOwner(owner: unknown): asserts owner is SessionOwner {
-  if (typeof owner !== 'string' || !VALID_OWNERS.has(owner as SessionOwner)) {
+/**
+ * S05 + B15b / AC21: fail-closed create-time owner for register().
+ * Accepts helm|human only; legacy:unknown is refused (closed migration-only sentinel).
+ * Stored 3-member set remains VALID_STORED_OWNERS (read / derive / CHECK).
+ */
+function assertRegisterOwner(owner: unknown): asserts owner is SessionCreateOwner {
+  if (typeof owner !== 'string' || !VALID_CREATE_OWNERS.has(owner as SessionCreateOwner)) {
     throw new Error(
-      `session owner required (helm|human|legacy:unknown); got ${owner === undefined || owner === null ? String(owner) : JSON.stringify(owner)}`
+      `session owner required (helm|human); got ${owner === undefined || owner === null ? String(owner) : JSON.stringify(owner)}`
     );
   }
 }
