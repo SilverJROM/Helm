@@ -414,11 +414,19 @@ VALUES (?,?,?,?,?,?,?,?,datetime('now'), ?)
       }
 
       // decision.action === 'REAP' — Helm-owned + idle assertion + live session.
-      // Execution vetoes (not decision authority): active worker, non-terminal run, @helm_child tag.
+      // Execution vetoes (not decision authority): active worker, non-terminal run,
+      // attached keep (S12-V1), @helm_child tag.
       if (this.hasLiveWorkerForSession(row.name)) {
         continue;
       }
       if (row.run_id != null && !this.isRunTerminalForSession(row.run_id)) {
+        continue;
+      }
+
+      // S12-V1: attached=true → KEEP; unknown/probe failure keep-biased → KEEP.
+      // Only a positive attached===false may proceed to REAP.
+      const attached = await this.probeSessionAttachedForReconcile(String(row.name));
+      if (attached !== false) {
         continue;
       }
 
@@ -440,16 +448,24 @@ VALUES (?,?,?,?,?,?,?,?,datetime('now'), ?)
         continue;
       }
 
-      // Targeted terminate only (no kill-server / kill-session -a / pkill). Best-effort.
+      // Targeted terminate only. S12-V2: markReaped only on success, or post-fail if provably gone.
+      // A failed kill with session still live/unknown leaves the row retryable (level-triggered).
       try {
         await this.tmux.terminateSession(row.name);
+        try {
+          this.sessionRegistry.markReaped(row.name, `reconcile:${decision.reason}`);
+        } catch {}
       } catch (err) {
         console.warn('[session-janitor] terminateSession failed (best-effort)', { name: row.name, err: String(err) });
+        const afterExists = await this.probeSessionExistsForReconcile(String(row.name));
+        if (afterExists === false) {
+          // Race: session gone despite throw — converge record only.
+          try {
+            this.sessionRegistry.markReaped(row.name, 'reconcile:session_gone');
+          } catch {}
+        }
+        // else still live or unknown → leave eligible for next tick (no false reaped).
       }
-      // Explicit markReaped with reconcile reason (hook may be absent or kill threw).
-      try {
-        this.sessionRegistry.markReaped(row.name, `reconcile:${decision.reason}`);
-      } catch {}
     }
   }
 
@@ -481,6 +497,28 @@ VALUES (?,?,?,?,?,?,?,?,datetime('now'), ?)
       return await this.tmux.sessionExists(name);
     } catch (err) {
       console.warn('[session-janitor] existence probe failed → unknown (KEEP)', { name, err: String(err) });
+      return null;
+    }
+  }
+
+  /**
+   * S12-V1: fail-safe attachment for REAP veto.
+   * true = attached (KEEP), false = unattached (may REAP), null = unknown (KEEP, keep-biased).
+   */
+  private async probeSessionAttachedForReconcile(name: string): Promise<boolean | null> {
+    const tmux = this.tmux as TmuxService & {
+      sessionAttached?: (n: string) => Promise<boolean | null>;
+    };
+    try {
+      if (typeof tmux.sessionAttached !== 'function') {
+        // No reader → unknown → KEEP (never REAP without a positive unattached fact).
+        return null;
+      }
+      const v = await tmux.sessionAttached(name);
+      if (v === true || v === false || v === null) return v;
+      return null;
+    } catch (err) {
+      console.warn('[session-janitor] attachment probe failed → unknown (KEEP)', { name, err: String(err) });
       return null;
     }
   }

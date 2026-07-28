@@ -222,6 +222,60 @@ describe('ST-R1/R2 @helm_child tmux ownership tag', () => {
   });
 
   // ---------------------------------------------------------------------------
+  // S12-V3 — sessionExistsTriState: only explicit gone messages → false; exit 1 alone → null
+  // ---------------------------------------------------------------------------
+
+  it('S12-V3: live has-session → true', async () => {
+    cpMock.impl = async () => ({ stdout: '', stderr: '' });
+    const tmux: any = new TmuxService();
+    await expect(tmux.sessionExistsTriState('helm-live')).resolves.toBe(true);
+  });
+
+  it('S12-V3: explicit no such session → false (provably gone)', async () => {
+    cpMock.impl = async () => {
+      const e: any = new Error("can't find session: helm-gone");
+      e.code = 1;
+      e.stderr = "can't find session: helm-gone";
+      throw e;
+    };
+    const tmux: any = new TmuxService();
+    await expect(tmux.sessionExistsTriState('helm-gone')).resolves.toBe(false);
+  });
+
+  it('S12-V3: explicit no server running → false', async () => {
+    cpMock.impl = async () => {
+      const e: any = new Error('no server running on /tmp/tmux-1000/default');
+      e.code = 1;
+      e.stderr = 'no server running on /tmp/tmux-1000/default';
+      throw e;
+    };
+    const tmux: any = new TmuxService();
+    await expect(tmux.sessionExistsTriState('helm-noserver')).resolves.toBe(false);
+  });
+
+  it('S12-V3: generic exit code 1 without gone message → null (unknown, not false)', async () => {
+    cpMock.impl = async () => {
+      const e: any = new Error('Command failed: tmux has-session');
+      e.code = 1;
+      e.stderr = 'error connecting to /tmp/tmux-1000/default (Permission denied)';
+      throw e;
+    };
+    const tmux: any = new TmuxService();
+    await expect(tmux.sessionExistsTriState('helm-perm')).resolves.toBeNull();
+  });
+
+  it('S12-V3: bare exit 1 empty message → null (must not over-CONVERGE)', async () => {
+    cpMock.impl = async () => {
+      const e: any = new Error('');
+      e.code = 1;
+      e.stderr = '';
+      throw e;
+    };
+    const tmux: any = new TmuxService();
+    await expect(tmux.sessionExistsTriState('helm-exit1')).resolves.toBeNull();
+  });
+
+  // ---------------------------------------------------------------------------
   // S09 / AC19 — last_used_at on agent output (prior-pane-snapshot delta only)
   // ---------------------------------------------------------------------------
 

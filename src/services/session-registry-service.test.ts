@@ -418,6 +418,8 @@ describe('S12 session reconciler (WorkerService.sessionJanitorTick)', () => {
   let ws: WorkerService;
   /** Map of session name → existence tri-state (default true = live). */
   let existsMap: Map<string, boolean | null>;
+  /** Map of session name → attached tri-state (default false = unattached, may REAP). */
+  let attachedMap: Map<string, boolean | null>;
 
   function seedSession(
     name: string,
@@ -459,6 +461,7 @@ describe('S12 session reconciler (WorkerService.sessionJanitorTick)', () => {
     reg = new SessionRegistryService(db);
     terminated = [];
     existsMap = new Map();
+    attachedMap = new Map();
     tmuxSpy = {
       terminateSession: async (name: string) => {
         terminated.push(name);
@@ -467,6 +470,9 @@ describe('S12 session reconciler (WorkerService.sessionJanitorTick)', () => {
       // S12: tri-state existence for decideSessionReconcile (default live).
       sessionExistsTriState: async (name: string) =>
         existsMap.has(name) ? existsMap.get(name)! : true,
+      // S12-V1: default unattached so REAP happy-path tests proceed; override per-test.
+      sessionAttached: async (name: string) =>
+        attachedMap.has(name) ? attachedMap.get(name)! : false,
     };
     ws = new WorkerService(db, {} as any, tmuxSpy as any, {} as any, {} as any, undefined, reg);
     // Enable janitor for synthetic path only. Deploy flag remains 0 (asserted below).
@@ -708,6 +714,70 @@ describe('S12 session reconciler (WorkerService.sessionJanitorTick)', () => {
     expect(terminated).toEqual(['helm-real-worker']);
     expect(terminated).not.toContain('helm-user-lookalike');
     expect(reg.get('helm-user-lookalike')!.status).toBe('idle');
+  });
+
+  // S12-V1 — attached keep (fail-safe REAP veto)
+  it('S12-V1: attached=true → KEEP (never terminate)', async () => {
+    seedSession('helm-s12-attached-proof', { status: 'idle' });
+    attachedMap.set('helm-s12-attached-proof', true);
+    await ws.sessionJanitorTick();
+    expect(terminated).toEqual([]);
+    expect(reg.get('helm-s12-attached-proof')!.status).toBe('idle');
+  });
+
+  it('S12-V1: attached=null (unknown) → KEEP keep-biased', async () => {
+    seedSession('helm-s12-attached-unknown', { status: 'idle' });
+    attachedMap.set('helm-s12-attached-unknown', null);
+    await ws.sessionJanitorTick();
+    expect(terminated).toEqual([]);
+    expect(reg.get('helm-s12-attached-unknown')!.status).toBe('idle');
+  });
+
+  it('S12-V1: sessionAttached throw → KEEP keep-biased', async () => {
+    tmuxSpy.sessionAttached = async () => {
+      throw new Error('display-message failed');
+    };
+    seedSession('helm-s12-attached-throw', { status: 'idle' });
+    await ws.sessionJanitorTick();
+    expect(terminated).toEqual([]);
+    expect(reg.get('helm-s12-attached-throw')!.status).toBe('idle');
+  });
+
+  // S12-V2 — terminate failure must not false-mark reaped
+  it('S12-V2: terminate throws + still live → leave idle, retryable on next tick', async () => {
+    let attempts = 0;
+    tmuxSpy.terminateSession = async (name: string) => {
+      attempts += 1;
+      terminated.push(name);
+      throw new Error('permission denied: kill-session');
+    };
+    seedSession('helm-s12-kill-fail', { status: 'idle' });
+    // still live after failed kill
+    existsMap.set('helm-s12-kill-fail', true);
+
+    await ws.sessionJanitorTick();
+    expect(attempts).toBe(1);
+    expect(reg.get('helm-s12-kill-fail')!.status).toBe('idle'); // not false-reaped
+
+    await ws.sessionJanitorTick();
+    expect(attempts).toBe(2); // level-triggered retry
+    expect(reg.get('helm-s12-kill-fail')!.status).toBe('idle');
+  });
+
+  it('S12-V2: terminate throws + re-probe gone → CONVERGE markReaped without success kill', async () => {
+    tmuxSpy.terminateSession = async (name: string) => {
+      terminated.push(name);
+      // session dies under us / already gone race
+      existsMap.set(name, false);
+      throw new Error('no such session');
+    };
+    seedSession('helm-s12-kill-race-gone', { status: 'idle' });
+    existsMap.set('helm-s12-kill-race-gone', true); // pre-decision live → REAP path
+
+    await ws.sessionJanitorTick();
+    expect(terminated).toEqual(['helm-s12-kill-race-gone']);
+    expect(reg.get('helm-s12-kill-race-gone')!.status).toBe('reaped');
+    expect(reg.get('helm-s12-kill-race-gone')!.reason).toBe('reconcile:session_gone');
   });
 
   it('HARD SAFETY: deploy HELM_SESSION_JANITOR remains 0', () => {

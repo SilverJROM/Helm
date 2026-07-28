@@ -18,30 +18,33 @@ heuristics while preserving hard safety rails.
    - **REAP** → vetoes then kill:
      - live worker (`launching|running`) → KEEP
      - non-terminal mapped run → KEEP
+     - **attached true or unknown** → KEEP (S12-V1; only `attached===false` proceeds)
      - `@helm_child` missing/throw → KEEP
-     - else targeted `terminateSession` + `markReaped(reconcile:…)`
-2. **Retired kill authority:** `HELM_SESSION_TTL_MS` / age, run-terminal as “done”,
-   `run_id == null` orphan path. TTL config left in place for S13; tick no longer reads it.
-3. **`sessionExistsTriState`** on `TmuxService`: fail-safe tri-state for the reconciler
-   (boolean `sessionExists` still collapses error→false for other callers).
+     - targeted `terminateSession` then `markReaped` **only on success**
+     - terminate throw + still live/unknown → **leave retryable** (S12-V2)
+     - terminate throw + re-probe gone → `markReaped(reconcile:session_gone)`
+2. **Retired kill authority:** TTL / age, run-terminal as “done”, `run_id == null` orphan.
+3. **`sessionExistsTriState` (S12-V3):** only explicit missing-session/no-server messages
+   → `false`; generic exit code 1 without that evidence → `null` (never over-CONVERGE).
+
+## Attempt 2 corrections (val L3 FAIL → fix)
+- **V1:** REAP path calls `sessionAttached`; true/unknown keep-biased KEEP.
+- **V2:** no `markReaped` after failed terminate unless re-probe proves gone.
+- **V3:** drop bare `err.code === 1` → false mapping.
+- Synthetic regressions for each.
 
 ## Code changes
-- `src/services/worker-service.ts` — rewrite janitor tick + probe helper; startup reuses tick
-- `src/tmux/tmux-service.ts` — `sessionExistsTriState`
-- `src/services/session-registry-service.test.ts` — S12 fake-tmux matrix (rewrite SL-R3 suite)
+- `src/services/worker-service.ts` — tick + attached probe + terminate/markReaped policy
+- `src/tmux/tmux-service.ts` — narrowed `sessionExistsTriState`
+- `src/services/session-registry-service.test.ts` — S12 matrix + V1/V2 cases
+- `src/tmux/tmux-helm-child-tag.test.ts` — S12-V3 production classifier cases
 - `plan/janitor-consent-redesign/changes.md` — this file
 
 ## Guardrails
 - `HELM_SESSION_JANITOR=0` unchanged in `.env` and `ecosystem.config.cjs`
-- Synthetic DB + fake tmux only; no live tmux targets; live `data/helm.db` mtime unchanged
-- No broad kill paths; no S13 shadow enum; no flag flip
-
-## Out of scope
-- S13 `off|shadow|on` parsing
-- S14 human manual close
-- Housekeeper / enabling janitor in deploy
+- Synthetic DB + fake tmux only; no live tmux; live `data/helm.db` untouched
+- No S13 shadow enum; no flag flip
 
 ## Test status
-- `npx tsc --noEmit -p tsconfig.json` → **exit 0**
-- `HELM_SESSION_JANITOR=0 HELM_DB_PATH=/tmp/… npx vitest run src/services/session-registry-service.test.ts src/services/session-reconcile-decision.test.ts --poolOptions.forks.maxForks=2` → **66 passed** (43 registry/S12 + 23 S11)
-- Live `data/helm.db` mtime/size unchanged across the run
+- `npx tsc --noEmit -p tsconfig.json` → exit 0 (re-run on commit)
+- Focused vitest with temp DB + `HELM_SESSION_JANITOR=0` (re-run on commit)

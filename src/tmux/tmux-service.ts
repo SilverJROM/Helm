@@ -207,13 +207,13 @@ export class TmuxService {
       return true;
     } catch (err: any) {
       const msg = String(err?.stderr ?? err?.message ?? err);
-      // Known "gone" signals from tmux has-session (exit 1 when missing / no server).
+      // S12-V3: ONLY explicit missing-session / no-server evidence → provably gone.
+      // Generic exit code 1 (socket/permission/unrecognized) is unknown → null, never false.
       if (
         /no server running/i.test(msg) ||
         /can'?t find session/i.test(msg) ||
         /no such session/i.test(msg) ||
-        /session not found/i.test(msg) ||
-        err?.code === 1
+        /session not found/i.test(msg)
       ) {
         return false;
       }
