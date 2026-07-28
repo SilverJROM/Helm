@@ -12,6 +12,10 @@ import type { HelmSessionRow, SessionRegistryService } from './session-registry-
 
 export const HOUSEKEEPER_PANE_TAIL_MAX_CHARS = 4000;
 export const HOUSEKEEPER_ENVELOPE_MAX_CHARS = 8000;
+const HOUSEKEEPER_EVIDENCE_STRING_MAX_CHARS = 700;
+const HOUSEKEEPER_EVIDENCE_MIN_STRING_CHARS = 120;
+const HOUSEKEEPER_PANE_TAIL_MIN_CHARS = 200;
+const HOUSEKEEPER_PROVENANCE_MAX_CHARS = 300;
 
 export interface HousekeeperTmuxReads {
   sessionActivity(name: string): Promise<number | null>;
@@ -98,6 +102,7 @@ export class HousekeeperService {
       lastDispatch: evidence.lastDispatch,
     });
     const boundedEnvelope = boundEnvelope(envelope);
+    assertBoundedEnvelope(boundedEnvelope);
     const investigationId = this.insertInvestigation({
       row: candidate.row,
       observation: candidate.observation,
@@ -121,6 +126,7 @@ export class HousekeeperService {
     }
 
     const brief = renderHousekeeperBrief(boundedEnvelope, usage, investigationId);
+    assertBoundedEnvelope(boundedEnvelope);
     const spawned = await this.transport.spawn({
       role: 'housekeeper',
       brief,
@@ -296,17 +302,70 @@ function buildHousekeeperEnvelope(params: {
 }
 
 function boundEnvelope(envelope: HousekeeperEnvelope): HousekeeperEnvelope {
-  let next = { ...envelope, pane_tail: boundText(envelope.pane_tail, HOUSEKEEPER_PANE_TAIL_MAX_CHARS) };
-  while (JSON.stringify(next).length > HOUSEKEEPER_ENVELOPE_MAX_CHARS && next.pane_tail.length > 200) {
-    next = { ...next, pane_tail: boundText(next.pane_tail, Math.max(200, next.pane_tail.length - 500)) };
+  const stages = [
+    { paneTailMax: HOUSEKEEPER_PANE_TAIL_MAX_CHARS, evidenceStringMax: HOUSEKEEPER_EVIDENCE_STRING_MAX_CHARS, evidenceRows: 5, keepLastDispatch: true },
+    { paneTailMax: 3000, evidenceStringMax: 500, evidenceRows: 5, keepLastDispatch: true },
+    { paneTailMax: 2000, evidenceStringMax: 350, evidenceRows: 3, keepLastDispatch: true },
+    { paneTailMax: 1000, evidenceStringMax: 220, evidenceRows: 2, keepLastDispatch: true },
+    { paneTailMax: HOUSEKEEPER_PANE_TAIL_MIN_CHARS, evidenceStringMax: HOUSEKEEPER_EVIDENCE_MIN_STRING_CHARS, evidenceRows: 1, keepLastDispatch: true },
+    { paneTailMax: HOUSEKEEPER_PANE_TAIL_MIN_CHARS, evidenceStringMax: HOUSEKEEPER_EVIDENCE_MIN_STRING_CHARS, evidenceRows: 0, keepLastDispatch: false },
+  ];
+
+  for (const stage of stages) {
+    const next = buildBoundEnvelopeStage(envelope, stage);
+    if (serializedEnvelopeLength(next) <= HOUSEKEEPER_ENVELOPE_MAX_CHARS) {
+      return next;
+    }
   }
-  return next;
+
+  throw new Error(`housekeeper envelope exceeds ${HOUSEKEEPER_ENVELOPE_MAX_CHARS} chars after deterministic bounding`);
 }
 
 function boundText(raw: string, maxChars: number): string {
   const text = String(raw ?? '');
   if (text.length <= maxChars) return text;
   return text.slice(text.length - maxChars);
+}
+
+function serializedEnvelopeLength(envelope: HousekeeperEnvelope): number {
+  return JSON.stringify(envelope).length;
+}
+
+function assertBoundedEnvelope(envelope: HousekeeperEnvelope): void {
+  const actual = serializedEnvelopeLength(envelope);
+  if (actual > HOUSEKEEPER_ENVELOPE_MAX_CHARS) {
+    throw new Error(`housekeeper envelope exceeds ${HOUSEKEEPER_ENVELOPE_MAX_CHARS} chars before persist/spawn (${actual})`);
+  }
+}
+
+function buildBoundEnvelopeStage(
+  envelope: HousekeeperEnvelope,
+  stage: { paneTailMax: number; evidenceStringMax: number; evidenceRows: number; keepLastDispatch: boolean },
+): HousekeeperEnvelope {
+  return {
+    ...envelope,
+    pane_tail: boundText(envelope.pane_tail, stage.paneTailMax),
+    pane_tail_provenance: boundText(envelope.pane_tail_provenance, HOUSEKEEPER_PROVENANCE_MAX_CHARS),
+    callback_facts: boundEvidenceRows(envelope.callback_facts, stage.evidenceRows, stage.evidenceStringMax),
+    run_facts: boundEvidenceRows(envelope.run_facts, stage.evidenceRows, stage.evidenceStringMax),
+    task_facts: boundEvidenceRows(envelope.task_facts, stage.evidenceRows, stage.evidenceStringMax),
+    last_dispatch: stage.keepLastDispatch ? boundEvidenceValue(envelope.last_dispatch, stage.evidenceStringMax) : null,
+  };
+}
+
+function boundEvidenceRows(rows: unknown[], maxRows: number, maxStringChars: number): unknown[] {
+  return rows.slice(0, maxRows).map((row) => boundEvidenceValue(row, maxStringChars));
+}
+
+function boundEvidenceValue(value: unknown, maxStringChars: number): unknown {
+  if (typeof value === 'string') return boundText(value, maxStringChars);
+  if (Array.isArray(value)) return value.map((entry) => boundEvidenceValue(entry, maxStringChars));
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, entry]) => [key, boundEvidenceValue(entry, maxStringChars)])
+    );
+  }
+  return value;
 }
 
 function renderHousekeeperBrief(

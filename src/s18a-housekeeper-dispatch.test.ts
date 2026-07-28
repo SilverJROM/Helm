@@ -21,6 +21,7 @@ import { AgentAssignmentService, assertProjectRunDispatchable } from './services
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const REAL_PANE_FIXTURE = path.join(REPO_ROOT, 'src/test-fixtures/panes/discovery-finished-turn-20260727.txt');
 const HOUSEKEEPER_SRC = path.join(REPO_ROOT, 'src/services/housekeeper-service.ts');
+const INDEX_SRC = path.join(REPO_ROOT, 'src/index.ts');
 
 function tempDbPath(prefix: string): { dbPath: string; cleanupFiles: () => void } {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -91,6 +92,34 @@ describe('S18a housekeeper dispatch', () => {
        VALUES (?, 'implementer', 'WORKING', '[helm callback] impl S18a STATUS: WORKING', 'file')`
     ).run(Number(dispatch.lastInsertRowid));
     return runId;
+  }
+
+  function oversizeRunFacts(runId: number) {
+    const hugeCallback = `callback-${'C'.repeat(12000)}`;
+    const hugeTask = `task-${'T'.repeat(12000)}`;
+    const hugeDispatch = `dispatch-${'D'.repeat(12000)}`;
+    db.prepare(`UPDATE run_tasks SET label = ? WHERE run_id = ?`).run(hugeTask, runId);
+    db.prepare(
+      `UPDATE callbacks
+       SET raw_line = ?
+       WHERE dispatch_id IN (
+         SELECT d.id
+         FROM dispatches d
+         JOIN task_attempts ta ON ta.id = d.attempt_id
+         JOIN run_tasks rt ON rt.id = ta.task_id
+         WHERE rt.run_id = ?
+       )`
+    ).run(hugeCallback, runId);
+    db.prepare(
+      `UPDATE dispatches
+       SET brief_path = ?, transport_handle = ?
+       WHERE attempt_id IN (
+         SELECT ta.id
+         FROM task_attempts ta
+         JOIN run_tasks rt ON rt.id = ta.task_id
+         WHERE rt.run_id = ?
+       )`
+    ).run(hugeDispatch, hugeDispatch, runId);
   }
 
   function makeService(usage: UsageSnapshot) {
@@ -233,6 +262,40 @@ describe('S18a housekeeper dispatch', () => {
     expect(reg.get('helm-w-target')!.status).toBe('active');
   });
 
+  it('bounds oversized callback, task, and dispatch evidence before persist and fake spawn', async () => {
+    const runId = seedRunFacts();
+    oversizeRunFacts(runId);
+    seedSession('helm-w-huge-evidence', { owner: 'helm', status: 'active', runId });
+    tmux.capturePane = async (name: string) => {
+      tmux.captures.push(name);
+      return 'tiny pane';
+    };
+
+    const svc = makeService(
+      snap({
+        grok45: { headroom: 0, depleted: true, worst_bucket: 99 },
+        spark: { headroom: 42, depleted: false, worst_bucket: 58 },
+        haiku: { headroom: 50, depleted: false, worst_bucket: 50 },
+      })
+    );
+    const result = await svc.dispatchOnce({ nowMs: Date.now() });
+    expect(result.outcome).toBe('dispatched');
+    if (result.outcome !== 'dispatched') return;
+
+    const inv = svc.getInvestigation(result.investigationId);
+    const envelope = JSON.parse(inv.envelope_json);
+    expect(JSON.stringify(envelope).length).toBeLessThanOrEqual(HOUSEKEEPER_ENVELOPE_MAX_CHARS);
+    expect(inv.envelope_json.length).toBeLessThanOrEqual(HOUSEKEEPER_ENVELOPE_MAX_CHARS);
+    expect(transport.spawnCalls).toHaveLength(1);
+    expect(transport.spawnCalls[0]!.brief.length).toBeLessThan(HOUSEKEEPER_ENVELOPE_MAX_CHARS + 500);
+    expect(JSON.stringify(envelope.callback_facts)).not.toContain('C'.repeat(1000));
+    expect(JSON.stringify(envelope.task_facts)).not.toContain('T'.repeat(1000));
+    expect(JSON.stringify(envelope.last_dispatch)).not.toContain('D'.repeat(1000));
+    expect(tmux.terminateCalls).toEqual([]);
+    expect(transport.reapCalls).toEqual([]);
+    expect(reg.get('helm-w-huge-evidence')!.status).toBe('active');
+  });
+
   it('usage no_dispatch is durable and does not spawn', async () => {
     seedSession('helm-w-no-usage', { owner: 'helm', status: 'active' });
     const svc = makeService({ ts: 1, stale: true, ok: 0, errors: ['offline'], rungs: {} });
@@ -265,5 +328,16 @@ describe('S18a housekeeper dispatch', () => {
     ]) {
       expect(src).not.toContain(forbidden);
     }
+  });
+
+  it('S18a production wiring uses a housekeeper-only no-op transport, never shared RealTransport', () => {
+    const src = fs.readFileSync(INDEX_SRC, 'utf8');
+    const housekeeperWiring = src.slice(src.indexOf('const housekeeperService = new HousekeeperService('), src.indexOf('const planningPhase ='));
+    const noopClass = src.slice(src.indexOf('class HousekeeperNoopTransport implements ITransport'), src.indexOf('const __filename'));
+    expect(src).toContain('class HousekeeperNoopTransport implements ITransport');
+    expect(housekeeperWiring).toContain('new HousekeeperNoopTransport()');
+    expect(housekeeperWiring).not.toContain('orchT');
+    expect(noopClass).toContain('spawn(');
+    expect(noopClass).not.toContain('terminateSession');
   });
 });

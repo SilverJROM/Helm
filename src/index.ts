@@ -146,6 +146,17 @@ class FakeTmuxService {
   }
 }
 
+class HousekeeperNoopTransport implements ITransport {
+  async spawn(params: Parameters<ITransport['spawn']>[0]): Promise<{ handle: string; role: string }> {
+    return {
+      handle: `housekeeper-noop:${params.sessionName ?? params.role}`,
+      role: params.role,
+    };
+  }
+
+  async reap(_handle: string, _reason = 'complete'): Promise<void> {}
+}
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -412,7 +423,7 @@ async function main(): Promise<void> {
     sessionRegistry,
     tmuxService as any,
     new HouseUsageSelector({ gateway: usageGateway }),
-    orchT,
+    new HousekeeperNoopTransport(),
   );
   const planningPhase = new PlanningPhaseService(orchT, runArtifactService, taskQueue);
   const escalationService = new EscalationService(db, usageGateway, assignmentService);  // B9fix2 F4: project escalation ladder via resolver
