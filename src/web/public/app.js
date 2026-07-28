@@ -1,7 +1,7 @@
 import { h, render } from 'https://esm.sh/preact@10.19.3';
 import { useState, useEffect, useRef } from 'https://esm.sh/preact@10.19.3/hooks';
 import htm from 'https://esm.sh/htm@3.1.1';
-import { paneLooksGenerating, extractAgentPaneSegment, extractHelmReply } from './reply-extractor.js';
+import { paneLooksGenerating, extractAgentPaneSegment, extractHelmReply, lastCompleteHelmReplyText } from './reply-extractor.js';
 import { phaseBrainAgentId, preferredPhaseAgentId } from './phase-agent-selection.js';
 import { seatLeaseSendChain } from './cc-session-reconcile.js';
 import { markUndeliveredById, applyDeliveryFailedById, hasOutstandingOptimistic } from './cc-delivery.js';
@@ -10,6 +10,7 @@ import { SESSION_PANE_CLASSES } from './session-pane.js';
 import { stripAnsiForDisplay } from './ansi-strip.js';
 import { buildDiscoveryMirrorHtml } from './discovery-mirror.js';
 import { isAgentReplyContinuation } from './chat-bubble-merge.js';
+import { decideDiscoveryReconcile } from './cc-disc-stream-reconcile.js';
 
 const html = htm.bind(h);
 const PA_DEFINITION_MAX = 50000;
@@ -964,28 +965,38 @@ function App() {
     if (ccWsTab !== 'discovery' || !ccWsProjectId || !ccWsCycleId || !token) return;
     if (!ccAgents[ccWsProjectId]) loadCcAgents(ccWsProjectId);
   }, [ccWsTab, ccWsProjectId, ccWsCycleId, token]);
-  // LIVE-ATTACH: auto-attach the discovery chat to an ALREADY-RUNNING seat on load, so the app reflects
-  // the live conversation instead of "Session Off / no messages" whenever a seat exists but wasn't spawned
-  // from THIS browser's memory (fresh reload, or a different browser like the operator's). Matches an active
-  // session by agent_id + the project's tmux marker (helm-chat-p<pid>-). Never spawns; only attaches.
-  useEffect(() => {
-    if (ccWsTab !== 'discovery' || !ccWsProjectId || !token) return;
+  // LIVE-ATTACH / E8 FIX1: auto-attach (and RE-attach) the discovery chat to an ALREADY-RUNNING seat,
+  // so the app reflects the live conversation instead of "Session Off / no messages" whenever a seat
+  // exists but this browser's live feed is missing — fresh reload, a different browser (the operator's),
+  // or Discovery's own stream having been dropped (proxy/tunnel idle timeout, network blip). Was
+  // one-shot: returned early forever once ccSession[pid] existed, without ever checking the EventSource
+  // was still alive — see SOL diagnosis. Now RECONCILES: on mount, on ccWsTab/ccWsProjectId change, and
+  // on a timer, using Discovery's OWN ref (ccDiscChatEsRef) so it can never be starved by the unrelated
+  // CC-chat route's stream lifecycle. Never spawns; only attaches.
+  const discReconcileRef = useRef(() => {});
+  discReconcileRef.current = () => {
     const pid = ccWsProjectId;
-    if (ccSession[pid] && ccSession[pid].sid) return; // already attached in this browser
-    // Match the live discovery seat by its tmux name (helm-chat-p<pid>-discovery-*) — robust and
-    // independent of ccPhaseAgents resolution (which is not in this effect's deps). agent_id comes
-    // from the session itself, so no stale-closure hazard.
-    const marker = `helm-chat-p${pid}-discovery`;
-    const live = (activeSessions || []).find(
-      (s) => s && s.tmux_session && s.tmux_session.includes(marker)
-    );
-    if (live && live.session_id && live.agent_id != null) {
-      const aid = live.agent_id;
-      const next = { sid: live.session_id, agentId: aid, tmux: live.tmux_session || null };
+    const sess = (ccSessionRef.current || {})[pid] || ccSession[pid];
+    const decision = decideDiscoveryReconcile({
+      pid,
+      session: sess,
+      streamReadyState: ccDiscChatEsRef.current ? ccDiscChatEsRef.current.readyState : null,
+      activeSessions,
+    });
+    if (decision.action === 'attach') {
+      ccDiscAttachStream(pid, decision.agentId, decision.sid);
+    } else if (decision.action === 'discover-and-attach') {
+      const next = { sid: decision.sid, agentId: decision.agentId, tmux: decision.tmux };
       setCcSession((p) => { const n = { ...p, [pid]: next }; ccSessionRef.current = n; return n; });
-      ccAttachStream(pid, aid, live.session_id);
+      ccDiscAttachStream(pid, decision.agentId, decision.sid);
     }
-  }, [ccWsTab, ccWsProjectId, activeSessions, token]);
+  };
+  useEffect(() => {
+    if (ccWsTab !== 'discovery' || !ccWsProjectId || !token) { ccDiscDetachStream(); return; }
+    discReconcileRef.current();
+    const id = setInterval(() => discReconcileRef.current(), 4000);
+    return () => { clearInterval(id); ccDiscDetachStream(); };
+  }, [ccWsTab, ccWsProjectId, token]);
   // B9-T04: Implementation tab's collapsed Docs rail (R-F6) reuses the same cycle-artifacts
   // listing as Discovery's living docs — widen the gate to fire on either tab (same pattern as
   // the B9-T01 plan-docs widen below) rather than duplicating the fetch.
@@ -1156,6 +1167,12 @@ function App() {
   const [ccLastReplyStrip, setCcLastReplyStrip] = useState({}); // pid -> 'collapsed'|'expanded'|'hidden'
   const [ccFavAgents,setCcFavAgents]=useState(() => { try { return JSON.parse(localStorage.getItem('helm_cc_fav_agents') || '[]'); } catch { return []; } });
   const ccChatEsRef = useRef(null);                     // one live SSE stream for the current pid's session
+  // E8 FIX1: Discovery owns an INDEPENDENT SSE stream. The old Command Center Chat route
+  // (07-command-center-chat) closes ccChatEsRef whenever it's not the active route (see the
+  // route-lifecycle effect below) — Discovery lives under 07-command-center-overview and must
+  // never depend on that shared ref surviving. See SOL diagnosis (plan/_backlog/SOL-discovery-
+  // reply-path-diagnosis.md): the second/third reply was lost exactly at this subscription boundary.
+  const ccDiscChatEsRef = useRef(null);
   const ccPendingUserRef = useRef({});                  // pid -> last user text (reply-extraction scope)
   const ccSessionRef = useRef({});                      // state mirror for cleanup paths
   const ccThreadRef = useRef({});                       // F2 round-7 (finding #5): LIVE mirror of ccThread (pid -> bubbles) so the SSE closure reads current thread state, not a stale attachment snapshot
@@ -1666,19 +1683,12 @@ function App() {
     }
     return '';
   };
-  const ccLiveReplyText = (pid, fallbackPane) => stripAnsiForDisplay(ccLivePane[pid] || fallbackPane || '');
+  // E8 FIX3: the strip shows the agent's LAST REPLY ONLY, taken from the last COMPLETE ⟦HELM_REPLY⟧
+  // pair in the raw pane — never the whole raw pane. The prior implementation handed the strip the
+  // entire pane text, which is why tmux's own pager chrome ("+65 lines (ctrl+o to expand)") could show
+  // up in it. No complete pair present → '' (the caller renders "Waiting for live output…", never chrome).
+  const ccLiveReplyText = (pid, fallbackPane) => lastCompleteHelmReplyText(stripAnsiForDisplay(ccLivePane[pid] || fallbackPane || ''));
   const ccHasLiveTurn = (pid, fallbackPane) => !!(ccLastUserPrompt(pid) || ccLiveReplyText(pid, fallbackPane));
-  // B6 / R6.24 de-dupe: keep last user bubble in the list; drop trailing agent bubbles (shown only in strip).
-  const ccThreadWithoutLiveTurn = (pid, thread, liveActive) => {
-    const arr = thread || [];
-    if (!liveActive || !arr.length) return arr;
-    let lastUserIndex = -1;
-    for (let i = arr.length - 1; i >= 0; i--) {
-      if (arr[i] && arr[i].role === 'user') { lastUserIndex = i; break; }
-    }
-    if (lastUserIndex < 0) return arr;
-    return arr.filter((m, i) => i <= lastUserIndex);
-  };
   const ccLastReplyMode = (pid) => ccLastReplyStrip[pid] || 'collapsed';
   const setCcLastReplyMode = (pid, mode) => setCcLastReplyStrip((p) => ({ ...p, [pid]: mode }));
   // B6 / R6.24: sticky last-reply-only strip (not last-prompt). Distinct surface; collapse / expand / hide.
@@ -1745,7 +1755,12 @@ function App() {
     requestAnimationFrame(() => applyStick(discChatBodyRef.current, intent));
     // iter3: do NOT clear pending on reply/fallback — keep as persistent current-turn anchor until next send (fixes wrapped-prompt scope loss)
   };
-  const ccDetachStream = () => { if (ccChatEsRef.current) { try { ccChatEsRef.current.close(); } catch {} ccChatEsRef.current = null; } };
+  // E8 FIX1: ref-parameterized core — ccChatEsRef (old CC-chat route) and ccDiscChatEsRef (Discovery)
+  // each get their own independent EventSource lifecycle; detaching/attaching one must never touch
+  // the other's connection.
+  const ccDetachStreamOn = (ref) => { if (ref.current) { try { ref.current.close(); } catch {} ref.current = null; } };
+  const ccDetachStream = () => ccDetachStreamOn(ccChatEsRef);
+  const ccDiscDetachStream = () => ccDetachStreamOn(ccDiscChatEsRef);
   // F2: an HTTP-acked message whose delivery failed → correct the EXACT optimistic user bubble to
   // delivered=false, matched by the stable msgId (the bubble's id) — NEVER by text (duplicate text would
   // mis-mark the wrong bubble and a reconnect replay would re-mark another same-text message).
@@ -1761,8 +1776,12 @@ function App() {
     try { authedFetch(ackUrl, { method: 'POST', body: JSON.stringify({ throughSeq }) }).catch(() => {}); } catch {}
   };
   const ccChannelForPid = (pid) => `project:${pid}`;
-  const ccAttachStream = (pid, aid, sid) => {
-    ccDetachStream();
+  // E8 FIX1: shared attach core, parameterized by WHICH ref owns the connection. `ccAttachStream`
+  // (below) preserves the old ccChatEsRef behavior byte-for-byte; `ccDiscAttachStream` is the same
+  // logic against Discovery's own independent ref, so closing one stream can never silently starve
+  // the other surface.
+  const ccAttachStreamOn = (ref, pid, aid, sid) => {
+    ccDetachStreamOn(ref);
     // F2 round-6/7: delivery notifications are keyed by LOGICAL CHANNEL (project:<pid>), so a REPLACEMENT sid's
     // stream still surfaces a failure produced by the OLD sid. round-7 (finding #1): stream via the PROJECT
     // route so the server derives channel=project:<pid> itself (no client ?channel=). Resume from this channel's
@@ -1773,7 +1792,7 @@ function App() {
     const sinceFailSeq = ccChannelCursorRef.current[channel] || 0;
     const epoch = ccDeliveryEpochRef.current || '';
     const es = new EventSource(`/api/projects/${pid}/agent-chat/${sid}/stream?access_token=${encodeURIComponent(token)}&sinceFailSeq=${sinceFailSeq}&epoch=${encodeURIComponent(epoch)}`);
-    ccChatEsRef.current = es;
+    ref.current = es;
     const noteLoss = (gen) => {
       if (typeof gen !== 'number') return;
       if (gen > (ccLastLossGenRef.current || 0)) ccLastLossGenRef.current = gen;
@@ -1812,8 +1831,17 @@ function App() {
         } else if (msg.type === 'error') { setCcErr(msg.error); ccClearSession(pid); }
       } catch {}
     };
-    es.onerror = () => {};
+    // E8 FIX1 (SOL proposed-correction #5): a dropped connection is a RECONCILIATION TRIGGER, not a
+    // no-op. Only reclaim OUR OWN ref, and only once the browser has genuinely given up reconnecting
+    // (readyState CLOSED) — while it's still CONNECTING the native EventSource retry is in flight and
+    // must not be fought. Nulling the ref lets the owning surface's reconciliation (Discovery's mount/
+    // route-change/timer effect, or the CC-chat route's re-attach-on-dep-change) reattach cleanly.
+    es.onerror = () => {
+      if (ref.current === es && es.readyState === EventSource.CLOSED) ref.current = null;
+    };
   };
+  const ccAttachStream = (pid, aid, sid) => ccAttachStreamOn(ccChatEsRef, pid, aid, sid);
+  const ccDiscAttachStream = (pid, aid, sid) => ccAttachStreamOn(ccDiscChatEsRef, pid, aid, sid);
   // F2 round-6: the owner acknowledges the app-wide loss uncertainty — clears the sticky global warning.
   const ccAckGlobalLoss = () => { ccLossGenAckedRef.current = ccLastLossGenRef.current || 0; setCcGlobalLossWarn(false); };
   const ccClearSession = (pid) => {
@@ -1847,7 +1875,9 @@ function App() {
       if (r.status === 409 && d.session_id && d.code !== 'SESSION_NAME_COLLISION') {
         // Agent already live (e.g. a Studio session) — attach instead of double-spawning.
         // B09: collision 409 has code SESSION_NAME_COLLISION and no attachable session_id path.
-        const next = { sid: d.session_id, agentId: aid, tmux: d.tmux_session || null };
+        // E8 FIX2: surfaces which provider conversation this seat is attached to, and whether it was
+        // resumed — absent on the "already live, attach" 409 path (create() was never called there).
+        const next = { sid: d.session_id, agentId: aid, tmux: d.tmux_session || null, conversationId: d.conversation_id || null, resumed: !!d.resumed };
         ccSetSession(pid, next);
         ccAttachStream(pid, aid, d.session_id);
         return next;
@@ -1857,7 +1887,9 @@ function App() {
         }
         throw new Error(d.error || ('session start failed (' + r.status + ')'));
       } else {
-        const next = { sid: d.session_id, agentId: aid, tmux: d.tmux_session || null };
+        // E8 FIX2: surfaces which provider conversation this seat is attached to, and whether it was
+        // resumed — absent on the "already live, attach" 409 path (create() was never called there).
+        const next = { sid: d.session_id, agentId: aid, tmux: d.tmux_session || null, conversationId: d.conversation_id || null, resumed: !!d.resumed };
         ccSetSession(pid, next);
         setCcThread(p => ({...p, [pid]: []}));
         setCcLivePane(p => ({...p, [pid]: ''}));
@@ -2144,7 +2176,11 @@ function App() {
   }, [ccErr]);
 
   useEffect(() => {
-    if (!token || !currentSlug.startsWith('02-studio')) return;
+    // E8 FIX1: this was Studio-only, so Discovery had no way to discover a live session on a full
+    // reload landing directly on 07-command-center-overview — activeSessions stayed [] forever and
+    // the LIVE-ATTACH reconcile effect above had nothing to match against. Widen to Discovery's route.
+    const onDiscoveryRoute = currentSlug === '07-command-center-overview';
+    if (!token || !(currentSlug.startsWith('02-studio') || onDiscoveryRoute)) return;
     loadActiveSessions();
     const iv = setInterval(loadActiveSessions, 3000);
     return () => clearInterval(iv);
@@ -5709,7 +5745,6 @@ function App() {
       // DC-R7: transparent send — an agent being selectable is enough; a session is auto-ensured on send.
       const canChat = !!discAgentId;
       const discLiveActive = sessOn && ccHasLiveTurn(pid);
-      const visibleThread = ccThreadWithoutLiveTurn(pid, thread, discLiveActive);
       // E7: default view is the 1:1 mirror; 'bubbles' is the opt-in reconstructed-chat toggle.
       const discMirrorMode = ccDiscViewMode[pid] !== 'bubbles';
 
@@ -5724,6 +5759,9 @@ function App() {
             : html`<option value="">no agents assigned</option>`}
         </select>`;
 
+      // E8 FIX3 (JROM design ruling, settled — do not re-open): the last-reply strip sits at the TOP of
+      // the chat body regardless of view mode (mirror OR bubbles). Duplication with the mirror/thread
+      // below is fine now — R6.24's original "not duplicated in the stream below" constraint is relaxed.
       const chatPane = ccDiscChatMin
         ? html`<div class="cc-disc-rail" data-testid="ws-disc-chat-rail" role="button" tabindex="0"
             onclick=${() => setCcDiscChatMin(false)}>
@@ -5736,6 +5774,9 @@ function App() {
               <div data-testid="ws-disc-chat-header-controls" style="display:flex;gap:4px;align-items:center;flex-wrap:nowrap">
                 ${agentSelect}
                 <button class="btn btn-sm" data-testid="ws-disc-session-toggle" disabled=${connecting}
+                  title=${sess && sess.sid
+                    ? `tmux: ${sess.tmux || '—'}${sess.conversationId ? ` · conversation: ${sess.conversationId}${sess.resumed ? ' (resumed)' : ''}` : ''}`
+                    : 'No live session'}
                   onclick=${() => ccToggleSession(pid, discAgentId)}>${connecting ? '⏳ Connecting…' : sessOn ? '⏻ Session On' : '⏻ Session Off'}</button>
                 <button class="btn btn-sm" data-testid="ws-disc-view-toggle"
                   title=${discMirrorMode
@@ -5754,17 +5795,16 @@ function App() {
               onscroll=${() => {
                 if (discChatBodyRef.current) discChatStickRef.current = captureStickIntent(discChatBodyRef.current);
               }}>
+              ${discLiveActive ? renderCcLiveReply(pid, brainName) : null}
               ${discMirrorMode
                 ? html`<div class="disc-mirror-wrap" data-testid="ws-disc-mirror-wrap"
                     ref=${(el) => { if (el) el.innerHTML = buildDiscoveryMirrorHtml(stripAnsiForDisplay(ccLivePane[pid] || '')); }}>
                   </div>`
                 : [
-                    discLiveActive ? renderCcLiveReply(pid, brainName) : null,
                     ccDeliveryGap[pid] ? html`<div data-testid="ws-disc-delivery-gap" style="color:#d29922;font-size:10px;padding:3px 6px;">⚠ some delivery statuses may be incomplete — reload to re-sync.</div>` : null,
                     ccGlobalLossWarn ? html`<div data-testid="ws-disc-loss-warn" style="color:#f85149;font-size:10px;padding:3px 6px;">⚠ delivery-status notifications were dropped under load — some sent messages' status is uncertain. <button class="btn btn-sm" style="padding:0 4px;font-size:9px" onclick=${ccAckGlobalLoss}>Dismiss</button></div>` : null,
-                    visibleThread.length ? visibleThread.map(m => {
+                    thread.length ? thread.map(m => {
                       const isU = m.role === 'user';
-                      // Live agent text lives only in the sticky strip (ccThreadWithoutLiveTurn drops trailing agents).
                       return html`<div class=${`cc-bubble ${isU ? 'user' : ''}`} data-testid=${isU ? 'ws-disc-chat-message' : 'ws-disc-chat-bubble-agent'} key=${m.id}>
                         <span class="who">${isU ? 'JROM' : brainName}</span>
                         ${m.thinking

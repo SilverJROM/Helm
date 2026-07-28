@@ -317,6 +317,29 @@ function extractHelmReply(pane, afterUserText) {
   return { state: 'fallback', text };
 }
 
+/**
+ * E8 FIX3: the last-reply STRIP is a distinct surface from the current-turn bubble extractors above —
+ * it must show the agent's LAST REPLY ONLY, deliberately marked with ⟦HELM_REPLY⟧ delimiters, never
+ * raw pane / tmux chrome (pager text like "+65 lines (ctrl+o to expand)", composer echoes, etc.).
+ * Scans the WHOLE pane (not scoped to "after the last user prompt" — the strip must keep showing the
+ * last reply even while a later, not-yet-submitted composer draft sits below it) for every complete
+ * OPEN...CLOSE pair and returns the text of the LAST one. No complete pair anywhere → '' (never falls
+ * back to raw pane).
+ */
+function lastCompleteHelmReplyText(pane) {
+  if (!pane) return '';
+  const text = String(pane);
+  HELM_REPLY_OPEN_RE.lastIndex = 0;
+  let lastReply = '';
+  let openMatch;
+  while ((openMatch = HELM_REPLY_OPEN_RE.exec(text)) !== null) {
+    const afterOpen = text.slice(openMatch.index + openMatch[0].length);
+    const closeMatch = afterOpen.match(HELM_REPLY_CLOSE_RE);
+    if (closeMatch) lastReply = afterOpen.slice(0, closeMatch.index).trim();
+  }
+  return lastReply;
+}
+
 // Re-export the consts for tests that may want them.
 export {
   HELM_REPLY_OPEN_RE,
@@ -324,6 +347,7 @@ export {
   paneLooksGenerating,
   extractAgentPaneSegment,
   extractHelmReply,
+  lastCompleteHelmReplyText,
   stripChrome,
   looksLikeChrome
 };
@@ -333,5 +357,6 @@ export default {
   HELM_REPLY_CLOSE_RE,
   paneLooksGenerating,
   extractAgentPaneSegment,
-  extractHelmReply
+  extractHelmReply,
+  lastCompleteHelmReplyText
 };

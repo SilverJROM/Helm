@@ -361,6 +361,8 @@ async function main(): Promise<void> {
     memoryService,
     projectService,
     fenceDir: process.env.HELM_FENCE_DIR || process.cwd(),
+    // E8 FIX2 / R-cycle-session-continuity: durable resumable-conversation lookup/persist.
+    db: db.raw,
   });
 
   // F2 round-8 (finding #1): SID↔scope binding. ONE shared pre-handler resolves the session and verifies the
@@ -1349,7 +1351,16 @@ async function main(): Promise<void> {
     }
     try {
       const result = await chatSessionService.create(agentId, body.model_id, pid, { projectFenceDir: project.directory, activeCycle });
-      return { session_id: result.sessionId, tmux_session: result.tmuxSession, spawn_model: result.spawnModel, project_dir: project.directory };
+      // E8 FIX2 / R-cycle-session-continuity req #6: surface which conversation this seat is
+      // attached to (and whether it's a resumed one) so the operator can see it, not just infer it.
+      return {
+        session_id: result.sessionId,
+        tmux_session: result.tmuxSession,
+        spawn_model: result.spawnModel,
+        project_dir: project.directory,
+        conversation_id: result.conversationId,
+        resumed: result.resumed,
+      };
     } catch (e: any) {
       // B09 / AC12: preserve B08 typed collision as a stable 409 refusal (not a generic 500).
       if (e?.code === 'SESSION_NAME_COLLISION' || e instanceof SessionNameCollisionError || e?.name === 'SessionNameCollisionError') {

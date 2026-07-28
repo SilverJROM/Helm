@@ -3601,6 +3601,24 @@ CREATE INDEX IF NOT EXISTS idx_helm_sessions_run ON helm_sessions(run_id);
           this.db.prepare('UPDATE schema_version SET version = 108').run();
         }
       }
+
+      // v109 / E8 FIX2 (R-cycle-session-continuity): new, self-contained table — no existing-table
+      // rebuild needed. CREATE TABLE IF NOT EXISTS is safe to run unconditionally on a live DB.
+      if (current && current.version < 109) {
+        this.db.exec(`
+CREATE TABLE IF NOT EXISTS chat_session_identities (
+  id INTEGER PRIMARY KEY,
+  project_id INTEGER NOT NULL,
+  agent_id INTEGER NOT NULL,
+  cycle_id INTEGER NOT NULL DEFAULT 0,
+  provider TEXT NOT NULL,
+  conversation_id TEXT NOT NULL,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(project_id, agent_id, cycle_id)
+);
+`);
+        this.db.prepare('UPDATE schema_version SET version = 109').run();
+      }
     }
   }
 

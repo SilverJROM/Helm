@@ -13,6 +13,15 @@ import { MemoryService, type MemoryRow } from './memory-service.js';
 import { ProjectService, type Project } from './project-service.js';
 import { PROVIDERS, seatReadySignal } from '../config/providers.js';
 import { applyEnvelopeIsolation } from './envelope-isolation.js';
+import type Database from 'better-sqlite3';
+import {
+  CLAUDE_CONVERSATION_ID_RE,
+  getStoredChatIdentity,
+  removeStoredChatIdentity,
+  storeChatIdentity,
+  waitForClaudeConversationId,
+  type ChatIdentityKey,
+} from './chat-session-identity.js';
 
 // C1 KEY-C1: agent test-chat transport (SSE+POST, DELIB consensus 2026-06-21).
 // Ephemeral in-memory session store — a test-chat session is a tmux pane running the
@@ -96,6 +105,10 @@ export interface ChatSessionDeps {
   // (which may emphasise reference/source paths like a migration's origin app).
   projectService?: ProjectService;
   fenceDir?: string;
+  // E8 FIX2 / R-cycle-session-continuity: when present, create() persists/looks up a resumable
+  // provider conversation id per (project, agent, cycle) chat identity. Absent (e.g. most existing
+  // tests) → identical behavior to before this fix, always cold-spawns.
+  db?: Database.Database;
   nowFn?: () => number;
 }
 
@@ -185,6 +198,20 @@ export class AgentBusyError extends Error {
   constructor(msg = 'agent is generating a response — try again in a moment') {
     super(msg);
     this.name = 'AgentBusyError';
+  }
+}
+
+/**
+ * E8 FIX2 / R-cycle-session-continuity: raised INTERNALLY when a `--resume <uuid>` attempt fails its
+ * ready probe. Never surfaces to an HTTP caller — `create()`'s public wrapper catches this exact type
+ * and retries once as a clean cold spawn (fail-open req #5: "a failed resume must never block a cycle
+ * from starting"). A plain Error from the SAME ready-probe check (no resume attempted) is a genuine
+ * spawn failure and is NOT retried.
+ */
+class ResumeAttemptFailedError extends Error {
+  constructor(msg: string) {
+    super(msg);
+    this.name = 'ResumeAttemptFailedError';
   }
 }
 
@@ -558,7 +585,31 @@ export class ChatSessionService {
     return { epoch, lossGeneration, gapThroughSeq, failures };
   }
 
+  /**
+   * E8 FIX2 / R-cycle-session-continuity: public entry point. Wraps `createInternal` with ONE
+   * fail-open retry — if a resume attempt turns out to be unresumable (stale/corrupt stored id,
+   * provider refuses it), `createInternal` throws `ResumeAttemptFailedError` instead of the generic
+   * ready-probe error; caught here exactly once and retried as a clean cold spawn (`skipResumeOnce`),
+   * so a bad stored id degrades to today's cold-spawn behavior instead of blocking the cycle. Any
+   * OTHER failure (unknown agent, model not validated, genuine spawn failure) passes straight through.
+   */
   async create(
+    agentId: number,
+    overrideModelId?: string,
+    projectId?: number,
+    opts?: { projectFenceDir?: string; activeCycle?: ActiveCycleContext | null; strictReadAllow?: string[]; skipResumeOnce?: boolean }
+  ): Promise<{ sessionId: string; tmuxSession: string; spawnModel: string; conversationId: string | null; resumed: boolean }> {
+    try {
+      return await this.createInternal(agentId, overrideModelId, projectId, opts);
+    } catch (err) {
+      if (err instanceof ResumeAttemptFailedError && !opts?.skipResumeOnce) {
+        return this.createInternal(agentId, overrideModelId, projectId, { ...opts, skipResumeOnce: true });
+      }
+      throw err;
+    }
+  }
+
+  private async createInternal(
     agentId: number,
     overrideModelId?: string,
     projectId?: number,
@@ -567,8 +618,8 @@ export class ChatSessionService {
     // B-ISO1: strictReadAllow is the OPT-IN strict READ profile (mechanical reuse of the same helper
     // as master/worker/real-transport). Absent (every existing caller) → fencedLaunch byte-identical
     // (default read-all). The harness does not launch chat seats, so this is lower-priority parity.
-    opts?: { projectFenceDir?: string; activeCycle?: ActiveCycleContext | null; strictReadAllow?: string[] }
-  ): Promise<{ sessionId: string; tmuxSession: string; spawnModel: string }> {
+    opts?: { projectFenceDir?: string; activeCycle?: ActiveCycleContext | null; strictReadAllow?: string[]; skipResumeOnce?: boolean }
+  ): Promise<{ sessionId: string; tmuxSession: string; spawnModel: string; conversationId: string | null; resumed: boolean }> {
     // 1. Resolve agent → spawn provider/model.
     const agent = this.deps.assignmentService.getAgent(agentId);
     if (!agent) throw new Error(`unknown agent: ${agentId}`);
@@ -659,6 +710,22 @@ export class ChatSessionService {
     } else {
       fenceDir = await ensureTestChatSandbox(spawnProvider);
     }
+    // E8 FIX2 / R-cycle-session-continuity: resolve a resumable PROVIDER conversation id for this
+    // (project, agent, cycle) chat identity BEFORE spawning, so the launch command can carry
+    // `--resume <uuid>` instead of cold-starting. Project-fenced sessions only (test-chat/Studio has
+    // no stable cycle-scoped identity to key on) and claude only (the only provider with a concrete,
+    // verified resume mechanism here) — any other case always cold-spawns exactly as before this fix.
+    const identityKey: ChatIdentityKey | null = (projectFenceDir && projectId != null)
+      ? { projectId, agentId, cycleId: opts?.activeCycle?.id ?? 0 }
+      : null;
+    let resumeConversationId: string | null = null;
+    if (!opts?.skipResumeOnce && identityKey && spawnProvider === 'claude') {
+      const stored = getStoredChatIdentity(this.deps.db, identityKey);
+      if (stored && stored.provider === 'claude' && CLAUDE_CONVERSATION_ID_RE.test(stored.conversationId)) {
+        resumeConversationId = stored.conversationId;
+      }
+    }
+    let conversationId: string | null = null;
     // B-ISO1: compose (+ fail-closed validate) the OPT-IN strict read env BEFORE createSession, so a
     // bad allowlist refuses the spawn cleanly. Absent → '' (fencedLaunch byte-identical to read-all).
     const strictEnv = opts?.strictReadAllow !== undefined ? makeStrictReadProfileEnv(opts.strictReadAllow) : '';
@@ -673,8 +740,15 @@ export class ChatSessionService {
 
     try {
       const sandboxBin = resolveHelmSandboxBin();
-      const { envPrefix, launchCmd } = applyEnvelopeIsolation(spawnProvider, spec.launch_cmd);
+      // E8 FIX2: an explicit --resume <uuid> — never bare `-c`/`--continue`, which resumes "the most
+      // recent conversation in this cwd" and is ambiguous the moment two seats share a directory
+      // (discovery/plancore/implementer/validator routinely do in Helm). See R-cycle-session-continuity.md.
+      const launchCmdBase = resumeConversationId ? `${spec.launch_cmd} --resume ${resumeConversationId}` : spec.launch_cmd;
+      const { envPrefix, launchCmd } = applyEnvelopeIsolation(spawnProvider, launchCmdBase);
       const fencedLaunch = `${strictEnv}${envPrefix}${sandboxBin} ${fenceDir} ${launchCmd}`;
+      // Real wall-clock time (NOT the injectable nowFn) — this is compared against actual filesystem
+      // mtimes below, which are always real time regardless of test clock mocking.
+      const spawnStartMs = Date.now();
       // trusted launch path (skipSafetyCheck) — mirrors RealTransport + WorkerService.
       await this.deps.tmux.sendCommand(target, fencedLaunch, true, true);
       // R7.26/B22b-cont: start the userspace guard as soon as the fenced process exists (not
@@ -693,58 +767,79 @@ export class ChatSessionService {
         target
       );
       if (!ready) {
+        // FAIL-OPEN (R-cycle-session-continuity req #5): a resume must never block the cycle. A
+        // distinct error type so the public create() wrapper can retry ONCE as a clean cold spawn —
+        // any other ready-probe failure (a genuine cold-spawn failure) throws the plain Error as before.
+        if (resumeConversationId) {
+          removeStoredChatIdentity(this.deps.db, identityKey!);
+          throw new ResumeAttemptFailedError(`resume ready probe failed for ${spawnProvider}/${spawnModel}`);
+        }
         throw new Error(`test-chat agent ready probe failed for ${spawnProvider}/${spawnModel}`);
       }
 
-      // 5. B5 L3 + B6b R-16 + AGENTROLE T3: inject identity + rules + app memories BEFORE session is exposed.
-      const endMarker = bootstrapEndMarker(sessionId);
-      const appMemories = this.deps.memoryService?.listMemories({ scope: 'app', status: 'approved' }) ?? [];
-      // Authoritative project directory/name/dev-url pulled LIVE from the project row (never a stale
-      // caller-passed value), so the agent always anchors on the real Helm-defined working directory.
-      const projectContext = projectId != null ? (this.deps.projectService?.getProject(projectId) ?? null) : null;
-      // JROM directive: the project outranks the base agent — surface the project's tech-stack + the
-      // authoritative doc paths so the agent treats them as governing (best-effort; never blocks spawn).
-      const projectDocs = projectContext?.directory ? await gatherProjectDocs(projectContext.directory) : null;
-      // SIDECAR: write the full role brief (persona + project authority + rules + memories) to a file
-      // the agent reads, and paste only a LEAN prompt into the composer. A single ~8.5KB paste dropped
-      // intermittently in the TUI (persona never landed); the lean prompt is small + reliable.
-      const sidecarContent = composeAgentSidecar(
-        bootstrapDefinitionMd,
-        appMemories,
-        agent.agent_type,
-        projectContext,
-        projectDocs,
-        opts?.activeCycle ?? null
-      );
-      const sidecarPath = path.join(os.tmpdir(), 'helm-agent-briefs', `${sessionId}.md`);
-      try {
-        await fs.mkdir(path.dirname(sidecarPath), { recursive: true });
-        await fs.writeFile(sidecarPath, sidecarContent, 'utf8');
-      } catch { /* best-effort; lean prompt still establishes identity + reply protocol */ }
-      const bootstrapPayload = composeLeanBootstrap(sessionId, {
-        agentName: agent.name,
-        projectName: projectContext?.name,
-        projectDir: projectContext?.directory,
-        sidecarPath
-      });
-      const bootstrapHash = createHash('sha256').update(bootstrapPayload).digest('hex').slice(0, 16);
-      // F2: this is an interactive SEAT — gate on the provider's composer ready glyph so a seat that has not
-      // yet reached its composer (auth/update/launch frame) is not falsely marked delivered. (Composer-ready
-      // was just awaited above, so the glyph is present for a genuinely-ready seat.)
-      const bootOk = await this.deps.tmux.sendAndSubmit(target, bootstrapPayload, { readySignal: seatReadySignal(spawnProvider) });
-      if (!bootOk) throw new Error('bootstrap sendAndSubmit failed');
-      // G1: submit-verify using F3 primitive (composerHoldsText + resubmitIfComposerHeld) for bootstrap.
-      // Ensures the HELM_REPLY_PROTOCOL (and memories) actually left the composer even on variable
-      // Enter-drop windows. Short loop; marker wait below provides additional confirmation.
-      const isFakeBoot = process.env.USE_FAKE_TMUX === '1' && process.env.NODE_ENV !== 'production';
-      if (!isFakeBoot) {
-        for (let i = 0; i < 3; i++) {
-          await new Promise((r) => setTimeout(r, 600));
-          const pressed = await this.deps.tmux.resubmitIfComposerHeld(target, bootstrapPayload);
-          if (!pressed) break;
+      let endMarker = '';
+      let bootstrapHash = '';
+      let bootstrapMarkerSeen = true;
+      const bootstrapSent = !resumeConversationId;
+      if (resumeConversationId) {
+        // E8 FIX2 / R-cycle-session-continuity: a RESUMED conversation already carries full context —
+        // identity, project docs, the reply protocol, every prior turn. Sending the bootstrap prompt
+        // again would BE the re-prompt this fix exists to remove. waitForTestChatComposerReady above
+        // already proved the resumed CLI replayed its history and reached its composer; project-fenced
+        // sessions skip the settle-wait unconditionally below too. capturePane() will show the raw
+        // (unfiltered) resumed transcript because bootstrapSent=false short-circuits
+        // sanitizePostBootstrap — exactly the "1:1 mirror" behavior E7 already established.
+      } else {
+        // 5. B5 L3 + B6b R-16 + AGENTROLE T3: inject identity + rules + app memories BEFORE session is exposed.
+        endMarker = bootstrapEndMarker(sessionId);
+        const appMemories = this.deps.memoryService?.listMemories({ scope: 'app', status: 'approved' }) ?? [];
+        // Authoritative project directory/name/dev-url pulled LIVE from the project row (never a stale
+        // caller-passed value), so the agent always anchors on the real Helm-defined working directory.
+        const projectContext = projectId != null ? (this.deps.projectService?.getProject(projectId) ?? null) : null;
+        // JROM directive: the project outranks the base agent — surface the project's tech-stack + the
+        // authoritative doc paths so the agent treats them as governing (best-effort; never blocks spawn).
+        const projectDocs = projectContext?.directory ? await gatherProjectDocs(projectContext.directory) : null;
+        // SIDECAR: write the full role brief (persona + project authority + rules + memories) to a file
+        // the agent reads, and paste only a LEAN prompt into the composer. A single ~8.5KB paste dropped
+        // intermittently in the TUI (persona never landed); the lean prompt is small + reliable.
+        const sidecarContent = composeAgentSidecar(
+          bootstrapDefinitionMd,
+          appMemories,
+          agent.agent_type,
+          projectContext,
+          projectDocs,
+          opts?.activeCycle ?? null
+        );
+        const sidecarPath = path.join(os.tmpdir(), 'helm-agent-briefs', `${sessionId}.md`);
+        try {
+          await fs.mkdir(path.dirname(sidecarPath), { recursive: true });
+          await fs.writeFile(sidecarPath, sidecarContent, 'utf8');
+        } catch { /* best-effort; lean prompt still establishes identity + reply protocol */ }
+        const bootstrapPayload = composeLeanBootstrap(sessionId, {
+          agentName: agent.name,
+          projectName: projectContext?.name,
+          projectDir: projectContext?.directory,
+          sidecarPath
+        });
+        bootstrapHash = createHash('sha256').update(bootstrapPayload).digest('hex').slice(0, 16);
+        // F2: this is an interactive SEAT — gate on the provider's composer ready glyph so a seat that has not
+        // yet reached its composer (auth/update/launch frame) is not falsely marked delivered. (Composer-ready
+        // was just awaited above, so the glyph is present for a genuinely-ready seat.)
+        const bootOk = await this.deps.tmux.sendAndSubmit(target, bootstrapPayload, { readySignal: seatReadySignal(spawnProvider) });
+        if (!bootOk) throw new Error('bootstrap sendAndSubmit failed');
+        // G1: submit-verify using F3 primitive (composerHoldsText + resubmitIfComposerHeld) for bootstrap.
+        // Ensures the HELM_REPLY_PROTOCOL (and memories) actually left the composer even on variable
+        // Enter-drop windows. Short loop; marker wait below provides additional confirmation.
+        const isFakeBoot = process.env.USE_FAKE_TMUX === '1' && process.env.NODE_ENV !== 'production';
+        if (!isFakeBoot) {
+          for (let i = 0; i < 3; i++) {
+            await new Promise((r) => setTimeout(r, 600));
+            const pressed = await this.deps.tmux.resubmitIfComposerHeld(target, bootstrapPayload);
+            if (!pressed) break;
+          }
         }
+        bootstrapMarkerSeen = await waitForBootstrapMarker(this.deps.tmux, target, endMarker);
       }
-      const bootstrapMarkerSeen = await waitForBootstrapMarker(this.deps.tmux, target, endMarker);
 
       // B5R: Studio/test-chat sessions are short bootstrap probes, so wait for idle before exposing.
       // Project-scoped Command Center sessions may read substantial project/cycle docs on first turn;
@@ -765,7 +860,7 @@ export class ChatSessionService {
         paneTarget: target,
         lastSnapshot: '',
         createdAt: (this.deps.nowFn ?? Date.now)(),
-        bootstrapSent: true,
+        bootstrapSent,
         bootstrapEndMarker: endMarker,
         bootstrapHash,
         bootstrapMarkerSeen,
@@ -775,6 +870,21 @@ export class ChatSessionService {
         fenceDir,
         sessionToken: createToken,
       });
+
+      // E8 FIX2: the session is live either way by this point — capturing/persisting the resumable
+      // id is a pure bonus for the NEXT reopen and must never affect THIS one. A cold spawn captures
+      // the freshly-written transcript id; a resumed spawn already knows its id (no re-detection).
+      if (identityKey && spawnProvider === 'claude') {
+        if (resumeConversationId) {
+          conversationId = resumeConversationId;
+        } else {
+          const detected = await waitForClaudeConversationId(fenceDir, spawnStartMs).catch(() => null);
+          if (detected && CLAUDE_CONVERSATION_ID_RE.test(detected)) {
+            storeChatIdentity(this.deps.db, identityKey, { provider: 'claude', conversationId: detected });
+            conversationId = detected;
+          }
+        }
+      }
     } catch (err) {
       // Boot failed — tear down the half-created pane so we never leak a session.
       // B02 C1: create-time token only (never late get-by-name).
@@ -789,7 +899,7 @@ export class ChatSessionService {
       throw err;
     }
 
-    return { sessionId, tmuxSession: sessionName, spawnModel };
+    return { sessionId, tmuxSession: sessionName, spawnModel, conversationId, resumed: !!resumeConversationId };
   }
 
   /**

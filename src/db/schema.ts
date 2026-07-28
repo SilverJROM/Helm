@@ -2,7 +2,7 @@ import type Database from "better-sqlite3";
 import { assertAllRoleTiersInvariants } from "./role-tier-invariants.js";
 import { PROVIDERS } from "../config/providers.js";
 
-export const SCHEMA_VERSION = 108;
+export const SCHEMA_VERSION = 109;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -924,6 +924,23 @@ CREATE TABLE IF NOT EXISTS routing_rules (
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_routing_rules_emitter_status ON routing_rules(emitter_role, when_status);
+
+-- v109 / E8 FIX2 (R-cycle-session-continuity): durable, resumable PROVIDER conversation id per chat
+-- session identity (project, agent, cycle). ChatSessionService's live session bookkeeping is an
+-- in-memory Map that a server restart erases entirely; this table survives so a reopened chat can
+-- \`--resume <uuid>\` the same provider-side conversation instead of cold-spawning and re-prompting.
+-- cycle_id uses a 0 sentinel (not NULL) for "no active cycle" so the UNIQUE constraint below actually
+-- de-dupes that case (SQLite treats distinct NULLs as non-equal for UNIQUE).
+CREATE TABLE IF NOT EXISTS chat_session_identities (
+  id INTEGER PRIMARY KEY,
+  project_id INTEGER NOT NULL,
+  agent_id INTEGER NOT NULL,
+  cycle_id INTEGER NOT NULL DEFAULT 0,
+  provider TEXT NOT NULL,
+  conversation_id TEXT NOT NULL,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(project_id, agent_id, cycle_id)
+);
 `;
 
 /** B03a: slugify a model name for Helm-canonical slug backfill (not the B04 registry map). */

@@ -29,6 +29,12 @@ const PANE_FIXTURES = [
   }
 ];
 
+// E8: discovery-live-20260728-2251.txt (SOL diagnosis fixture — three completed HELM_REPLY turns,
+// the second reply's own content contains a box-drawing markdown table) is deliberately NOT added to
+// PANE_FIXTURES above. It exercises FIX1 (src/cc-disc-stream-reconcile.test.ts) and FIX3 (the
+// last-reply-strip suite), neither of which uses this suite's single-current-turn pending/reply
+// convention. It still carries a provenance header and is covered by the directory-wide check below.
+
 function readPaneFixture(file) {
   const raw = readFileSync(new URL(`./test-fixtures/panes/${file}`, import.meta.url), 'utf8');
   return raw.replace(/^# HELM_PROVENANCE: source_session=[^\n]+ capture_date=\d{4}-\d{2}-\d{2}\n/, '');
@@ -529,7 +535,12 @@ Gathering the current status
     const paneFiles = readdirSync(new URL('./test-fixtures/panes/', import.meta.url))
       .filter(file => file.endsWith('.txt'))
       .sort();
-    expect(paneFiles).toEqual(PANE_FIXTURES.map(fixture => fixture.file).sort());
+    // E8: every REAL captured pane in this directory must carry provenance — widened from an exact-
+    // equality list (PANE_FIXTURES) so a fixture captured for a DIFFERENT purpose than this suite's
+    // single-current-turn pending/reply convention (e.g. discovery-live-20260728-2251.txt, used by
+    // FIX1/FIX3's own suites for its three-reply, multi-turn content) can live here too without being
+    // forced through it. PANE_FIXTURES itself must still be a subset — nothing here was removed.
+    expect(paneFiles).toEqual(expect.arrayContaining(PANE_FIXTURES.map(fixture => fixture.file)));
 
     for (const file of paneFiles) {
       const raw = readFileSync(new URL(`./test-fixtures/panes/${file}`, import.meta.url), 'utf8');
