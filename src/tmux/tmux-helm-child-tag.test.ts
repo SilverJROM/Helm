@@ -51,7 +51,14 @@ describe('ST-R1/R2 @helm_child tmux ownership tag', () => {
       if (args[0] === 'has-session') throw new Error('no such session');
       return { stdout: '', stderr: '' };
     };
-    const tmux: any = new TmuxService();
+    // fix1: createSession now requires a durable onCreate token to succeed — a hooked registry stub
+    // stands in here so this test still exercises the tag ordering, not the (separately tested)
+    // unhooked-rejects case.
+    const tmux: any = new TmuxService({
+      onCreate: (name: string) => ({ id: 1, name, owner: 'helm', expectedStatus: 'active', generation: 0 }),
+      onTerminate: () => false,
+      onUse: () => {},
+    });
     const ret = await tmux.createSession('helm-w-tagtest', undefined, { owner: 'helm' });
     expect(ret).toBe('helm-w-tagtest:0.0');
 
@@ -89,7 +96,10 @@ describe('ST-R1/R2 @helm_child tmux ownership tag', () => {
     };
     const seen: Array<{ name: string; opts?: any }> = [];
     const tmux: any = new TmuxService({
-      onCreate: (name: string, opts?: any) => { seen.push({ name, opts }); },
+      onCreate: (name: string, opts?: any) => {
+        seen.push({ name, opts });
+        return { id: 1, name, owner: 'helm', expectedStatus: 'active', generation: 0 };
+      },
       onTerminate: () => false,
       onUse: () => {},
     });
@@ -118,7 +128,10 @@ describe('ST-R1/R2 @helm_child tmux ownership tag', () => {
     };
     const seen: any[] = [];
     const tmux: any = new TmuxService({
-      onCreate: (name: string, opts?: any) => { seen.push({ name, opts }); },
+      onCreate: (name: string, opts?: any) => {
+        seen.push({ name, opts });
+        return { id: 1, name, owner: 'helm', expectedStatus: 'active', generation: 0 };
+      },
       onTerminate: () => false,
       onUse: () => {},
     });
@@ -132,7 +145,11 @@ describe('ST-R1/R2 @helm_child tmux ownership tag', () => {
       if (args[0] === 'has-session') throw new Error('no such session');
       return { stdout: '', stderr: '' };
     };
-    const tmux: any = new TmuxService();
+    const tmux: any = new TmuxService({
+      onCreate: (name: string) => ({ id: 1, name, owner: 'human', expectedStatus: 'active', generation: 0 }),
+      onTerminate: () => false,
+      onUse: () => {},
+    });
     await expect(tmux.createSession('helm-chat-ok', undefined, { owner: 'human' })).resolves.toBe('helm-chat-ok:0.0');
     expect(cpMock.calls.some((c) => c.args[0] === 'new-session')).toBe(true);
   });
@@ -568,5 +585,95 @@ describe('AC19 / F-07: owner/tag persist fail-closed', () => {
     expect(row).toBeTruthy();
     expect(row!.owner).toBe('helm');
     expect(row!.status).toBe('active');
+  });
+
+  // -------------------------------------------------------------------------
+  // fix1 (redteam-sol CRITICAL): a successful `onCreate` return that lacks a token, or an unhooked
+  // TmuxService's NOOP hook, previously satisfied createSession without any durable registry row —
+  // AND a rollback kill that itself failed was silently swallowed, hiding a surviving live orphan.
+  // -------------------------------------------------------------------------
+
+  it('fix1: onCreate returns void (no throw) → create rejected + session torn down (owner ack mandatory)', async () => {
+    cpMock.impl = async (_cmd: string, args: string[]) => {
+      if (args[0] === 'has-session') throw new Error('no such session');
+      return { stdout: '', stderr: '' };
+    };
+    const registered: string[] = [];
+    // A hook that never throws but also never returns a token — the exact fail-open shape redteam-sol
+    // flagged (a swallowed persist error inside the hook, or a hook that just forgot to return it).
+    const tmux: any = new TmuxService({
+      onCreate: (name: string) => { registered.push(name); },
+      onTerminate: () => false,
+      onUse: () => {},
+    });
+    await expect(tmux.createSession('helm-w-fix1void', undefined, { owner: 'helm' })).rejects.toThrow(
+      /owner persistence not acknowledged/
+    );
+    expect(registered).toEqual(['helm-w-fix1void']);
+    const killCall = cpMock.calls.find(
+      (c) => c.args[0] === 'kill-session' && c.args.includes('helm-w-fix1void')
+    );
+    expect(killCall).toBeTruthy();
+  });
+
+  it('fix1: unhooked TmuxService (no registry attached) rejects create — closes the ST-R1 unowned-success gap', async () => {
+    cpMock.impl = async (_cmd: string, args: string[]) => {
+      if (args[0] === 'has-session') throw new Error('no such session');
+      return { stdout: '', stderr: '' };
+    };
+    const tmux: any = new TmuxService(); // NOOP registry hook — never wired via setRegistryHook.
+    await expect(tmux.createSession('helm-w-fix1unhooked', undefined, { owner: 'helm' })).rejects.toThrow(
+      /owner persistence not acknowledged/
+    );
+    const killCall = cpMock.calls.find(
+      (c) => c.args[0] === 'kill-session' && c.args.includes('helm-w-fix1unhooked')
+    );
+    expect(killCall).toBeTruthy();
+  });
+
+  it('fix1: rollback kill also rejects with the session still live → surfaces BOTH failures (no swallow)', async () => {
+    let created = false;
+    cpMock.impl = async (_cmd: string, args: string[]) => {
+      if (args[0] === 'has-session') {
+        // Pre-check (before new-session): absent, so createSession proceeds. Post-failure rollback
+        // probe (after new-session): the session genuinely IS still live — kill really did fail.
+        if (!created) throw new Error('no such session');
+        return { stdout: '', stderr: '' };
+      }
+      if (args[0] === 'new-session') {
+        created = true;
+        return { stdout: '', stderr: '' };
+      }
+      if (args[0] === 'set-option') throw new Error('set-option boom');
+      if (args[0] === 'kill-session') throw new Error('kill-session boom');
+      return { stdout: '', stderr: '' };
+    };
+    const tmux: any = new TmuxService();
+    const err: any = await tmux
+      .createSession('helm-w-fix1killfail', undefined, { owner: 'helm' })
+      .catch((e: any) => e);
+    expect(err).toBeInstanceOf(AggregateError);
+    expect(String(err.message)).toContain('helm-w-fix1killfail');
+    expect(String(err.message)).toMatch(/still be LIVE/);
+    const inner = (err.errors ?? []).map((e: any) => String(e?.message ?? e));
+    expect(inner.some((m: string) => /set-option boom/.test(m))).toBe(true);
+    expect(inner.some((m: string) => /kill-session boom/.test(m))).toBe(true);
+  });
+
+  it('fix1: rollback kill rejects but the session is verified provably gone (race) → only the original cause surfaces', async () => {
+    cpMock.impl = async (_cmd: string, args: string[]) => {
+      // "gone" for every has-session probe (both the pre-check and the post-kill-failure verify) —
+      // a genuine race where the session died on its own before/because of the failed kill attempt.
+      if (args[0] === 'has-session') throw new Error('no such session');
+      if (args[0] === 'set-option') throw new Error('set-option boom');
+      if (args[0] === 'kill-session') throw new Error('kill-session boom (already gone)');
+      return { stdout: '', stderr: '' };
+    };
+    const tmux: any = new TmuxService();
+    // Only the ORIGINAL cause surfaces — a kill failure against an already-gone session is not a live
+    // orphan and must not be reported as one (no false alarm).
+    await expect(tmux.createSession('helm-w-fix1killrace', undefined, { owner: 'helm' })).rejects.toThrow(
+      /set-option boom/
+    );
   });
 });

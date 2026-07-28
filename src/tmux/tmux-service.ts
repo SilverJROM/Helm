@@ -151,6 +151,8 @@ export class SessionNameCollisionError extends Error {
 }
 
 const NOOP_REGISTRY_HOOK: TmuxSessionRegistryHook = {
+  // fix1 / AC19: a void return is no longer proof of owner persistence — publishCreatedSession now
+  // requires a truthy onCreate token, so an unhooked TmuxService can never report a successful create.
   onCreate() {},
   // No registry: never claim success (token-bearing terminate will refuse kill without a real CAS).
   onTerminate() {
@@ -784,9 +786,8 @@ export class TmuxService {
     try {
       await execFileAsync('tmux', ['set-option', '-t', sessionName, '@helm_child', '1']);
     } catch (err) {
-      // Remove the orphan (tag incomplete); rethrow so the caller never publishes/relies on it.
-      await this.killSessionRaw(sessionName).catch(() => {});
-      throw err;
+      // Remove the orphan (tag incomplete); rollback failure must surface, never vanish (fix1).
+      await this.rollbackOrphanSession(sessionName, err);
     }
   }
 
@@ -795,21 +796,61 @@ export class TmuxService {
    *
    * AC19 / F-07: registry/owner persistence is mandatory, not best-effort — a durable unowned active
    * row is exactly the state AC19 forbids. A throwing onCreate rejects the create: the just-created
-   * tmux session (published under `name`) is torn down (kill-only, no registry write — onCreate never
-   * committed a row) and the failure is rethrown so the caller never treats this as a success.
+   * tmux session (published under `name`) is torn down and the failure is rethrown so the caller never
+   * treats this as a success.
+   *
+   * fix1: absence-of-throw is not proof of persistence either. `onCreate` is typed `token | void`, and
+   * a hook (or the NOOP default on an unhooked TmuxService) that returns void without throwing produced
+   * exactly the same fail-open result the redteam flagged — a live tagged session with no registry row.
+   * A falsy return is now treated identically to a thrown error: reject + roll back.
    */
   private async publishCreatedSession(name: string, opts?: TmuxSessionCreateOpts): Promise<void> {
-    let createdToken: TmuxSessionStatusToken | void;
+    let createdToken: TmuxSessionStatusToken | void = undefined;
     try {
       createdToken = this.registryHook.onCreate(name, opts);
     } catch (err) {
       console.warn('[tmux] registry onCreate failed — rejecting create (AC19 fail-closed)', { name, err: String(err) });
-      await this.terminateSession(name, { noRegistryWrite: true }).catch(() => {});
-      throw err;
+      await this.rollbackOrphanSession(name, err);
     }
-    if (createdToken && opts?.sessionTokenOut) {
-      opts.sessionTokenOut.token = createdToken;
+    if (!createdToken) {
+      console.warn('[tmux] registry onCreate returned no durable token — rejecting create (AC19 fail-closed)', { name });
+      await this.rollbackOrphanSession(
+        name,
+        new Error(`registry onCreate returned no durable token for ${name} — owner persistence not acknowledged (AC19 fail-closed)`)
+      );
     }
+    if (opts?.sessionTokenOut) {
+      opts.sessionTokenOut.token = createdToken as TmuxSessionStatusToken;
+    }
+  }
+
+  /**
+   * fix1 (AC19 / F-07): shared rollback for a failed post-create step (tag or registry persist). The
+   * prior implementation swallowed a `kill-session` rollback failure (`.catch(() => {})`), which meant
+   * a session that survived BOTH the original failure and the cleanup kill was reported only as the
+   * original error — the live, untagged/unowned orphan itself was invisible to the caller.
+   *
+   * Kill success (or a kill failure where a follow-up tri-state probe PROVES the session is already
+   * gone — e.g. a race where it died between the failed call and this check) rethrows only the
+   * original cause. Any other outcome (kill failed AND the session is still live or unknown) throws an
+   * AggregateError carrying both failures, so the rejection itself makes the surviving orphan visible
+   * instead of reading as an ordinary create failure.
+   */
+  private async rollbackOrphanSession(sessionName: string, cause: unknown): Promise<never> {
+    const causeErr = cause instanceof Error ? cause : new Error(String(cause));
+    try {
+      await this.killSessionRaw(sessionName);
+    } catch (killErr) {
+      const stillThere = await this.sessionExistsTriState(sessionName);
+      if (stillThere === false) {
+        throw causeErr;
+      }
+      throw new AggregateError(
+        [causeErr, killErr instanceof Error ? killErr : new Error(String(killErr))],
+        `rollback kill failed for ${sessionName} after create failure — session may still be LIVE and untagged/unowned (orig: ${causeErr.message})`
+      );
+    }
+    throw causeErr;
   }
 
   // ST-R2: positive Helm-ownership probe. Returns true ONLY if the live session carries the

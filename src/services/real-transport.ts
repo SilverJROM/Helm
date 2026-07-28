@@ -44,7 +44,8 @@ export function formatLifecycleHandle(sessionName: string, spawnId: string): str
 
 
 interface RealTransportDeps {
-  tmux?: TmuxService;
+  // fix1 / AC19: required, not optional — see the constructor guard below.
+  tmux: TmuxService;
   artifacts?: any; // RunArtifactService | stub (recordDispatch only needed for dispatch.start success path)
   resolver?: ProviderResolverService;
 }
@@ -75,12 +76,21 @@ export class RealTransport implements ITransport {
     { sessionName: string; token?: SessionStatusToken }
   >();
 
-  constructor(deps: RealTransportDeps = {}) {
+  constructor(deps: RealTransportDeps) {
     const isFake = process.env.USE_FAKE_TMUX === '1' && process.env.NODE_ENV !== 'production';
     if (isFake) {
       throw new Error('RealTransport strictly behind !USE_FAKE_TMUX=1 (non-production) per batch-A1 approval; real tmux/worker paths untouched. Use FakeTransport when the flag is set.');
     }
-    this.tmux = deps.tmux ?? new TmuxService();
+    // fix1 / AC19: no silent unhooked fallback. A private `new TmuxService()` here would carry the
+    // NOOP registry hook, which (after tmux-service.ts's mandatory-token fix) can never successfully
+    // create a session — but failing loudly at construction is a clearer signal than a hidden fallback
+    // that only breaks later, or worse, quietly persists as an unhooked instance. Every real caller
+    // (src/index.ts) already passes the shared hooked instance; the runtime guard below defends
+    // `as any`/non-TS callers that bypass the now-required type.
+    if (!deps?.tmux) {
+      throw new Error('RealTransport requires an explicit hooked TmuxService (deps.tmux) — no unhooked fallback (AC19 fail-closed)');
+    }
+    this.tmux = deps.tmux;
     this.resolver = deps.resolver ?? new ProviderResolverService();
     this.artifacts = deps.artifacts ?? new NoopArtifacts();
     this.dispatch = new DispatchService(this.tmux, this.artifacts);

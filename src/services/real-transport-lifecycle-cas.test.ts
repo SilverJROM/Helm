@@ -56,6 +56,11 @@ describe('B02 C1 R3/R4 RealTransport lifecycle-handle + CAS-before-kill', () => 
     });
   });
 
+  it('fix1 / AC19: constructor rejects a missing tmux dep — no silent unhooked fallback', () => {
+    expect(() => new RealTransport({} as any)).toThrow(/requires an explicit hooked TmuxService/);
+    expect(() => new RealTransport(undefined as any)).toThrow(/requires an explicit hooked TmuxService/);
+  });
+
   it('reap(A) after same-name B: zero kill-session, B stays active (CAS stale aborts kill)', async () => {
     const dbPath = path.join(
       os.tmpdir(),
