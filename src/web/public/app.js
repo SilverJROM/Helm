@@ -7,15 +7,12 @@ import { seatLeaseSendChain } from './cc-session-reconcile.js';
 import { markUndeliveredById, applyDeliveryFailedById, hasOutstandingOptimistic } from './cc-delivery.js';
 import { captureStickIntent, applyStick } from './pane-bottom-stick.js';
 import { SESSION_PANE_CLASSES } from './session-pane.js';
+import { stripAnsiForDisplay } from './ansi-strip.js';
+import { buildDiscoveryMirrorHtml } from './discovery-mirror.js';
+import { isAgentReplyContinuation } from './chat-bubble-merge.js';
 
 const html = htm.bind(h);
 const PA_DEFINITION_MAX = 50000;
-
-function stripAnsiForDisplay(s) {
-  return String(s || '')
-    .replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '')
-    .replace(/\x1b\][^\x07]*\x07/g, '');
-}
 
 // B11 UI2: load marked + DOMPurify from CDN once (no build). Fallback to escaped pre for safety.
 let __mdLoaded = false;
@@ -792,6 +789,10 @@ function App() {
   // B7-T01: Discovery tab — split chat (reuses ccSession/ccThread/agent-chat plumbing keyed by
   // ccWsProjectId) + living docs pane, either pane minimizable to a rail (R-C1).
   const [ccDiscChatMin, setCcDiscChatMin] = useState(false);
+  // E7: Discovery default view is the 1:1 session mirror (raw pane, formatted for readability,
+  // nothing inferred). The reconstructed-bubble view survives behind this toggle — pid -> 'mirror'
+  // (default, any value other than 'bubbles') | 'bubbles'.
+  const [ccDiscViewMode, setCcDiscViewMode] = useState({});
   // DC-R4: docs rail defaults COLLAPSED (helm_disc_docs_min, default '1'); localStorage-backed.
   const [ccDiscDocsMin, setCcDiscDocsMin] = useState(() => localStorage.getItem('helm_disc_docs_min') !== '0');
   const [ccDiscArtifacts, setCcDiscArtifacts] = useState({});   // cycleId -> {docs,images,flow,other}
@@ -3204,7 +3205,10 @@ function App() {
     setChatThreadMessages(prev => {
       const last = prev[prev.length - 1];
       const bubble = { role: 'agent', text, thinking, fallback };
-      if (last && last.role === 'agent') {
+      // E7 fix: only merge into the last bubble when this is the SAME reply still forming
+      // (growing/shrinking text). A second, distinct reply — even one that starts by
+      // re-entering "thinking" — must append a new bubble instead of overwriting the first.
+      if (isAgentReplyContinuation(last, text)) {
         return [...prev.slice(0, -1), { ...last, ...bubble, ts: last.ts || Date.now() }];
       }
       return [...prev, { id: nextChatMsgId(), ts: Date.now(), ...bubble }];
@@ -5706,6 +5710,8 @@ function App() {
       const canChat = !!discAgentId;
       const discLiveActive = sessOn && ccHasLiveTurn(pid);
       const visibleThread = ccThreadWithoutLiveTurn(pid, thread, discLiveActive);
+      // E7: default view is the 1:1 mirror; 'bubbles' is the opt-in reconstructed-chat toggle.
+      const discMirrorMode = ccDiscViewMode[pid] !== 'bubbles';
 
       // DC-R7: compact "who am I talking to" selector — default is the resolved Discovery brain.
       const agentSelect = html`<select class="cc-disc-agent-select" data-testid="ws-disc-agent-select"
@@ -5731,6 +5737,12 @@ function App() {
                 ${agentSelect}
                 <button class="btn btn-sm" data-testid="ws-disc-session-toggle" disabled=${connecting}
                   onclick=${() => ccToggleSession(pid, discAgentId)}>${connecting ? '⏳ Connecting…' : sessOn ? '⏻ Session On' : '⏻ Session Off'}</button>
+                <button class="btn btn-sm" data-testid="ws-disc-view-toggle"
+                  title=${discMirrorMode
+                    ? 'Showing the raw session mirror — switch to reconstructed chat bubbles'
+                    : 'Showing reconstructed chat bubbles — switch to the raw session mirror'}
+                  onclick=${() => setCcDiscViewMode(p => ({...p, [pid]: discMirrorMode ? 'bubbles' : 'mirror'}))}
+                  >${discMirrorMode ? 'View: Mirror' : 'View: Bubbles'}</button>
                 <button class="btn btn-sm" data-testid="ws-disc-chat-minimize" onclick=${() => setCcDiscChatMin(true)}>Minimize</button>
               </div>
             </div>
@@ -5742,21 +5754,27 @@ function App() {
               onscroll=${() => {
                 if (discChatBodyRef.current) discChatStickRef.current = captureStickIntent(discChatBodyRef.current);
               }}>
-              ${discLiveActive ? renderCcLiveReply(pid, brainName) : null}
-              ${ccDeliveryGap[pid] ? html`<div data-testid="ws-disc-delivery-gap" style="color:#d29922;font-size:10px;padding:3px 6px;">⚠ some delivery statuses may be incomplete — reload to re-sync.</div>` : null}
-              ${ccGlobalLossWarn ? html`<div data-testid="ws-disc-loss-warn" style="color:#f85149;font-size:10px;padding:3px 6px;">⚠ delivery-status notifications were dropped under load — some sent messages' status is uncertain. <button class="btn btn-sm" style="padding:0 4px;font-size:9px" onclick=${ccAckGlobalLoss}>Dismiss</button></div>` : null}
-              ${visibleThread.length ? visibleThread.map(m => {
-                const isU = m.role === 'user';
-                // Live agent text lives only in the sticky strip (ccThreadWithoutLiveTurn drops trailing agents).
-                return html`<div class=${`cc-bubble ${isU ? 'user' : ''}`} data-testid=${isU ? 'ws-disc-chat-message' : 'ws-disc-chat-bubble-agent'} key=${m.id}>
-                  <span class="who">${isU ? 'JROM' : brainName}</span>
-                  ${m.thinking
-                    ? html`<div class="text-sec" style="font-style:italic">thinking…</div>`
-                    : html`<div style="white-space:pre-wrap">${m.text}</div>`}
-                  ${m.fallback ? html`<div class="text-sec" style="font-size:9px" title="Agent didn't wrap its reply in the Helm reply markers — showing raw output.">⚠ unstructured reply</div>` : null}
-                  ${isU && m.delivered === false ? html`<span style="color:#f85149;font-size:8px;">⚠ not delivered</span>` : null}
-                </div>`;
-              }) : (discLiveActive ? null : html`<div class="text-sec" data-testid="ws-disc-chat-empty" style="padding:6px;font-size:11px">No messages yet. ${canChat ? `Type a message to start chatting with ${brainName}.` : 'Assign an agent to this project to chat.'}</div>`)}
+              ${discMirrorMode
+                ? html`<div class="disc-mirror-wrap" data-testid="ws-disc-mirror-wrap"
+                    ref=${(el) => { if (el) el.innerHTML = buildDiscoveryMirrorHtml(stripAnsiForDisplay(ccLivePane[pid] || '')); }}>
+                  </div>`
+                : [
+                    discLiveActive ? renderCcLiveReply(pid, brainName) : null,
+                    ccDeliveryGap[pid] ? html`<div data-testid="ws-disc-delivery-gap" style="color:#d29922;font-size:10px;padding:3px 6px;">⚠ some delivery statuses may be incomplete — reload to re-sync.</div>` : null,
+                    ccGlobalLossWarn ? html`<div data-testid="ws-disc-loss-warn" style="color:#f85149;font-size:10px;padding:3px 6px;">⚠ delivery-status notifications were dropped under load — some sent messages' status is uncertain. <button class="btn btn-sm" style="padding:0 4px;font-size:9px" onclick=${ccAckGlobalLoss}>Dismiss</button></div>` : null,
+                    visibleThread.length ? visibleThread.map(m => {
+                      const isU = m.role === 'user';
+                      // Live agent text lives only in the sticky strip (ccThreadWithoutLiveTurn drops trailing agents).
+                      return html`<div class=${`cc-bubble ${isU ? 'user' : ''}`} data-testid=${isU ? 'ws-disc-chat-message' : 'ws-disc-chat-bubble-agent'} key=${m.id}>
+                        <span class="who">${isU ? 'JROM' : brainName}</span>
+                        ${m.thinking
+                          ? html`<div class="text-sec" style="font-style:italic">thinking…</div>`
+                          : html`<div style="white-space:pre-wrap">${m.text}</div>`}
+                        ${m.fallback ? html`<div class="text-sec" style="font-size:9px" title="Agent didn't wrap its reply in the Helm reply markers — showing raw output.">⚠ unstructured reply</div>` : null}
+                        ${isU && m.delivered === false ? html`<span style="color:#f85149;font-size:8px;">⚠ not delivered</span>` : null}
+                      </div>`;
+                    }) : (discLiveActive ? null : html`<div class="text-sec" data-testid="ws-disc-chat-empty" style="padding:6px;font-size:11px">No messages yet. ${canChat ? `Type a message to start chatting with ${brainName}.` : 'Assign an agent to this project to chat.'}</div>`),
+                  ]}
             </div>
             <div class="cc-disc-pane-footer cc-composer" data-testid="ws-disc-composer">
               <textarea data-testid="ws-disc-chat-composer" disabled=${!canChat}
