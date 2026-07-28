@@ -6,8 +6,8 @@ import { setTimeout as setTimeoutPromise } from "node:timers/promises";
 
 import { DatabaseService } from "../db/database.js";
 import { AgentEventsService, AgentEventInput } from "./agent-events-service.js";
-import { TmuxService, type TmuxTerminateOpts } from "../tmux/tmux-service.js";
-import { sessionStatusTokenFromRow } from "./session-registry-service.js";
+import { TmuxService } from "../tmux/tmux-service.js";
+import type { SessionStatusToken } from "./session-registry-service.js";
 import { ProviderResolverService, ProviderLaunchSpec } from "./provider-resolver-service.js";
 import { MasterModelService, MasterModelEntry } from "./master-model-service.js";
 import { PROVIDERS, ProviderDefinition } from "../config/providers.js";
@@ -64,6 +64,11 @@ export class MasterRuntimeService {
   // A1b: per-target seat-binary scan context (launch marker + resolved bin) armed by launchMaster for the
   // ready-probe; keyed by tmux target, cleared on every launch exit.
   private seatScanCtx = new Map<string, { marker: string; bin: string }>();
+  /**
+   * B02 C1 fix cycle 2: create-time SessionStatusToken keyed by session name.
+   * Cleanup uses this map only — never SELECT/get by name at terminate.
+   */
+  private readonly masterSessionTokens = new Map<string, SessionStatusToken>();
   private readonly promptsDir: string;
 
   // P2-3: auto fallback state (ctor-injected gateway per brief/consensus; separate tick)
@@ -98,26 +103,14 @@ export class MasterRuntimeService {
     this.reapStaleSwitches();
   }
 
-  /**
-   * B02 C1: capture helm_sessions token at the terminate decision boundary (one SELECT).
-   * No row / already reaped / invalid authority → explicit kill-only (noRegistryWrite).
-   * Never relies on terminateSession's removed name-only get→markReaped fallback.
-   */
-  private terminateOptsForSession(name: string): TmuxTerminateOpts {
-    if (!name) return { noRegistryWrite: true };
-    try {
-      const row = this.db
-        .prepare(
-          `SELECT id, name, owner, status, generation FROM helm_sessions WHERE name = ?`
-        )
-        .get(name) as
-        | { id: number; name: string; owner: string | null; status: string; generation: number }
-        | undefined;
-      if (!row || row.status === "reaped") return { noRegistryWrite: true };
-      return { sessionToken: sessionStatusTokenFromRow(row) };
-    } catch {
-      return { noRegistryWrite: true };
-    }
+  /** B02 C1: terminate with create-time retained token only (else explicit kill-only). */
+  private async terminateWithRetainedToken(name: string): Promise<void> {
+    const tok = this.masterSessionTokens.get(name);
+    await this.tmux.terminateSession(
+      name,
+      tok ? { sessionToken: tok } : { noRegistryWrite: true }
+    );
+    this.masterSessionTokens.delete(name);
   }
 
   /** B25 fix2: chain entry is launch-legal iff PROVIDERS allow-list (or dynamic) accepts it. */
@@ -215,7 +208,14 @@ export class MasterRuntimeService {
     let created = false;
     try {
       // S05: preflight probe seats are Helm-owned.
-      await this.tmux.createSession(probeSession, cwd, { owner: 'helm', kind: 'preflight' });
+      // B02 C1: retain create-time token for finally teardown.
+      const probeTokenOut: { token?: SessionStatusToken } = {};
+      await this.tmux.createSession(probeSession, cwd, {
+        owner: 'helm',
+        kind: 'preflight',
+        sessionTokenOut: probeTokenOut,
+      });
+      if (probeTokenOut.token) this.masterSessionTokens.set(probeSession, probeTokenOut.token);
       created = true;
       const target = `${probeSession}:0.0`;
       for (const bin of bins) {
@@ -251,7 +251,7 @@ export class MasterRuntimeService {
       // leave any unverified binary as fail-closed MISSING
     } finally {
       if (created) {
-        try { await this.tmux.terminateSession(probeSession, this.terminateOptsForSession(probeSession)); } catch {}
+        try { await this.terminateWithRetainedToken(probeSession); } catch {}
       }
     }
     return result;
@@ -332,7 +332,7 @@ export class MasterRuntimeService {
   }): Promise<never> {
     this.seatScanCtx.delete(p.target);
     if (p.createdThisTime) {
-      try { await this.tmux.terminateSession(p.sessionName, this.terminateOptsForSession(p.sessionName)); } catch { /* best-effort */ }
+      try { await this.terminateWithRetainedToken(p.sessionName); } catch { /* best-effort */ }
     }
     try { this.governedDocGuards.get(p.sessionName)?.stop(); } catch {}
     this.governedDocGuards.delete(p.sessionName);
@@ -472,7 +472,13 @@ export class MasterRuntimeService {
     const exists = await this.tmux.sessionExists(sessionName);
     if (!exists) {
       // S05: phase-brain seats (plancore/ibrain) are Helm-owned.
-      await this.tmux.createSession(sessionName, projectDir, { owner: 'helm' }); // C3 cwd lock
+      // B02 C1: retain create-time CAS token for this master lifecycle (cleanup never late-captures).
+      const masterTokenOut: { token?: SessionStatusToken } = {};
+      await this.tmux.createSession(sessionName, projectDir, {
+        owner: 'helm',
+        sessionTokenOut: masterTokenOut,
+      }); // C3 cwd lock
+      if (masterTokenOut.token) this.masterSessionTokens.set(sessionName, masterTokenOut.token);
       createdThisTime = true;
     }
     this.activeMasterSessions.add(sessionName); // RTF-M5: track on EVERY launch (reused sessions too for shutdown)
@@ -638,7 +644,7 @@ task_id required in convention (include when known); backend warns but records i
       // (If it pre-existed we do not kill it here.)
       if (createdThisTime) {
         try {
-          await this.tmux.terminateSession(sessionName, this.terminateOptsForSession(sessionName));
+          await this.terminateWithRetainedToken(sessionName);
         } catch {
           // best-effort; do not swallow the original timeout error
         }
@@ -703,7 +709,7 @@ task_id required in convention (include when known); backend warns but records i
       }
       if (!codexGenuine) {
         if (createdThisTime) {
-          try { await this.tmux.terminateSession(sessionName, this.terminateOptsForSession(sessionName)); } catch {}
+          try { await this.terminateWithRetainedToken(sessionName); } catch {}
         }
         try { this.governedDocGuards.get(sessionName)?.stop(); } catch {}
         this.governedDocGuards.delete(sessionName);
@@ -1469,7 +1475,7 @@ task_id required in convention (include when known); backend warns but records i
         // P2-r2: the NEW master launched but never ACKed. Do NOT leave it 'running' for the supervisor
         // to adopt as a valid context-resumed master. Kill the un-acked session + mark the runtime row
         // 'failed' so the supervisor recovers it cleanly (fresh relaunch) next tick.
-        try { await this.tmux.terminateSession(sess, this.terminateOptsForSession(sess)); } catch {}
+        try { await this.terminateWithRetainedToken(sess); } catch {}
         try { this.governedDocGuards.get(sess)?.stop(); } catch {}
         this.governedDocGuards.delete(sess);
         try { this.db.prepare("UPDATE master_runtimes SET state='failed', intentional_park_until=NULL WHERE project_id = ?").run(projectId); } catch {}
@@ -1635,7 +1641,7 @@ task_id required in convention (include when known); backend warns but records i
   async terminateAllActiveMasters(): Promise<void> {
     for (const sess of Array.from(this.activeMasterSessions)) {
       try {
-        await this.tmux.terminateSession(sess, this.terminateOptsForSession(sess));
+        await this.terminateWithRetainedToken(sess);
         this.activeMasterSessions.delete(sess);
       } catch (e) {
         console.warn('[MasterRuntimeService] terminateAllActiveMasters failed', { sess, err: String(e) });

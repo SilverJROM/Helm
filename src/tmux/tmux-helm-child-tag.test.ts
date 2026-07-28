@@ -415,7 +415,10 @@ describe('ST-R1/R2 @helm_child tmux ownership tag', () => {
     const lastUsed = reg.get('helm-chat-s09reap')!.last_used_at;
 
     const tmux: any = new TmuxService({
-      onCreate: (n: string) => reg.register(n, { owner: 'helm' }),
+      onCreate: (n: string) => {
+        const row = reg.register(n, { owner: 'helm' });
+        return row ? sessionStatusTokenFromRow(row) : undefined;
+      },
       // B02 C1: no get(name) fallback — token required for registry mutation.
       onTerminate: (_n: string, token?: any) => {
         if (token) reg.markReaped(token);

@@ -37,7 +37,7 @@ import { createScopedChatSidPre } from "./services/delivery-channel.js";
 import { MasterRuntimeService } from "./services/master-runtime-service.js";
 import { WorkerService } from "./services/worker-service.js";
 import { HelmIdentityService, requireActiveNativeProject } from "./services/helm-identity-service.js";
-import { SessionRegistryService } from "./services/session-registry-service.js";
+import { SessionRegistryService, sessionStatusTokenFromRow } from "./services/session-registry-service.js";
 import type { SessionStatusToken } from "./services/lifecycle-cas.js";
 import { SessionCloseService } from "./services/session-close-service.js";
 import { registerSessionCloseRoutes } from "./api/routes/session-close-routes.js";
@@ -306,7 +306,12 @@ async function main(): Promise<void> {
       // rows land linked with decision authority at the choke point. Owner is required pre-spawn
       // in createSession; register() also refuses missing owner (defensive).
       onCreate: (name: string, opts?: { projectId?: number | null; runId?: number | null; kind?: string; owner?: 'helm' | 'human' | 'legacy:unknown' }) => {
-        try { sessionRegistry.register(name, opts as any); } catch {}
+        // B02 C1: return create-time CAS token so callers retain it (never late get-by-name).
+        try {
+          const row = sessionRegistry.register(name, opts as any);
+          if (row) return sessionStatusTokenFromRow(row);
+        } catch {}
+        return undefined;
       },
       // B02 C1: registry mutation only with decision-boundary token — never get(name) fallback.
       onTerminate: (_name: string, token?: SessionStatusToken) => {
@@ -374,8 +379,6 @@ async function main(): Promise<void> {
     memoryService,
     projectService,
     fenceDir: process.env.HELM_FENCE_DIR || process.cwd(),
-    // B02 C1: decision-boundary capture for chat terminate (no name-only registry write).
-    captureSessionToken: (name) => sessionRegistry.captureStatusToken(name),
   });
 
   // F2 round-8 (finding #1): SID↔scope binding. ONE shared pre-handler resolves the session and verifies the
@@ -429,8 +432,6 @@ async function main(): Promise<void> {
     : new RealTransport({
         artifacts: runArtifactService,
         tmux: tmuxService,
-        // B02 C1: decision-boundary capture for reap/terminate (no name-only registry write).
-        captureSessionToken: (name) => sessionRegistry.captureStatusToken(name),
       });
   const housekeeperService = new HousekeeperService(
     db,
@@ -3369,8 +3370,13 @@ async function main(): Promise<void> {
       return reply.code(409).send({ error: 'already closed' });
     }
     try {
-      // B02 C1: capture token at close decision boundary (or kill-only if absent/reaped).
-      const closeTok = sessionRegistry.captureStatusToken(session);
+      // B02 C1: acquire token once at close decision (not a create path; no late re-capture loop).
+      // Prefer retained identity from registry at the start of this close handler only.
+      const closeRow = sessionRegistry.get(session);
+      const closeTok =
+        closeRow && closeRow.status !== 'reaped'
+          ? sessionStatusTokenFromRow(closeRow)
+          : undefined;
       await tmuxService.terminateSession(
         session,
         closeTok ? { sessionToken: closeTok } : { noRegistryWrite: true }

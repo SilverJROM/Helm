@@ -41,12 +41,46 @@ export type TextSubmissionState = "held" | "submitted" | "indeterminate";
 // S05 / AC2: owner REQUIRED pre-spawn — createSession refuses missing/invalid before any tmux mutation.
 export type TmuxSessionOwner = 'helm' | 'human' | 'legacy:unknown';
 
+/** B02: CAS token shape carried from create/register through terminate. */
+export type TmuxSessionStatusToken = {
+  id: number;
+  name: string;
+  owner: 'helm' | 'human' | 'legacy:unknown';
+  expectedStatus: 'active' | 'idle' | 'reaped';
+  generation: number;
+};
+
+/**
+ * B02 C1: termination registry policy.
+ * - `sessionToken`: decision-boundary CAS token — only path that may mutate helm_sessions.
+ * - `noRegistryWrite: true`: explicit kill-only (tmux destroy, no markReaped).
+ * Passing neither is treated as kill-only (fail-safe); never re-read by name to invent a token.
+ */
+export interface TmuxTerminateOpts {
+  /**
+   * Captured at create/register (or other authoritative acquire) and retained by the caller.
+   * Required for any registry markReaped on terminate. Must not be rebuilt from get(name) at cleanup.
+   */
+  sessionToken?: TmuxSessionStatusToken;
+  /**
+   * Explicit: kill tmux only — do not mutate helm_sessions.
+   * Use when no decision-boundary token exists (unregistered / already reaped / probe cleanup).
+   */
+  noRegistryWrite?: boolean;
+}
+
 export interface TmuxSessionCreateOpts {
   projectId?: number | null;
   runId?: number | null;
   kind?: string;
   /** Decision authority. Required at create (S05 pre-spawn refusal). */
   owner: TmuxSessionOwner;
+  /**
+   * B02 C1 fix cycle 2: when set, createSession fills `token` with the register() CAS identity
+   * returned by onCreate. Callers MUST retain that token for later terminate/markReaped — never
+   * re-capture by name at cleanup.
+   */
+  sessionTokenOut?: { token?: TmuxSessionStatusToken };
 }
 
 const VALID_SESSION_OWNERS = new Set<string>(['helm', 'human', 'legacy:unknown']);
@@ -60,39 +94,16 @@ export function assertValidSessionOwner(owner: unknown): asserts owner is TmuxSe
   }
 }
 
-/**
- * B02 C1: termination registry policy.
- * - `sessionToken`: decision-boundary CAS token — only path that may mutate helm_sessions.
- * - `noRegistryWrite: true`: explicit kill-only (tmux destroy, no markReaped).
- * Passing neither is treated as kill-only (fail-safe); never re-read by name to invent a token.
- */
-export interface TmuxTerminateOpts {
-  /**
-   * Captured at the caller's decision boundary (id/name/owner/expectedStatus/generation).
-   * Required for any registry markReaped on terminate. Must not be rebuilt from get(name) inside
-   * the terminate hook after a name-only call.
-   */
-  sessionToken?: {
-    id: number;
-    name: string;
-    owner: 'helm' | 'human' | 'legacy:unknown';
-    expectedStatus: 'active' | 'idle' | 'reaped';
-    generation: number;
-  };
-  /**
-   * Explicit: kill tmux only — do not mutate helm_sessions.
-   * Use when no decision-boundary token exists (unregistered / already reaped / probe cleanup).
-   */
-  noRegistryWrite?: boolean;
-}
-
 export interface TmuxSessionRegistryHook {
-  onCreate(name: string, opts?: TmuxSessionCreateOpts): void;
+  /**
+   * B02 C1: may return the register() SessionStatusToken so createSession can fill sessionTokenOut.
+   */
+  onCreate(name: string, opts?: TmuxSessionCreateOpts): TmuxSessionStatusToken | void;
   /**
    * B02 C1: registry mutation only when a decision-boundary token is supplied.
    * Name-only / missing token ⇒ no registry write (never get(name) fallback).
    */
-  onTerminate(name: string, token?: TmuxTerminateOpts['sessionToken']): void;
+  onTerminate(name: string, token?: TmuxSessionStatusToken): void;
   // SL-R2/R4: fired on ACTIVE INPUT to a session (sendKeys). Refreshes last_used_at so the janitor's
   // TTL means "idle for TTL" not "alive for TTL" — keeps actively-used standalone sessions alive.
   onUse(name: string): void;
@@ -541,7 +552,15 @@ export class TmuxService {
     // SL-R1 / A2 / S05: register EVERY created session centrally (single choke point), carrying owner +
     // optional projectId/runId/kind so helm_sessions rows are linked at create time. Best-effort — a
     // registry failure must never break session creation (owner already validated pre-spawn).
-    try { this.registryHook.onCreate(name, opts); } catch (err) { console.warn('[tmux] registry onCreate failed', { name, err: String(err) }); }
+    // B02 C1: retain the register() CAS token via sessionTokenOut (create/acquire boundary only).
+    try {
+      const createdToken = this.registryHook.onCreate(name, opts);
+      if (createdToken && opts?.sessionTokenOut) {
+        opts.sessionTokenOut.token = createdToken;
+      }
+    } catch (err) {
+      console.warn('[tmux] registry onCreate failed', { name, err: String(err) });
+    }
     return `${name}:0.0`;
   }
 

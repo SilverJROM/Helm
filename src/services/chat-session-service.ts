@@ -77,6 +77,11 @@ export interface ChatSession {
   fenceDir?: string;
   // NOTE (F2, round-6): delivery failures live in a ChatSessionService-level ledger keyed by LOGICAL CHANNEL
   // (NOT sid), decoupled from session lifecycle — see channelLedger.
+  /**
+   * B02 C1 fix cycle 2: create/register SessionStatusToken retained for terminate.
+   * Never re-captured by name at cleanup.
+   */
+  sessionToken?: import('./lifecycle-cas.js').SessionStatusToken;
 }
 
 export interface ChatSessionDeps {
@@ -92,11 +97,6 @@ export interface ChatSessionDeps {
   projectService?: ProjectService;
   fenceDir?: string;
   nowFn?: () => number;
-  /**
-   * B02 C1: optional decision-boundary token capture for terminate.
-   * Absent → explicit noRegistryWrite (kill-only).
-   */
-  captureSessionToken?: (name: string) => import('./lifecycle-cas.js').SessionStatusToken | undefined;
 }
 
 export interface ActiveCycleContext {
@@ -663,7 +663,13 @@ export class ChatSessionService {
     // bad allowlist refuses the spawn cleanly. Absent → '' (fencedLaunch byte-identical to read-all).
     const strictEnv = opts?.strictReadAllow !== undefined ? makeStrictReadProfileEnv(opts.strictReadAllow) : '';
     // S05 / AC3: discovery/chat is human-owned decision authority (never auto-reap candidate).
-    const target = await this.deps.tmux.createSession(sessionName, fenceDir, { owner: 'human' });
+    // B02 C1: retain create/register CAS token for fail/terminate paths.
+    const sessionTokenOut: { token?: import('./lifecycle-cas.js').SessionStatusToken } = {};
+    const target = await this.deps.tmux.createSession(sessionName, fenceDir, {
+      owner: 'human',
+      sessionTokenOut,
+    });
+    const createToken = sessionTokenOut.token;
 
     try {
       const sandboxBin = resolveHelmSandboxBin();
@@ -766,15 +772,16 @@ export class ChatSessionService {
         spawnProvider,
         spawnModel,
         projectId: projectFenceDir ? projectId : undefined,
-        fenceDir
+        fenceDir,
+        sessionToken: createToken,
       });
     } catch (err) {
       // Boot failed — tear down the half-created pane so we never leak a session.
+      // B02 C1: create-time token only (never late get-by-name).
       try {
-        const tok = this.deps.captureSessionToken?.(sessionName);
         await this.deps.tmux.terminateSession(
           sessionName,
-          tok ? { sessionToken: tok } : { noRegistryWrite: true }
+          createToken ? { sessionToken: createToken } : { noRegistryWrite: true }
         );
       } catch {}
       try { this.governedDocGuards.get(sessionName)?.stop(); } catch {}
@@ -924,11 +931,10 @@ export class ChatSessionService {
     if (!sess) return; // no-op if already gone (idempotent for DELETE + shutdown sweep)
     this.sessions.delete(sessionId);
     try {
-      // B02 C1: decision-boundary token or explicit kill-only.
-      const tok = this.deps.captureSessionToken?.(sess.tmuxSession);
+      // B02 C1: create-time token retained on ChatSession (never late get-by-name).
       await this.deps.tmux.terminateSession(
         sess.tmuxSession,
-        tok ? { sessionToken: tok } : { noRegistryWrite: true }
+        sess.sessionToken ? { sessionToken: sess.sessionToken } : { noRegistryWrite: true }
       );
     } catch {}
     try { this.governedDocGuards.get(sess.tmuxSession)?.stop(); } catch {}

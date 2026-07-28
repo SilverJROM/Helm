@@ -220,35 +220,25 @@ WHERE id = ? AND name = ? AND owner = ? AND status = ? AND generation = ?
 
   /**
    * SL-R2 / B02 AC6: session terminated/closed. Sets ended_at.
-   * Full CAS predicates — id, name, owner, expected status, generation. Zero rows ⇒ stale.
-   * Legal source is non-reaped only (C2: reaped→reaped same-token replay is stale).
+   * Identity CAS: id + name + owner + generation (replacement re-register bumps generation).
+   * Status may progress active→idle within the same lifecycle before reap (create-time token
+   * retained through cleanup); legal sources are active|idle only.
+   * C2: reaped→reaped same-token replay is stale (no reason rewrite).
    */
   markReaped(token: SessionStatusToken, reason?: string): SessionStatusCasResult {
     if (!token?.name) return { applied: false, stale: true };
     // C2: already-reaped tokens must not re-apply or rewrite reason indefinitely.
     if (token.expectedStatus === 'reaped') return { applied: false, stale: true };
+    if (token.expectedStatus !== 'active' && token.expectedStatus !== 'idle') {
+      return { applied: false, stale: true };
+    }
+    // Same lifecycle may be active or idle at kill time; generation+id fence replacement.
     const info = this.db.prepare(`
 UPDATE helm_sessions SET status = 'reaped', ended_at = datetime('now'), reason = COALESCE(?, reason)
-WHERE id = ? AND name = ? AND owner = ? AND status = ? AND generation = ?
-  AND status != 'reaped'
-`).run(reason ?? null, token.id, token.name, token.owner, token.expectedStatus, token.generation);
+WHERE id = ? AND name = ? AND owner = ? AND generation = ?
+  AND status IN ('active', 'idle')
+`).run(reason ?? null, token.id, token.name, token.owner, token.generation);
     return Number(info.changes) === 1 ? { applied: true } : { applied: false, stale: true };
-  }
-
-  /**
-   * B02 C1: capture a decision-boundary token for a named session (one shot).
-   * Returns undefined when absent or already reaped — callers should use
-   * `terminateSession(name, { noRegistryWrite: true })` rather than invent a token.
-   */
-  captureStatusToken(name: string): SessionStatusToken | undefined {
-    if (!name) return undefined;
-    const row = this.get(name);
-    if (!row || row.status === 'reaped') return undefined;
-    try {
-      return sessionStatusTokenFromRow(row);
-    } catch {
-      return undefined;
-    }
   }
 
   /**

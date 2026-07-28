@@ -10,8 +10,11 @@ import { PROVIDERS } from '../config/providers.js';
 import { resolveHelmSandboxBin, makeWriteFencePolicy, makeStrictReadProfileEnv } from '../security/landlock-sandbox.js';
 import { startGovernedDocGuard, type GovernedDocGuardHandle } from './doc-path-guard.js';
 import { applyEnvelopeIsolation } from './envelope-isolation.js';
-import { sessionStatusTokenFromRow, type SessionRegistryService } from './session-registry-service.js';
-import type { TmuxTerminateOpts } from '../tmux/tmux-service.js';
+import {
+  sessionStatusTokenFromRow,
+  type SessionRegistryService,
+  type SessionStatusToken,
+} from './session-registry-service.js';
 import { HelmIdentityService } from './helm-identity-service.js';
 import { finalizeWorkerRuntimeRow, finalizeSessionGoneWorkers } from './worker-runtime-finalize.js';
 import { decideSessionReconcile } from './session-reconcile-decision.js';
@@ -23,6 +26,11 @@ export class WorkerService {
   // R7.26/B22b: userspace fence for the 3 plan/<cycle> governed docs, keyed by tmux session
   // name, for the fenced worker's lifetime (north-star.md is kernel-fenced; see helm-sandbox.c).
   private governedDocGuards = new Map<string, GovernedDocGuardHandle>();
+  /**
+   * B02 C1 fix cycle 2: create-time SessionStatusToken keyed by worker_runtimes.id.
+   * Never re-capture by session name at cleanup (replacement lifecycle would match).
+   */
+  private workerSessionTokens = new Map<number, SessionStatusToken>();
   private readonly identity?: HelmIdentityService;
 
   constructor(
@@ -38,16 +46,6 @@ export class WorkerService {
     identity?: HelmIdentityService
   ) {
     this.identity = identity;
-  }
-
-  /**
-   * B02 C1: decision-boundary terminate opts — CAS token when registry row is live, else
-   * explicit kill-only (never name-only get→markReaped inside the terminate hook).
-   */
-  private terminateOptsForSession(name: string): TmuxTerminateOpts {
-    const token = this.sessionRegistry?.captureStatusToken(name);
-    if (token) return { sessionToken: token };
-    return { noRegistryWrite: true };
   }
 
   // AC1/AC2: the native active project (never a legacy numeric-ID match) is the sole slug source;
@@ -195,8 +193,18 @@ VALUES (?,?,?,?,?,?,?,?,datetime('now'), ?)
       const slug = nativeProject ? nativeProject.directory_name : 'unknown';
       const sessionName = `helm-w-${slug}-${id}`;
       const target = `${sessionName}:0.0`;
+      const workerId = Number(id);
+      // B02 C1: capture CAS token at create/register — retain for launch-fail + reapWorker.
+      const sessionTokenOut: { token?: SessionStatusToken } = {};
       try {
-        await this.tmux.createSession(sessionName, projectDir, { owner: 'helm', kind: 'worker', projectId, runId: runId ?? null }); // C3 cwd lock; S05 owner=helm
+        await this.tmux.createSession(sessionName, projectDir, {
+          owner: 'helm',
+          kind: 'worker',
+          projectId,
+          runId: runId ?? null,
+          sessionTokenOut,
+        }); // C3 cwd lock; S05 owner=helm
+        if (sessionTokenOut.token) this.workerSessionTokens.set(workerId, sessionTokenOut.token);
         this.activeWorkerSessions.add(sessionName);
         this.db.prepare("UPDATE worker_runtimes SET session=? WHERE id=?").run(sessionName, id);
         // SL-R2: the registry hook fired on createSession registered this session 'active'; enrich the
@@ -250,7 +258,15 @@ VALUES (?,?,?,?,?,?,?,?,datetime('now'), ?)
         });
         return this.db.prepare("SELECT * FROM worker_runtimes WHERE id=?").get(id);
       } catch (e: any) {
-        try { await this.tmux.terminateSession(sessionName, this.terminateOptsForSession(sessionName)); } catch {}
+        // B02 C1: use create-time token only (never late get-by-name).
+        const createTok = this.workerSessionTokens.get(workerId);
+        try {
+          await this.tmux.terminateSession(
+            sessionName,
+            createTok ? { sessionToken: createTok } : { noRegistryWrite: true }
+          );
+        } catch {}
+        this.workerSessionTokens.delete(workerId);
         this.activeWorkerSessions.delete(sessionName);
         try { this.governedDocGuards.get(sessionName)?.stop(); } catch {}
         this.governedDocGuards.delete(sessionName);
@@ -281,8 +297,15 @@ VALUES (?,?,?,?,?,?,?,?,datetime('now'), ?)
       // H3: always best-effort kill the session when one is present. getPanePid() returns null
       // on a tmux error, so gating the kill on a truthy PID could leave a live session orphaned
       // while the row is marked terminal (idempotency then blocks any future cleanup).
-      // B02 C1: capture token at this reap decision boundary (not name-only terminate).
-      try { await this.tmux.terminateSession(session, this.terminateOptsForSession(session)); } catch {}
+      // B02 C1: create-time token retained by worker id — never late capture by session name.
+      const createTok = this.workerSessionTokens.get(id);
+      try {
+        await this.tmux.terminateSession(
+          session,
+          createTok ? { sessionToken: createTok } : { noRegistryWrite: true }
+        );
+      } catch {}
+      this.workerSessionTokens.delete(id);
       this.activeWorkerSessions.delete(session);
       try { this.governedDocGuards.get(session)?.stop(); } catch {}
       this.governedDocGuards.delete(session);

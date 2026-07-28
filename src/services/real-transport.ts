@@ -11,7 +11,6 @@ import { matchInterstitial, InterstitialBlockedError } from './cli-interstitials
 import { applyEnvelopeIsolation } from './envelope-isolation.js';
 import type { SeatInspection } from './seat-pane-state.js';
 import type { SessionStatusToken } from './lifecycle-cas.js';
-import type { TmuxTerminateOpts } from '../tmux/tmux-service.js';
 
 // Hard-pin the worker identity when the host CLI supports a system-prompt override (claude).
 // Kept apostrophe-free so it embeds directly inside single quotes in the launch command (no shell escaping).
@@ -23,11 +22,6 @@ interface RealTransportDeps {
   tmux?: TmuxService;
   artifacts?: any; // RunArtifactService | stub (recordDispatch only needed for dispatch.start success path)
   resolver?: ProviderResolverService;
-  /**
-   * B02 C1: optional decision-boundary token capture for terminate/reap.
-   * When absent, terminate uses explicit noRegistryWrite (kill-only).
-   */
-  captureSessionToken?: (name: string) => SessionStatusToken | undefined;
 }
 
 // Minimal stub so RealTransport + DispatchService work in thin mode (no DB/RunArtifactService)
@@ -44,10 +38,14 @@ export class RealTransport implements ITransport {
   private readonly artifacts: any;
   private readonly resolver: ProviderResolverService;
   private readonly dispatch: DispatchService;
-  private readonly captureSessionToken?: (name: string) => SessionStatusToken | undefined;
   // R7.26/B22b-cont: userspace fence for the 3 plan/<cycle> governed docs, keyed by tmux session
   // name, for the fenced agent's lifetime. north-star.md is kernel-fenced; see helm-sandbox.c.
   private readonly governedDocGuards = new Map<string, GovernedDocGuardHandle>();
+  /**
+   * B02 C1 fix cycle 2: create-time SessionStatusToken keyed by session name for THIS spawn only.
+   * Reap/cleanup uses this map — never late get-by-name (replacement would match).
+   */
+  private readonly sessionTokens = new Map<string, SessionStatusToken>();
 
   constructor(deps: RealTransportDeps = {}) {
     const isFake = process.env.USE_FAKE_TMUX === '1' && process.env.NODE_ENV !== 'production';
@@ -58,14 +56,6 @@ export class RealTransport implements ITransport {
     this.resolver = deps.resolver ?? new ProviderResolverService();
     this.artifacts = deps.artifacts ?? new NoopArtifacts();
     this.dispatch = new DispatchService(this.tmux, this.artifacts);
-    this.captureSessionToken = deps.captureSessionToken;
-  }
-
-  /** B02 C1: CAS token when capturer wired; else explicit kill-only. */
-  private terminateOptsForSession(name: string): TmuxTerminateOpts {
-    const token = this.captureSessionToken?.(name);
-    if (token) return { sessionToken: token };
-    return { noRegistryWrite: true };
   }
 
   private resolveProviderForModel(model: string): string {
@@ -154,11 +144,15 @@ export class RealTransport implements ITransport {
     // Honor explicit sessionName for per-project projcore (from projects.projcore_session or default <slug>-projcore)
     const sessionName = params.sessionName || `helm-${batchId}-${role}-${Date.now().toString(36).slice(-8)}`;
     // A2 + S05: projectId/runId + owner=helm (brains/workers via transport) at createSession choke point.
+    // B02 C1: retain create/register CAS token for cleanup/reap (never late capture by name).
+    const sessionTokenOut: { token?: SessionStatusToken } = {};
     const target = await this.tmux.createSession(sessionName, fenceDir, {
       projectId: params.projectId ?? null,
       runId: params.runId ?? null,
       owner: 'helm',
+      sessionTokenOut,
     });
+    if (sessionTokenOut.token) this.sessionTokens.set(sessionName, sessionTokenOut.token);
 
     try {
       // Launch the real agent (grok-4.5 etc) under fence + skipSafety (trusted launch path, like WorkerService)
@@ -233,7 +227,14 @@ export class RealTransport implements ITransport {
 
       return { handle: target, role };
     } catch (e) {
-      try { await this.tmux.terminateSession(sessionName, this.terminateOptsForSession(sessionName)); } catch {}
+      const createTok = this.sessionTokens.get(sessionName);
+      try {
+        await this.tmux.terminateSession(
+          sessionName,
+          createTok ? { sessionToken: createTok } : { noRegistryWrite: true }
+        );
+      } catch {}
+      this.sessionTokens.delete(sessionName);
       try { this.governedDocGuards.get(sessionName)?.stop(); } catch {}
       this.governedDocGuards.delete(sessionName);
       throw e;
@@ -430,11 +431,16 @@ export class RealTransport implements ITransport {
     }
 
     try {
-      // B02 C1: decision-boundary token via captureSessionToken (wired in index), else kill-only.
-      await this.tmux.terminateSession(sessionName, this.terminateOptsForSession(sessionName));
+      // B02 C1: create-time token from spawn map only (never late get-by-name).
+      const createTok = this.sessionTokens.get(sessionName);
+      await this.tmux.terminateSession(
+        sessionName,
+        createTok ? { sessionToken: createTok } : { noRegistryWrite: true }
+      );
     } catch {
       // idempotent / best-effort reap
     }
+    this.sessionTokens.delete(sessionName);
     try { this.governedDocGuards.get(sessionName)?.stop(); } catch {}
     this.governedDocGuards.delete(sessionName);
   }

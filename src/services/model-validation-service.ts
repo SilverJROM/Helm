@@ -1,10 +1,10 @@
 import { randomBytes } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { DatabaseService } from '../db/database.js';
-import { TmuxService, type TmuxTerminateOpts } from '../tmux/tmux-service.js';
+import { TmuxService } from '../tmux/tmux-service.js';
 import { KlooDiscoveryService, type KlooValidateResult } from './kloo-discovery-service.js';
 import { applyEnvelopeIsolation, HELM_ENVELOPE_DIRECTIVE } from './envelope-isolation.js';
-import { sessionStatusTokenFromRow } from './session-registry-service.js';
+import type { SessionStatusToken } from './session-registry-service.js';
 
 // Minimal seam so tests can inject a stub discovery without hitting the network.
 export interface KlooValidator {
@@ -303,9 +303,17 @@ export class ModelValidationService {
     const marker = `HELM_VALID_${nonce}`;
     const prompt = `Reply with exactly ${marker} and no other text.`;
 
+    // B02 C1: create-time token retained for finally teardown (never late SELECT-by-name).
+    let createToken: SessionStatusToken | undefined;
     try {
       // S05: validation probe seats are Helm-owned.
-      await this.tmux!.createSession(sessionName, undefined, { owner: 'helm', kind: 'test' });
+      const sessionTokenOut: { token?: SessionStatusToken } = {};
+      await this.tmux!.createSession(sessionName, undefined, {
+        owner: 'helm',
+        kind: 'test',
+        sessionTokenOut,
+      });
+      createToken = sessionTokenOut.token;
       const baseCmd = `codex -m ${model.model_id} --dangerously-bypass-approvals-and-sandbox`;
       const { envPrefix: _envPrefix, launchCmd } = applyEnvelopeIsolation('codex', baseCmd);
       // envPrefix is '' for codex; launchCmd carries -c project_doc_max_bytes=0
@@ -331,26 +339,12 @@ export class ModelValidationService {
       }
       return { status: 'invalid', detail: `timeout: no response after ${timeoutMs}ms` };
     } finally {
-      // B02 C1: capture decision-boundary token for this validation seat, or kill-only.
       try {
-        await this.tmux!.terminateSession(sessionName, this.terminateOptsForSession(sessionName));
+        await this.tmux!.terminateSession(
+          sessionName,
+          createToken ? { sessionToken: createToken } : { noRegistryWrite: true }
+        );
       } catch {}
-    }
-  }
-
-  /** B02 C1: CAS token from helm_sessions at terminate decision, else explicit noRegistryWrite. */
-  private terminateOptsForSession(name: string): TmuxTerminateOpts {
-    if (!name) return { noRegistryWrite: true };
-    try {
-      const row = this.db
-        .prepare(`SELECT id, name, owner, status, generation FROM helm_sessions WHERE name = ?`)
-        .get(name) as
-        | { id: number; name: string; owner: string | null; status: string; generation: number }
-        | undefined;
-      if (!row || row.status === 'reaped') return { noRegistryWrite: true };
-      return { sessionToken: sessionStatusTokenFromRow(row) };
-    } catch {
-      return { noRegistryWrite: true };
     }
   }
 

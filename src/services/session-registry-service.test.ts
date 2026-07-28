@@ -711,7 +711,10 @@ describe('S12 session reconciler (WorkerService.sessionJanitorTick)', () => {
     const { TmuxService } = await import('../tmux/tmux-service.js');
     const tmux = new (TmuxService as any)();
     tmux.setRegistryHook({
-      onCreate: (n: string) => reg.register(n, { owner: 'helm' }),
+      onCreate: (n: string) => {
+        const row = reg.register(n, { owner: 'helm' });
+        return row ? sessionStatusTokenFromRow(row) : undefined;
+      },
       // B02 C1: no get(name) fallback — token required for registry mutation.
       onTerminate: (_n: string, token?: any) => {
         if (token) reg.markReaped(token);
@@ -1094,52 +1097,45 @@ describe('B02 AC6 session status CAS (markIdle / markReaped predicates)', () => 
   });
 
   it('C1: re-register after capture → old terminate token changes 0 rows (no name-only fallback)', async () => {
-    const { TmuxService } = await import('../tmux/tmux-service.js');
     const first = reg.register('helm-w-cas-c1-term', { owner: 'helm' })!;
     const oldToken = sessionStatusTokenFromRow(first);
 
     // World moves: same name, new lifecycle generation (replacement).
-    const second = reg.register('helm-w-cas-c1-term', { owner: 'helm' })!;
+    const second = reg.register('helm-w-cas-c1-term', { owner: 'human' })!;
     expect(second.generation).toBeGreaterThan(first.generation);
     expect(second.status).toBe('active');
+    expect(second.owner).toBe('human');
 
     // Old decision-boundary token must not reap the replacement.
     expect(reg.markReaped(oldToken, 'stale-terminate')).toEqual({ applied: false, stale: true });
     expect(reg.get('helm-w-cas-c1-term')!.status).toBe('active');
     expect(reg.get('helm-w-cas-c1-term')!.generation).toBe(second.generation);
+    expect(reg.get('helm-w-cas-c1-term')!.owner).toBe('human');
     expect(reg.get('helm-w-cas-c1-term')!.reason).toBeNull();
+  });
 
-    // terminateSession without token is kill-only (no registry mutation) — replacement stays active.
-    const tmux = new (TmuxService as any)({
-      onCreate: () => {},
-      onTerminate: (_n: string, token?: any) => {
-        if (token) reg.markReaped(token);
-      },
-      onUse: () => {},
-    });
-    // Avoid real tmux: stub kill path by calling onTerminate policy via terminateSession after
-    // monkey-patching ensureValid + exec. Instead assert the public opts contract directly:
-    // with only noRegistryWrite, onTerminate is never asked to invent a token.
-    let terminatedWith: any = null;
-    const orig = tmux.terminateSession.bind(tmux);
-    tmux.terminateSession = async (name: string, opts?: any) => {
-      terminatedWith = { name, opts };
-      // Simulate post-kill hook policy (mirror TmuxService: only fire onTerminate with token).
-      if (opts?.sessionToken && !opts?.noRegistryWrite) {
-        reg.markReaped(opts.sessionToken, 'hook');
-      }
-    };
-    await tmux.terminateSession('helm-w-cas-c1-term', { sessionToken: oldToken });
-    expect(terminatedWith.opts.sessionToken.generation).toBe(oldToken.generation);
-    expect(reg.get('helm-w-cas-c1-term')!.status).toBe('active'); // old token still stale
+  it('C1 fix cycle 2: retained create-time token after re-register — production-style cleanup does not reap B', () => {
+    // Simulates worker/real-transport map: retain token A at create; never late get-by-name.
+    const lifecycleA = reg.register('helm-w-cas-c1-prod', { owner: 'helm' })!;
+    const retainedA = sessionStatusTokenFromRow(lifecycleA);
+    // Caller state holds only retainedA (and maybe name string) — like workerSessionTokens map.
 
-    await tmux.terminateSession('helm-w-cas-c1-term', { noRegistryWrite: true });
-    expect(reg.get('helm-w-cas-c1-term')!.status).toBe('active'); // kill-only
+    // Replacement lifecycle B (e.g. human re-registered the same name).
+    const lifecycleB = reg.register('helm-w-cas-c1-prod', { owner: 'human' })!;
+    expect(lifecycleB.generation).toBeGreaterThan(retainedA.generation);
+    expect(lifecycleB.owner).toBe('human');
 
-    // Current token still transitions once.
-    expect(reg.markReaped(sessionStatusTokenFromRow(reg.get('helm-w-cas-c1-term')!), 'current')).toEqual({
-      applied: true,
-    });
-    void orig;
+    // Late name capture would have produced B's token (the defect). We prove the retained A path.
+    const lateWouldBeB = sessionStatusTokenFromRow(reg.get('helm-w-cas-c1-prod')!);
+    expect(lateWouldBeB.generation).toBe(lifecycleB.generation);
+
+    // A's cleanup uses retained create-time token only.
+    const result = reg.markReaped(retainedA, 'lifecycle-a-cleanup');
+    expect(result).toEqual({ applied: false, stale: true });
+    const after = reg.get('helm-w-cas-c1-prod')!;
+    expect(after.status).toBe('active');
+    expect(after.owner).toBe('human');
+    expect(after.generation).toBe(lifecycleB.generation);
+    expect(after.reason).toBeNull();
   });
 });
