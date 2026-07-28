@@ -214,10 +214,10 @@ describe('ST-R1/R2 @helm_child tmux ownership tag', () => {
     expect(cpMock.calls.find((c) => c.args[0] === 'send-keys')).toBeFalsy();
   });
 
-  it('S08: invalid session name rejects before tmux call for activity/attached readers', async () => {
+  it('S08: invalid session name returns null before tmux call for activity/attached readers', async () => {
     const tmux: any = new TmuxService();
-    await expect(tmux.sessionActivity('helm bad')).rejects.toThrow();
-    await expect(tmux.sessionAttached('helm bad')).rejects.toThrow();
+    await expect(tmux.sessionActivity('helm bad')).resolves.toBeNull();
+    await expect(tmux.sessionAttached('helm bad')).resolves.toBeNull();
     expect(cpMock.calls).toEqual([]);
   });
 });
