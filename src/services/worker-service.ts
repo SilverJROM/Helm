@@ -594,7 +594,9 @@ VALUES (?,?,?,?,?,?,?,?,datetime('now'), ?)
     if (runId == null) return false;
     try {
       const run = this.db.prepare("SELECT status, phase FROM runs WHERE id = ?").get(runId) as any;
-      if (!run) return true; // run row gone → nothing to protect
+      // AC3/F-10: a missing row is uncertainty, not proof the run finished — veto REAP (fail-safe,
+      // matches the query-error branch below), never assert completion from absence.
+      if (!run) return false;
       const status = String(run.status || '').toLowerCase();
       const phase = String(run.phase || '').toLowerCase();
       return ['complete', 'failed'].includes(status) || ['complete', 'failed', 'blocked'].includes(phase);

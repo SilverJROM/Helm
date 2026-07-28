@@ -559,6 +559,34 @@ describe('S12 session reconciler (WorkerService.sessionJanitorTick)', () => {
     expect(reg.get('helm-batch-A1-implementer-done')!.status).toBe('reaped');
   });
 
+  it('KEEP: missing run row vetoes REAP (F-10/AC3 — missing row is uncertainty, not terminal)', async () => {
+    const runId = seedRun('active', 'executing');
+    seedSession('helm-batch-A1-implementer-missing-run', { status: 'idle', runId });
+    db.prepare('DELETE FROM runs WHERE id = ?').run(runId);
+    await ws.sessionJanitorTick();
+    expect(terminated).toEqual([]);
+    expect(reg.get('helm-batch-A1-implementer-missing-run')!.status).toBe('idle');
+  });
+
+  it('KEEP: run-lookup query failure vetoes REAP (fail-safe unchanged)', async () => {
+    const runId = seedRun('active', 'executing');
+    seedSession('helm-batch-A1-implementer-run-query-fail', { status: 'idle', runId });
+    const origPrepare = db.prepare.bind(db);
+    const prepareSpy = vi.spyOn(db, 'prepare').mockImplementation((sql: string) => {
+      if (typeof sql === 'string' && /FROM runs WHERE id = \?/.test(sql)) {
+        throw new Error('forced-run-lookup-failure');
+      }
+      return origPrepare(sql);
+    });
+    try {
+      await ws.sessionJanitorTick();
+    } finally {
+      prepareSpy.mockRestore();
+    }
+    expect(terminated).toEqual([]);
+    expect(reg.get('helm-batch-A1-implementer-run-query-fail')!.status).toBe('idle');
+  });
+
   it('F3 DELETED: run_id null + active is NOT reaped (no orphan/TTL kill path)', async () => {
     seedSession('helm-batch-A1-implementer-noRun', { status: 'active', runId: null, ageSecs: 25 * 60 });
     await ws.sessionJanitorTick();
