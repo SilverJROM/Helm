@@ -56,6 +56,9 @@ export interface HousekeeperApplyInput {
   rationale: string;
 }
 
+/** Typed apply_error when done evidence cites nothing checkable in the stored envelope (B10b / AC14). */
+export const HOUSEKEEPER_APPLY_ERROR_EVIDENCE_NOT_IN_ENVELOPE = 'evidence_not_in_envelope';
+
 export type HousekeeperApplyResult =
   | { ok: true; outcome: 'applied_done'; investigationId: number; sessionName: string }
   | { ok: true; outcome: 'needs_human'; investigationId: number; sessionName: string }
@@ -261,6 +264,26 @@ export class HousekeeperService {
         investigationId: id,
         sessionName: row.session_name,
         error: 'done ineligible: bounded probe insufficient (failed/empty capture, null run_id, or absent facts)',
+      };
+    }
+
+    // B10b / AC14: claimed evidence must cite checkable material from the persisted envelope.
+    // Non-empty prose is not evidence. needs-human is never gated by citation.
+    if (verdict === 'done' && !evidenceCitesStoredEnvelope(evidence, row.envelope_json)) {
+      this.db
+        .prepare(
+          `UPDATE housekeeper_investigations
+           SET callback_verdict = ?, callback_evidence = ?, callback_rationale = ?,
+               status = 'apply_rejected', apply_error = ?, applied_at = datetime('now')
+           WHERE id = ?`
+        )
+        .run(verdict, evidence, rationale, HOUSEKEEPER_APPLY_ERROR_EVIDENCE_NOT_IN_ENVELOPE, id);
+      return {
+        ok: false,
+        outcome: 'invalid_callback_proof',
+        investigationId: id,
+        sessionName: row.session_name,
+        error: `${HOUSEKEEPER_APPLY_ERROR_EVIDENCE_NOT_IN_ENVELOPE}: claimed evidence cites nothing checkable in stored envelope`,
       };
     }
 
@@ -521,6 +544,122 @@ function isDoneEligibleFromStoredEnvelope(envelopeJson: unknown): boolean {
         : (envelopeJson as HousekeeperEnvelope);
     if (!parsed || typeof parsed !== 'object') return false;
     return isDoneEligibleFromEnvelope(parsed);
+  } catch {
+    return false;
+  }
+}
+
+const EVIDENCE_CITE_PANE_TOKEN_MIN = 8;
+const EVIDENCE_CITE_PANE_WINDOW = 24;
+const EVIDENCE_CITE_FACT_MIN = 4;
+
+/** Lifecycle/boolean tokens present in nearly every envelope — not sufficient as sole citation. */
+const LOW_SIGNAL_CITE_ATOMS = new Set([
+  'active',
+  'idle',
+  'working',
+  'executing',
+  'true',
+  'false',
+  'null',
+  'file',
+  'ok',
+  'empty',
+  'failed',
+  'worker',
+]);
+
+function normalizeCiteText(value: string): string {
+  return String(value ?? '')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/** Collect checkable atoms from the investigation envelope (pane-tail + durable facts). */
+export function collectEnvelopeCiteAtoms(envelope: HousekeeperEnvelope): string[] {
+  const atoms = new Set<string>();
+  const add = (raw: string, minLen: number) => {
+    const n = normalizeCiteText(raw);
+    if (n.length >= minLen && !LOW_SIGNAL_CITE_ATOMS.has(n)) atoms.add(n);
+  };
+
+  const pane = String(envelope?.pane_tail ?? '');
+  for (const tok of pane.toLowerCase().split(/[^a-z0-9_./:@-]+/)) {
+    if (tok.length >= EVIDENCE_CITE_PANE_TOKEN_MIN && !LOW_SIGNAL_CITE_ATOMS.has(tok)) atoms.add(tok);
+  }
+  for (const line of pane.split(/\n/)) {
+    const n = normalizeCiteText(line);
+    if (n.length < EVIDENCE_CITE_PANE_WINDOW) continue;
+    // Distinctive windows from real pane lines (bounded scan).
+    const limit = Math.min(n.length, 240);
+    for (let i = 0; i + EVIDENCE_CITE_PANE_WINDOW <= limit; i += EVIDENCE_CITE_PANE_WINDOW) {
+      const win = n.slice(i, i + EVIDENCE_CITE_PANE_WINDOW);
+      if (!LOW_SIGNAL_CITE_ATOMS.has(win)) atoms.add(win);
+    }
+    // Also keep a head slice for lines that models often quote.
+    const head = n.slice(0, Math.min(n.length, 48));
+    if (!LOW_SIGNAL_CITE_ATOMS.has(head)) atoms.add(head);
+  }
+
+  const walk = (value: unknown): void => {
+    if (value == null) return;
+    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+      add(String(value), EVIDENCE_CITE_FACT_MIN);
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) walk(item);
+      return;
+    }
+    if (typeof value === 'object') {
+      for (const v of Object.values(value as Record<string, unknown>)) walk(v);
+    }
+  };
+  walk(envelope?.callback_facts);
+  walk(envelope?.run_facts);
+  walk(envelope?.task_facts);
+  walk(envelope?.last_dispatch);
+
+  return [...atoms];
+}
+
+/**
+ * Match a checkable atom inside the claim.
+ * Long pane windows may be substrings; short atoms require whole-token/phrase boundaries
+ * so e.g. envelope token "complete" does not accept claim word "completed".
+ */
+function claimIncludesCiteAtom(claim: string, atom: string): boolean {
+  if (!atom) return false;
+  if (atom.length >= EVIDENCE_CITE_PANE_WINDOW) {
+    return claim.includes(atom);
+  }
+  const escaped = atom.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(`(?:^|[^a-z0-9])${escaped}(?:[^a-z0-9]|$)`);
+  return re.test(claim);
+}
+
+/**
+ * AC14: claimed evidence must reference facts actually present in the envelope
+ * (pane-tail content, callback/run/task facts, last dispatch). Non-empty prose alone fails.
+ */
+export function evidenceCitesEnvelope(evidence: string, envelope: HousekeeperEnvelope): boolean {
+  if (!envelope || typeof envelope !== 'object') return false;
+  const claim = normalizeCiteText(evidence);
+  if (!claim) return false;
+  const atoms = collectEnvelopeCiteAtoms(envelope);
+  if (atoms.length === 0) return false;
+  return atoms.some((atom) => claimIncludesCiteAtom(claim, atom));
+}
+
+function evidenceCitesStoredEnvelope(evidence: string, envelopeJson: unknown): boolean {
+  try {
+    const parsed =
+      typeof envelopeJson === 'string'
+        ? (JSON.parse(envelopeJson) as HousekeeperEnvelope)
+        : (envelopeJson as HousekeeperEnvelope);
+    if (!parsed || typeof parsed !== 'object') return false;
+    return evidenceCitesEnvelope(evidence, parsed);
   } catch {
     return false;
   }

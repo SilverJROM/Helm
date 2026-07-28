@@ -11,7 +11,12 @@ import Database from 'better-sqlite3';
 import { DatabaseService } from './db/database.js';
 import { SCHEMA_VERSION } from './db/schema.js';
 import { SessionRegistryService } from './services/session-registry-service.js';
-import { HousekeeperService, HOUSEKEEPER_ENVELOPE_MAX_CHARS, HOUSEKEEPER_PANE_TAIL_MAX_CHARS } from './services/housekeeper-service.js';
+import {
+  HousekeeperService,
+  HOUSEKEEPER_APPLY_ERROR_EVIDENCE_NOT_IN_ENVELOPE,
+  HOUSEKEEPER_ENVELOPE_MAX_CHARS,
+  HOUSEKEEPER_PANE_TAIL_MAX_CHARS,
+} from './services/housekeeper-service.js';
 import { HouseUsageSelector } from './services/house-usage-selector.js';
 import { UsageGatewayService } from './services/usage-gateway-service.js';
 import { FakeTransport } from './services/fake-transport.js';
@@ -22,6 +27,17 @@ const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..
 const REAL_PANE_FIXTURE = path.join(REPO_ROOT, 'src/test-fixtures/panes/discovery-finished-turn-20260727.txt');
 const HOUSEKEEPER_SRC = path.join(REPO_ROOT, 'src/services/housekeeper-service.ts');
 const INDEX_SRC = path.join(REPO_ROOT, 'src/index.ts');
+
+/** Plausible prose that does not appear in the real pane fixture or default seed facts. */
+const FABRICATED_DONE_EVIDENCE =
+  'pane showed completed prompt and no active generation; fabricated clean shutdown observed';
+
+/**
+ * Evidence that cites real envelope material: fixture pane phrase + seed task/callback facts.
+ * Pane text comes only from src/test-fixtures/panes/ (never hand-authored).
+ */
+const CITING_DONE_EVIDENCE =
+  'pane shows Status: INTERVIEWING; task label housekeeper facts; callback STATUS: WORKING for S18a';
 
 function tempDbPath(prefix: string): { dbPath: string; cleanupFiles: () => void } {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -73,24 +89,27 @@ describe('S18a/S18b housekeeper dispatch/apply', () => {
     tmux.attached.set(name, false);
   }
 
-  function seedRunFacts(): number {
+  function seedRunFacts(opts: { taskKey?: string; label?: string; batch?: string } = {}): number {
+    const taskKey = opts.taskKey ?? 'S18a';
+    const label = opts.label ?? 'housekeeper facts';
+    const batch = opts.batch ?? 'S18a';
     const run = db.prepare(`INSERT INTO runs (project_id, status, phase) VALUES (NULL, 'active', 'executing')`).run();
     const runId = Number(run.lastInsertRowid);
     const task = db.prepare(
       `INSERT INTO run_tasks (run_id, task_key, label, batch, status, attempts_count)
-       VALUES (?, 'S18a', 'housekeeper facts', 'S18a', 'working', 1)`
-    ).run(runId);
+       VALUES (?, ?, ?, ?, 'working', 1)`
+    ).run(runId, taskKey, label, batch);
     const attempt = db.prepare(
       `INSERT INTO task_attempts (task_id, attempt_num, status) VALUES (?, 1, 'working')`
     ).run(Number(task.lastInsertRowid));
     const dispatch = db.prepare(
       `INSERT INTO dispatches (attempt_id, role, brief_path, transport_handle)
-       VALUES (?, 'implementer', 'prompts/S18a.md', 'fake-worker')`
-    ).run(Number(attempt.lastInsertRowid));
+       VALUES (?, 'implementer', ?, 'fake-worker')`
+    ).run(Number(attempt.lastInsertRowid), `prompts/${taskKey}.md`);
     db.prepare(
       `INSERT INTO callbacks (dispatch_id, role, state, raw_line, source)
-       VALUES (?, 'implementer', 'WORKING', '[helm callback] impl S18a STATUS: WORKING', 'file')`
-    ).run(Number(dispatch.lastInsertRowid));
+       VALUES (?, 'implementer', 'WORKING', ?, 'file')`
+    ).run(Number(dispatch.lastInsertRowid), `[helm callback] impl ${taskKey} STATUS: WORKING`);
     return runId;
   }
 
@@ -361,7 +380,7 @@ describe('S18a/S18b housekeeper dispatch/apply', () => {
 
     const applied = svc.applyCallback(dispatched.investigationId, {
       verdict: 'done',
-      evidence: 'pane showed completed prompt and no active generation',
+      evidence: CITING_DONE_EVIDENCE,
       rationale: 'safe to mark idle only',
     });
 
@@ -369,7 +388,7 @@ describe('S18a/S18b housekeeper dispatch/apply', () => {
     const inv = svc.getInvestigation(dispatched.investigationId);
     expect(inv.status).toBe('applied_done');
     expect(inv.callback_verdict).toBe('done');
-    expect(inv.callback_evidence).toContain('completed prompt');
+    expect(inv.callback_evidence).toContain('housekeeper facts');
     expect(inv.callback_rationale).toContain('mark idle only');
     expect(reg.get('helm-w-apply-done')!.status).toBe('idle');
     expect(reg.get('helm-w-apply-done')!.reason).toBe('housekeeper-done');
@@ -396,7 +415,7 @@ describe('S18a/S18b housekeeper dispatch/apply', () => {
 
     expect(() => svc.applyCallback(dispatched.investigationId, {
       verdict: 'done',
-      evidence: 'pane showed completed prompt and no active generation',
+      evidence: CITING_DONE_EVIDENCE,
       rationale: 'safe to mark idle only',
     })).toThrow(/forced audit write failure/);
 
@@ -450,7 +469,7 @@ describe('S18a/S18b housekeeper dispatch/apply', () => {
 
     const first = svc.applyCallback(dispatched.investigationId, {
       verdict: 'done',
-      evidence: 'pane showed completed prompt and no active generation',
+      evidence: CITING_DONE_EVIDENCE,
       rationale: 'safe to mark idle only',
     });
     const duplicate = svc.applyCallback(dispatched.investigationId, {
@@ -471,7 +490,7 @@ describe('S18a/S18b housekeeper dispatch/apply', () => {
     const inv = svc.getInvestigation(dispatched.investigationId);
     expect(inv.status).toBe('applied_done');
     expect(inv.callback_verdict).toBe('done');
-    expect(inv.callback_evidence).toBe('pane showed completed prompt and no active generation');
+    expect(inv.callback_evidence).toBe(CITING_DONE_EVIDENCE);
     expect(inv.callback_rationale).toBe('safe to mark idle only');
     expect(reg.get('helm-w-idempotent-done')!.status).toBe('idle');
     expect(tmux.terminateCalls).toEqual([]);
@@ -618,7 +637,7 @@ describe('S18a/S18b housekeeper dispatch/apply', () => {
     db.prepare(`UPDATE helm_sessions SET owner = 'human' WHERE name = ?`).run('helm-w-owner-flip');
     const rejected = svc.applyCallback(dispatched.investigationId, {
       verdict: 'done',
-      evidence: 'stale callback after owner changed',
+      evidence: CITING_DONE_EVIDENCE,
       rationale: 'must not mark idle',
     });
 
@@ -627,6 +646,109 @@ describe('S18a/S18b housekeeper dispatch/apply', () => {
     expect(inv.status).toBe('apply_rejected');
     expect(inv.callback_verdict).toBe('done');
     expect(reg.get('helm-w-owner-flip')!.status).toBe('active');
+    expect(tmux.terminateCalls).toEqual([]);
+    expect(transport.reapCalls).toEqual([]);
+  });
+
+  it('B10b AC14: done whose evidence cites nothing in stored envelope is rejected with typed apply_error', async () => {
+    const runId = seedRunFacts();
+    seedSession('helm-w-b10b-empty-cite', { owner: 'helm', status: 'active', runId });
+    const svc = makeService(snap({ spark: { headroom: 42, depleted: false, worst_bucket: 58 } }));
+    const dispatched = await svc.dispatchOnce({ nowMs: Date.now() });
+    expect(dispatched.outcome).toBe('dispatched');
+    if (dispatched.outcome !== 'dispatched') return;
+
+    const envelope = JSON.parse(svc.getInvestigation(dispatched.investigationId).envelope_json);
+    expect(envelope.probe).toMatchObject({
+      pane_capture: 'ok',
+      facts_obtainable: true,
+      facts_present: true,
+    });
+    expect(String(envelope.pane_tail || '')).toContain('INTERVIEWING');
+    expect(FABRICATED_DONE_EVIDENCE.toLowerCase()).not.toContain('interviewing');
+    expect(FABRICATED_DONE_EVIDENCE.toLowerCase()).not.toContain('housekeeper facts');
+
+    const rejected = svc.applyCallback(dispatched.investigationId, {
+      verdict: 'done',
+      evidence: FABRICATED_DONE_EVIDENCE,
+      rationale: 'plausible prose must not pass without envelope citation',
+    });
+
+    expect(rejected).toMatchObject({ ok: false, outcome: 'invalid_callback_proof' });
+    expect(String((rejected as any).error || '')).toContain(HOUSEKEEPER_APPLY_ERROR_EVIDENCE_NOT_IN_ENVELOPE);
+    const inv = svc.getInvestigation(dispatched.investigationId);
+    expect(inv.status).toBe('apply_rejected');
+    expect(inv.apply_error).toBe(HOUSEKEEPER_APPLY_ERROR_EVIDENCE_NOT_IN_ENVELOPE);
+    expect(inv.callback_verdict).toBe('done');
+    expect(inv.callback_evidence).toBe(FABRICATED_DONE_EVIDENCE);
+    expect(reg.get('helm-w-b10b-empty-cite')!.status).toBe('active');
+    expect(tmux.terminateCalls).toEqual([]);
+    expect(transport.reapCalls).toEqual([]);
+  });
+
+  it('B10b AC14: evidence citing real envelope facts is accepted', async () => {
+    const runId = seedRunFacts();
+    seedSession('helm-w-b10b-real-cite', { owner: 'helm', status: 'active', runId });
+    const svc = makeService(snap({ spark: { headroom: 42, depleted: false, worst_bucket: 58 } }));
+    const dispatched = await svc.dispatchOnce({ nowMs: Date.now() });
+    expect(dispatched.outcome).toBe('dispatched');
+    if (dispatched.outcome !== 'dispatched') return;
+
+    const envelope = JSON.parse(svc.getInvestigation(dispatched.investigationId).envelope_json);
+    expect(envelope.pane_tail).toContain('INTERVIEWING');
+    expect(JSON.stringify(envelope.task_facts)).toContain('housekeeper facts');
+    expect(fs.existsSync(REAL_PANE_FIXTURE)).toBe(true);
+
+    const applied = svc.applyCallback(dispatched.investigationId, {
+      verdict: 'done',
+      evidence: CITING_DONE_EVIDENCE,
+      rationale: 'evidence grounded in persisted envelope',
+    });
+
+    expect(applied).toMatchObject({ ok: true, outcome: 'applied_done' });
+    const inv = svc.getInvestigation(dispatched.investigationId);
+    expect(inv.status).toBe('applied_done');
+    expect(inv.apply_error).toBeNull();
+    expect(inv.callback_evidence).toBe(CITING_DONE_EVIDENCE);
+    expect(reg.get('helm-w-b10b-real-cite')!.status).toBe('idle');
+    expect(tmux.terminateCalls).toEqual([]);
+    expect(transport.reapCalls).toEqual([]);
+  });
+
+  it('B10b AC14: fabricated-but-plausible evidence for envelope holding different facts is rejected', async () => {
+    // Envelope holds alternate task facts; claim cites default S18a / housekeeper facts instead.
+    const runId = seedRunFacts({
+      taskKey: 'B99-alt',
+      label: 'alternate-envelope-task-label',
+      batch: 'B99',
+    });
+    seedSession('helm-w-b10b-wrong-facts', { owner: 'helm', status: 'active', runId });
+    const svc = makeService(snap({ spark: { headroom: 42, depleted: false, worst_bucket: 58 } }));
+    const dispatched = await svc.dispatchOnce({ nowMs: Date.now() });
+    expect(dispatched.outcome).toBe('dispatched');
+    if (dispatched.outcome !== 'dispatched') return;
+
+    const envelope = JSON.parse(svc.getInvestigation(dispatched.investigationId).envelope_json);
+    expect(JSON.stringify(envelope.task_facts)).toContain('alternate-envelope-task-label');
+    expect(JSON.stringify(envelope.task_facts)).not.toContain('housekeeper facts');
+    expect(JSON.stringify(envelope.task_facts)).not.toContain('S18a');
+
+    // Fabricated claim sounds done and even quotes a different task universe + generic prose.
+    const wrongFactsEvidence =
+      'task housekeeper facts for S18a finished; pane showed completed prompt and no active generation';
+
+    const rejected = svc.applyCallback(dispatched.investigationId, {
+      verdict: 'done',
+      evidence: wrongFactsEvidence,
+      rationale: 'claim cites facts from a different investigation envelope',
+    });
+
+    expect(rejected).toMatchObject({ ok: false, outcome: 'invalid_callback_proof' });
+    expect(String((rejected as any).error || '')).toContain(HOUSEKEEPER_APPLY_ERROR_EVIDENCE_NOT_IN_ENVELOPE);
+    const inv = svc.getInvestigation(dispatched.investigationId);
+    expect(inv.status).toBe('apply_rejected');
+    expect(inv.apply_error).toBe(HOUSEKEEPER_APPLY_ERROR_EVIDENCE_NOT_IN_ENVELOPE);
+    expect(reg.get('helm-w-b10b-wrong-facts')!.status).toBe('active');
     expect(tmux.terminateCalls).toEqual([]);
     expect(transport.reapCalls).toEqual([]);
   });
