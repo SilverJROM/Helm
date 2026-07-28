@@ -261,42 +261,45 @@ describe('Leg D: dynamic-task batch resolution', () => {
 });
 
 describe('A6b-L3: clearRun generation guard (recycled runId/taskId poisoning a new occupant)', () => {
-  it('a mark* call for a taskId enqueued under a PRIOR generation of runId is ignored, not applied to the current occupant', () => {
-    // SQLite reuses a freed runs.id/run_tasks.id after CASCADE delete. A run's own background dispatch
-    // (still awaiting a real callback) can settle AFTER that run was stopped+deleted and call
-    // mark*(taskId, runId) against a runId/taskId pair a brand-new run has since reused — this must not
-    // silently mark the NEW occupant's live task terminal.
+  it('a mark* call with a PRIOR claim token is ignored, not applied to the current occupant', () => {
+    // B03 C1: production holds the claim-time TaskTerminalToken through async. After clearRun+recycle,
+    // settling with that token must not terminalize B.
     const q = new TaskQueueService();
     const runId = 30;
-    const taskId = 475; // same numeric id reused across "occupants" of runId 30, exactly as SQLite does
+    const taskId = 475;
 
-    q.enqueue(runId, taskId, [], false, 'A6b'); // occupant #1 (e.g. a prior, now-deleted run)
-    q.clearRun(runId); // simulates stop()+cascade-delete: occupant #1's slot is torn down
+    q.enqueue(runId, taskId, [], false, 'A6b'); // occupant #1
+    const tokenA = q.claimNextReady(runId);
+    expect(tokenA).toBeTruthy();
+    expect(tokenA!.taskId).toBe(taskId);
 
-    q.enqueue(runId, taskId, [], false, 'A6b'); // occupant #2 (the new run, id recycled)
-    expect(q.getNextReady(runId)).toBe(taskId); // occupant #2's task is legitimately in flight
+    q.clearRun(runId); // occupant #1 torn down (tokenA still held by "async" A)
 
-    // Occupant #1's orphaned background chain finally settles and calls markFailed with its OWN
-    // (now-stale) taskId/runId — this must be rejected, not corrupt occupant #2's in-flight task.
-    q.markFailed(taskId, runId);
+    q.enqueue(runId, taskId, [], false, 'A6b'); // occupant #2, same numeric ids
+    const tokenB = q.claimNextReady(runId);
+    expect(tokenB).toBeTruthy();
+    expect(tokenB!.taskId).toBe(taskId);
+    expect(tokenB!.runGeneration).not.toBe(tokenA!.runGeneration);
 
-    expect(q.isBlockedByFailure(taskId)).toBe(false);
-    expect(q.classifyDrainState(runId).kind).not.toBe('unknown-pending-stall');
-    // occupant #2's task is still genuinely in flight and can still be completed normally.
-    q.markComplete(taskId, runId);
+    // Occupant #1's orphaned chain settles with its IMMUTABLE claim token — must not corrupt B.
+    expect(q.markFailed(tokenA!)).toBe(false);
+    expect(q.isInFlight(runId)).toBe(true);
+    expect(q.classifyDrainState(runId).kind).not.toBe('all-complete');
+
+    // Occupant #2 still completes with its own claim token.
+    expect(q.markComplete(tokenB!)).toBe(true);
     expect(q.classifyDrainState(runId).kind).toBe('all-complete');
   });
 
   it('a mark* call for the CURRENT generation still applies normally (guard does not over-reject)', () => {
     const q = new TaskQueueService();
     const runId = 31;
-    // Belt-and-braces pre-ingest clear (the normal startRunDetached/seedFromCyclePlan pattern) before the
-    // real enqueue — same generation throughout, so the guard must NOT reject this run's own writes.
     q.clearRun(runId);
     q.enqueue(runId, 1, [], false, 'A6b');
-    q.enqueue(runId, 2, [1], false, 'A6b'); // depends on 1
-    q.markFailed(1, runId);
-    expect(q.isBlockedByFailure(2)).toBe(true); // the mark applied — 2 is blocked by failed prereq 1
+    q.enqueue(runId, 2, [1], false, 'A6b');
+    const tok1 = q.freezeTerminalToken(runId, 1)!;
+    expect(q.markFailed(tok1)).toBe(true);
+    expect(q.isBlockedByFailure(2)).toBe(true);
     expect(q.classifyDrainState(runId).kind).toBe('failed-block');
   });
 });
@@ -342,9 +345,9 @@ describe('B03/AC7: durable task terminal CAS (run_id + status + generation)', ()
     q.enqueue(runId, tFail, [], false, 'B1');
     q.enqueue(runId, tDefer, [], false, 'B1');
 
-    q.markComplete(tComplete, runId);
-    q.markFailed(tFail, runId);
-    q.markDeferred(tDefer, runId);
+    expect(q.markComplete(q.freezeTerminalToken(runId, tComplete)!)).toBe(true);
+    expect(q.markFailed(q.freezeTerminalToken(runId, tFail)!)).toBe(true);
+    expect(q.markDeferred(q.freezeTerminalToken(runId, tDefer)!)).toBe(true);
 
     expect(
       db.raw.prepare('SELECT status FROM run_tasks WHERE id = ?').get(tComplete)
@@ -358,42 +361,71 @@ describe('B03/AC7: durable task terminal CAS (run_id + status + generation)', ()
     expect(q.classifyDrainState(runId).kind).toBe('all-complete');
   });
 
-  it('recycled (taskId, runId) rejects prior lifecycle durable write (stale generation)', () => {
+  it('C1 production-path: A claim held through clearRun+B reuses ids; A markFailed leaves B durable+mem intact', () => {
+    // Exact redteam C1 sequence: same TaskQueueService instance (production shape).
     const q = new TaskQueueService(artifacts);
-    const runId = artifacts.createRun(null, 'b03-recycle');
-    const taskId = artifacts.recordTask(runId, 'T1', 'recycle-me', 'B1');
+    const runId = artifacts.createRun(null, 'b03-c1');
+    const taskId = artifacts.recordTask(runId, 'T1', 'c1-recycle', 'B1');
     const genA = (
       db.raw.prepare('SELECT generation FROM runs WHERE id = ?').get(runId) as { generation: number }
     ).generation;
     q.enqueue(runId, taskId, [], false, 'B1', genA);
-    expect(q.getNextReady(runId)).toBe(taskId);
 
-    // Simulate a new occupant of the same numeric (runId, taskId): bump durable generation while
-    // the prior occupant still holds the old captured token (process-local clear + re-enqueue).
-    db.raw.prepare('UPDATE runs SET generation = ? WHERE id = ?').run(genA + 1000, runId);
+    // A claims/dispatches and holds the immutable token across the "async" gap.
+    const tokenA = q.claimNextReady(runId);
+    expect(tokenA).toBeTruthy();
+    expect(tokenA!.taskId).toBe(taskId);
+    expect(tokenA!.runGeneration).toBe(genA);
+    expect(tokenA!.runId).toBe(runId);
+
+    // A deleted; B reuses exact numeric ids with a new durable generation.
+    const genB = genA + 1000;
+    db.raw.prepare('UPDATE runs SET generation = ? WHERE id = ?').run(genB, runId);
+    // Keep the same run_tasks row (recycled id shape); reset to pending for B.
+    db.raw
+      .prepare("UPDATE run_tasks SET status='pending', updated_at=datetime('now') WHERE id=? AND run_id=?")
+      .run(taskId, runId);
     q.clearRun(runId);
-    q.enqueue(runId, taskId, [], false, 'B1', genA + 1000); // current lifecycle
-    expect(q.getNextReady(runId)).toBe(taskId);
+    q.enqueue(runId, taskId, [], false, 'B1', genB);
+    const tokenB = q.claimNextReady(runId);
+    expect(tokenB).toBeTruthy();
+    expect(tokenB!.runGeneration).toBe(genB);
+    expect(tokenB!.runGeneration).not.toBe(tokenA!.runGeneration);
 
-    // Prior lifecycle late write: inject the stale generation onto a shadow call path by enqueueing
-    // under genA into a separate queue instance that still has the old token (same shape as a
-    // process that never saw clearRun — force taskRunGeneration by re-binding via enqueue on a
-    // fresh service that never cleared, using genA).
-    const staleQ = new TaskQueueService(artifacts);
-    staleQ.enqueue(runId, taskId, [], false, 'B1', genA);
-    staleQ.markFailed(taskId, runId);
+    // A settles markFailed with its claim token — must NOT adopt B's mutable map gen.
+    expect(q.markFailed(tokenA!)).toBe(false);
 
-    // Durable row still pending/working for the current occupant; stale must not terminalize it.
     const row = db.raw.prepare('SELECT status FROM run_tasks WHERE id = ?').get(taskId) as { status: string };
-    expect(row.status).toBe('pending');
-    // Current occupant can still complete with its own gen.
-    q.markComplete(taskId, runId);
+    expect(row.status).toBe('pending'); // B still non-terminal
+    expect(q.isInFlight(runId)).toBe(true); // B still in flight
+    // B can still complete with its own claim token.
+    expect(q.markComplete(tokenB!)).toBe(true);
     expect(
       db.raw.prepare('SELECT status FROM run_tasks WHERE id = ?').get(taskId)
     ).toEqual({ status: 'complete' });
   });
 
-  it('SQL predicates include run_id + expected non-terminal status + runs.generation (not WHERE id=? only)', () => {
+  it('missing generation on token fail-closes (no durable write, no in-mem mutation)', () => {
+    const q = new TaskQueueService(artifacts);
+    const runId = artifacts.createRun(null, 'b03-failclosed');
+    const taskId = artifacts.recordTask(runId, 'T-fc', 'fail-closed', 'B1');
+    q.enqueue(runId, taskId, [], false, 'B1');
+    q.claimNextReady(runId);
+
+    const bogus = Object.freeze({
+      taskId,
+      runId,
+      runGeneration: Number.NaN,
+      expectedStatus: 'pending' as const,
+    });
+    expect(q.markFailed(bogus)).toBe(false);
+    expect(q.isInFlight(runId)).toBe(true);
+    expect(
+      db.raw.prepare('SELECT status FROM run_tasks WHERE id = ?').get(taskId)
+    ).toEqual({ status: 'pending' });
+  });
+
+  it('SQL predicates include run_id + expected status + runs.generation (not WHERE id=? only)', () => {
     const q = new TaskQueueService(artifacts);
     const runId = artifacts.createRun(null, 'b03-sql');
     const taskId = artifacts.recordTask(runId, 'T-sql', 'sql-fence', 'B1');
@@ -401,18 +433,19 @@ describe('B03/AC7: durable task terminal CAS (run_id + status + generation)', ()
       db.raw.prepare('SELECT generation FROM runs WHERE id = ?').get(runId) as { generation: number }
     ).generation;
     q.enqueue(runId, taskId, [], false, 'B1', gen);
+    const token = q.freezeTerminalToken(runId, taskId)!;
 
-    // Wrong run_id → 0 rows even with correct task id + generation
+    // Wrong run_id → 0 rows
     const wrongRun = db.raw
       .prepare(
         `UPDATE run_tasks
          SET status = 'complete', updated_at = datetime('now')
          WHERE id = ?
            AND run_id = ?
-           AND status IN ('pending', 'working')
+           AND (status = ? OR (? = 'pending' AND status = 'working'))
            AND EXISTS (SELECT 1 FROM runs r WHERE r.id = run_tasks.run_id AND r.generation = ?)`
       )
-      .run(taskId, runId + 99999, gen) as { changes: number };
+      .run(taskId, runId + 99999, token.expectedStatus, token.expectedStatus, gen) as { changes: number };
     expect(wrongRun.changes).toBe(0);
 
     // Wrong generation → 0 rows
@@ -422,25 +455,15 @@ describe('B03/AC7: durable task terminal CAS (run_id + status + generation)', ()
          SET status = 'failed', updated_at = datetime('now')
          WHERE id = ?
            AND run_id = ?
-           AND status IN ('pending', 'working')
+           AND (status = ? OR (? = 'pending' AND status = 'working'))
            AND EXISTS (SELECT 1 FROM runs r WHERE r.id = run_tasks.run_id AND r.generation = ?)`
       )
-      .run(taskId, runId, gen + 1) as { changes: number };
+      .run(taskId, runId, token.expectedStatus, token.expectedStatus, gen + 1) as { changes: number };
     expect(wrongGen.changes).toBe(0);
 
-    // Already terminal → expected status fence rejects (second complete is stale)
-    q.markComplete(taskId, runId);
-    const replay = db.raw
-      .prepare(
-        `UPDATE run_tasks
-         SET status = 'complete', updated_at = datetime('now')
-         WHERE id = ?
-           AND run_id = ?
-           AND status IN ('pending', 'working')
-           AND EXISTS (SELECT 1 FROM runs r WHERE r.id = run_tasks.run_id AND r.generation = ?)`
-      )
-      .run(taskId, runId, gen) as { changes: number };
-    expect(replay.changes).toBe(0);
+    expect(q.markComplete(token)).toBe(true);
+    // Replay same token against already-terminal row → 0 rows / fail closed
+    expect(q.markComplete(token)).toBe(false);
     expect(
       db.raw.prepare('SELECT status FROM run_tasks WHERE id = ?').get(taskId)
     ).toEqual({ status: 'complete' });
@@ -454,13 +477,13 @@ describe('B03/AC7: durable task terminal CAS (run_id + status + generation)', ()
       db.raw.prepare('SELECT generation FROM runs WHERE id = ?').get(runId) as { generation: number }
     ).generation;
     q.enqueue(runId, taskId, [], false, 'B1', gen);
-    expect(q.getNextReady(runId)).toBe(taskId);
+    const token = q.claimNextReady(runId)!;
+    expect(token.runGeneration).toBe(gen);
 
     // Force mismatch: durable gen moved under the captured token
     db.raw.prepare('UPDATE runs SET generation = ? WHERE id = ?').run(gen + 7, runId);
-    q.markFailed(taskId, runId);
+    expect(q.markFailed(token)).toBe(false);
 
-    expect(q.isBlockedByFailure(taskId)).toBe(false);
     expect(q.isInFlight(runId)).toBe(true);
     expect(
       db.raw.prepare('SELECT status FROM run_tasks WHERE id = ?').get(taskId)

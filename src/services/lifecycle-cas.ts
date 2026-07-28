@@ -17,6 +17,23 @@ export interface LifecycleToken {
   generation: number;
 }
 
+/**
+ * B03 / AC7: immutable task-terminal identity captured at claim/dispatch.
+ * Must be carried through the async continuation and passed to markComplete/Failed/Deferred.
+ * Writers must never re-resolve `runGeneration` from a mutable taskId map at write time
+ * (that re-adopts the recycled occupant's generation — redteam C1).
+ */
+export type TaskExpectedStatus = 'pending' | 'working';
+
+export interface TaskTerminalToken {
+  taskId: number;
+  runId: number;
+  /** Durable runs.generation (or process-local epoch when no DB) frozen at claim. */
+  runGeneration: number;
+  /** Non-terminal status at claim; CAS accepts this status or pending→working promotion. */
+  expectedStatus: TaskExpectedStatus;
+}
+
 /** Session status values that participate in CAS status writers (AC6 / B02). */
 export type SessionCasStatus = 'active' | 'idle' | 'reaped';
 

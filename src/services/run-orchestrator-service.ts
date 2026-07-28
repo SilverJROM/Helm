@@ -9,7 +9,7 @@ import { RunArtifactService } from './run-artifact-service.js';
 import { PlanningPhaseService } from './planning-phase-service.js';
 import { PlanParserService } from './plan-parser-service.js';
 import { parseExecutionPlan } from './execution-plan-parser.js';
-import { TaskQueueService } from './task-queue-service.js';
+import { TaskQueueService, type TaskTerminalToken } from './task-queue-service.js';
 import { OrchestratorLoop, RunAbortedError, TERMINAL_RUN_PHASES, TERMINAL_RUN_STATUSES } from './orchestrator-loop.js';
 import { getRunAbort, clearRunAbort } from './run-abort-registry.js';
 import { ProjectService } from './project-service.js';
@@ -2292,8 +2292,11 @@ Use the exact JROM-clone standards: adversarial, verify against requirements con
     loop: OrchestratorLoop,
     queue: TaskQueueService = this.deps.queue
   ): Promise<void> {
-    let nextTaskId: number | null;
-    while ((nextTaskId = queue.getNextReady(runId)) != null) {
+    let claim: TaskTerminalToken | null;
+    while ((claim = queue.claimNextReady(runId)) != null) {
+      // B03 C1: freeze token at claim; carry through await — never rebuild from taskId maps at mark*.
+      const terminalToken = claim;
+      const nextTaskId = terminalToken.taskId;
       // R5a: task boundary — re-check before EVERY task dispatch (run-74 zombie evidence:
       // a run UPDATEd to failed kept spawning implementer sessions for 30+ min).
       this.assertRunActive(runId, 'task-boundary');
@@ -2372,7 +2375,7 @@ validation_criteria: ${validationCriteria}
           briefContract,
         });
         if (tres.finalStatus === 'PASS') {
-          queue.markComplete(nextTaskId, runId);
+          queue.markComplete(terminalToken);
           // B10-T06: after any PASS, check if this completed a batch. If so, run deploy + DEV UI-proof gate.
           // Only acts on batch boundary (last task of the batch PASSed). Does not affect per-task flow.
           // Leg D §5: keying the gate off the persisted `batch` means it now fires for EVERY labeled-batch
@@ -2393,19 +2396,19 @@ validation_criteria: ${validationCriteria}
             });
           }
         } else if (tres.finalStatus === 'DEFERRED') {
-          queue.markDeferred(nextTaskId, runId);
+          queue.markDeferred(terminalToken);
         } else if (tres.finalStatus === 'BLOCKED') {
           // phase=blocked + critical-repro-pause.md already written inside loop (R-F3 operator-facing); stop dispatch
           console.log(`[RunOrchestrator] user-critical repro pause triggered for run ${runId}`);
           break;
         } else {
-          queue.markFailed(nextTaskId, runId);
+          queue.markFailed(terminalToken);
         }
       } catch (e: any) {
         // R5a: a run-abort stops the WHOLE loop (task already reaped/marked by the loop's own
         // abort path) — mark the in-flight task failed for bookkeeping and propagate.
         if (e instanceof RunAbortedError) {
-          try { queue.markFailed(nextTaskId, runId); } catch {}
+          try { queue.markFailed(terminalToken); } catch {}
           throw e;
         }
         // Surfacing a swallowed runTask exception is important: a silent catch here hid an issue-path
@@ -2415,7 +2418,7 @@ validation_criteria: ${validationCriteria}
           const aid = this.deps.artifacts.recordAttempt(nextTaskId, 99);
           this.deps.artifacts.recordValidation(aid, 'FAIL', `runTask exception: ${e?.message || e}`);
         } catch {}
-        queue.markFailed(nextTaskId, runId);
+        queue.markFailed(terminalToken);
       }
     }
   }

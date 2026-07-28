@@ -1,5 +1,8 @@
 import { RunArtifactService } from './run-artifact-service.js';
 import { compareBatchLabels, DEFAULT_BATCH } from './execution-plan-parser.js';
+import type { TaskExpectedStatus, TaskTerminalToken } from './lifecycle-cas.js';
+
+export type { TaskExpectedStatus, TaskTerminalToken } from './lifecycle-cas.js';
 
 /**
  * Structured drain-state classification (Leg D §4). Produced by classifyDrainState after a drain so the
@@ -49,94 +52,187 @@ export class TaskQueueService {
   // deferred / complete tasks that markComplete/markDeferred remove from the live `queues` array.
   private batchOf: Record<number, string> = {}; // taskId -> resolved batch label
   private allTasks: Record<number, number[]> = {}; // runId -> every enqueued task id (append-only)
-  // A6b-L3 (send-back): SQLite reuses a freed `runs.id`/`run_tasks.id` after CASCADE delete. A run's own
-  // background dispatch (drainDispatch awaiting a real implementer/validator callback, real wallMs up to
-  // 30min) can still be in flight when that run is stopped+deleted; when it finally settles it calls
-  // mark*(taskId, runId) with STALE ids that may by then belong to a brand-new occupant of the same
-  // (runId, taskId) pair. runEpoch/taskEpoch let mark* detect and reject a write from a prior occupant
-  // instead of silently corrupting the current one's in-flight task as failed/complete/deferred (which
-  // manifests as getNextReady/classifyDrainState seeing a task wrongly terminal — a queue/DB divergence
-  // reported as `unknown-pending-stall` with zero attempts, even though the current occupant never ran).
+  // A6b-L3 / B03 C1: SQLite reuses freed runs.id/run_tasks.id after CASCADE. A run's async dispatch
+  // can settle after clearRun+recycle and call mark* with STALE ids that now belong to a new occupant.
+  // Process-local runEpoch is used only to *seed* a synthetic generation at enqueue when no durable
+  // runs.generation is available (pure in-mem tests). Production identity is the immutable
+  // TaskTerminalToken captured at claimNextReady — mark* never re-reads generation from taskId maps.
   private runEpoch: Record<number, number> = {}; // runId -> process-local epoch, bumped every clearRun
-  private taskEpoch: Record<number, number> = {}; // taskId -> the runEpoch it was enqueued under
-  // B03 / AC7: durable run generation captured at enqueue (from runs.generation / explicit arg). Never
-  // re-read at mark* time — late SELECT would accept the new occupant's gen and defeat the fence.
-  private taskRunGeneration: Record<number, number | undefined> = {};
+  // Enqueue-time generation seed (durable runs.generation or synthetic epoch). Read only at claim to
+  // freeze into TaskTerminalToken; mark* must not consult this map.
+  private taskRunGeneration: Record<number, number> = {};
 
   constructor(private readonly artifacts?: RunArtifactService) {}
 
-  /** True when taskId was enqueued under a since-superseded generation of runId (a stale/prior occupant). */
-  private isStaleWrite(runId: number, taskId: number): boolean {
-    return (this.taskEpoch[taskId] ?? 0) !== (this.runEpoch[runId] || 0);
+  /**
+   * Resolve generation to freeze at enqueue. Explicit arg > SELECT runs.generation > process-local
+   * epoch (pure in-mem). Always returns a finite number so claim can build a complete token.
+   */
+  private resolveEnqueueGeneration(runId: number, explicit?: number): number {
+    if (explicit != null && Number.isFinite(explicit) && explicit >= 0) return Number(explicit);
+    if (this.artifacts) {
+      try {
+        const row = this.artifacts['db'].raw
+          .prepare('SELECT generation FROM runs WHERE id = ?')
+          .get(runId) as { generation: number } | undefined;
+        if (row && typeof row.generation === 'number' && Number.isFinite(row.generation)) {
+          return row.generation;
+        }
+      } catch {
+        /* fall through to epoch */
+      }
+    }
+    return this.runEpoch[runId] || 0;
   }
 
-  /**
-   * Capture runs.generation for this task at the enqueue/claim boundary. Explicit arg wins; otherwise
-   * SELECT from runs when a durable artifacts handle is present. Missing capture → no durable terminal
-   * write (never fall back to WHERE id=? only).
-   */
-  private captureRunGeneration(runId: number, explicit?: number): number | undefined {
-    if (explicit != null && Number.isFinite(explicit) && explicit >= 0) return Number(explicit);
-    if (!this.artifacts) return undefined;
+  private readTaskExpectedStatus(runId: number, taskId: number): TaskExpectedStatus {
+    if (!this.artifacts) return 'pending';
     try {
       const row = this.artifacts['db'].raw
-        .prepare('SELECT generation FROM runs WHERE id = ?')
-        .get(runId) as { generation: number } | undefined;
-      if (row && typeof row.generation === 'number' && Number.isFinite(row.generation)) {
-        return row.generation;
-      }
+        .prepare('SELECT status FROM run_tasks WHERE id = ? AND run_id = ?')
+        .get(taskId, runId) as { status: string } | undefined;
+      if (row?.status === 'working') return 'working';
     } catch {
-      /* missing row / closed db — leave undefined */
+      /* default pending */
     }
-    return undefined;
+    return 'pending';
   }
 
   /**
-   * B03 / AC7: durable terminal CAS. Requires task id + run_id + expected non-terminal status +
-   * captured runs.generation. Returns true when the durable write applied (or there is no artifacts
-   * handle so only in-mem will run). Returns false when the world moved — caller must NOT mutate in-mem.
+   * Freeze an immutable terminal token for a task that is already enqueued (claim/dispatch boundary).
+   * Does not set inFlight — use claimNextReady for the full claim. Returns null if generation is
+   * missing/non-finite (fail closed — no synthetic invent at write time).
+   */
+  freezeTerminalToken(
+    runId: number,
+    taskId: number,
+    expectedStatus?: TaskExpectedStatus
+  ): TaskTerminalToken | null {
+    const runGeneration = this.taskRunGeneration[taskId];
+    if (runGeneration == null || !Number.isFinite(runGeneration)) {
+      return null;
+    }
+    const status = expectedStatus ?? this.readTaskExpectedStatus(runId, taskId);
+    // Return a plain frozen object (no shared mutable refs).
+    return Object.freeze({
+      taskId,
+      runId,
+      runGeneration,
+      expectedStatus: status,
+    });
+  }
+
+  /**
+   * B03 / AC7 C1: claim the next ready task and return an immutable terminal token bound to this
+   * dispatch. Callers must carry the token through async work and pass it to mark* — never rebuild
+   * from taskId maps after await.
+   */
+  claimNextReady(runId: number): TaskTerminalToken | null {
+    if (this.inFlight[runId]) return null;
+    const earliest = this.earliestOpenBatch(runId);
+    if (earliest === null) return null;
+    const q = this.queues[runId] || [];
+    for (let i = 0; i < q.length; i++) {
+      const tid = q[i];
+      if (this.batchOf[tid] !== earliest) continue;
+      if (this.failedTasks.has(tid) || this.deferredTasks.has(tid)) continue;
+      if (this.completedTasks.has(tid)) continue;
+      if (this.isSatisfied(tid)) {
+        const token = this.freezeTerminalToken(runId, tid);
+        if (!token) {
+          console.warn(
+            `[TaskQueueService] claimNextReady(${runId}) refused task ${tid} — no frozen run generation`
+          );
+          return null;
+        }
+        this.inFlight[runId] = tid;
+        return token;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * B03 / AC7: durable terminal CAS using ONLY fields from the immutable token.
+   * Never reads taskRunGeneration[taskId] (mutable slot). Missing/non-finite generation → fail closed.
    */
   private applyTerminalDurable(
-    taskId: number,
-    runId: number,
+    token: TaskTerminalToken,
     terminal: 'complete' | 'failed' | 'deferred'
   ): boolean {
-    if (!this.artifacts) return true;
-    const generation = this.taskRunGeneration[taskId];
-    if (generation == null) {
-      console.warn(
-        `[TaskQueueService] durable mark ${terminal}(${taskId}, ${runId}) skipped — no run generation captured at enqueue`
-      );
-      // No id-only fallback. In-mem may still apply under the process-local epoch guard.
+    if (!this.artifacts) {
+      // Pure in-mem: token.runGeneration is the process-local epoch frozen at claim; reject if the
+      // run occupancy epoch has moved (clearRun) without consulting taskId maps for generation.
+      if (token.runGeneration !== (this.runEpoch[token.runId] || 0)) {
+        console.warn(
+          `[TaskQueueService] stale in-mem mark ${terminal}(task=${token.taskId}, run=${token.runId}, gen=${token.runGeneration}) ignored — run epoch moved`
+        );
+        return false;
+      }
       return true;
     }
+    if (token.runGeneration == null || !Number.isFinite(token.runGeneration)) {
+      console.warn(
+        `[TaskQueueService] durable mark ${terminal}(task=${token.taskId}, run=${token.runId}) fail-closed — missing run generation on token`
+      );
+      return false;
+    }
     try {
+      // Accept exact expectedStatus, or pending→working promotion during the same dispatch
+      // (recordAttempt may advance status after claim without issuing a new token).
       const result = this.artifacts['db'].raw
         .prepare(
           `UPDATE run_tasks
            SET status = ?, updated_at = datetime('now')
            WHERE id = ?
              AND run_id = ?
-             AND status IN ('pending', 'working')
+             AND (
+               status = ?
+               OR (? = 'pending' AND status = 'working')
+             )
              AND EXISTS (
                SELECT 1 FROM runs r
                WHERE r.id = run_tasks.run_id AND r.generation = ?
              )`
         )
-        .run(terminal, taskId, runId, generation) as { changes: number };
+        .run(
+          terminal,
+          token.taskId,
+          token.runId,
+          token.expectedStatus,
+          token.expectedStatus,
+          token.runGeneration
+        ) as { changes: number };
       if (!result || result.changes === 0) {
         console.warn(
-          `[TaskQueueService] stale durable mark ${terminal}(${taskId}, ${runId}, gen=${generation}) ignored — 0 rows (run_id/status/generation fence)`
+          `[TaskQueueService] stale durable mark ${terminal}(task=${token.taskId}, run=${token.runId}, gen=${token.runGeneration}, expected=${token.expectedStatus}) ignored — 0 rows`
         );
         return false;
       }
       return true;
     } catch (err) {
       console.warn(
-        `[TaskQueueService] durable mark ${terminal}(${taskId}, ${runId}) failed:`,
+        `[TaskQueueService] durable mark ${terminal}(task=${token.taskId}, run=${token.runId}) failed:`,
         err instanceof Error ? err.message : err
       );
       return false;
+    }
+  }
+
+  private applyTerminalInMem(
+    token: TaskTerminalToken,
+    terminal: 'complete' | 'failed' | 'deferred'
+  ): void {
+    if (terminal === 'complete') this.completedTasks.add(token.taskId);
+    if (terminal === 'failed') this.failedTasks.add(token.taskId);
+    if (terminal === 'deferred') this.deferredTasks.add(token.taskId);
+    if (this.inFlight[token.runId] === token.taskId) {
+      this.inFlight[token.runId] = null;
+    }
+    if (terminal === 'complete' || terminal === 'deferred') {
+      if (this.queues[token.runId]) {
+        this.queues[token.runId] = this.queues[token.runId].filter((id) => id !== token.taskId);
+      }
     }
   }
 
@@ -146,7 +242,6 @@ export class TaskQueueService {
     for (const taskId of taskIds) {
       delete this.deps[taskId];
       delete this.batchOf[taskId];
-      delete this.taskEpoch[taskId];
       delete this.taskRunGeneration[taskId];
       this.failedTasks.delete(taskId);
       this.deferredTasks.delete(taskId);
@@ -155,7 +250,8 @@ export class TaskQueueService {
     delete this.queues[runId];
     delete this.allTasks[runId];
     delete this.inFlight[runId];
-    // Bump LAST: any write still in flight for the pre-bump generation is now provably stale.
+    // Bump LAST: any token still in flight for the pre-bump generation is now provably stale
+    // (pure in-mem path compares token.runGeneration to this epoch).
     this.runEpoch[runId] = (this.runEpoch[runId] || 0) + 1;
   }
 
@@ -166,7 +262,8 @@ export class TaskQueueService {
 
   /**
    * @param runGeneration optional durable `runs.generation` captured by the caller (preferred when
-   *   already known from createRun). When omitted and artifacts is set, SELECT generation FROM runs.
+   *   already known from createRun). When omitted and artifacts is set, SELECT generation FROM runs;
+   *   pure in-mem falls back to process-local runEpoch.
    */
   enqueue(
     runId: number,
@@ -178,8 +275,7 @@ export class TaskQueueService {
   ): void {
     if (!this.queues[runId]) this.queues[runId] = [];
     if (!this.allTasks[runId]) this.allTasks[runId] = [];
-    this.taskEpoch[taskId] = this.runEpoch[runId] || 0;
-    this.taskRunGeneration[taskId] = this.captureRunGeneration(runId, runGeneration);
+    this.taskRunGeneration[taskId] = this.resolveEnqueueGeneration(runId, runGeneration);
     this.deps[taskId] = [...(depTaskIds || [])];
     this.batchOf[taskId] = this.normBatch(batch);
     if (!this.allTasks[runId].includes(taskId)) this.allTasks[runId].push(taskId);
@@ -225,23 +321,13 @@ export class TaskQueueService {
    * skipped (independent siblings drain). A later batch stays closed until every earlier-batch task is
    * complete. Single-batch (all-'default') plans behave exactly as before (earliest open batch == the only
    * batch, so every task is eligible).
+   *
+   * Prefer claimNextReady for production paths that later call mark* — it returns the immutable
+   * TaskTerminalToken that must ride the async continuation (B03 C1).
    */
   getNextReady(runId: number): number | null {
-    if (this.inFlight[runId]) return null; // strictly one at a time
-    const earliest = this.earliestOpenBatch(runId);
-    if (earliest === null) return null; // no non-complete task anywhere
-    const q = this.queues[runId] || [];
-    for (let i = 0; i < q.length; i++) {
-      const tid = q[i];
-      if (this.batchOf[tid] !== earliest) continue; // barrier: only the earliest open batch may dispatch
-      if (this.failedTasks.has(tid) || this.deferredTasks.has(tid)) continue;
-      if (this.completedTasks.has(tid)) continue; // defensive (completed are removed from queues already)
-      if (this.isSatisfied(tid)) {
-        this.inFlight[runId] = tid;
-        return tid;
-      }
-    }
-    return null;
+    const token = this.claimNextReady(runId);
+    return token ? token.taskId : null;
   }
 
   /**
@@ -269,55 +355,77 @@ export class TaskQueueService {
     return true;
   }
 
-  markComplete(taskId: number, runId?: number): void {
-    if (runId != null && this.isStaleWrite(runId, taskId)) {
-      console.warn(`[TaskQueueService] stale markComplete(${taskId}, ${runId}) ignored — runId was recycled since this task's generation (a prior occupant's late write)`);
-      return;
+  /**
+   * Resolve mark* argument to an immutable token.
+   * - Primary: pass the TaskTerminalToken from claimNextReady (production / async).
+   * - Legacy sync: (taskId, runId) freezes generation NOW from enqueue maps — only safe on the
+   *   same-lifecycle sync path; after clearRun/recycle this adopts the NEW occupant (C1). Production
+   *   drain paths must pass the claim-time token object through await.
+   */
+  private resolveMarkToken(
+    tokenOrTaskId: TaskTerminalToken | number,
+    runId?: number
+  ): TaskTerminalToken | null {
+    if (
+      tokenOrTaskId != null &&
+      typeof tokenOrTaskId === 'object' &&
+      typeof (tokenOrTaskId as TaskTerminalToken).taskId === 'number' &&
+      typeof (tokenOrTaskId as TaskTerminalToken).runId === 'number' &&
+      typeof (tokenOrTaskId as TaskTerminalToken).runGeneration === 'number'
+    ) {
+      return tokenOrTaskId as TaskTerminalToken;
     }
-    // B03 / AC7: durable CAS before in-mem. Stale durable fence must not corrupt the live queue.
-    if (runId != null && this.artifacts) {
-      if (!this.applyTerminalDurable(taskId, runId, 'complete')) return;
+    if (typeof tokenOrTaskId === 'number' && runId != null) {
+      return this.freezeTerminalToken(runId, tokenOrTaskId);
     }
-    this.completedTasks.add(taskId);
-    if (runId && this.inFlight[runId] === taskId) {
-      this.inFlight[runId] = null;
-    }
-    // remove from queue front if present (defensive)
-    if (runId && this.queues[runId]) {
-      this.queues[runId] = this.queues[runId].filter((id) => id !== taskId);
-    }
+    return null;
   }
 
-  markFailed(taskId: number, runId?: number): void {
-    if (runId != null && this.isStaleWrite(runId, taskId)) {
-      console.warn(`[TaskQueueService] stale markFailed(${taskId}, ${runId}) ignored — runId was recycled since this task's generation (a prior occupant's late write)`);
-      return;
+  /**
+   * B03 / AC7: terminal mark using an immutable claim/dispatch token (preferred).
+   * Never re-reads generation from a mutable taskId map when a token object is supplied.
+   * Returns false when the fence rejects (caller must not retry with a refreshed token).
+   */
+  markComplete(token: TaskTerminalToken): boolean;
+  /** @deprecated sync tests only — freezes generation at call time; unsafe across async recycle. */
+  markComplete(taskId: number, runId: number): boolean;
+  markComplete(tokenOrTaskId: TaskTerminalToken | number, runId?: number): boolean {
+    const token = this.resolveMarkToken(tokenOrTaskId, runId);
+    if (!token || !Number.isFinite(token.runGeneration)) {
+      console.warn(`[TaskQueueService] markComplete fail-closed — missing token/runGeneration`);
+      return false;
     }
-    if (runId != null && this.artifacts) {
-      if (!this.applyTerminalDurable(taskId, runId, 'failed')) return;
-    }
-    this.failedTasks.add(taskId);
-    if (runId && this.inFlight[runId] === taskId) {
-      this.inFlight[runId] = null;
-    }
+    if (!this.applyTerminalDurable(token, 'complete')) return false;
+    this.applyTerminalInMem(token, 'complete');
+    return true;
   }
 
-  markDeferred(taskId: number, runId?: number): void {
-    if (runId != null && this.isStaleWrite(runId, taskId)) {
-      console.warn(`[TaskQueueService] stale markDeferred(${taskId}, ${runId}) ignored — runId was recycled since this task's generation (a prior occupant's late write)`);
-      return;
+  markFailed(token: TaskTerminalToken): boolean;
+  /** @deprecated sync tests only — freezes generation at call time; unsafe across async recycle. */
+  markFailed(taskId: number, runId: number): boolean;
+  markFailed(tokenOrTaskId: TaskTerminalToken | number, runId?: number): boolean {
+    const token = this.resolveMarkToken(tokenOrTaskId, runId);
+    if (!token || !Number.isFinite(token.runGeneration)) {
+      console.warn(`[TaskQueueService] markFailed fail-closed — missing token/runGeneration`);
+      return false;
     }
-    if (runId != null && this.artifacts) {
-      if (!this.applyTerminalDurable(taskId, runId, 'deferred')) return;
+    if (!this.applyTerminalDurable(token, 'failed')) return false;
+    this.applyTerminalInMem(token, 'failed');
+    return true;
+  }
+
+  markDeferred(token: TaskTerminalToken): boolean;
+  /** @deprecated sync tests only — freezes generation at call time; unsafe across async recycle. */
+  markDeferred(taskId: number, runId: number): boolean;
+  markDeferred(tokenOrTaskId: TaskTerminalToken | number, runId?: number): boolean {
+    const token = this.resolveMarkToken(tokenOrTaskId, runId);
+    if (!token || !Number.isFinite(token.runGeneration)) {
+      console.warn(`[TaskQueueService] markDeferred fail-closed — missing token/runGeneration`);
+      return false;
     }
-    this.deferredTasks.add(taskId);
-    if (runId && this.inFlight[runId] === taskId) {
-      this.inFlight[runId] = null;
-    }
-    // remove from queue (defensive)
-    if (runId && this.queues[runId]) {
-      this.queues[runId] = this.queues[runId].filter((id) => id !== taskId);
-    }
+    if (!this.applyTerminalDurable(token, 'deferred')) return false;
+    this.applyTerminalInMem(token, 'deferred');
+    return true;
   }
 
   // Test helpers (no prod surface)
