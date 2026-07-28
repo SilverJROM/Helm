@@ -643,19 +643,27 @@ export class RunOrchestratorService {
     // originally gated. Re-read runs.generation for the precreated id here — same synchronous tick as
     // startRunDetached's own capture (no await has run yet), so this cannot observe a later recycle —
     // and thread it through every such path.
+    // B04 fix cycle 4 (redteam-sol R3 C2): fail CLOSED, not silently ungated, when a detached call
+    // cannot capture its generation token. The row was inserted synchronously by startRunDetached in
+    // the same tick immediately before this read, so a missing/unreadable generation here is an
+    // anomalous state — never treat it as "proceed ungated."
     let runGenToken: number | undefined;
     if (input.precreatedRunId != null && Number.isFinite(Number(input.precreatedRunId))) {
       const rid = Number(input.precreatedRunId);
       clearRunAbort(rid);
       try { this.deps.queue.clearRun(rid); } catch { /* never block start */ }
+      let row: { generation: number } | undefined;
       try {
-        const row = this.deps.artifacts['db'].raw
+        row = this.deps.artifacts['db'].raw
           .prepare('SELECT generation FROM runs WHERE id = ?')
           .get(rid) as { generation: number } | undefined;
-        if (row && typeof row.generation === 'number' && Number.isFinite(row.generation)) {
-          runGenToken = row.generation;
-        }
-      } catch { /* leave undefined — downstream calls degrade to their pre-B04 unguarded behavior */ }
+      } catch (e: any) {
+        throw new Error(`B04: failed to capture lifecycle generation for precreated run ${rid}; refusing to dispatch ungated: ${e?.message || e}`);
+      }
+      if (!row || typeof row.generation !== 'number' || !Number.isFinite(row.generation)) {
+        throw new Error(`B04: precreated run ${rid} has no readable generation; refusing to dispatch ungated`);
+      }
+      runGenToken = row.generation;
     }
 
     // B-ISO1 (sol wiring review fix #4): resolve the RUN-SCOPED strict read policy ONCE, at run start,
@@ -2408,8 +2416,41 @@ Use the exact JROM-clone standards: adversarial, verify against requirements con
     /** B04 fix cycle 3 (validator V2): captured runs.generation when reached via startRunDetached. */
     expectedGeneration?: number
   ): Promise<void> {
-    let claim: TaskTerminalToken | null;
-    while ((claim = queue.claimNextReady(runId)) != null) {
+    // B04 fix cycle 4 (redteam-sol R3 C2, CRITICAL): expectedGeneration was previously forwarded only
+    // to terminal writers below — this claim loop itself had no ownership check at all.
+    // TaskQueueService is keyed by numeric runId; a recycled occupant clears and re-enqueues under the
+    // SAME id (task-queue-service.ts clearRun/enqueue), so a stale continuation could claim the NEW
+    // occupant's own token. That token legitimately carries the new occupant's own fresh generation —
+    // B03's per-task terminal CAS is not a defense against this, because the claim itself is not
+    // stale from the queue's point of view. The harm is that the STALE continuation would then execute
+    // the work with ITS OWN (wrong) project/plan/runDir context and mark the new occupant's task
+    // complete. Fence every claim attempt on runs.id + generation BEFORE calling claimNextReady —
+    // never claim-then-reject (a claim mutates queue state; rejecting after the fact would still have
+    // consumed the new occupant's dispatch slot).
+    const genGated = expectedGeneration != null && Number.isFinite(Number(expectedGeneration));
+    const ownsCurrentGeneration = (): boolean => {
+      if (!genGated) return true; // no captured token (non-detached call) — unchanged, ungated behavior
+      try {
+        const row = this.deps.artifacts['db'].raw
+          .prepare('SELECT generation FROM runs WHERE id = ?')
+          .get(runId) as { generation: number } | undefined;
+        return !!row && Number(row.generation) === Number(expectedGeneration);
+      } catch {
+        return false; // read failure — fail closed, never assume ownership
+      }
+    };
+    let claim: TaskTerminalToken | null = null;
+    while (true) {
+      if (!ownsCurrentGeneration()) {
+        if (genGated) {
+          console.warn(
+            `[run-orchestrator] drainDispatch stopped for run ${runId} generation ${expectedGeneration} — no longer current (stale continuation); no further claims`
+          );
+        }
+        break;
+      }
+      claim = queue.claimNextReady(runId);
+      if (claim == null) break;
       // B03 C1: freeze token at claim; carry through await — never rebuild from taskId maps at mark*.
       const terminalToken = claim;
       const nextTaskId = terminalToken.taskId;

@@ -1021,6 +1021,70 @@ describe('RunOrchestratorService (A2 wiring)', () => {
       expect(newWorkerAfter.state).toBe('running');
       expect(newWorkerAfter.ended_at).toBeNull();
     });
+
+    // B04 fix cycle 4 (redteam-sol R3 C2, CRITICAL): the prior fixes gated terminal writers (the
+    // final UPDATE, transitionRunToBlocked, the finalizers) but drainDispatch itself had no ownership
+    // check before queue.claimNextReady(runId). TaskQueueService is keyed by numeric runId; a recycled
+    // occupant B clears and re-enqueues under the SAME id, so a stale continuation A could claim B's
+    // OWN token — which legitimately carries B's OWN fresh generation, so B03's per-task terminal CAS
+    // is not a defense — execute the work with A's (wrong) project/plan/runDir context via
+    // loop.runTask, and mark B's task complete. This reproduces the redteam's exact repro: drive the
+    // REAL production drainDispatch (not a reimplementation) with A's stale captured generation
+    // against B's task, already enqueued in the shared queue exactly as B's own real dispatch would
+    // have left it.
+    it('a stale drainDispatch cannot claim or complete a recycled occupant\'s already-queued task', async () => {
+      const proj = projectSvc.createProject({ name: 'b04-queue-takeover', directory: '/tmp/b04-queue-takeover' });
+      const pid = proj.id;
+      const runDirA = path.join(os.tmpdir(), `helm-b04-queue-takeover-${Date.now()}`);
+
+      const nativeRunId = artifacts.createRun(pid, 'b04queueA', path.join(runDirA, CANONICAL_CYCLE_ARTIFACTS.northStar), null);
+      const staleGeneration = (db.raw.prepare('SELECT generation FROM runs WHERE id = ?').get(nativeRunId) as any).generation;
+
+      // A has no live worker yet (FK-safe delete).
+      db.raw.prepare('DELETE FROM runs WHERE id = ?').run(nativeRunId);
+      expect((db.raw.prepare('SELECT COUNT(*) AS n FROM runs').get() as any).n).toBe(0);
+
+      const { allocateLifecycleGeneration } = await import('./lifecycle-cas.js');
+      const freshGeneration = allocateLifecycleGeneration(db.raw);
+      expect(freshGeneration).not.toBe(staleGeneration);
+      db.raw
+        .prepare(
+          `INSERT INTO runs (id, project_id, cycle_id, batch_id, north_star_ref, status, phase, generation)
+           VALUES (?,?,?,?,?,'active','executing',?)`
+        )
+        .run(nativeRunId, pid, null, 'b04-recycled-queue-takeover', null, freshGeneration);
+
+      // B's own real dispatch: a durable run_tasks row plus the SAME shared in-memory queue enqueues
+      // it under the SAME numeric runId, carrying B's OWN fresh generation — exactly how a real
+      // startRunInner's queue.clearRun + enqueue populates the shared queue after row-id reuse.
+      const bTaskInfo = db.raw
+        .prepare(`INSERT INTO run_tasks (run_id, task_key, label, status) VALUES (?, 'T1', 'B own task', 'pending')`)
+        .run(nativeRunId);
+      const bTaskId = Number(bTaskInfo.lastInsertRowid);
+      queue.clearRun(nativeRunId);
+      queue.enqueue(nativeRunId, bTaskId, [], false, 'default', freshGeneration);
+
+      const runTaskSpy = vi.fn().mockResolvedValue({ finalStatus: 'PASS' });
+      const fakeLoop = { runTask: runTaskSpy } as any;
+
+      // A's stale continuation drives the REAL drainDispatch with ITS OWN (now-stale) captured token.
+      await (orch as any).drainDispatch(nativeRunId, runDirA, 'b04queueA', proj, fakeLoop, queue, staleGeneration);
+
+      // The stale continuation must never have claimed, executed, or completed B's task.
+      expect(runTaskSpy).not.toHaveBeenCalled();
+      const bTaskAfter = db.raw.prepare('SELECT status FROM run_tasks WHERE id = ?').get(bTaskId) as any;
+      expect(bTaskAfter.status).toBe('pending');
+      expect(queue.isInFlight(nativeRunId)).toBe(false);
+
+      // B's own (current-generation) continuation can still legitimately claim and complete its task —
+      // the fence rejects only the stale caller, it does not poison the slot for the real occupant.
+      const token = queue.claimNextReady(nativeRunId);
+      expect(token).not.toBeNull();
+      expect(token!.taskId).toBe(bTaskId);
+      expect(queue.markComplete(token!)).toBe(true);
+      const bTaskFinal = db.raw.prepare('SELECT status FROM run_tasks WHERE id = ?').get(bTaskId) as any;
+      expect(bTaskFinal.status).toBe('complete');
+    });
   });
 
   it('D-b: startRun enters interview phase, waits for NORTH-STAR-READY (no autonomous before), transitions planning->execute; plan per-task model/effort flows (D-b1 + D-b2)', async () => {
