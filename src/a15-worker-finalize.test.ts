@@ -10,6 +10,7 @@ import {
   finalizeBrainSessionRow,
   configureWorkerRuntimeFinalize,
 } from './services/worker-runtime-finalize.js';
+import { allocateLifecycleGeneration } from './services/lifecycle-cas.js';
 import { ProjectService } from './services/project-service.js';
 import { RunArtifactService } from './services/run-artifact-service.js';
 import {
@@ -97,6 +98,50 @@ describe.sequential('A15 worker_runtimes finalize-to-reaped', () => {
     }
     // Idempotent
     const n2 = await finalizeRunWorkerRuntimes(db.raw, runId, 'run-complete');
+    expect(n2).toBe(0);
+  });
+
+  it('(a3) B04/AC8: expectedGeneration gate rejects a recycled runId — new occupant\'s live workers survive', async () => {
+    const staleGeneration = (db.raw.prepare('SELECT generation FROM runs WHERE id = ?').get(runId) as any).generation;
+
+    // Synthetic recycle: delete the (now childless — worker_runtimes.run_id FK requires no live
+    // children to delete cleanly) run row, then re-insert a NEW occupant reusing the SAME numeric id
+    // with a freshly-allocated generation (D01 mechanism) — mirrors SQLite rowid reuse after CASCADE.
+    db.raw.prepare('DELETE FROM runs WHERE id = ?').run(runId);
+    const freshGeneration = allocateLifecycleGeneration(db.raw);
+    expect(freshGeneration).not.toBe(staleGeneration);
+    db.raw
+      .prepare(
+        `INSERT INTO runs (id, project_id, cycle_id, batch_id, north_star_ref, status, phase, generation)
+         VALUES (?,?,?,?,?,'active','executing',?)`
+      )
+      .run(runId, projectId, null, 'recycled-batch', null, freshGeneration);
+    const newOccupantWorker = insertRunning('helm-a15-new-occupant-live');
+
+    // Old finalizer, still holding the stale (pre-recycle) generation, must select nothing.
+    const reapedSessions: string[] = [];
+    const n = await finalizeRunWorkerRuntimes(db.raw, runId, 'detached-start-failed', async (s) => {
+      reapedSessions.push(s);
+    }, staleGeneration);
+
+    expect(n).toBe(0);
+    expect(reapedSessions).toEqual([]);
+    const newRow = db.raw.prepare('SELECT state FROM worker_runtimes WHERE id = ?').get(newOccupantWorker) as any;
+    expect(newRow.state).toBe('running');
+  });
+
+  it('(a4) B04/AC8: matching expectedGeneration still finalizes normally (current generation terminalizes once)', async () => {
+    const currentGeneration = (db.raw.prepare('SELECT generation FROM runs WHERE id = ?').get(runId) as any).generation;
+    const worker = insertRunning('helm-a15-current-gen');
+
+    const n = await finalizeRunWorkerRuntimes(db.raw, runId, 'detached-start-failed', undefined, currentGeneration);
+    expect(n).toBe(1);
+    const row = db.raw.prepare('SELECT state, ended_at FROM worker_runtimes WHERE id = ?').get(worker) as any;
+    expect(row.state).toBe('reaped');
+    expect(row.ended_at).toBeTruthy();
+
+    // Idempotent — same generation, already terminal, no double-finalize.
+    const n2 = await finalizeRunWorkerRuntimes(db.raw, runId, 'detached-start-failed', undefined, currentGeneration);
     expect(n2).toBe(0);
   });
 
@@ -447,5 +492,49 @@ describe.sequential('S03 brain completion assertion (finalizeBrainSessionRow)', 
     expect(reg.get(session)!.status).toBe('idle');
     expect(reg.get(session)!.reason).toBe('detached-start-failed');
     expect(reg.get(session)!.ended_at).toBeNull();
+  });
+
+  it('(4) B04/AC8: expectedGeneration mismatch (recycled run) makes finalizeBrainSessionRow a no-op', () => {
+    const session = 'helm-ibrain-s03_brain';
+    reg.register(session, { owner: 'helm', projectId, runId, kind: 'ibrain' });
+    expect(reg.get(session)!.status).toBe('active');
+    const actualGeneration = (db.raw.prepare('SELECT generation FROM runs WHERE id = ?').get(runId) as any).generation;
+
+    const changed = finalizeBrainSessionRow(db.raw, {
+      projectId,
+      runId,
+      session,
+      role: 'ibrain',
+      reason: 'detached-start-failed',
+      state: 'failed',
+      expectedGeneration: actualGeneration + 1, // stale token — run has since recycled/moved on
+    });
+
+    expect(changed).toBe(false);
+    const wr = db.raw
+      .prepare(`SELECT COUNT(*) AS n FROM worker_runtimes WHERE run_id = ? AND session = ?`)
+      .get(runId, session) as { n: number };
+    expect(Number(wr.n)).toBe(0);
+    expect(reg.get(session)!.status).toBe('active');
+  });
+
+  it('(5) B04/AC8: matching expectedGeneration still finalizes normally', () => {
+    const session = 'helm-ibrain-s03_brain';
+    reg.register(session, { owner: 'helm', projectId, runId, kind: 'ibrain' });
+    const actualGeneration = (db.raw.prepare('SELECT generation FROM runs WHERE id = ?').get(runId) as any).generation;
+
+    const changed = finalizeBrainSessionRow(db.raw, {
+      projectId,
+      runId,
+      session,
+      role: 'ibrain',
+      reason: 'detached-start-failed',
+      state: 'failed',
+      expectedGeneration: actualGeneration,
+    });
+
+    expect(changed).toBe(true);
+    expect(reg.get(session)!.status).toBe('idle');
+    expect(reg.get(session)!.reason).toBe('detached-start-failed');
   });
 });

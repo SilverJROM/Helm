@@ -40,6 +40,7 @@ import type { PlannerPanelService } from './planner-panel-service.js';
 import type { PlannerPanel } from './adaptive-planning-phase.js';
 import { makeGrokAwareProviderModelAvailability } from './grok-auth-availability.js';
 import { finalizeBrainSessionRow } from './worker-runtime-finalize.js';
+import type { LifecycleToken } from './lifecycle-cas.js';
 
 // CYCLE-BUILDDIR: a cycle-plan run builds the deliverable in this subdir OF the cycle workspace (never the
 // workspace root — that holds north-star.md, which puts helm-sandbox in PROTECTED-ROOT mode and blocks
@@ -335,6 +336,13 @@ export class RunOrchestratorService {
     const batchId = input.batchId || `r${Date.now().toString(36)}`;
     const runDir = resolveRunDir(input.projectId, batchId); // #46: single resolver
     const runId = this.deps.artifacts.createRun(input.projectId, batchId, path.join(runDir, CANONICAL_CYCLE_ARTIFACTS.northStar), input.cycleId ?? null);
+    // B04 / AC8: freeze the run's lifecycle token (id + B03 allocator generation) at the authoritative
+    // dispatch boundary — the instant the row exists. The background continuation below closes over
+    // this const and never re-reads runs.generation from the (possibly recycled) runId later.
+    const runRow = this.deps.artifacts['db'].raw
+      .prepare('SELECT generation FROM runs WHERE id = ?')
+      .get(runId) as { generation: number } | undefined;
+    const runToken: LifecycleToken = { id: runId, generation: Number(runRow?.generation ?? 0) };
     // A6b: process-local TaskQueueService is keyed by runId. SQLite reuses free runs.id after CASCADE
     // delete; a prior run's stuck inFlight / failedTasks / allTasks then makes getNextReady() return
     // null forever → DB has pending run_tasks but drainDispatch immediately pending-after-drain stalls
@@ -358,22 +366,42 @@ export class RunOrchestratorService {
     } catch { /* transcript persist is best-effort */ }
     void this.startRun({ ...input, batchId, precreatedRunId: runId }).catch((e: any) => {
       console.error(`[run-orchestrator] detached startRun failed for run ${runId} (project ${input.projectId}, batch ${batchId}): ${e?.stack || e?.message || e}`);
+      // B04 / AC8: the failure UPDATE is the CAS gate for this whole terminal chain — it compares
+      // runs.id + runs.generation against the token frozen at dispatch. changes !== 1 means the row
+      // is already terminal, gone, or a new occupant recycled this id; the old chain must no-op
+      // rather than mark the recycled row failed or reap/finalize its live workers (D01: changes===0
+      // is stale/KEEP, never refresh-and-retry).
+      let casApplied = false;
       try {
-        this.deps.artifacts['db'].raw
-          .prepare(`UPDATE runs SET phase = 'failed', status = 'failed', ended_at = datetime('now') WHERE id = ? AND phase NOT IN ('complete','failed','blocked')`)
-          .run(runId);
-      } catch {}
+        const result = this.deps.artifacts['db'].raw
+          .prepare(
+            `UPDATE runs SET phase = 'failed', status = 'failed', ended_at = datetime('now')
+             WHERE id = ? AND generation = ? AND phase NOT IN ('complete','failed','blocked')`
+          )
+          .run(runToken.id, runToken.generation) as { changes?: number };
+        casApplied = Number(result?.changes || 0) === 1;
+      } catch { /* casApplied stays false — treat as stale, do not run terminal bookkeeping */ }
+      if (!casApplied) {
+        console.warn(
+          `[run-orchestrator] detached startRun failure for run ${runToken.id} generation ${runToken.generation} is stale/already-terminal — skipping cycle/worker/brain terminal bookkeeping`
+        );
+        return;
+      }
       // A7 / R3.15: detached failure is a true terminal — advance cycle board if linked.
-      this.terminalizeCycleAtRunEnd({ runId, cycleId: input.cycleId ?? null });
+      this.terminalizeCycleAtRunEnd({ runId: runToken.id, cycleId: input.cycleId ?? null });
       // A15 + S03: finalize workers first, then ibrain assert (true terminal; no reap — D-a3).
+      // B04: both independently re-compare runs.generation against runToken at their own pre-reap/
+      // pre-mutate selection — defense against recycling in the window between the CAS above and
+      // these awaited operations.
       void (async () => {
         try {
-          await this.finalizeRunWorkerRuntimes(runId, 'detached-start-failed');
+          await this.finalizeRunWorkerRuntimes(runToken.id, 'detached-start-failed', runToken.generation);
           this.assertImplementationBrainComplete({
             projectId: input.projectId,
-            runId,
+            runId: runToken.id,
             reason: 'detached-start-failed',
             state: 'failed',
+            expectedGeneration: runToken.generation,
           });
         } catch { /* best-effort terminal bookkeeping */ }
       })();
@@ -410,7 +438,13 @@ export class RunOrchestratorService {
    * Best-effort reaps the tmux session then shared finalizeWriter → reaped + ended_at.
    * Used at true run terminals and planning-done-yield so seats never stick as running.
    */
-  private async finalizeRunWorkerRuntimes(runId: number, reason: string): Promise<number> {
+  /**
+   * @param expectedGeneration B04 / AC8: when supplied, the shared finalizer only selects/reaps
+   *   worker_runtimes rows whose run still carries this exact runs.generation — a stale caller
+   *   (recycled runId) selects nothing. Omitted by every pre-existing synchronous call site, whose
+   *   generation cannot have moved within their own still-live run's execution.
+   */
+  private async finalizeRunWorkerRuntimes(runId: number, reason: string, expectedGeneration?: number): Promise<number> {
     try {
       const { finalizeRunWorkerRuntimes: finalizeRun } = await import('./worker-runtime-finalize.js');
       const db = this.deps.artifacts['db'].raw;
@@ -418,7 +452,7 @@ export class RunOrchestratorService {
         try {
           await this.deps.transport.reap(`${session}:0.0`, reason);
         } catch { /* best-effort */ }
-      });
+      }, expectedGeneration);
     } catch {
       return 0;
     }
@@ -437,6 +471,8 @@ export class RunOrchestratorService {
     state?: 'done' | 'failed' | 'reaped';
     provider?: string;
     model?: string;
+    /** B04 / AC8: captured runs.generation — a mismatch makes finalizeBrainSessionRow a no-op. */
+    expectedGeneration?: number;
   }): void {
     try {
       const db = this.deps.artifacts['db'].raw;
@@ -456,6 +492,7 @@ export class RunOrchestratorService {
         state: opts.state ?? 'done',
         provider: opts.provider,
         model: opts.model,
+        expectedGeneration: opts.expectedGeneration,
       });
     } catch {
       /* best-effort bookkeeping — never block the run terminal path */

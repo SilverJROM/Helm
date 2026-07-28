@@ -642,6 +642,100 @@ describe('RunOrchestratorService (A2 wiring)', () => {
     expect(events.listByBatch(`chat-${pid}`).filter((m: any) => m.body && m.body.kind === 'run-prompt').length).toBe(1);
   }, 30000);
 
+  // B04 / AC8: startRunDetached freezes a run lifecycle token (id + B03 generation) at dispatch and
+  // requires it, unchanged, before the detached .catch() marks the run failed, advances cycle
+  // bookkeeping, reaps workers, or finalizes the ibrain session. Force startRun to reject on a
+  // controlled promise so the recycle can be injected deterministically between dispatch and failure.
+  describe('B04: detached-start-failed CAS on runs.generation (AC8)', () => {
+    it('old detached failure cannot fail a recycled run row, nor terminate its live workers', async () => {
+      const proj = projectSvc.createProject({ name: 'b04-stale', directory: '/tmp/b04-stale' });
+      const pid = proj.id;
+
+      let rejectStart!: (e: unknown) => void;
+      const controlled = new Promise<number>((_resolve, reject) => { rejectStart = reject; });
+      const startRunSpy = vi.spyOn(orch, 'startRun').mockReturnValue(controlled);
+
+      const { runId } = orch.startRunDetached({ projectId: pid, prompt: 'b04 stale detached', batchId: 'b04stale1' });
+      const staleGeneration = (db.raw.prepare('SELECT generation FROM runs WHERE id = ?').get(runId) as any).generation;
+
+      // Synthetic recycle: no live worker_runtimes reference this run yet, so the row can be deleted
+      // cleanly (FK-safe), then a NEW occupant reuses the SAME numeric id with a fresh generation and
+      // spawns its own live worker — exactly the F-09 scenario (project delete + rowid reuse).
+      const { allocateLifecycleGeneration } = await import('./lifecycle-cas.js');
+      db.raw.prepare('DELETE FROM runs WHERE id = ?').run(runId);
+      const freshGeneration = allocateLifecycleGeneration(db.raw);
+      expect(freshGeneration).not.toBe(staleGeneration);
+      db.raw
+        .prepare(
+          `INSERT INTO runs (id, project_id, cycle_id, batch_id, north_star_ref, status, phase, generation)
+           VALUES (?,?,?,?,?,'active','executing',?)`
+        )
+        .run(runId, pid, null, 'b04-recycled-batch', null, freshGeneration);
+      const newWorkerInfo = db.raw
+        .prepare(
+          `INSERT INTO worker_runtimes (project_id, role, provider, model, session, correlation_id, state, spawned_by, run_id, started_at)
+           VALUES (?,?,?,?,?,?,'running','b04-test',?, datetime('now'))`
+        )
+        .run(pid, 'implementer', 'grok', 'grok-4.5', 'helm-b04-new-occupant', 'b04-corr-stale', runId);
+      const newWorkerId = Number(newWorkerInfo.lastInsertRowid);
+
+      rejectStart(new Error('synthetic detached startRun failure'));
+      await controlled.catch(() => {});
+      await new Promise((r) => setTimeout(r, 100)); // let the .catch handler's async IIFE settle
+
+      const recycledRun = db.raw.prepare('SELECT phase, status, generation FROM runs WHERE id = ?').get(runId) as any;
+      expect(recycledRun.phase).not.toBe('failed');
+      expect(recycledRun.status).not.toBe('failed');
+      expect(recycledRun.generation).toBe(freshGeneration); // untouched — new occupant's identity intact
+
+      const newWorkerRow = db.raw.prepare('SELECT state, ended_at FROM worker_runtimes WHERE id = ?').get(newWorkerId) as any;
+      expect(newWorkerRow.state).toBe('running'); // not reaped/finalized by the stale chain
+      expect(newWorkerRow.ended_at).toBeNull();
+
+      startRunSpy.mockRestore();
+    });
+
+    it('current generation still terminalizes once: run marked failed, workers reaped, ibrain finalized', async () => {
+      const proj = projectSvc.createProject({ name: 'b04-current', directory: '/tmp/b04-current' });
+      const pid = proj.id;
+
+      let rejectStart!: (e: unknown) => void;
+      const controlled = new Promise<number>((_resolve, reject) => { rejectStart = reject; });
+      const startRunSpy = vi.spyOn(orch, 'startRun').mockReturnValue(controlled);
+
+      const { runId } = orch.startRunDetached({ projectId: pid, prompt: 'b04 current gen', batchId: 'b04current1' });
+
+      const workerInfo = db.raw
+        .prepare(
+          `INSERT INTO worker_runtimes (project_id, role, provider, model, session, correlation_id, state, spawned_by, run_id, started_at)
+           VALUES (?,?,?,?,?,?,'running','b04-test',?, datetime('now'))`
+        )
+        .run(pid, 'implementer', 'grok', 'grok-4.5', 'helm-b04-current-worker', 'b04-corr-current', runId);
+      const workerId = Number(workerInfo.lastInsertRowid);
+
+      rejectStart(new Error('synthetic detached startRun failure'));
+      await controlled.catch(() => {});
+      await new Promise((r) => setTimeout(r, 100));
+
+      const run = db.raw.prepare('SELECT phase, status, generation FROM runs WHERE id = ?').get(runId) as any;
+      expect(run.phase).toBe('failed');
+      expect(run.status).toBe('failed');
+
+      const worker = db.raw.prepare('SELECT state, ended_at FROM worker_runtimes WHERE id = ?').get(workerId) as any;
+      expect(worker.state).toBe('reaped');
+      expect(worker.ended_at).toBeTruthy();
+
+      // Second concurrent stale-catch-style call at the same (still current) token is a pure re-check —
+      // proves the terminal transition happened exactly once (phase guard already NOT IN blocked/failed).
+      const rerun = db.raw
+        .prepare(`UPDATE runs SET phase='failed' WHERE id=? AND generation=? AND phase NOT IN ('complete','failed','blocked')`)
+        .run(runId, run.generation ?? 0) as { changes?: number };
+      expect(Number(rerun?.changes || 0)).toBe(0);
+
+      startRunSpy.mockRestore();
+    });
+  });
+
   it('D-b: startRun enters interview phase, waits for NORTH-STAR-READY (no autonomous before), transitions planning->execute; plan per-task model/effort flows (D-b1 + D-b2)', async () => {
     const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
     const proj = projectSvc.createProject({ name: 'cards', directory: '/tmp/cards' });

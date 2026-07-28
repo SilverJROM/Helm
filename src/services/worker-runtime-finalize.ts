@@ -107,22 +107,39 @@ export function finalizeWorkerRuntimeRow(
 /**
  * Finalize every non-terminal worker_runtimes row for a run.
  * Optionally reaps the tmux session first (best-effort). Returns count of rows transitioned.
+ *
+ * @param expectedGeneration B04 / AC8: when supplied, the pre-reap SELECT additionally requires
+ *   `runs.generation` (for `run_id`) to still equal this captured value — a stale caller holding a
+ *   recycled/deleted-and-reused `runId` selects zero rows instead of reaping the new occupant's live
+ *   workers. Omitted preserves the pre-B04 unguarded selection for callers with no captured token.
  */
 export async function finalizeRunWorkerRuntimes(
   db: FinalizeDb,
   runId: number,
   reason: string,
-  reapSession?: (session: string) => void | Promise<void>
+  reapSession?: (session: string) => void | Promise<void>,
+  expectedGeneration?: number
 ): Promise<number> {
   if (runId == null || !Number.isFinite(Number(runId))) return 0;
+  const gated = expectedGeneration != null && Number.isFinite(Number(expectedGeneration));
   let rows: any[] = [];
   try {
-    rows = db
-      .prepare(
-        `SELECT id, session FROM worker_runtimes
-         WHERE run_id = ? AND state NOT IN ('done','failed','reaped')`
-      )
-      .all(runId) as any[];
+    rows = gated
+      ? (db
+          .prepare(
+            `SELECT id, session FROM worker_runtimes
+             WHERE run_id = ? AND state NOT IN ('done','failed','reaped')
+               AND EXISTS (
+                 SELECT 1 FROM runs r WHERE r.id = worker_runtimes.run_id AND r.generation = ?
+               )`
+          )
+          .all(runId, expectedGeneration) as any[])
+      : (db
+          .prepare(
+            `SELECT id, session FROM worker_runtimes
+             WHERE run_id = ? AND state NOT IN ('done','failed','reaped')`
+          )
+          .all(runId) as any[]);
   } catch {
     return 0;
   }
@@ -159,12 +176,32 @@ export function finalizeBrainSessionRow(
     state?: WorkerTerminalState;
     provider?: string;
     model?: string;
+    /**
+     * B04 / AC8: captured runs.generation for `runId`. When supplied, a mismatch (row deleted or
+     * recycled by a new occupant since capture) makes this whole call a no-op before any
+     * worker_runtimes row is read or written — the brain/session-finalization leg of the detached
+     * failure CAS chain.
+     */
+    expectedGeneration?: number;
   }
 ): boolean {
   const session = String(opts.session ?? '').trim();
   if (!session) return false;
   if (opts.projectId == null || !Number.isFinite(Number(opts.projectId))) return false;
   if (opts.runId == null || !Number.isFinite(Number(opts.runId))) return false;
+
+  if (opts.expectedGeneration != null && Number.isFinite(Number(opts.expectedGeneration))) {
+    try {
+      const runRow = db.prepare('SELECT generation FROM runs WHERE id = ?').get(opts.runId) as
+        | { generation: number }
+        | undefined;
+      if (!runRow || Number(runRow.generation) !== Number(opts.expectedGeneration)) {
+        return false;
+      }
+    } catch {
+      return false;
+    }
+  }
 
   const role = (opts.role && String(opts.role).trim()) || 'ibrain';
   const state: WorkerTerminalState = opts.state ?? 'done';
