@@ -4,7 +4,9 @@
  * Reads Codex usage from the provider's wham/usage endpoint using local Codex
  * auth. Does NOT shell out to crew scaffolding (~/.claude/agents/lib/agent-usage.sh).
  *
- * Product rungs today (see UsageGatewayService.mapToRung): codex55, spark.
+ * Product rungs (see UsageGatewayService.mapToRung): codex55, spark (live Codex
+ * fetch); house ladder also normalizes grok45 + haiku (S17/AC30 — injected or
+ * future provider clients; this file still only fetches Codex).
  */
 import * as fs from "node:fs";
 import * as os from "node:os";
