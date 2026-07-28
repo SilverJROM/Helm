@@ -59,6 +59,9 @@ export interface HousekeeperApplyInput {
 /** Typed apply_error when done evidence cites nothing checkable in the stored envelope (B10b / AC14). */
 export const HOUSEKEEPER_APPLY_ERROR_EVIDENCE_NOT_IN_ENVELOPE = 'evidence_not_in_envelope';
 
+/** Typed apply_error when persisted session CAS token no longer matches the row (B11 / AC16). */
+export const HOUSEKEEPER_APPLY_ERROR_SESSION_CAS_STALE = 'session_cas_stale';
+
 export type HousekeeperApplyResult =
   | { ok: true; outcome: 'applied_done'; investigationId: number; sessionName: string }
   | { ok: true; outcome: 'needs_human'; investigationId: number; sessionName: string }
@@ -66,6 +69,7 @@ export type HousekeeperApplyResult =
   | { ok: false; outcome: 'invalid_callback_proof'; investigationId: number; sessionName: string; error: string }
   | { ok: false; outcome: 'not_found'; error: string }
   | { ok: false; outcome: 'owner_recheck_failed'; investigationId: number; sessionName: string; owner: string | null; error: string }
+  | { ok: false; outcome: 'session_cas_stale'; investigationId: number; sessionName: string; owner: string | null; error: string }
   | { ok: false; outcome: 'terminal_conflict'; investigationId: number; sessionName: string; existingVerdict: string | null; error: string };
 
 /** Explicit bounded-probe outcomes persisted on the investigation envelope (B10 / AC13). */
@@ -287,27 +291,7 @@ export class HousekeeperService {
       };
     }
 
-    const session = this.sessionRegistry.get(row.session_name);
-
-    if (!session || session.owner !== 'helm') {
-      this.db
-        .prepare(
-          `UPDATE housekeeper_investigations
-           SET callback_verdict = ?, callback_evidence = ?, callback_rationale = ?,
-               status = 'apply_rejected', apply_error = ?, applied_at = datetime('now')
-           WHERE id = ?`
-        )
-        .run(verdict, evidence, rationale, 'owner_recheck_failed', id);
-      return {
-        ok: false,
-        outcome: 'owner_recheck_failed',
-        investigationId: id,
-        sessionName: row.session_name,
-        owner: session?.owner ?? null,
-        error: 'session owner is no longer helm',
-      };
-    }
-
+    // needs-human never mutates session status — no CAS, no late get-by-name.
     if (verdict === 'needs-human') {
       this.db
         .prepare(
@@ -320,7 +304,46 @@ export class HousekeeperService {
       return { ok: true, outcome: 'needs_human', investigationId: id, sessionName: row.session_name };
     }
 
-    this.db.raw.transaction(() => {
+    // B11 / AC16: done uses the session CAS token frozen on the investigation at dispatch.
+    // Never re-fetch by name for the mutation token (late recapture would adopt a replacement lifecycle).
+    let token;
+    try {
+      token = sessionStatusTokenFromInvestigation(row);
+    } catch {
+      this.db
+        .prepare(
+          `UPDATE housekeeper_investigations
+           SET callback_verdict = ?, callback_evidence = ?, callback_rationale = ?,
+               status = 'apply_rejected', apply_error = ?, applied_at = datetime('now')
+           WHERE id = ?`
+        )
+        .run(verdict, evidence, rationale, HOUSEKEEPER_APPLY_ERROR_SESSION_CAS_STALE, id);
+      const live = this.sessionRegistry.get(row.session_name);
+      return {
+        ok: false,
+        outcome: 'session_cas_stale',
+        investigationId: id,
+        sessionName: row.session_name,
+        owner: live?.owner ?? null,
+        error: 'session CAS token missing or invalid on investigation; not refreshed',
+      };
+    }
+
+    // Same transaction: markIdle CAS then terminal audit. Stale CAS → apply_rejected, no token refresh.
+    // Audit RAISE rolls back idle mark (fail-closed). Stale never leaves applied_done.
+    const applied = this.db.transaction((): boolean => {
+      const cas = this.sessionRegistry.markIdle(token, 'housekeeper-done');
+      if (!cas.applied) {
+        this.db
+          .prepare(
+            `UPDATE housekeeper_investigations
+             SET callback_verdict = ?, callback_evidence = ?, callback_rationale = ?,
+                 status = 'apply_rejected', apply_error = ?, applied_at = datetime('now')
+             WHERE id = ? AND status NOT IN ('applied_done', 'needs_human')`
+          )
+          .run(verdict, evidence, rationale, HOUSEKEEPER_APPLY_ERROR_SESSION_CAS_STALE, id);
+        return false;
+      }
       this.db
         .prepare(
           `UPDATE housekeeper_investigations
@@ -329,10 +352,21 @@ export class HousekeeperService {
            WHERE id = ? AND status NOT IN ('applied_done', 'needs_human')`
         )
         .run(verdict, evidence, rationale, id);
-      // B02 AC6: CAS markIdle with the session row captured at owner recheck (one-shot token).
-      // Full investigation-token persistence is B11 — here we only make the status write CAS-only.
-      this.sessionRegistry.markIdle(sessionStatusTokenFromRow(session), 'housekeeper-done');
+      return true;
     })();
+
+    if (!applied) {
+      // Diagnostic only — never used to rebuild a retry token.
+      const live = this.sessionRegistry.get(row.session_name);
+      return {
+        ok: false,
+        outcome: 'session_cas_stale',
+        investigationId: id,
+        sessionName: row.session_name,
+        owner: live?.owner ?? null,
+        error: 'session CAS stale: original id/name/owner/status/generation no longer matches; token not refreshed',
+      };
+    }
     return { ok: true, outcome: 'applied_done', investigationId: id, sessionName: row.session_name };
   }
 
@@ -394,17 +428,21 @@ export class HousekeeperService {
 
   private insertInvestigation(params: InsertInvestigationParams): number {
     const selected = params.usage.ok ? params.usage : null;
+    // B11 / AC16: freeze full session CAS token at dispatch (never re-resolve by name at apply).
     const info = this.db
       .prepare(
         `INSERT INTO housekeeper_investigations (
-          helm_session_id, session_name, owner, status, trigger_reason, state_signature, observation_json,
+          helm_session_id, session_name, owner, session_status, session_generation,
+          status, trigger_reason, state_signature, observation_json,
           pane_tail, pane_tail_provenance, envelope_json, usage_json,
           selected_provider, selected_model, selected_slug, selected_rung_index, selected_reason
-        ) VALUES (?, ?, 'helm', 'dispatching', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ) VALUES (?, ?, 'helm', ?, ?, 'dispatching', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         params.row.id,
         params.row.name,
+        params.row.status,
+        params.row.generation,
         params.observation.reason,
         params.stateSignature,
         JSON.stringify(params.observation),
@@ -712,6 +750,32 @@ function evidenceCitesStoredEnvelope(evidence: string, envelopeJson: unknown): b
   } catch {
     return false;
   }
+}
+
+/**
+ * B11 / AC16: rebuild SessionStatusToken only from investigation columns frozen at dispatch.
+ * Never SELECT helm_sessions by name here — that would re-adopt a replacement lifecycle.
+ */
+function sessionStatusTokenFromInvestigation(row: {
+  helm_session_id: number | null;
+  session_name: string;
+  owner: string;
+  session_status: string;
+  session_generation: number;
+}) {
+  if (row.helm_session_id == null || !Number.isFinite(row.helm_session_id)) {
+    throw new Error('sessionStatusTokenFromInvestigation: helm_session_id required');
+  }
+  if (typeof row.session_generation !== 'number' || !Number.isFinite(row.session_generation)) {
+    throw new Error('sessionStatusTokenFromInvestigation: session_generation required');
+  }
+  return sessionStatusTokenFromRow({
+    id: row.helm_session_id,
+    name: row.session_name,
+    owner: row.owner,
+    status: row.session_status,
+    generation: row.session_generation,
+  });
 }
 
 function buildHousekeeperEnvelope(params: {

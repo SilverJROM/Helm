@@ -3504,6 +3504,26 @@ CREATE TABLE IF NOT EXISTS lifecycle_seq (
 
         this.db.prepare('UPDATE schema_version SET version = 106').run();
       }
+
+      // v107 / B11 (janitor-audit-remediation, AC16): freeze session CAS token fields on
+      // housekeeper_investigations so apply-done never late-recaptures by name. Additive only.
+      if (current && current.version < 107) {
+        if (hasTable('housekeeper_investigations')) {
+          const cols = this.db.prepare('PRAGMA table_info(housekeeper_investigations)').all() as any[];
+          const hasCol = (name: string) => cols.some((c) => c.name === name);
+          if (!hasCol('session_status')) {
+            this.db.exec(
+              `ALTER TABLE housekeeper_investigations ADD COLUMN session_status TEXT NOT NULL DEFAULT 'active'`
+            );
+          }
+          if (!hasCol('session_generation')) {
+            this.db.exec(
+              `ALTER TABLE housekeeper_investigations ADD COLUMN session_generation INTEGER NOT NULL DEFAULT 0`
+            );
+          }
+        }
+        this.db.prepare('UPDATE schema_version SET version = 107').run();
+      }
     }
   }
 

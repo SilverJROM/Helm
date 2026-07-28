@@ -14,6 +14,7 @@ import { SessionRegistryService } from './services/session-registry-service.js';
 import {
   HousekeeperService,
   HOUSEKEEPER_APPLY_ERROR_EVIDENCE_NOT_IN_ENVELOPE,
+  HOUSEKEEPER_APPLY_ERROR_SESSION_CAS_STALE,
   HOUSEKEEPER_ENVELOPE_MAX_CHARS,
   HOUSEKEEPER_PANE_TAIL_MAX_CHARS,
 } from './services/housekeeper-service.js';
@@ -256,7 +257,7 @@ describe('S18a/S18b housekeeper dispatch/apply', () => {
   afterEach(() => cleanup());
 
   it('fresh DB has v105 investigation/apply table', () => {
-    expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(105); // pin removed (bumps with each phase, e.g. B01 -> 106)
+    expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(107); // pin removed (bumps with each phase; B11 -> 107)
     const cols = db.raw.prepare(`PRAGMA table_info(housekeeper_investigations)`).all().map((c: any) => c.name);
     expect(cols).toContain('session_name');
     expect(cols).toContain('envelope_json');
@@ -267,6 +268,9 @@ describe('S18a/S18b housekeeper dispatch/apply', () => {
     expect(cols).toContain('callback_rationale');
     expect(cols).toContain('applied_at');
     expect(cols).toContain('apply_error');
+    // B11 / AC16: session CAS token frozen at dispatch
+    expect(cols).toContain('session_status');
+    expect(cols).toContain('session_generation');
   });
 
   it('v103→v105 upgrade adds investigation/apply table', () => {
@@ -715,11 +719,14 @@ describe('S18a/S18b housekeeper dispatch/apply', () => {
       rationale: 'must not mark idle',
     });
 
-    expect(rejected).toMatchObject({ ok: false, outcome: 'owner_recheck_failed', owner: 'human' });
+    // B11 / AC16: owner flip fails CAS on persisted token (owner predicate); 0 session rows mutated.
+    expect(rejected).toMatchObject({ ok: false, outcome: 'session_cas_stale', owner: 'human' });
     const inv = svc.getInvestigation(dispatched.investigationId);
     expect(inv.status).toBe('apply_rejected');
+    expect(inv.apply_error).toBe(HOUSEKEEPER_APPLY_ERROR_SESSION_CAS_STALE);
     expect(inv.callback_verdict).toBe('done');
     expect(reg.get('helm-w-owner-flip')!.status).toBe('active');
+    expect(reg.get('helm-w-owner-flip')!.owner).toBe('human');
     expect(tmux.terminateCalls).toEqual([]);
     expect(transport.reapCalls).toEqual([]);
   });
@@ -928,5 +935,164 @@ describe('S18a/S18b housekeeper dispatch/apply', () => {
     expect(housekeeperWiring).not.toContain('orchT');
     expect(noopClass).toContain('spawn(');
     expect(noopClass).not.toContain('terminateSession');
+  });
+
+  // --- B11 / AC16: housekeeper session CAS token persistence ---
+
+  it('B11 AC16: owner flip between investigation and apply affects 0 session rows', async () => {
+    const runId = seedRunFacts({ terminal: true });
+    seedSession('helm-w-b11-owner', { owner: 'helm', status: 'active', runId });
+    const svc = makeService(snap({ spark: { headroom: 42, depleted: false, worst_bucket: 58 } }));
+    const dispatched = await svc.dispatchOnce({ nowMs: Date.now() });
+    expect(dispatched.outcome).toBe('dispatched');
+    if (dispatched.outcome !== 'dispatched') return;
+
+    const invBefore = svc.getInvestigation(dispatched.investigationId);
+    expect(invBefore.session_status).toBe('active');
+    expect(invBefore.owner).toBe('helm');
+    expect(typeof invBefore.session_generation).toBe('number');
+    expect(invBefore.helm_session_id).toBe(reg.get('helm-w-b11-owner')!.id);
+
+    db.prepare(`UPDATE helm_sessions SET owner = 'human' WHERE name = ?`).run('helm-w-b11-owner');
+    const before = reg.get('helm-w-b11-owner')!;
+    expect(before.owner).toBe('human');
+    expect(before.status).toBe('active');
+
+    const rejected = svc.applyCallback(dispatched.investigationId, {
+      verdict: 'done',
+      evidence: CITING_DONE_EVIDENCE,
+      rationale: 'must not mark idle after owner flip',
+    });
+
+    expect(rejected).toMatchObject({ ok: false, outcome: 'session_cas_stale', owner: 'human' });
+    const inv = svc.getInvestigation(dispatched.investigationId);
+    expect(inv.status).toBe('apply_rejected');
+    expect(inv.apply_error).toBe(HOUSEKEEPER_APPLY_ERROR_SESSION_CAS_STALE);
+    const after = reg.get('helm-w-b11-owner')!;
+    expect(after.status).toBe('active');
+    expect(after.owner).toBe('human');
+    expect(after.generation).toBe(before.generation);
+    expect(after.reason).toBeNull();
+    expect(tmux.terminateCalls).toEqual([]);
+    expect(transport.reapCalls).toEqual([]);
+  });
+
+  it('B11 AC16: generation/name lifecycle replacement between investigation and apply affects 0 rows', async () => {
+    const runId = seedRunFacts({ terminal: true });
+    const original = reg.register('helm-w-b11-gen', { owner: 'helm', kind: 'worker', runId })!;
+    tmux.activity.set(original.name, Math.floor((Date.now() - 8 * 60 * 60 * 1000) / 1000));
+    tmux.attached.set(original.name, false);
+    // Age the row so observation selects INVESTIGATE (register() sets last_used_at=now).
+    db.prepare(
+      `UPDATE helm_sessions SET last_used_at = datetime('now', '-8 hours'), created_at = datetime('now', '-8 hours') WHERE name = ?`
+    ).run(original.name);
+
+    const svc = makeService(snap({ spark: { headroom: 42, depleted: false, worst_bucket: 58 } }));
+    const dispatched = await svc.dispatchOnce({ nowMs: Date.now() });
+    expect(dispatched.outcome).toBe('dispatched');
+    if (dispatched.outcome !== 'dispatched') return;
+
+    const inv = svc.getInvestigation(dispatched.investigationId);
+    expect(inv.helm_session_id).toBe(original.id);
+    expect(inv.session_generation).toBe(original.generation);
+    expect(inv.session_status).toBe('active');
+    expect(inv.owner).toBe('helm');
+
+    // Same name, new lifecycle (generation bump); replacement stays helm/active.
+    const replacement = reg.register('helm-w-b11-gen', { owner: 'helm', kind: 'worker', runId })!;
+    expect(replacement.id).toBe(original.id); // upsert keeps row id
+    expect(replacement.generation).toBeGreaterThan(original.generation);
+    expect(replacement.status).toBe('active');
+    expect(replacement.owner).toBe('helm');
+
+    const rejected = svc.applyCallback(dispatched.investigationId, {
+      verdict: 'done',
+      evidence: CITING_DONE_EVIDENCE,
+      rationale: 'must not idle the replacement lifecycle',
+    });
+
+    expect(rejected).toMatchObject({ ok: false, outcome: 'session_cas_stale' });
+    const invAfter = svc.getInvestigation(dispatched.investigationId);
+    expect(invAfter.status).toBe('apply_rejected');
+    expect(invAfter.apply_error).toBe(HOUSEKEEPER_APPLY_ERROR_SESSION_CAS_STALE);
+    // Frozen investigation token unchanged (no refresh).
+    expect(invAfter.session_generation).toBe(original.generation);
+    expect(invAfter.helm_session_id).toBe(original.id);
+
+    const live = reg.get('helm-w-b11-gen')!;
+    expect(live.status).toBe('active');
+    expect(live.owner).toBe('helm');
+    expect(live.generation).toBe(replacement.generation);
+    expect(live.reason).toBeNull();
+    expect(tmux.terminateCalls).toEqual([]);
+    expect(transport.reapCalls).toEqual([]);
+  });
+
+  it('B11 AC16: eligible envelope writes audit and marks idle atomically once', async () => {
+    const runId = seedRunFacts({ terminal: true });
+    const seeded = reg.register('helm-w-b11-happy', { owner: 'helm', kind: 'worker', runId })!;
+    tmux.activity.set(seeded.name, Math.floor((Date.now() - 8 * 60 * 60 * 1000) / 1000));
+    tmux.attached.set(seeded.name, false);
+    db.prepare(
+      `UPDATE helm_sessions SET last_used_at = datetime('now', '-8 hours'), created_at = datetime('now', '-8 hours') WHERE name = ?`
+    ).run(seeded.name);
+
+    const svc = makeService(snap({ spark: { headroom: 42, depleted: false, worst_bucket: 58 } }));
+    const dispatched = await svc.dispatchOnce({ nowMs: Date.now() });
+    expect(dispatched.outcome).toBe('dispatched');
+    if (dispatched.outcome !== 'dispatched') return;
+
+    const invOpen = svc.getInvestigation(dispatched.investigationId);
+    expect(invOpen.session_generation).toBe(seeded.generation);
+    expect(invOpen.session_status).toBe('active');
+    expect(invOpen.helm_session_id).toBe(seeded.id);
+
+    const originalMarkIdle = reg.markIdle.bind(reg);
+    let markIdleCalls = 0;
+    const tokens: Array<{ id: number; generation: number; owner: string; expectedStatus: string }> = [];
+    reg.markIdle = ((token, reason?) => {
+      markIdleCalls += 1;
+      tokens.push({
+        id: token.id,
+        generation: token.generation,
+        owner: token.owner,
+        expectedStatus: token.expectedStatus,
+      });
+      return originalMarkIdle(token, reason);
+    }) as SessionRegistryService['markIdle'];
+
+    const applied = svc.applyCallback(dispatched.investigationId, {
+      verdict: 'done',
+      evidence: CITING_DONE_EVIDENCE,
+      rationale: 'safe to mark idle only',
+    });
+    expect(applied).toMatchObject({ ok: true, outcome: 'applied_done' });
+    expect(markIdleCalls).toBe(1);
+    expect(tokens[0]).toMatchObject({
+      id: seeded.id,
+      generation: seeded.generation,
+      owner: 'helm',
+      expectedStatus: 'active',
+    });
+
+    const inv = svc.getInvestigation(dispatched.investigationId);
+    expect(inv.status).toBe('applied_done');
+    expect(inv.apply_error).toBeNull();
+    expect(inv.callback_verdict).toBe('done');
+    expect(inv.callback_evidence).toContain('STATUS: DONE');
+    expect(reg.get('helm-w-b11-happy')!.status).toBe('idle');
+    expect(reg.get('helm-w-b11-happy')!.reason).toBe('housekeeper-done');
+    expect(reg.get('helm-w-b11-happy')!.generation).toBe(seeded.generation);
+
+    // Terminal replay: no second markIdle, no token refresh.
+    const replay = svc.applyCallback(dispatched.investigationId, {
+      verdict: 'done',
+      evidence: CITING_DONE_EVIDENCE,
+      rationale: 'replay must not re-idle',
+    });
+    expect(replay).toMatchObject({ ok: true, outcome: 'applied_done' });
+    expect(markIdleCalls).toBe(1);
+    expect(tmux.terminateCalls).toEqual([]);
+    expect(transport.reapCalls).toEqual([]);
   });
 });

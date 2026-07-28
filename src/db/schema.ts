@@ -2,7 +2,7 @@ import type Database from "better-sqlite3";
 import { assertAllRoleTiersInvariants } from "./role-tier-invariants.js";
 import { PROVIDERS } from "../config/providers.js";
 
-export const SCHEMA_VERSION = 106;
+export const SCHEMA_VERSION = 107;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -512,11 +512,15 @@ CREATE TABLE IF NOT EXISTS lifecycle_seq (
 INSERT INTO lifecycle_seq (name, next) VALUES ('global', 1) ON CONFLICT(name) DO NOTHING;
 
 -- v104 / S18a + v105 / S18b: durable housekeeper investigation dispatch/apply evidence.
+-- v107 / B11: session CAS token frozen at dispatch (id already via helm_session_id + session_name + owner).
 CREATE TABLE IF NOT EXISTS housekeeper_investigations (
   id INTEGER PRIMARY KEY,
   helm_session_id INTEGER REFERENCES helm_sessions(id) ON DELETE SET NULL,
   session_name TEXT NOT NULL,
   owner TEXT NOT NULL CHECK(owner = 'helm'),
+  -- B11 / AC16: expectedStatus + generation captured at investigation open; apply must not re-fetch by name.
+  session_status TEXT NOT NULL DEFAULT 'active' CHECK(session_status IN ('active','idle','reaped')),
+  session_generation INTEGER NOT NULL DEFAULT 0 CHECK(session_generation >= 0),
   status TEXT NOT NULL CHECK(status IN ('no_dispatch','dispatching','dispatched','applied_done','needs_human','apply_rejected')) DEFAULT 'dispatching',
   trigger_reason TEXT NOT NULL,
   state_signature TEXT,
