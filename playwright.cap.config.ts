@@ -7,7 +7,8 @@ export default defineConfig({
   // alongside the pre-existing batch-cap-projects.spec.ts — previously only the latter matched,
   // so a new live spec silently ran nothing against :3110.
   // Optional trailing letter allows split rows (A6b, A15-style still uses digits only).
-  testMatch: /(batch-cap-projects\.spec|[AB]\d+[a-z]?\.live\.spec)\.ts$/,
+  // S14b: also collect janitor-consent S-series live specs (S14b, S16, S19, …).
+  testMatch: /(batch-cap-projects\.spec|[ABS]\d+[a-z]?\.live\.spec)\.ts$/,
   timeout: 180 * 1000,
   expect: { timeout: 30 * 1000 },
   fullyParallel: false,

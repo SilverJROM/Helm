@@ -81,6 +81,7 @@ function navIconSvg(kind) {
   if (kind === 'setup') return svg(html`<path d="M3 4.5A1.5 1.5 0 0 1 4.5 3H7l1 1.5h3.5A1.5 1.5 0 0 1 13 6v6.5A1.5 1.5 0 0 1 11.5 14h-7A1.5 1.5 0 0 1 3 12.5V4.5z"/><circle cx="8" cy="9" r="1.5"/>`);
   if (kind === 'cmd') return svg(html`<rect x="2.5" y="3" width="11" height="10" rx="1.5"/><path d="M5 6.5h4M5 9h6M5 11.5h3"/>`);
   if (kind === 'tracking') return svg(html`<path d="M2.5 13V8.5M6.5 13V5M10.5 13V9.5M14 13V3"/>`);
+  if (kind === 'sessions') return svg(html`<rect x="2.5" y="3.5" width="11" height="9" rx="1.5"/><path d="M5 7h6M5 9.5h4"/>`);
   return svg(html`<ellipse cx="8" cy="5" rx="5" ry="2"/><path d="M3 5v4c0 1.1 2.2 2 5 2s5-.9 5-2V5"/><path d="M3 9v2c0 1.1 2.2 2 5 2s5-.9 5-2V9"/>`);
 }
 
@@ -108,6 +109,10 @@ const SECTIONS = {
   ]},
   tracking: { title: 'Tracking', tabs: [
     {slug: '12-tracking', key: 'tracking', label: 'Tracking'}
+  ]},
+  // S14b: human manual-close surface for registry sessions (owner + status; Close only for owner=human).
+  sessions: { title: 'Sessions', tabs: [
+    {slug: '13-sessions', key: 'sessions', label: 'Sessions'}
   ]}
 };
 
@@ -1224,6 +1229,13 @@ function App() {
   const [trackingErr, setTrackingErr] = useState('');
   const [trackingLoading, setTrackingLoading] = useState(false);
 
+  // S14b Sessions panel — GET /api/sessions (+owner/status); POST close only for human-owned rows.
+  const [sessionsList, setSessionsList] = useState([]);
+  const [sessionsErr, setSessionsErr] = useState('');
+  const [sessionsMsg, setSessionsMsg] = useState('');
+  const [sessionsLoading, setSessionsLoading] = useState(false);
+  const [sessionsClosingName, setSessionsClosingName] = useState('');
+
   // E2 Memory UI (M2)
   const [memories, setMemories] = useState([]);
   const [memScope, setMemScope] = useState('app');
@@ -1404,6 +1416,56 @@ function App() {
     }
   };
   const refreshTracking = () => loadTracking();
+
+  // S14b: registry sessions list (owner + status). Manual refresh only.
+  const loadSessions = async () => {
+    setSessionsErr('');
+    setSessionsLoading(true);
+    try {
+      const r = await authedFetch('/api/sessions');
+      const d = await r.json();
+      setSessionsList(Array.isArray(d.sessions) ? d.sessions : []);
+    } catch (e) {
+      setSessionsErr('Failed to load sessions (see banner)');
+      setSessionsList([]);
+    } finally {
+      setSessionsLoading(false);
+    }
+  };
+  const refreshSessions = () => loadSessions();
+  // S14b: plain manual close — human-owned only; explicit confirm; honest success/error.
+  const closeRegistrySession = async (s) => {
+    const name = s && s.name ? String(s.name) : '';
+    if (!name) return;
+    if (s.owner !== 'human') return;
+    if (s.status === 'reaped') return;
+    if (sessionsClosingName) return;
+    if (!window.confirm(`Close session ${name}? This terminates the tmux session and cannot be undone.`)) return;
+    setSessionsErr('');
+    setSessionsMsg('');
+    setSessionsClosingName(name);
+    try {
+      const r = await authedFetch(`/api/sessions/${encodeURIComponent(name)}/close`, {
+        method: 'POST',
+        allowStatuses: [400, 403, 404, 409, 500],
+      });
+      let body = null;
+      try { body = await r.json(); } catch { body = null; }
+      if (!r.ok || !body || body.ok !== true) {
+        const reason = body && body.reason ? String(body.reason) : '';
+        const errMsg = body && body.error ? String(body.error) : (body && body.message ? String(body.message) : '');
+        const detail = [errMsg, reason && `reason=${reason}`].filter(Boolean).join(' · ') || `Close failed (HTTP ${r.status})`;
+        setSessionsErr(detail);
+        return;
+      }
+      setSessionsMsg(body.already_reaped ? `Session ${name} was already closed.` : `Closed session ${name}.`);
+      await loadSessions();
+    } catch (e) {
+      setSessionsErr(e && e.message ? String(e.message) : 'Close failed');
+    } finally {
+      setSessionsClosingName('');
+    }
+  };
 
   // E2 Memory loads + refresh (body-aware authedFetch: GETs bodyless, no Content-Type)
   const loadProjectsForMem = async () => {
@@ -4728,6 +4790,11 @@ function App() {
   // O6.2 Tracking load on tab (manual refresh only after that; no auto-poll — read-only, on-demand)
   useEffect(() => {
     if (currentSlug === '12-tracking' && token) loadTracking();
+  }, [currentSlug, token]);
+
+  // S14b Sessions load on tab (manual refresh only; no auto-poll)
+  useEffect(() => {
+    if (currentSlug === '13-sessions' && token) loadSessions();
   }, [currentSlug, token]);
 
   // E2 Memory load on tab (and on scope/project/horizon change)
@@ -9624,6 +9691,49 @@ function App() {
         ${orphanSessions.map(s => html`<div class="list-item" data-testid=${`tracking-orphan-${s.id}`} key=${s.id} style="cursor:default">${s.name} · ${s.status}</div>`)}
       </div>` : null}
     </div>`;
+  } else if (currentSlug === '13-sessions') {
+    // S14b: Sessions panel — owner/status visible; Close only for human-owned non-reaped rows.
+    const ownerLabel = (o) => (o == null || o === '' ? '—' : String(o));
+    const canClose = (s) => s && s.owner === 'human' && s.status !== 'reaped';
+    const ownerChip = (o) => {
+      if (o === 'human') return 'chip-green';
+      if (o === 'helm') return 'chip-blue';
+      return 'chip-gray';
+    };
+    const sessionRows = (sessionsList || []).map((s) => {
+      const name = s.name || '';
+      const rowKey = name || String(s.created_at || Math.random());
+      return html`
+        <div class="list-item" data-testid=${`sessions-row-${name}`} key=${rowKey} style="cursor:default;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          <code style="font-size:11px;min-width:12em">${name}</code>
+          <span class="chip chip-gray" style="font-size:9px">${s.kind || '—'}</span>
+          <span data-testid=${`sessions-owner-${name}`} class=${`chip ${ownerChip(s.owner)}`} style="font-size:9px" title="owner">${ownerLabel(s.owner)}</span>
+          <span data-testid=${`sessions-status-${name}`} class="chip" style="font-size:9px" title="status">${s.status || '—'}</span>
+          ${canClose(s) ? html`<button
+            type="button"
+            class="btn btn-sm"
+            data-testid=${`sessions-close-${name}`}
+            style="margin-left:auto;color:#f85149;border-color:#f85149;font-size:10px;padding:2px 8px"
+            disabled=${sessionsClosingName === name || !!sessionsClosingName}
+            title="Close this human-owned session"
+            onclick=${() => closeRegistrySession(s)}
+          >${sessionsClosingName === name ? 'Closing…' : 'Close'}</button>` : html`<span style="margin-left:auto;font-size:10px;color:var(--text-sec)">${s.owner === 'human' && s.status === 'reaped' ? 'already closed' : 'no manual close'}</span>`}
+        </div>`;
+    });
+    mainContent = html`<div data-testid="sessions-panel">
+      <div class="top-toolbar">
+        <div class="section-note" style="margin-bottom:0;flex:1">Registry sessions with owner and status. Manual close is available only for human-owned sessions (explicit confirmation required).</div>
+        <button data-testid="sessions-refresh-btn" class="btn btn-sm" style="margin-left:12px" onclick=${refreshSessions} disabled=${sessionsLoading}>${sessionsLoading ? 'Refreshing…' : 'Refresh'}</button>
+      </div>
+      ${sessionsErr ? html`<div data-testid="sessions-error" style="color:#f85149;font-size:12px;margin-top:8px">${sessionsErr}</div>` : null}
+      ${sessionsMsg ? html`<div data-testid="sessions-success" style="color:#3fb950;font-size:12px;margin-top:8px">${sessionsMsg}</div>` : null}
+      <div class="card mt-8">
+        <div class="card-header"><div class="card-title">Sessions (${(sessionsList || []).length})</div></div>
+        ${(sessionsList || []).length
+          ? sessionRows
+          : html`<div class="inline-note" data-testid="sessions-empty" style="padding:10px">${sessionsLoading ? 'Loading…' : 'No sessions in registry.'}</div>`}
+      </div>
+    </div>`;
   }
 
   if (isStudio) {
@@ -9871,6 +9981,10 @@ function App() {
             <div class=${`nav-item ${activeSection==='tracking'?'active':''}`} data-testid="nav-tracking" title="Tracking" onclick=${() => onNav('tracking')}>
               <span class="nav-item-icon">${navIconSvg('tracking')}</span>
               <span class="nav-item-label">Tracking</span>
+            </div>
+            <div class=${`nav-item ${activeSection==='sessions'?'active':''}`} data-testid="nav-sessions" title="Sessions" onclick=${() => onNav('sessions')}>
+              <span class="nav-item-icon">${navIconSvg('sessions')}</span>
+              <span class="nav-item-label">Sessions</span>
             </div>
           </div>
           ${agentsColCollapsed && (activeSessions || []).length ? html`
