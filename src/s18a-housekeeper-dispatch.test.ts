@@ -28,16 +28,22 @@ const REAL_PANE_FIXTURE = path.join(REPO_ROOT, 'src/test-fixtures/panes/discover
 const HOUSEKEEPER_SRC = path.join(REPO_ROOT, 'src/services/housekeeper-service.ts');
 const INDEX_SRC = path.join(REPO_ROOT, 'src/index.ts');
 
-/** Plausible prose that does not appear in the real pane fixture or default seed facts. */
+/** Plausible prose that does not appear as terminal-support in non-terminal seeds. */
 const FABRICATED_DONE_EVIDENCE =
   'pane showed completed prompt and no active generation; fabricated clean shutdown observed';
 
 /**
- * Evidence that cites real envelope material: fixture pane phrase + seed task/callback facts.
- * Pane text comes only from src/test-fixtures/panes/ (never hand-authored).
+ * Redteam CRITICAL probe: real task-key atom + fabricated completion while envelope is WORKING.
+ */
+const REDTEAM_FABRICATED_COMPLETION_EVIDENCE =
+  'S18a completed successfully; no active generation observed; all work is done and the seat can be marked idle. This is intentionally fabricated because the persisted envelope only says WORKING and INTERVIEWING.';
+
+/**
+ * Evidence citing terminal-support phrases present in terminal seed facts (status: done / completed).
+ * Identity-only cites (task key alone) are intentionally insufficient under AC14 fix1.
  */
 const CITING_DONE_EVIDENCE =
-  'pane shows Status: INTERVIEWING; task label housekeeper facts; callback STATUS: WORKING for S18a';
+  'callback STATUS: DONE for S18a; task housekeeper facts status: complete';
 
 function tempDbPath(prefix: string): { dbPath: string; cleanupFiles: () => void } {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -89,27 +95,36 @@ describe('S18a/S18b housekeeper dispatch/apply', () => {
     tmux.attached.set(name, false);
   }
 
-  function seedRunFacts(opts: { taskKey?: string; label?: string; batch?: string } = {}): number {
+  function seedRunFacts(
+    opts: { taskKey?: string; label?: string; batch?: string; terminal?: boolean } = {},
+  ): number {
     const taskKey = opts.taskKey ?? 'S18a';
     const label = opts.label ?? 'housekeeper facts';
     const batch = opts.batch ?? 'S18a';
+    const terminal = opts.terminal === true;
+    // run_tasks.status CHECK: pending|working|complete|failed|deferred
+    const taskStatus = terminal ? 'complete' : 'working';
+    const callbackState = terminal ? 'DONE' : 'WORKING';
+    const callbackLine = terminal
+      ? `[helm callback] impl ${taskKey} STATUS: DONE`
+      : `[helm callback] impl ${taskKey} STATUS: WORKING`;
     const run = db.prepare(`INSERT INTO runs (project_id, status, phase) VALUES (NULL, 'active', 'executing')`).run();
     const runId = Number(run.lastInsertRowid);
     const task = db.prepare(
       `INSERT INTO run_tasks (run_id, task_key, label, batch, status, attempts_count)
-       VALUES (?, ?, ?, ?, 'working', 1)`
-    ).run(runId, taskKey, label, batch);
+       VALUES (?, ?, ?, ?, ?, 1)`
+    ).run(runId, taskKey, label, batch, taskStatus);
     const attempt = db.prepare(
-      `INSERT INTO task_attempts (task_id, attempt_num, status) VALUES (?, 1, 'working')`
-    ).run(Number(task.lastInsertRowid));
+      `INSERT INTO task_attempts (task_id, attempt_num, status) VALUES (?, 1, ?)`
+    ).run(Number(task.lastInsertRowid), terminal ? 'complete' : 'working');
     const dispatch = db.prepare(
       `INSERT INTO dispatches (attempt_id, role, brief_path, transport_handle)
        VALUES (?, 'implementer', ?, 'fake-worker')`
     ).run(Number(attempt.lastInsertRowid), `prompts/${taskKey}.md`);
     db.prepare(
       `INSERT INTO callbacks (dispatch_id, role, state, raw_line, source)
-       VALUES (?, 'implementer', 'WORKING', ?, 'file')`
-    ).run(Number(dispatch.lastInsertRowid), `[helm callback] impl ${taskKey} STATUS: WORKING`);
+       VALUES (?, 'implementer', ?, ?, 'file')`
+    ).run(Number(dispatch.lastInsertRowid), callbackState, callbackLine);
     return runId;
   }
 
@@ -364,7 +379,7 @@ describe('S18a/S18b housekeeper dispatch/apply', () => {
   });
 
   it('apply done persists evidence/rationale and only marks helm session idle; zero terminate/reap', async () => {
-    const runId = seedRunFacts();
+    const runId = seedRunFacts({ terminal: true });
     seedSession('helm-w-apply-done', { owner: 'helm', status: 'active', runId });
     const svc = makeService(snap({ spark: { headroom: 42, depleted: false, worst_bucket: 58 } }));
     const dispatched = await svc.dispatchOnce({ nowMs: Date.now() });
@@ -388,7 +403,7 @@ describe('S18a/S18b housekeeper dispatch/apply', () => {
     const inv = svc.getInvestigation(dispatched.investigationId);
     expect(inv.status).toBe('applied_done');
     expect(inv.callback_verdict).toBe('done');
-    expect(inv.callback_evidence).toContain('housekeeper facts');
+    expect(inv.callback_evidence).toContain('STATUS: DONE');
     expect(inv.callback_rationale).toContain('mark idle only');
     expect(reg.get('helm-w-apply-done')!.status).toBe('idle');
     expect(reg.get('helm-w-apply-done')!.reason).toBe('housekeeper-done');
@@ -397,7 +412,7 @@ describe('S18a/S18b housekeeper dispatch/apply', () => {
   });
 
   it('apply done writes audit evidence before markIdle and fail-closes if audit write fails', async () => {
-    const runId = seedRunFacts();
+    const runId = seedRunFacts({ terminal: true });
     seedSession('helm-w-audit-first', { owner: 'helm', status: 'active', runId });
     const svc = makeService(snap({ spark: { headroom: 42, depleted: false, worst_bucket: 58 } }));
     const dispatched = await svc.dispatchOnce({ nowMs: Date.now() });
@@ -453,7 +468,7 @@ describe('S18a/S18b housekeeper dispatch/apply', () => {
   });
 
   it('apply done is terminal/idempotent and rejects conflicting later verdicts without another markIdle', async () => {
-    const runId = seedRunFacts();
+    const runId = seedRunFacts({ terminal: true });
     seedSession('helm-w-idempotent-done', { owner: 'helm', status: 'active', runId });
     const svc = makeService(snap({ spark: { headroom: 42, depleted: false, worst_bucket: 58 } }));
     const dispatched = await svc.dispatchOnce({ nowMs: Date.now() });
@@ -621,7 +636,7 @@ describe('S18a/S18b housekeeper dispatch/apply', () => {
   });
 
   it('apply rejects uncertainty/other verdicts and re-checks owner=helm before markIdle', async () => {
-    const runId = seedRunFacts();
+    const runId = seedRunFacts({ terminal: true });
     seedSession('helm-w-owner-flip', { owner: 'helm', status: 'active', runId });
     const svc = makeService(snap({ spark: { headroom: 42, depleted: false, worst_bucket: 58 } }));
     const dispatched = await svc.dispatchOnce({ nowMs: Date.now() });
@@ -686,8 +701,8 @@ describe('S18a/S18b housekeeper dispatch/apply', () => {
     expect(transport.reapCalls).toEqual([]);
   });
 
-  it('B10b AC14: evidence citing real envelope facts is accepted', async () => {
-    const runId = seedRunFacts();
+  it('B10b AC14: evidence citing real terminal envelope facts is accepted', async () => {
+    const runId = seedRunFacts({ terminal: true });
     seedSession('helm-w-b10b-real-cite', { owner: 'helm', status: 'active', runId });
     const svc = makeService(snap({ spark: { headroom: 42, depleted: false, worst_bucket: 58 } }));
     const dispatched = await svc.dispatchOnce({ nowMs: Date.now() });
@@ -696,13 +711,14 @@ describe('S18a/S18b housekeeper dispatch/apply', () => {
 
     const envelope = JSON.parse(svc.getInvestigation(dispatched.investigationId).envelope_json);
     expect(envelope.pane_tail).toContain('INTERVIEWING');
-    expect(JSON.stringify(envelope.task_facts)).toContain('housekeeper facts');
+    expect(JSON.stringify(envelope.callback_facts)).toMatch(/STATUS: DONE/i);
+    expect(JSON.stringify(envelope.task_facts)).toContain('complete');
     expect(fs.existsSync(REAL_PANE_FIXTURE)).toBe(true);
 
     const applied = svc.applyCallback(dispatched.investigationId, {
       verdict: 'done',
       evidence: CITING_DONE_EVIDENCE,
-      rationale: 'evidence grounded in persisted envelope',
+      rationale: 'evidence grounded in terminal facts of persisted envelope',
     });
 
     expect(applied).toMatchObject({ ok: true, outcome: 'applied_done' });
@@ -715,12 +731,47 @@ describe('S18a/S18b housekeeper dispatch/apply', () => {
     expect(transport.reapCalls).toEqual([]);
   });
 
+  it('B10b AC14 fix1: WORKING envelope rejects fabricated completion that only cites real task key', async () => {
+    // Redteam CRITICAL: any-atom path accepted "S18a completed…" while envelope said WORKING.
+    const runId = seedRunFacts(); // non-terminal: WORKING + working task
+    seedSession('helm-w-b10b-redteam-any-atom', { owner: 'helm', status: 'active', runId });
+    const svc = makeService(snap({ spark: { headroom: 42, depleted: false, worst_bucket: 58 } }));
+    const dispatched = await svc.dispatchOnce({ nowMs: Date.now() });
+    expect(dispatched.outcome).toBe('dispatched');
+    if (dispatched.outcome !== 'dispatched') return;
+
+    const envelope = JSON.parse(svc.getInvestigation(dispatched.investigationId).envelope_json);
+    expect(envelope.pane_tail).toContain('INTERVIEWING');
+    expect(JSON.stringify(envelope.callback_facts)).toMatch(/STATUS: WORKING/i);
+    expect(JSON.stringify(envelope.callback_facts)).not.toMatch(/STATUS: DONE/i);
+    expect(JSON.stringify(envelope.task_facts)).toContain('working');
+    expect(REDTEAM_FABRICATED_COMPLETION_EVIDENCE).toContain('S18a');
+    expect(REDTEAM_FABRICATED_COMPLETION_EVIDENCE.toLowerCase()).toMatch(/completed|done/);
+
+    const rejected = svc.applyCallback(dispatched.investigationId, {
+      verdict: 'done',
+      evidence: REDTEAM_FABRICATED_COMPLETION_EVIDENCE,
+      rationale: 'fabricated completion must not free-ride on real task key',
+    });
+
+    expect(rejected).toMatchObject({ ok: false, outcome: 'invalid_callback_proof' });
+    expect(String((rejected as any).error || '')).toContain(HOUSEKEEPER_APPLY_ERROR_EVIDENCE_NOT_IN_ENVELOPE);
+    const inv = svc.getInvestigation(dispatched.investigationId);
+    expect(inv.status).toBe('apply_rejected');
+    expect(inv.apply_error).toBe(HOUSEKEEPER_APPLY_ERROR_EVIDENCE_NOT_IN_ENVELOPE);
+    expect(inv.callback_evidence).toBe(REDTEAM_FABRICATED_COMPLETION_EVIDENCE);
+    expect(reg.get('helm-w-b10b-redteam-any-atom')!.status).toBe('active');
+    expect(tmux.terminateCalls).toEqual([]);
+    expect(transport.reapCalls).toEqual([]);
+  });
+
   it('B10b AC14: fabricated-but-plausible evidence for envelope holding different facts is rejected', async () => {
-    // Envelope holds alternate task facts; claim cites default S18a / housekeeper facts instead.
+    // Envelope holds alternate terminal facts; claim cites default S18a identity + free-text completion.
     const runId = seedRunFacts({
       taskKey: 'B99-alt',
       label: 'alternate-envelope-task-label',
       batch: 'B99',
+      terminal: true,
     });
     seedSession('helm-w-b10b-wrong-facts', { owner: 'helm', status: 'active', runId });
     const svc = makeService(snap({ spark: { headroom: 42, depleted: false, worst_bucket: 58 } }));
@@ -732,8 +783,9 @@ describe('S18a/S18b housekeeper dispatch/apply', () => {
     expect(JSON.stringify(envelope.task_facts)).toContain('alternate-envelope-task-label');
     expect(JSON.stringify(envelope.task_facts)).not.toContain('housekeeper facts');
     expect(JSON.stringify(envelope.task_facts)).not.toContain('S18a');
+    expect(JSON.stringify(envelope.callback_facts)).toMatch(/STATUS: DONE/i);
 
-    // Fabricated claim sounds done and even quotes a different task universe + generic prose.
+    // Identity from another universe + completion English — does not quote status: done / raw_line.
     const wrongFactsEvidence =
       'task housekeeper facts for S18a finished; pane showed completed prompt and no active generation';
 

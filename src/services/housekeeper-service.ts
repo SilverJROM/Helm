@@ -267,8 +267,8 @@ export class HousekeeperService {
       };
     }
 
-    // B10b / AC14: claimed evidence must cite checkable material from the persisted envelope.
-    // Non-empty prose is not evidence. needs-human is never gated by citation.
+    // B10b / AC14: done requires evidence citing terminal-support facts in the persisted envelope.
+    // Any-atom identity cite (task key alone) is not enough; needs-human is never gated.
     if (verdict === 'done' && !evidenceCitesStoredEnvelope(evidence, row.envelope_json)) {
       this.db
         .prepare(
@@ -283,7 +283,7 @@ export class HousekeeperService {
         outcome: 'invalid_callback_proof',
         investigationId: id,
         sessionName: row.session_name,
-        error: `${HOUSEKEEPER_APPLY_ERROR_EVIDENCE_NOT_IN_ENVELOPE}: claimed evidence cites nothing checkable in stored envelope`,
+        error: `${HOUSEKEEPER_APPLY_ERROR_EVIDENCE_NOT_IN_ENVELOPE}: claimed completion is not supported by terminal facts in stored envelope`,
       };
     }
 
@@ -549,24 +549,17 @@ function isDoneEligibleFromStoredEnvelope(envelopeJson: unknown): boolean {
   }
 }
 
-const EVIDENCE_CITE_PANE_TOKEN_MIN = 8;
 const EVIDENCE_CITE_PANE_WINDOW = 24;
-const EVIDENCE_CITE_FACT_MIN = 4;
 
-/** Lifecycle/boolean tokens present in nearly every envelope — not sufficient as sole citation. */
-const LOW_SIGNAL_CITE_ATOMS = new Set([
-  'active',
+/** Status values that can support a done/completion claim (case-folded). */
+const TERMINAL_SUPPORT_STATUSES = new Set([
+  'done',
+  'complete',
+  'completed',
+  'success',
+  'succeeded',
   'idle',
-  'working',
-  'executing',
-  'true',
-  'false',
-  'null',
-  'file',
-  'ok',
-  'empty',
-  'failed',
-  'worker',
+  'finished',
 ]);
 
 function normalizeCiteText(value: string): string {
@@ -576,57 +569,58 @@ function normalizeCiteText(value: string): string {
     .trim();
 }
 
-/** Collect checkable atoms from the investigation envelope (pane-tail + durable facts). */
-export function collectEnvelopeCiteAtoms(envelope: HousekeeperEnvelope): string[] {
+function isTerminalSupportStatus(raw: string): boolean {
+  return TERMINAL_SUPPORT_STATUSES.has(normalizeCiteText(raw));
+}
+
+/**
+ * Terminal-support atoms only — identity atoms (task key, label) are intentionally excluded.
+ * Prefer distinctive `status: <terminal>` phrases and terminal callback raw lines so bare
+ * English words like "completed" / "done" in fabricated prose cannot free-ride.
+ */
+export function collectTerminalSupportAtoms(envelope: HousekeeperEnvelope): string[] {
   const atoms = new Set<string>();
-  const add = (raw: string, minLen: number) => {
+  const addPhrase = (raw: string, minLen = 8) => {
     const n = normalizeCiteText(raw);
-    if (n.length >= minLen && !LOW_SIGNAL_CITE_ATOMS.has(n)) atoms.add(n);
+    if (n.length >= minLen) atoms.add(n);
+  };
+  const addStatusPhrase = (status: string) => {
+    if (!isTerminalSupportStatus(status)) return;
+    addPhrase(`status: ${normalizeCiteText(status)}`, 8);
   };
 
+  const considerRow = (row: unknown): void => {
+    if (!row || typeof row !== 'object') return;
+    const r = row as Record<string, unknown>;
+    if (typeof r.state === 'string') addStatusPhrase(r.state);
+    if (typeof r.status === 'string') addStatusPhrase(r.status);
+    if (typeof r.raw_line === 'string') {
+      const raw = r.raw_line;
+      const m = String(raw).match(/status:\s*([a-z0-9_-]+)/i);
+      if (m && isTerminalSupportStatus(m[1])) {
+        addStatusPhrase(m[1]);
+        addPhrase(raw, 12);
+      }
+    }
+  };
+
+  for (const row of envelope?.callback_facts ?? []) considerRow(row);
+  for (const row of envelope?.run_facts ?? []) considerRow(row);
+  for (const row of envelope?.task_facts ?? []) considerRow(row);
+  considerRow(envelope?.last_dispatch);
+
+  // Pane: only explicit STATUS: <terminal> tokens already present in the capture.
   const pane = String(envelope?.pane_tail ?? '');
-  for (const tok of pane.toLowerCase().split(/[^a-z0-9_./:@-]+/)) {
-    if (tok.length >= EVIDENCE_CITE_PANE_TOKEN_MIN && !LOW_SIGNAL_CITE_ATOMS.has(tok)) atoms.add(tok);
+  for (const m of pane.matchAll(/status:\s*([a-z0-9_-]+)/gi)) {
+    if (isTerminalSupportStatus(m[1])) addStatusPhrase(m[1]);
   }
-  for (const line of pane.split(/\n/)) {
-    const n = normalizeCiteText(line);
-    if (n.length < EVIDENCE_CITE_PANE_WINDOW) continue;
-    // Distinctive windows from real pane lines (bounded scan).
-    const limit = Math.min(n.length, 240);
-    for (let i = 0; i + EVIDENCE_CITE_PANE_WINDOW <= limit; i += EVIDENCE_CITE_PANE_WINDOW) {
-      const win = n.slice(i, i + EVIDENCE_CITE_PANE_WINDOW);
-      if (!LOW_SIGNAL_CITE_ATOMS.has(win)) atoms.add(win);
-    }
-    // Also keep a head slice for lines that models often quote.
-    const head = n.slice(0, Math.min(n.length, 48));
-    if (!LOW_SIGNAL_CITE_ATOMS.has(head)) atoms.add(head);
-  }
-
-  const walk = (value: unknown): void => {
-    if (value == null) return;
-    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
-      add(String(value), EVIDENCE_CITE_FACT_MIN);
-      return;
-    }
-    if (Array.isArray(value)) {
-      for (const item of value) walk(item);
-      return;
-    }
-    if (typeof value === 'object') {
-      for (const v of Object.values(value as Record<string, unknown>)) walk(v);
-    }
-  };
-  walk(envelope?.callback_facts);
-  walk(envelope?.run_facts);
-  walk(envelope?.task_facts);
-  walk(envelope?.last_dispatch);
 
   return [...atoms];
 }
 
 /**
  * Match a checkable atom inside the claim.
- * Long pane windows may be substrings; short atoms require whole-token/phrase boundaries
+ * Long phrases may be substrings; short atoms require whole-token/phrase boundaries
  * so e.g. envelope token "complete" does not accept claim word "completed".
  */
 function claimIncludesCiteAtom(claim: string, atom: string): boolean {
@@ -640,14 +634,14 @@ function claimIncludesCiteAtom(claim: string, atom: string): boolean {
 }
 
 /**
- * AC14: claimed evidence must reference facts actually present in the envelope
- * (pane-tail content, callback/run/task facts, last dispatch). Non-empty prose alone fails.
+ * AC14: done evidence must cite terminal-support facts from the persisted envelope.
+ * Any-atom identity cite (task key / label alone) is insufficient; empty terminal set fails closed.
  */
 export function evidenceCitesEnvelope(evidence: string, envelope: HousekeeperEnvelope): boolean {
   if (!envelope || typeof envelope !== 'object') return false;
   const claim = normalizeCiteText(evidence);
   if (!claim) return false;
-  const atoms = collectEnvelopeCiteAtoms(envelope);
+  const atoms = collectTerminalSupportAtoms(envelope);
   if (atoms.length === 0) return false;
   return atoms.some((atom) => claimIncludesCiteAtom(claim, atom));
 }
