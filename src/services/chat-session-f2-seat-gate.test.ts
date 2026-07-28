@@ -21,7 +21,7 @@ class SeatStubTmux extends TmuxService {
   onEnter: (() => void) | null = null;
   async capturePane(_t: string, _l = 200): Promise<string> { this.captures += 1; return this.captures <= this.bootUntilCapture ? this.bootFrame : this.readyFrame; }
   async sessionExists(_t: string): Promise<boolean> { return true; }
-  async terminateSession(_n: string): Promise<void> { /* no real tmux */ }
+  async terminateSession(_n: string): Promise<boolean> { return true; /* no real tmux */ }
   async waitForReady(_t: string, _signal = '❯', _timeoutMs = 30000): Promise<boolean> { this.events.push('composer-ready'); return true; }
   async sendLiteralText(_t: string, text: string): Promise<void> { this.events.push('paste'); this.typed.push(text); }
   async sendEnter(_t: string) { if (this.onEnter) this.onEnter(); return { message: 'enter', blocked: false }; }

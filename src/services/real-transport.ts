@@ -459,27 +459,45 @@ export class RealTransport implements ITransport {
     const { sessionName, tmuxTarget, spawnId } = parseLifecycleHandle(handle);
     if (!sessionName) return;
 
-    // Reuse B7 DSP7 clearContext — use tmux target without lifecycle #suffix.
+    // B02 C1 R3: token bound to spawnId on the handle — never the current name-map entry.
+    const rec = spawnId ? this.lifecycles.get(spawnId) : undefined;
+    const createTok = rec?.token;
+
+    if (createTok) {
+      // B02 C1 R4: terminateSession claims CAS first; kills only if applied.
+      // Do NOT clearContext/guard-stop before claim — those are name-bound and would hit B.
+      let killed = false;
+      try {
+        killed = await this.tmux.terminateSession(sessionName, { sessionToken: createTok });
+      } catch {
+        killed = false;
+      }
+      if (spawnId) this.lifecycles.delete(spawnId);
+      if (killed) {
+        try {
+          this.governedDocGuards.get(sessionName)?.stop();
+        } catch {}
+        this.governedDocGuards.delete(sessionName);
+      }
+      return;
+    }
+
+    // No lifecycle token: explicit kill-only path (name-only handle).
     try {
       const providerGuess = /claude/i.test(handle) ? 'claude' : 'grok';
       await this.tmux.clearContext(tmuxTarget, providerGuess);
     } catch {
-      // best-effort (matches tmux-service implementation)
+      /* best-effort */
     }
-
     try {
-      // B02 C1 R3: token bound to spawnId on the handle — never the current name-map entry.
-      const rec = spawnId ? this.lifecycles.get(spawnId) : undefined;
-      const createTok = rec?.token;
-      await this.tmux.terminateSession(
-        sessionName,
-        createTok ? { sessionToken: createTok } : { noRegistryWrite: true }
-      );
+      await this.tmux.terminateSession(sessionName, { noRegistryWrite: true });
     } catch {
-      // idempotent / best-effort reap
+      /* best-effort */
     }
     if (spawnId) this.lifecycles.delete(spawnId);
-    try { this.governedDocGuards.get(sessionName)?.stop(); } catch {}
+    try {
+      this.governedDocGuards.get(sessionName)?.stop();
+    } catch {}
     this.governedDocGuards.delete(sessionName);
   }
 

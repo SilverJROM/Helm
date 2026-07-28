@@ -86,7 +86,7 @@ describe('ST-R1/R2 @helm_child tmux ownership tag', () => {
     const seen: Array<{ name: string; opts?: any }> = [];
     const tmux: any = new TmuxService({
       onCreate: (name: string, opts?: any) => { seen.push({ name, opts }); },
-      onTerminate: () => {},
+      onTerminate: () => false,
       onUse: () => {},
     });
     await tmux.createSession('helm-batch-A2-plancore-x1', '/tmp/proj', { projectId: 7, runId: 88, owner: 'helm' });
@@ -115,7 +115,7 @@ describe('ST-R1/R2 @helm_child tmux ownership tag', () => {
     const seen: any[] = [];
     const tmux: any = new TmuxService({
       onCreate: (name: string, opts?: any) => { seen.push({ name, opts }); },
-      onTerminate: () => {},
+      onTerminate: () => false,
       onUse: () => {},
     });
     await tmux.createSession('helm-w-ok', '/tmp', { owner: 'helm', kind: 'worker' });
@@ -283,7 +283,7 @@ describe('ST-R1/R2 @helm_child tmux ownership tag', () => {
     const uses: string[] = [];
     const tmux: any = new TmuxService({
       onCreate: () => {},
-      onTerminate: () => {},
+      onTerminate: () => false,
       onUse: (n: string) => { uses.push(n); },
     });
     cpMock.impl = async () => ({ stdout: '❯ idle prompt\n', stderr: '' });
@@ -298,7 +298,7 @@ describe('ST-R1/R2 @helm_child tmux ownership tag', () => {
     const uses: string[] = [];
     const tmux: any = new TmuxService({
       onCreate: () => {},
-      onTerminate: () => {},
+      onTerminate: () => false,
       onUse: (n: string) => { uses.push(n); },
     });
     let frame = 'frame-A\n';
@@ -314,7 +314,7 @@ describe('ST-R1/R2 @helm_child tmux ownership tag', () => {
     const uses: string[] = [];
     const tmux: any = new TmuxService({
       onCreate: () => {},
-      onTerminate: () => {},
+      onTerminate: () => false,
       onUse: (n: string) => { uses.push(n); },
     });
     let frame = 'A\n';
@@ -331,7 +331,7 @@ describe('ST-R1/R2 @helm_child tmux ownership tag', () => {
     const uses: string[] = [];
     const tmux: any = new TmuxService({
       onCreate: () => {},
-      onTerminate: () => {},
+      onTerminate: () => false,
       onUse: (n: string) => { uses.push(n); },
     });
     let frame = 'hello world\n';
@@ -348,7 +348,7 @@ describe('ST-R1/R2 @helm_child tmux ownership tag', () => {
     const uses: string[] = [];
     const tmux: any = new TmuxService({
       onCreate: () => {},
-      onTerminate: () => {},
+      onTerminate: () => false,
       onUse: (n: string) => { uses.push(n); },
     });
     // touchSession is what sendAndSubmit/sendCommand/sendEnter/sendKeys call.
@@ -360,7 +360,7 @@ describe('ST-R1/R2 @helm_child tmux ownership tag', () => {
     const uses: string[] = [];
     const tmux: any = new TmuxService({
       onCreate: () => {},
-      onTerminate: () => {},
+      onTerminate: () => false,
       onUse: (n: string) => { uses.push(n); },
     });
     let frame = 'stable\n';
@@ -421,7 +421,8 @@ describe('ST-R1/R2 @helm_child tmux ownership tag', () => {
       },
       // B02 C1: no get(name) fallback — token required for registry mutation.
       onTerminate: (_n: string, token?: any) => {
-        if (token) reg.markReaped(token);
+        if (!token) return false;
+        return reg.markReaped(token).applied === true;
       },
       onUse: (n: string) => reg.touch(n),
     });

@@ -100,10 +100,10 @@ export interface TmuxSessionRegistryHook {
    */
   onCreate(name: string, opts?: TmuxSessionCreateOpts): TmuxSessionStatusToken | void;
   /**
-   * B02 C1: registry mutation only when a decision-boundary token is supplied.
-   * Name-only / missing token ⇒ no registry write (never get(name) fallback).
+   * B02 C1 R4: CAS registry claim for this token. Must return true only when markReaped applied.
+   * terminateSession kills tmux ONLY after a true return — stale false aborts kill (protects B).
    */
-  onTerminate(name: string, token?: TmuxSessionStatusToken): void;
+  onTerminate(name: string, token?: TmuxSessionStatusToken): boolean;
   // SL-R2/R4: fired on ACTIVE INPUT to a session (sendKeys). Refreshes last_used_at so the janitor's
   // TTL means "idle for TTL" not "alive for TTL" — keeps actively-used standalone sessions alive.
   onUse(name: string): void;
@@ -111,7 +111,10 @@ export interface TmuxSessionRegistryHook {
 
 const NOOP_REGISTRY_HOOK: TmuxSessionRegistryHook = {
   onCreate() {},
-  onTerminate() {},
+  // No registry: never claim success (token-bearing terminate will refuse kill without a real CAS).
+  onTerminate() {
+    return false;
+  },
   onUse() {}
 };
 
@@ -634,22 +637,49 @@ export class TmuxService {
     return last?.target || sessionTarget;
   }
 
-  async terminateSession(sessionName: string, opts?: TmuxTerminateOpts): Promise<void> {
+  /**
+   * Destroy a tmux session, optionally gated by a decision-boundary CAS token.
+   *
+   * B02 C1 R4 ordering (CRITICAL):
+   * - With `sessionToken`: registry claim (`onTerminate` / markReaped) runs **first**.
+   *   Only if the claim applies (`true`) is `kill-session` issued. Stale token → **no kill**
+   *   (same-name replacement B must not be physically destroyed by stale A cleanup).
+   * - With `noRegistryWrite` or missing token: kill-only (no registry mutation).
+   *
+   * @returns true if kill-session was performed; false if aborted (stale CAS / refused).
+   */
+  async terminateSession(sessionName: string, opts?: TmuxTerminateOpts): Promise<boolean> {
     this.ensureValidSessionName(sessionName);
-    await execFileAsync("tmux", ["kill-session", "-t", sessionName]);
+    const token = opts?.sessionToken;
+    const killOnly = !!opts?.noRegistryWrite || !token;
+
+    if (!killOnly && token) {
+      // CAS claim before any destructive tmux action.
+      let applied = false;
+      try {
+        applied = this.registryHook.onTerminate(sessionName, token) === true;
+      } catch (err) {
+        console.warn('[tmux] registry onTerminate failed — refusing kill', {
+          sessionName,
+          err: String(err),
+        });
+        return false;
+      }
+      if (!applied) {
+        // Stale lifecycle token: do not kill the name (may now be replacement B).
+        return false;
+      }
+    }
+
+    await this.killSessionRaw(sessionName);
     // S09: drop prior pane snapshot so a recreated same-name session re-baselines (no stale delta).
     this.lastPaneSnapshots.delete(sessionName);
-    // B02 C1: registry mutation ONLY with a decision-boundary sessionToken.
-    // Explicit noRegistryWrite (or missing token) ⇒ kill-only; never get(name) to invent a token.
-    const token = opts?.sessionToken;
-    if (!token || opts?.noRegistryWrite) {
-      return;
-    }
-    try {
-      this.registryHook.onTerminate(sessionName, token);
-    } catch (err) {
-      console.warn('[tmux] registry onTerminate failed', { sessionName, err: String(err) });
-    }
+    return true;
+  }
+
+  /** Overridable for tests — production runs `tmux kill-session -t <name>`. */
+  protected async killSessionRaw(sessionName: string): Promise<void> {
+    await execFileAsync("tmux", ["kill-session", "-t", sessionName]);
   }
 
   async terminatePane(target: string): Promise<void> {

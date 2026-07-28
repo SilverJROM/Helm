@@ -717,7 +717,8 @@ describe('S12 session reconciler (WorkerService.sessionJanitorTick)', () => {
       },
       // B02 C1: no get(name) fallback — token required for registry mutation.
       onTerminate: (_n: string, token?: any) => {
-        if (token) reg.markReaped(token);
+        if (!token) return false;
+        return reg.markReaped(token).applied === true;
       },
       onUse: (n: string) => reg.touch(n),
     });

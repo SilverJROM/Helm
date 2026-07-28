@@ -313,12 +313,14 @@ async function main(): Promise<void> {
         } catch {}
         return undefined;
       },
-      // B02 C1: registry mutation only with decision-boundary token — never get(name) fallback.
-      onTerminate: (_name: string, token?: SessionStatusToken) => {
+      // B02 C1 R4: return true only when markReaped applied — gates kill-session in terminateSession.
+      onTerminate: (_name: string, token?: SessionStatusToken): boolean => {
         try {
-          if (!token) return;
-          sessionRegistry.markReaped(token);
-        } catch {}
+          if (!token) return false;
+          return sessionRegistry.markReaped(token).applied === true;
+        } catch {
+          return false;
+        }
       },
       // SL-R2/R4: active-input refreshes last_used_at so the TTL means "idle for TTL" (in-use sessions kept).
       onUse: (name: string) => { try { sessionRegistry.touch(name); } catch {} }
