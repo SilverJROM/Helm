@@ -54,7 +54,8 @@ describe.sequential('B12 worker timeout activity gate (AC17)', () => {
   }
 
   function makeWorker(sessionActivity: number | null) {
-    const terminateSession = vi.fn(async () => undefined);
+    // Typed mock: session name is the first real arg (vi.fn() alone infers zero-arg [] → TS2493).
+    const terminateSession = vi.fn(async (_name: string, _opts?: unknown) => undefined);
     const sendAndSubmit = vi.fn(async () => true);
     const sendKeys = vi.fn(async () => ({ message: 'ok', blocked: false }));
     const fakeTmux = {
