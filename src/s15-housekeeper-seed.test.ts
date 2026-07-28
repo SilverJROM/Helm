@@ -63,7 +63,7 @@ describe('S15 housekeeper seed (AC28/AC31)', () => {
     expect((dbs.raw.prepare('SELECT version FROM schema_version').get() as any).version).toBe(
       SCHEMA_VERSION
     );
-    expect(SCHEMA_VERSION).toBe(103);
+    expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(103);
     expect(B09A_HOUSE_NAMES).toContain('housekeeper');
     expect(B09A_CANONICAL_NAMES).toContain('housekeeper');
     expect(B09A_CANONICAL_NAMES).toHaveLength(11);
@@ -186,7 +186,7 @@ describe('S15 housekeeper seed (AC28/AC31)', () => {
 
     const second = new DatabaseService(t.dbPath);
     const ver = (second.raw.prepare('SELECT version FROM schema_version').get() as any).version;
-    expect(ver).toBe(103);
+    expect(ver).toBe(SCHEMA_VERSION);
     const rows = second.raw.prepare("SELECT * FROM agents WHERE name = 'housekeeper'").all() as any[];
     expect(rows).toHaveLength(1);
     expect(rows[0].agent_type).toBe('house');

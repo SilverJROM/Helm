@@ -236,6 +236,13 @@ WHERE name = ?
     ).all() as HelmSessionRow[];
   }
 
+  /** S18a: investigation candidates are Helm-owned and still active at the SQL boundary. */
+  listHelmOwnedActiveCandidates(): HelmSessionRow[] {
+    return this.db.prepare(
+      `SELECT * FROM helm_sessions WHERE owner = 'helm' AND status = 'active' ORDER BY id DESC`
+    ).all() as HelmSessionRow[];
+  }
+
   get(name: string): HelmSessionRow | undefined {
     return this.db.prepare(`SELECT * FROM helm_sessions WHERE name = ?`).get(name) as HelmSessionRow | undefined;
   }

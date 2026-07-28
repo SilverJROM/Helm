@@ -3345,6 +3345,37 @@ ALTER TABLE runs_new RENAME TO runs;
         applyHousekeeperSeed(this.db);
         this.db.prepare('UPDATE schema_version SET version = 103').run();
       }
+
+      // v104 / S18a: housekeeper investigation dispatch evidence.
+      // Investigation-only; no status repair, markIdle, markReaped, or reap in this migration.
+      if (current && current.version < 104) {
+        this.db.exec(`
+CREATE TABLE IF NOT EXISTS housekeeper_investigations (
+  id INTEGER PRIMARY KEY,
+  helm_session_id INTEGER REFERENCES helm_sessions(id) ON DELETE SET NULL,
+  session_name TEXT NOT NULL,
+  owner TEXT NOT NULL CHECK(owner = 'helm'),
+  status TEXT NOT NULL CHECK(status IN ('no_dispatch','dispatching','dispatched')) DEFAULT 'dispatching',
+  trigger_reason TEXT NOT NULL,
+  observation_json TEXT NOT NULL,
+  pane_tail TEXT NOT NULL,
+  pane_tail_provenance TEXT NOT NULL,
+  envelope_json TEXT NOT NULL,
+  usage_json TEXT NOT NULL,
+  selected_provider TEXT,
+  selected_model TEXT,
+  selected_slug TEXT,
+  selected_rung_index INTEGER,
+  selected_reason TEXT,
+  dispatch_handle TEXT,
+  dispatched_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_housekeeper_investigations_session ON housekeeper_investigations(session_name, created_at);
+CREATE INDEX IF NOT EXISTS idx_housekeeper_investigations_status ON housekeeper_investigations(status);
+`);
+        this.db.prepare('UPDATE schema_version SET version = 104').run();
+      }
     }
   }
 

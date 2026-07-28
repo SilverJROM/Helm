@@ -40,6 +40,9 @@ import { HelmIdentityService, requireActiveNativeProject } from "./services/helm
 import { SessionRegistryService } from "./services/session-registry-service.js";
 import { SessionCloseService } from "./services/session-close-service.js";
 import { registerSessionCloseRoutes } from "./api/routes/session-close-routes.js";
+import { HousekeeperService } from "./services/housekeeper-service.js";
+import { HouseUsageSelector } from "./services/house-usage-selector.js";
+import { registerHousekeeperRoutes } from "./api/routes/housekeeper-routes.js";
 import { configureWorkerRuntimeFinalize } from "./services/worker-runtime-finalize.js";
 import { UsageGatewayService } from "./services/usage-gateway-service.js";
 import { ModelService } from "./services/model-service.js";
@@ -127,6 +130,8 @@ class FakeTmuxService {
   async forceKillPane(_target: string) { }
   // S14a V4: human-close tag gate under USE_FAKE_TMUX=1 — treat fake sessions as Helm-created.
   async sessionHasHelmChildTag(_name: string) { return true; }
+  async sessionActivity(_name: string) { return null; }
+  async sessionAttached(_name: string) { return null; }
   async capturePane(target: string, _lines = 200) { return this.panes.get(target) ?? this.basePane(); }
   async waitForReady(_target: string, _signal = '❯', _timeoutMs = 30000) { return true; }
 
@@ -402,6 +407,13 @@ async function main(): Promise<void> {
   const orchT: ITransport = useFakeTmux
     ? new FakeTransport()
     : new RealTransport({ artifacts: runArtifactService, tmux: tmuxService });
+  const housekeeperService = new HousekeeperService(
+    db,
+    sessionRegistry,
+    tmuxService as any,
+    new HouseUsageSelector({ gateway: usageGateway }),
+    orchT,
+  );
   const planningPhase = new PlanningPhaseService(orchT, runArtifactService, taskQueue);
   const escalationService = new EscalationService(db, usageGateway, assignmentService);  // B9fix2 F4: project escalation ladder via resolver
   const panelService = new PanelService(orchT, runArtifactService);
@@ -1071,6 +1083,12 @@ async function main(): Promise<void> {
   registerSessionCloseRoutes(app, {
     sessionRegistry,
     sessionCloseService,
+    authMiddleware,
+    requireOwnerPre,
+    requireLocalLaunchPre,
+  });
+  registerHousekeeperRoutes(app, {
+    housekeeperService,
     authMiddleware,
     requireOwnerPre,
     requireLocalLaunchPre,

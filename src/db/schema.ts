@@ -2,7 +2,7 @@ import type Database from "better-sqlite3";
 import { assertAllRoleTiersInvariants } from "./role-tier-invariants.js";
 import { PROVIDERS } from "../config/providers.js";
 
-export const SCHEMA_VERSION = 103;
+export const SCHEMA_VERSION = 104;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -496,6 +496,32 @@ CREATE TABLE IF NOT EXISTS helm_sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_helm_sessions_status ON helm_sessions(status);
 CREATE INDEX IF NOT EXISTS idx_helm_sessions_run ON helm_sessions(run_id);
+
+-- v104 / S18a: durable housekeeper investigation dispatch evidence.
+-- Investigation-only in this slice: callbacks/apply/cooldown land in S18b.
+CREATE TABLE IF NOT EXISTS housekeeper_investigations (
+  id INTEGER PRIMARY KEY,
+  helm_session_id INTEGER REFERENCES helm_sessions(id) ON DELETE SET NULL,
+  session_name TEXT NOT NULL,
+  owner TEXT NOT NULL CHECK(owner = 'helm'),
+  status TEXT NOT NULL CHECK(status IN ('no_dispatch','dispatching','dispatched')) DEFAULT 'dispatching',
+  trigger_reason TEXT NOT NULL,
+  observation_json TEXT NOT NULL,
+  pane_tail TEXT NOT NULL,
+  pane_tail_provenance TEXT NOT NULL,
+  envelope_json TEXT NOT NULL,
+  usage_json TEXT NOT NULL,
+  selected_provider TEXT,
+  selected_model TEXT,
+  selected_slug TEXT,
+  selected_rung_index INTEGER,
+  selected_reason TEXT,
+  dispatch_handle TEXT,
+  dispatched_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_housekeeper_investigations_session ON housekeeper_investigations(session_name, created_at);
+CREATE INDEX IF NOT EXISTS idx_housekeeper_investigations_status ON housekeeper_investigations(status);
 
 -- B3a v11 (consensus §5): 3 additive tables for watcher-of-watchers substrate (plumbing only; no worker watcher table in v1).
 -- plumbing_configs: per-project/role (for coord/plancore/ibrain) with bounded self + JROM override.
