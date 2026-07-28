@@ -3,7 +3,9 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import fsSync from 'node:fs';
+import { createHash } from 'node:crypto';
 import { DatabaseService } from '../db/database.js';
+import { RunIngestService, RUN_REGISTER_ENVELOPE, computeRunRegisterPayloadHash } from './run-ingest-service.js';
 import { RunArtifactService } from './run-artifact-service.js';
 import { PlanParserService } from './plan-parser-service.js';
 import { PlanningPhaseService } from './planning-phase-service.js';
@@ -731,6 +733,82 @@ describe('RunOrchestratorService (A2 wiring)', () => {
         .prepare(`UPDATE runs SET phase='failed' WHERE id=? AND generation=? AND phase NOT IN ('complete','failed','blocked')`)
         .run(runId, run.generation ?? 0) as { changes?: number };
       expect(Number(rerun?.changes || 0)).toBe(0);
+
+      startRunSpy.mockRestore();
+    });
+
+    // B04 fix cycle 1 (redteam-sol C1) / B01 residual: runs.generation is shared by the native
+    // lifecycle allocator and the caller-supplied ingest identity component. Before the fix, an
+    // ingest caller could (deliberately or by chance) supply the exact generation a deleted native
+    // run once held on the same recycled numeric id, making AC8's id+generation CAS match the wrong
+    // occupant. Production-path trace: native A (R,G) detached-pending -> A deleted (no live worker,
+    // FK-safe) -> ingest B registers reusing numeric id R and supplying G as its own generation -> B
+    // spawns a live worker -> A's stale detached catch fires. B must be completely untouched.
+    it('B01 residual C1: ingest registration reusing a deleted native run\'s exact generation on a recycled id cannot be matched by the stale native detached CAS', async () => {
+      const proj = projectSvc.createProject({ name: 'b04-ingest-collision', directory: '/tmp/b04-ingest-collision' });
+      const pid = proj.id;
+
+      let rejectStart!: (e: unknown) => void;
+      const controlled = new Promise<number>((_resolve, reject) => { rejectStart = reject; });
+      const startRunSpy = vi.spyOn(orch, 'startRun').mockReturnValue(controlled);
+
+      // Native lifecycle A: runId=R, generation=G. Kept childless (no worker) so its row can be
+      // deleted cleanly under the worker_runtimes FK.
+      const { runId: nativeRunId } = orch.startRunDetached({ projectId: pid, prompt: 'native A', batchId: 'b04ingestA' });
+      const staleGeneration = (db.raw.prepare('SELECT generation FROM runs WHERE id = ?').get(nativeRunId) as any).generation;
+
+      db.raw.prepare('DELETE FROM runs WHERE id = ?').run(nativeRunId);
+      expect((db.raw.prepare('SELECT COUNT(*) AS n FROM runs').get() as any).n).toBe(0);
+
+      // Ingest lifecycle B registers under a DIFFERENT external identity, deliberately supplying A's
+      // now-freed generation as its own caller-supplied generation — the exact redteam C1 vector.
+      const ingest = new RunIngestService(db);
+      const hashes = {
+        ready: createHash('sha256').update('ready').digest('hex'),
+        plan: createHash('sha256').update('plan').digest('hex'),
+        queue: createHash('sha256').update('queue').digest('hex'),
+        topology: createHash('sha256').update('topology').digest('hex'),
+      };
+      const fields = {
+        event_id: 'b04-ingest-collision-event',
+        external_run_id: 'ext-b04-collision',
+        generation: staleGeneration,
+        hashes,
+      };
+      const payload_hash = computeRunRegisterPayloadHash(pid, fields);
+      const registered = ingest.register(pid, { envelope: RUN_REGISTER_ENVELOPE, ...fields, payload_hash });
+      expect(registered.httpStatus).toBe(201);
+      const ingestRunId = registered.body.run_id;
+      expect(ingestRunId).toBe(nativeRunId); // recycled the exact same numeric id
+
+      // The fix: B's actual written/echoed generation must NOT equal A's stale generation.
+      expect(registered.body.generation).not.toBe(staleGeneration);
+      const bRowBefore = db.raw.prepare('SELECT generation, status, phase FROM runs WHERE id = ?').get(ingestRunId) as any;
+      expect(bRowBefore.generation).toBe(registered.body.generation);
+      expect(bRowBefore.generation).not.toBe(staleGeneration);
+
+      // B starts a live worker.
+      const workerInfo = db.raw
+        .prepare(
+          `INSERT INTO worker_runtimes (project_id, role, provider, model, session, correlation_id, state, spawned_by, run_id, started_at)
+           VALUES (?,?,?,?,?,?,'running','b04-test',?, datetime('now'))`
+        )
+        .run(pid, 'implementer', 'grok', 'grok-4.5', 'helm-b04-ingest-b-worker', 'b04-corr-ingest', ingestRunId);
+      const bWorkerId = Number(workerInfo.lastInsertRowid);
+
+      // A's stale detached promise finally rejects.
+      rejectStart(new Error('synthetic stale native detached failure'));
+      await controlled.catch(() => {});
+      await new Promise((r) => setTimeout(r, 100));
+
+      const bAfter = db.raw.prepare('SELECT phase, status, generation FROM runs WHERE id = ?').get(ingestRunId) as any;
+      expect(bAfter.phase).not.toBe('failed');
+      expect(bAfter.status).not.toBe('failed');
+      expect(bAfter.generation).toBe(bRowBefore.generation);
+
+      const bWorkerAfter = db.raw.prepare('SELECT state, ended_at FROM worker_runtimes WHERE id = ?').get(bWorkerId) as any;
+      expect(bWorkerAfter.state).toBe('running');
+      expect(bWorkerAfter.ended_at).toBeNull();
 
       startRunSpy.mockRestore();
     });
