@@ -1,4 +1,5 @@
 import type { DatabaseService } from '../db/database.js';
+import { allocateLifecycleGeneration } from './lifecycle-cas.js';
 
 // SL-R1/R2 (session-lifecycle): registry of EVERY tmux session Helm creates.
 // Wired into the single TmuxService.createSession/terminateSession choke point (see src/index.ts),
@@ -20,6 +21,8 @@ export interface HelmSessionRow {
   /** S07 backfills pre-existing nulls; new registers must pass owner (S05 refuses create without it). */
   owner: SessionOwner | null;
   status: HelmSessionStatus;
+  /** B01 / D01 / AC4: lifecycle nonce, allocated fresh on every insert and every upsert-conflict. */
+  generation: number;
   created_at: string;
   last_used_at: string | null;
   ended_at: string | null;
@@ -132,9 +135,17 @@ export function deriveSessionOwner(name: string, kind?: string | null): SessionO
 export class SessionRegistryService {
   constructor(private readonly db: DatabaseService) {}
 
-  /** SL-R1: upsert an active row for a session on create (last-wins on name). */
-  register(name: string, opts: RegisterOpts): void {
-    if (!name) return;
+  /**
+   * SL-R1: upsert an active row for a session on create (last-wins on name).
+   * B01 / D01 / AC4: allocates a fresh lifecycle generation from the shared non-cascading
+   * `lifecycle_seq` counter on BOTH the insert branch and the upsert-conflict branch, so a
+   * re-registration of the same name is always distinguishable from the row it replaces. Returns
+   * the captured row identity — callers that need a CAS token for a later mutation must read it
+   * from this return value, never re-fetch it, since a re-fetch after this call could already be
+   * observing a subsequent register().
+   */
+  register(name: string, opts: RegisterOpts): HelmSessionRow | undefined {
+    if (!name) return undefined;
     // S05: defensive refuse — direct callers without owner throw. Create-path refusal is pre-spawn
     // in TmuxService.createSession (onCreate after new-session is try/caught and too late — F2).
     assertRegisterOwner(opts?.owner);
@@ -142,22 +153,28 @@ export class SessionRegistryService {
     const projectId = opts.projectId ?? null;
     const runId = opts.runId ?? null;
     const owner = opts.owner;
-    // Upsert: a re-created session name resets to active + refreshes context/created_at.
-    // S04: owner uses COALESCE so recreated names never silently drop decision authority.
-    this.db.prepare(`
-INSERT INTO helm_sessions (name, kind, project_id, run_id, owner, status, created_at, last_used_at, ended_at, reason)
-VALUES (?, ?, ?, ?, ?, 'active', datetime('now'), datetime('now'), NULL, NULL)
+    const registerTxn = this.db.transaction((): HelmSessionRow => {
+      const generation = allocateLifecycleGeneration(this.db);
+      // Upsert: a re-created session name resets to active + refreshes context/created_at.
+      // S04: owner uses COALESCE so recreated names never silently drop decision authority.
+      return this.db.prepare(`
+INSERT INTO helm_sessions (name, kind, project_id, run_id, owner, status, generation, created_at, last_used_at, ended_at, reason)
+VALUES (?, ?, ?, ?, ?, 'active', ?, datetime('now'), datetime('now'), NULL, NULL)
 ON CONFLICT(name) DO UPDATE SET
   kind = COALESCE(excluded.kind, helm_sessions.kind),
   project_id = COALESCE(excluded.project_id, helm_sessions.project_id),
   run_id = COALESCE(excluded.run_id, helm_sessions.run_id),
   owner = COALESCE(excluded.owner, helm_sessions.owner),
   status = 'active',
+  generation = excluded.generation,
   created_at = datetime('now'),
   last_used_at = datetime('now'),
   ended_at = NULL,
   reason = NULL
-`).run(name, kind, projectId, runId, owner);
+RETURNING *
+`).get(name, kind, projectId, runId, owner, generation) as HelmSessionRow;
+    });
+    return registerTxn();
   }
 
   /**

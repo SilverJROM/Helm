@@ -4,6 +4,7 @@ import path from "node:path";
 import fs from "node:fs";
 import { SCHEMA_VERSION, SCHEMA_SQL, V89_IBRAIN_DEFINITION_MD, V89_KNOWN_CANONICAL_PLANCORE_HASHES, V89_PLANCORE_DEFINITION_MD, applyFreshDbExtras, applyB04CanonicalModelSeeds, applyB12bRoleTierSeeds, applyB17TeamTierSeeds, applyB1TeamsSeeds, applyB3AgentRoleCapabilitySeeds, applyB2HelmAgentSeeds, applyB09aCanonicalRosterSeeds, applyB09bPruneNonCanonicalAgents, applyB25OrphanModelHygiene, applyB25dDeleteUnknownProviderMasterRuntimes, applyB6AgentMemorySeeds, applyB11PanelistRetirement, applyHousekeeperSeed, seedRoutingRules } from "./schema.js";
 import { deriveSessionOwner } from "../services/session-registry-service.js";
+import { allocateLifecycleGeneration } from "../services/lifecycle-cas.js";
 
 // Schema-data constants live in ./schema.ts. Migration logic stub here
 // ready for P1-2 to extend (per brief: seed schema_version to 1 only).
@@ -3446,6 +3447,63 @@ CREATE INDEX IF NOT EXISTS idx_housekeeper_investigations_signature
         }
         this.db.prepare('UPDATE schema_version SET version = 105').run();
       }
+
+      // v106 / B01 (janitor-audit-remediation, D01): shared lifecycle_seq allocator +
+      // helm_sessions.generation. Additive only; no kill path touched. Seeds the sequence above
+      // every existing generation (native + ingest), backfills native runs only (external_run_id
+      // IS NULL — never rewrites an ingest row's (project_id, external_run_id, generation) UNIQUE
+      // identity), and backfills existing helm_sessions rows to DISTINCT generations (never a
+      // constant — an all-0 backfill would make a stale snapshot and a freshly re-registered row
+      // indistinguishable for one cycle, precisely F-02).
+      if (current && current.version < 106) {
+        this.db.exec(`
+CREATE TABLE IF NOT EXISTS lifecycle_seq (
+  name TEXT PRIMARY KEY,
+  next INTEGER NOT NULL
+);
+`);
+        this.db.prepare(
+          `INSERT INTO lifecycle_seq (name, next) VALUES ('global', 1) ON CONFLICT(name) DO NOTHING`
+        ).run();
+
+        if (hasTable('helm_sessions')) {
+          const sessionCols = this.db.prepare('PRAGMA table_info(helm_sessions)').all() as any[];
+          if (!sessionCols.some((c) => c.name === 'generation')) {
+            this.db.exec(
+              `ALTER TABLE helm_sessions ADD COLUMN generation INTEGER NOT NULL DEFAULT 0 CHECK(generation >= 0)`
+            );
+          }
+        }
+
+        if (hasTable('runs')) {
+          // Seed strictly above every existing runs.generation — ingest rows may already carry a
+          // nonzero value; native rows are all 0 pre-backfill per D01 Fact 1.
+          const maxGenRow = this.db.prepare(`SELECT COALESCE(MAX(generation), 0) AS maxGen FROM runs`).get() as { maxGen: number };
+          const seedNext = Math.max(1, maxGenRow.maxGen + 1);
+          this.db.prepare(`UPDATE lifecycle_seq SET next = MAX(next, ?) WHERE name = 'global'`).run(seedNext);
+
+          // Backfill native rows ONLY — idx_runs_project_external_generation is UNIQUE on
+          // (project_id, external_run_id, generation), an ingest row's durable identity that must
+          // never be rewritten (D01 Migration constraint 2).
+          const nativeRunIds = this.db.prepare(`SELECT id FROM runs WHERE external_run_id IS NULL`).all() as { id: number }[];
+          const setRunGeneration = this.db.prepare(`UPDATE runs SET generation = ? WHERE id = ?`);
+          for (const { id } of nativeRunIds) {
+            setRunGeneration.run(allocateLifecycleGeneration(this.db), id);
+          }
+        }
+
+        if (hasTable('helm_sessions')) {
+          // Backfill every existing row to a DISTINCT generation (D01 Migration constraint 3) —
+          // never a constant; an all-0 backfill is exactly the F-02 race this batch closes.
+          const sessionIds = this.db.prepare(`SELECT id FROM helm_sessions`).all() as { id: number }[];
+          const setSessionGeneration = this.db.prepare(`UPDATE helm_sessions SET generation = ? WHERE id = ?`);
+          for (const { id } of sessionIds) {
+            setSessionGeneration.run(allocateLifecycleGeneration(this.db), id);
+          }
+        }
+
+        this.db.prepare('UPDATE schema_version SET version = 106').run();
+      }
     }
   }
 
@@ -3455,6 +3513,11 @@ CREATE INDEX IF NOT EXISTS idx_housekeeper_investigations_signature
 
   prepare(sql: string): Database.Statement {
     return this.db.prepare(sql);
+  }
+
+  /** B01: thin delegation so callers get a transaction-wrapped fn without reaching for `.raw`. */
+  transaction<F extends (...args: any[]) => unknown>(fn: F): Database.Transaction<F> {
+    return this.db.transaction(fn);
   }
 
   exec(sql: string): void {

@@ -2,7 +2,7 @@ import type Database from "better-sqlite3";
 import { assertAllRoleTiersInvariants } from "./role-tier-invariants.js";
 import { PROVIDERS } from "../config/providers.js";
 
-export const SCHEMA_VERSION = 105;
+export const SCHEMA_VERSION = 106;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -489,6 +489,10 @@ CREATE TABLE IF NOT EXISTS helm_sessions (
   -- S04 / AC1: binary decision authority (+ closed legacy sentinel). S07 backfills nulls via name/kind.
   owner TEXT CHECK(owner IS NULL OR owner IN ('helm','human','legacy:unknown')),
   status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','idle','reaped')),
+  -- B01 / D01 / AC4: lifecycle nonce allocated from lifecycle_seq on every insert and every
+  -- upsert-conflict branch of register(). Discriminates a freshly re-registered row from a stale
+  -- snapshot of the same name, which the row id alone cannot (the upsert retains row id).
+  generation INTEGER NOT NULL DEFAULT 0 CHECK(generation >= 0),
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   last_used_at TEXT,
   ended_at TEXT,
@@ -496,6 +500,16 @@ CREATE TABLE IF NOT EXISTS helm_sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_helm_sessions_status ON helm_sessions(status);
 CREATE INDEX IF NOT EXISTS idx_helm_sessions_run ON helm_sessions(run_id);
+
+-- B01 / D01: one durable, monotonic, never-reset sequence shared by runs.generation and
+-- helm_sessions.generation. A cascading DELETE of either table never touches this row, so a
+-- recycled runs.id or a re-registered helm_sessions.name can never be handed a generation that
+-- collides with the lifecycle it replaced.
+CREATE TABLE IF NOT EXISTS lifecycle_seq (
+  name TEXT PRIMARY KEY,
+  next INTEGER NOT NULL
+);
+INSERT INTO lifecycle_seq (name, next) VALUES ('global', 1) ON CONFLICT(name) DO NOTHING;
 
 -- v104 / S18a + v105 / S18b: durable housekeeper investigation dispatch/apply evidence.
 CREATE TABLE IF NOT EXISTS housekeeper_investigations (

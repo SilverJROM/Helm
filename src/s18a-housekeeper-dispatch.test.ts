@@ -163,7 +163,7 @@ describe('S18a/S18b housekeeper dispatch/apply', () => {
   afterEach(() => cleanup());
 
   it('fresh DB has v105 investigation/apply table', () => {
-    expect(SCHEMA_VERSION).toBe(105);
+    expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(105); // pin removed (bumps with each phase, e.g. B01 -> 106)
     const cols = db.raw.prepare(`PRAGMA table_info(housekeeper_investigations)`).all().map((c: any) => c.name);
     expect(cols).toContain('session_name');
     expect(cols).toContain('envelope_json');
@@ -200,7 +200,7 @@ describe('S18a/S18b housekeeper dispatch/apply', () => {
       `);
       raw.close();
       const migrated = new DatabaseService(t.dbPath);
-      expect((migrated.raw.prepare(`SELECT version FROM schema_version`).get() as any).version).toBe(105);
+      expect((migrated.raw.prepare(`SELECT version FROM schema_version`).get() as any).version).toBe(SCHEMA_VERSION);
       expect(
         migrated.raw.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='housekeeper_investigations'`).get()
       ).toBeTruthy();

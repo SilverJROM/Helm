@@ -7,6 +7,7 @@ import { DatabaseService } from '../db/database.js';
 import { SCHEMA_VERSION } from '../db/schema.js';
 import { SessionRegistryService, deriveSessionKind, deriveSessionOwner } from './session-registry-service.js';
 import { WorkerService } from './worker-service.js';
+import { loadConfig } from '../config/config.js';
 
 function makeTempDb(): { db: DatabaseService; cleanup: () => void } {
   const dbPath = path.join(os.tmpdir(), `helm-slr-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
@@ -842,5 +843,162 @@ describe('S12 session reconciler (WorkerService.sessionJanitorTick)', () => {
     expect(tickBody).not.toMatch(/HELM_SESSION_TTL_MS/);
     expect(tickBody).not.toMatch(/pastTtl|ttlSecs|ttlMs/);
     expect(tickBody).toMatch(/decideSessionReconcile/);
+  });
+});
+
+// B01 (janitor-audit-remediation, D01): shared lifecycle_seq allocator + helm_sessions.generation.
+// Synthetic/copied fixtures only; HELM_SESSION_JANITOR stays 0; never touch live data/helm.db.
+function tempDbPathOnly(prefix: string): { dbPath: string; cleanup: () => void } {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  const dbPath = path.join(dir, `helm-test-${process.pid}.db`);
+  return {
+    dbPath,
+    cleanup: () => {
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+    },
+  };
+}
+
+describe('B01 lifecycle generation allocator (D01 / AC4)', () => {
+  it('fresh DB: lifecycle_seq seeded at 1 (untouched by boot seeds); SCHEMA_VERSION >=106', () => {
+    const t = tempDbPathOnly('helm-b01-fresh-');
+    try {
+      const dbs = new DatabaseService(t.dbPath);
+      expect((dbs.raw.prepare('SELECT version FROM schema_version').get() as any).version).toBe(SCHEMA_VERSION);
+      expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(106);
+      const seq = dbs.raw.prepare(`SELECT * FROM lifecycle_seq WHERE name = 'global'`).get() as any;
+      expect(seq).toBeTruthy();
+      expect(seq.next).toBe(1); // no register()/native run has allocated yet on a fresh DB
+      dbs.close();
+    } finally {
+      t.cleanup();
+    }
+  });
+
+  it('upgrade DB (v105->106): native runs backfilled to distinct gens, ingest identity untouched, sessions backfilled distinct, sequence seeded above both', () => {
+    const t = tempDbPathOnly('helm-b01-upgrade-');
+    try {
+      const old = new Database(t.dbPath);
+      old.exec(`
+CREATE TABLE schema_version (version INTEGER PRIMARY KEY);
+INSERT INTO schema_version (version) VALUES (105);
+CREATE TABLE runs (
+  id INTEGER PRIMARY KEY,
+  project_id INTEGER,
+  external_run_id TEXT,
+  generation INTEGER NOT NULL DEFAULT 0 CHECK(generation >= 0)
+);
+CREATE UNIQUE INDEX idx_runs_project_external_generation
+  ON runs(project_id, external_run_id, generation)
+  WHERE project_id IS NOT NULL AND external_run_id IS NOT NULL;
+CREATE TABLE helm_sessions (
+  id INTEGER PRIMARY KEY,
+  name TEXT UNIQUE NOT NULL,
+  kind TEXT,
+  project_id INTEGER,
+  run_id INTEGER,
+  owner TEXT,
+  status TEXT NOT NULL DEFAULT 'active',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  last_used_at TEXT,
+  ended_at TEXT,
+  reason TEXT
+);
+`);
+      // D01 Fact 1: every native run row has generation = 0 pre-migration.
+      old.prepare(`INSERT INTO runs (project_id, external_run_id, generation) VALUES (1, NULL, 0)`).run();
+      old.prepare(`INSERT INTO runs (project_id, external_run_id, generation) VALUES (1, NULL, 0)`).run();
+      old.prepare(`INSERT INTO runs (project_id, external_run_id, generation) VALUES (2, NULL, 0)`).run();
+      // an ingest row already carries a nonzero generation and must never be rewritten (D01 Migration constraint 2).
+      old.prepare(`INSERT INTO runs (project_id, external_run_id, generation) VALUES (1, 'ovm-ext-1', 7)`).run();
+      old.prepare(`INSERT INTO helm_sessions (name, owner, status) VALUES ('helm-old-a', 'helm', 'idle')`).run();
+      old.prepare(`INSERT INTO helm_sessions (name, owner, status) VALUES ('helm-old-b', 'helm', 'active')`).run();
+      old.prepare(`INSERT INTO helm_sessions (name, owner, status) VALUES ('helm-old-c', 'human', 'active')`).run();
+      old.close();
+
+      const dbs = new DatabaseService(t.dbPath);
+      expect((dbs.raw.prepare('SELECT version FROM schema_version').get() as any).version).toBe(SCHEMA_VERSION);
+
+      const nativeGens = (dbs.raw.prepare(`SELECT generation FROM runs WHERE external_run_id IS NULL ORDER BY id`).all() as any[]).map((r) => r.generation);
+      expect(nativeGens.length).toBe(3);
+      expect(new Set(nativeGens).size).toBe(3); // distinct
+      for (const g of nativeGens) expect(g).toBeGreaterThan(0);
+
+      const ingestRow = dbs.raw.prepare(`SELECT external_run_id, generation FROM runs WHERE external_run_id = 'ovm-ext-1'`).get() as any;
+      expect(ingestRow.external_run_id).toBe('ovm-ext-1');
+      expect(ingestRow.generation).toBe(7); // untouched — never rewrite ingest identity
+
+      const sessionGens = (dbs.raw.prepare(`SELECT generation FROM helm_sessions ORDER BY id`).all() as any[]).map((r) => r.generation);
+      expect(sessionGens.length).toBe(3);
+      expect(new Set(sessionGens).size).toBe(3); // distinct — never a constant (D01 Migration constraint 3)
+      for (const g of sessionGens) expect(g).toBeGreaterThan(0);
+
+      const seq = dbs.raw.prepare(`SELECT next FROM lifecycle_seq WHERE name = 'global'`).get() as any;
+      expect(seq.next).toBeGreaterThan(Math.max(...nativeGens, ...sessionGens, 7));
+
+      dbs.close();
+    } finally {
+      t.cleanup();
+    }
+  });
+
+  it("allocator survives deletes: a row occupying a recycled id never inherits the deleted lifecycle's generation", () => {
+    const t = makeTempDb();
+    try {
+      const reg = new SessionRegistryService(t.db);
+      const first = reg.register('helm-recycle-target', { owner: 'helm' })!;
+      expect(first.generation).toBeGreaterThan(0);
+
+      t.db.raw.prepare(`DELETE FROM helm_sessions WHERE id = ?`).run(first.id);
+      // Simulate SQLite recycling the freed rowid onto a new occupant (the exact F-02/F-09 shape:
+      // same row id, unrelated lifecycle) — assert independently of SQLite's actual free-list order.
+      t.db.raw.prepare(
+        `INSERT INTO helm_sessions (id, name, owner, status, generation) VALUES (?, 'helm-recycle-occupant', 'helm', 'active', 0)`
+      ).run(first.id);
+
+      const occupant = reg.register('helm-recycle-occupant', { owner: 'helm' })!;
+      expect(occupant.id).toBe(first.id);
+      expect(occupant.generation).toBeGreaterThan(first.generation); // never reused, strictly greater
+    } finally {
+      t.cleanup();
+    }
+  });
+
+  it('same-name re-registration increments generation; independently-registered names get distinct generations; register() returns the captured identity', () => {
+    const t = makeTempDb();
+    try {
+      const reg = new SessionRegistryService(t.db);
+      const first = reg.register('helm-reuse-a', { owner: 'helm' })!;
+      expect(first).toMatchObject({ name: 'helm-reuse-a', owner: 'helm', status: 'active' });
+      expect(typeof first.id).toBe('number');
+      expect(typeof first.generation).toBe('number');
+
+      const second = reg.register('helm-reuse-a', { owner: 'helm' })!; // re-registration, same name
+      expect(second.id).toBe(first.id); // upsert retains row identity
+      expect(second.generation).toBeGreaterThan(first.generation); // AC4: nonce bumped every re-registration/upsert
+
+      const other = reg.register('helm-reuse-b', { owner: 'helm' })!;
+      expect(other.generation).not.toBe(first.generation);
+      expect(other.generation).not.toBe(second.generation);
+    } finally {
+      t.cleanup();
+    }
+  });
+});
+
+describe('B01 AC23 tripwire: HELM_SESSION_JANITOR standing default', () => {
+  it('parses to off by default and ecosystem.config.cjs still carries "0"', () => {
+    const prev = process.env.HELM_SESSION_JANITOR;
+    delete process.env.HELM_SESSION_JANITOR;
+    try {
+      const cfg = loadConfig();
+      expect(cfg.HELM_SESSION_JANITOR).toBe('off');
+    } finally {
+      if (prev === undefined) delete process.env.HELM_SESSION_JANITOR;
+      else process.env.HELM_SESSION_JANITOR = prev;
+    }
+
+    const eco = fs.readFileSync(path.resolve(__dirname, '../../ecosystem.config.cjs'), 'utf8');
+    expect(eco).toMatch(/HELM_SESSION_JANITOR:\s*["']0["']/);
   });
 });

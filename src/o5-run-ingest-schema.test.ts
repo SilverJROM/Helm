@@ -56,10 +56,14 @@ describe('O5.1 run ingest durability schema v85', () => {
     const t = tempDb('helm-o51-v84-'); cleanups.push(t.cleanup);
     createV84Db(t.dbPath);
     const dbs = new DatabaseService(t.dbPath);
-    expect(dbs.raw.prepare('SELECT id, project_id, batch_id, external_run_id, generation, source, state_revision, register_seal_hash, terminal_seal_hash FROM runs').get()).toEqual({
-      id: 41, project_id: 1, batch_id: 'O5', external_run_id: null, generation: 0, source: 'native', state_revision: 0,
+    const row = dbs.raw.prepare('SELECT id, project_id, batch_id, external_run_id, generation, source, state_revision, register_seal_hash, terminal_seal_hash FROM runs').get() as any;
+    expect(row).toMatchObject({
+      id: 41, project_id: 1, batch_id: 'O5', external_run_id: null, source: 'native', state_revision: 0,
       register_seal_hash: null, terminal_seal_hash: null,
     });
+    // B01/D01: native runs backfill to a fresh nonzero generation — this row is the exact F-09
+    // shape (native run, generation was unconditionally 0 before B01 fixed the allocator).
+    expect(row.generation).toBeGreaterThan(0);
     expect((dbs.raw.prepare('SELECT version FROM schema_version').get() as any).version).toBe(SCHEMA_VERSION);
     expect(dbs.raw.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
     dbs.close();
