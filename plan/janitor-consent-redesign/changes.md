@@ -1,40 +1,37 @@
-# S10 changes — observed idle helper (AC16/17/18, AC21 trigger, AC26)
+# S11 changes — pure reconcile decision (AC14/18/25/26)
 
 ## Root cause / objective
-Idleness must be **observed** from DB + tmux facts (`max(last_used_at, session_activity)`), never from
-`last_used_at` alone. Attached seats are never candidates. `run_id IS NULL` is normal for chat seats and
-is not abandonment. Observation may only **trigger investigation** — never REAP (S11 owns decisions;
-S12 owns janitor wiring).
+The legacy janitor treated `run_id == null` as “done” (F3) and used idleness/TTL as kill
+authority — E5 class. North-star: **reap only when Helm asserted completion** (`status=idle`),
+or **converge** when the session is already gone. Never human/legacy/unasserted. S11 is the pure
+decision model only; S12 wires `sessionJanitorTick`.
 
 ## Mechanism
-1. **Pure** `observeSessionIdleness(facts)` in `session-observation.ts` — no tmux I/O, no DB writes.
-2. **effectiveActivityMs** = max of parseable `last_used_at` (fallback `created_at`) and S08
-   `session_activity` (epoch seconds → ms). Missing sides ignored, never coerced to 0.
-3. **Priority rules:**
-   - `attached === true` → `KEEP` (`attached_excluded`) — AC17
-   - `attached === null` → `KEEP` (`attached_unknown`) — fail-safe
-   - no usable activity → `KEEP` (`missing_activity_facts`)
-   - idle age < hours-scale threshold (default 4h) → `KEEP` (`within_idle_threshold`)
-   - else → `INVESTIGATE` (`hours_idle_anomaly`) — AC21/26
-4. **Return union** is only `KEEP | INVESTIGATE` — REAP is not representable.
-5. **`runId` is never authority** (AC18): null neither forces INVESTIGATE nor blocks a positive idle signal.
+1. **Pure** `decideSessionReconcile(row, facts)` → `{ action: REAP|CONVERGE|KEEP, reason }`.
+2. **Priority (keep-biased):**
+   - `status === reaped` → `KEEP` (`already_reaped`)
+   - `owner !== helm` → `KEEP` (`owner_not_helm`) — human / legacy / null
+   - `sessionExists === false` → `CONVERGE` (`session_gone`) — AC14, no kill
+   - `sessionExists == null` → `KEEP` (`session_unknown`)
+   - `status !== idle` → `KEEP` (`unasserted`) — AC8/26
+   - helm + idle + live → `REAP` (`asserted_complete_live`) — AC25
+3. **`run_id` is never authority** (AC18): explicitly `void`ed; F3 null clause deleted from model.
+4. No idle-age / TTL / run-terminal inputs. No tmux, no DB, no writes.
 
 ## Code changes
-- `src/services/session-observation.ts` — pure helper + timestamp normalizers + DEFAULT_IDLE_THRESHOLD_MS
-- `src/services/session-observation.test.ts` — table tests (stale/fresh cross, attached, null run, unknown,
-  hours-idle INVESTIGATE, no-REAP source guard, HELM_SESSION_JANITOR=0)
+- `src/services/session-reconcile-decision.ts` — pure decision + stable reasons
+- `src/services/session-reconcile-decision.test.ts` — exhaustive table + AC18 pairs + source guards
+- `plan/janitor-consent-redesign/changes.md` — this file
 
 ## Guardrails
 - `HELM_SESSION_JANITOR=0` unchanged in `.env` and `ecosystem.config.cjs`
-- Pure/synthetic facts only; no live tmux; no live `data/helm.db` mutation
-- No janitor tick wiring, no S11 decision fn, no housekeeper spawn
+- Synthetic facts only; no live tmux; no live `data/helm.db` mutation
+- No janitor tick wiring (S12); no housekeeper; no flag flip
 
 ## Out of scope
-- S11 pure `REAP | CONVERGE | KEEP` decision
-- S12 `sessionJanitorTick` / startup reconciliation wiring
-- S18 housekeeper dispatch / investigation table
-- Flag flip to enable janitor
+- S12 wire into `sessionJanitorTick` / retire legacy F3 + TTL kill path
+- S13 shadow mode, S14 human close, S18 housekeeper
 
 ## Test status
 - `npx tsc --noEmit -p tsconfig.json` → **exit 0**
-- `HELM_SESSION_JANITOR=0 npx vitest run src/services/session-observation.test.ts --poolOptions.forks.maxForks=2` → **16 passed**
+- `HELM_SESSION_JANITOR=0 npx vitest run src/services/session-reconcile-decision.test.ts --poolOptions.forks.maxForks=2` → **23 passed**
