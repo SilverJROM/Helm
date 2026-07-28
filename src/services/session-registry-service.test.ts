@@ -27,6 +27,23 @@ function makeTempDb(): { db: DatabaseService; cleanup: () => void } {
   };
 }
 
+const LIVE_DB_PATH = path.join(process.cwd(), 'data', 'helm.db');
+
+/**
+ * B15 fix1 / val §7.2: under WAL with a long-lived open connection (the live server), the main
+ * file's mtime does not move on writes — only -wal/-shm do. A single-file mtime guard is
+ * structurally incapable of catching a write in that configuration. Snapshot all three.
+ */
+function liveDbMtimes(): Record<'main' | 'wal' | 'shm', number | null> {
+  const suffix = { main: '', wal: '-wal', shm: '-shm' } as const;
+  const out = {} as Record<'main' | 'wal' | 'shm', number | null>;
+  for (const key of Object.keys(suffix) as Array<keyof typeof suffix>) {
+    const p = LIVE_DB_PATH + suffix[key];
+    out[key] = fs.existsSync(p) ? fs.statSync(p).mtimeMs : null;
+  }
+  return out;
+}
+
 describe('SL-R1/R2 SessionRegistryService', () => {
   let db: DatabaseService;
   let cleanup: () => void;
@@ -130,11 +147,10 @@ describe('S04 helm_sessions.owner (AC1)', () => {
   let db: DatabaseService;
   let cleanup: () => void;
   let reg: SessionRegistryService;
-  let liveMtimeBefore: number | null;
+  let liveMtimesBefore: ReturnType<typeof liveDbMtimes>;
 
   beforeEach(() => {
-    const livePath = path.join(process.cwd(), 'data', 'helm.db');
-    liveMtimeBefore = fs.existsSync(livePath) ? fs.statSync(livePath).mtimeMs : null;
+    liveMtimesBefore = liveDbMtimes();
     const t = makeTempDb();
     db = t.db;
     cleanup = t.cleanup;
@@ -142,9 +158,8 @@ describe('S04 helm_sessions.owner (AC1)', () => {
   });
   afterEach(() => {
     cleanup();
-    const livePath = path.join(process.cwd(), 'data', 'helm.db');
-    if (liveMtimeBefore != null && fs.existsSync(livePath)) {
-      expect(fs.statSync(livePath).mtimeMs).toBe(liveMtimeBefore);
+    if (liveMtimesBefore.main != null) {
+      expect(liveDbMtimes()).toEqual(liveMtimesBefore);
     }
   });
 
@@ -258,16 +273,14 @@ describe('S04 helm_sessions.owner (AC1)', () => {
 // Synthetic/copied fixtures only; HELM_SESSION_JANITOR=0; live data/helm.db mtime untouched.
 // ---------------------------------------------------------------------------
 describe('S07 owner backfill v102 + listHelmOwnedCandidates (AC5)', () => {
-  let liveMtimeBefore: number | null;
+  let liveMtimesBefore: ReturnType<typeof liveDbMtimes>;
 
   beforeEach(() => {
-    const livePath = path.join(process.cwd(), 'data', 'helm.db');
-    liveMtimeBefore = fs.existsSync(livePath) ? fs.statSync(livePath).mtimeMs : null;
+    liveMtimesBefore = liveDbMtimes();
   });
   afterEach(() => {
-    const livePath = path.join(process.cwd(), 'data', 'helm.db');
-    if (liveMtimeBefore != null && fs.existsSync(livePath)) {
-      expect(fs.statSync(livePath).mtimeMs).toBe(liveMtimeBefore);
+    if (liveMtimesBefore.main != null) {
+      expect(liveDbMtimes()).toEqual(liveMtimesBefore);
     }
   });
 
@@ -414,16 +427,14 @@ describe('S07 owner backfill v102 + listHelmOwnedCandidates (AC5)', () => {
 // Synthetic/copied fixtures only; HELM_SESSION_JANITOR stays 0; never touch live data/helm.db.
 // ---------------------------------------------------------------------------
 describe('B15 owner NOT NULL (AC20)', () => {
-  let liveMtimeBefore: number | null;
+  let liveMtimesBefore: ReturnType<typeof liveDbMtimes>;
 
   beforeEach(() => {
-    const livePath = path.join(process.cwd(), 'data', 'helm.db');
-    liveMtimeBefore = fs.existsSync(livePath) ? fs.statSync(livePath).mtimeMs : null;
+    liveMtimesBefore = liveDbMtimes();
   });
   afterEach(() => {
-    const livePath = path.join(process.cwd(), 'data', 'helm.db');
-    if (liveMtimeBefore != null && fs.existsSync(livePath)) {
-      expect(fs.statSync(livePath).mtimeMs).toBe(liveMtimeBefore);
+    if (liveMtimesBefore.main != null) {
+      expect(liveDbMtimes()).toEqual(liveMtimesBefore);
     }
   });
 
