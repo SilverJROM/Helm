@@ -65,8 +65,9 @@ export class MasterRuntimeService {
   // ready-probe; keyed by tmux target, cleared on every launch exit.
   private seatScanCtx = new Map<string, { marker: string; bin: string }>();
   /**
-   * B02 C1 fix cycle 2: create-time SessionStatusToken keyed by session name.
-   * Cleanup uses this map only — never SELECT/get by name at terminate.
+   * B02 C1 R3: **current** lifecycle token per master session name (for terminateAll only).
+   * Per-launch fail cleanup must pass the create-time token from the stack (`thisLaunchToken`),
+   * never resolve-by-name (a later same-name create would overwrite and reap B under A cleanup).
    */
   private readonly masterSessionTokens = new Map<string, SessionStatusToken>();
   private readonly promptsDir: string;
@@ -103,14 +104,25 @@ export class MasterRuntimeService {
     this.reapStaleSwitches();
   }
 
-  /** B02 C1: terminate with create-time retained token only (else explicit kill-only). */
-  private async terminateWithRetainedToken(name: string): Promise<void> {
-    const tok = this.masterSessionTokens.get(name);
+  /**
+   * B02 C1 R3: terminate with an explicit create/launch-time token (not a name lookup).
+   * If `token` is omitted, kill-only (no registry write). Map entry cleared only when it still
+   * matches this exact token (id+generation) so same-name B is not deleted by stale A cleanup.
+   */
+  private async terminateWithLifecycleToken(
+    name: string,
+    token?: SessionStatusToken
+  ): Promise<void> {
     await this.tmux.terminateSession(
       name,
-      tok ? { sessionToken: tok } : { noRegistryWrite: true }
+      token ? { sessionToken: token } : { noRegistryWrite: true }
     );
-    this.masterSessionTokens.delete(name);
+    if (token) {
+      const cur = this.masterSessionTokens.get(name);
+      if (cur && cur.id === token.id && cur.generation === token.generation) {
+        this.masterSessionTokens.delete(name);
+      }
+    }
   }
 
   /** B25 fix2: chain entry is launch-legal iff PROVIDERS allow-list (or dynamic) accepts it. */
@@ -251,7 +263,12 @@ export class MasterRuntimeService {
       // leave any unverified binary as fail-closed MISSING
     } finally {
       if (created) {
-        try { await this.terminateWithRetainedToken(probeSession); } catch {}
+        try {
+          await this.terminateWithLifecycleToken(
+            probeSession,
+            this.masterSessionTokens.get(probeSession)
+          );
+        } catch {}
       }
     }
     return result;
@@ -329,10 +346,14 @@ export class MasterRuntimeService {
     overlay_sha: string;
     toolkits_sha: string | null;
     role: PhaseBrainRole;
+    /** B02 C1 R3: this-launch create-time token (never name-map lookup). */
+    sessionToken?: SessionStatusToken;
   }): Promise<never> {
     this.seatScanCtx.delete(p.target);
     if (p.createdThisTime) {
-      try { await this.terminateWithRetainedToken(p.sessionName); } catch { /* best-effort */ }
+      try {
+        await this.terminateWithLifecycleToken(p.sessionName, p.sessionToken);
+      } catch { /* best-effort */ }
     }
     try { this.governedDocGuards.get(p.sessionName)?.stop(); } catch {}
     this.governedDocGuards.delete(p.sessionName);
@@ -469,16 +490,19 @@ export class MasterRuntimeService {
     const target = `${sessionName}:0.0`;
 
     let createdThisTime = false;
+    // B02 C1 R3: this launch's create-time token (stack-local) for fail cleanup — not name-map get.
+    let thisLaunchToken: SessionStatusToken | undefined;
     const exists = await this.tmux.sessionExists(sessionName);
     if (!exists) {
       // S05: phase-brain seats (plancore/ibrain) are Helm-owned.
-      // B02 C1: retain create-time CAS token for this master lifecycle (cleanup never late-captures).
       const masterTokenOut: { token?: SessionStatusToken } = {};
       await this.tmux.createSession(sessionName, projectDir, {
         owner: 'helm',
         sessionTokenOut: masterTokenOut,
       }); // C3 cwd lock
-      if (masterTokenOut.token) this.masterSessionTokens.set(sessionName, masterTokenOut.token);
+      thisLaunchToken = masterTokenOut.token;
+      // Current-lifecycle map for terminateAll only (overwrite = new current occupant).
+      if (thisLaunchToken) this.masterSessionTokens.set(sessionName, thisLaunchToken);
       createdThisTime = true;
     }
     this.activeMasterSessions.add(sessionName); // RTF-M5: track on EVERY launch (reused sessions too for shutdown)
@@ -634,7 +658,8 @@ task_id required in convention (include when known); backend warns but records i
           projectId, run_id, sessionName, target, role: runtimeRole,
           provider: effective.provider, model: effective.model,
           bin: launchBin, snippet: e.snippet, createdThisTime,
-          core_sha, overlay_sha, toolkits_sha
+          core_sha, overlay_sha, toolkits_sha,
+          sessionToken: thisLaunchToken,
         });
       }
       else throw e;
@@ -644,7 +669,7 @@ task_id required in convention (include when known); backend warns but records i
       // (If it pre-existed we do not kill it here.)
       if (createdThisTime) {
         try {
-          await this.terminateWithRetainedToken(sessionName);
+          await this.terminateWithLifecycleToken(sessionName, thisLaunchToken);
         } catch {
           // best-effort; do not swallow the original timeout error
         }
@@ -702,14 +727,15 @@ task_id required in convention (include when known); backend warns but records i
             projectId, run_id, sessionName, target, role: runtimeRole,
             provider: effective.provider, model: effective.model,
             bin: launchBin, snippet: e.snippet, createdThisTime,
-            core_sha, overlay_sha, toolkits_sha
+            core_sha, overlay_sha, toolkits_sha,
+            sessionToken: thisLaunchToken,
           });
         }
         else throw e;
       }
       if (!codexGenuine) {
         if (createdThisTime) {
-          try { await this.terminateWithRetainedToken(sessionName); } catch {}
+          try { await this.terminateWithLifecycleToken(sessionName, thisLaunchToken); } catch {}
         }
         try { this.governedDocGuards.get(sessionName)?.stop(); } catch {}
         this.governedDocGuards.delete(sessionName);
@@ -1475,7 +1501,9 @@ task_id required in convention (include when known); backend warns but records i
         // P2-r2: the NEW master launched but never ACKed. Do NOT leave it 'running' for the supervisor
         // to adopt as a valid context-resumed master. Kill the un-acked session + mark the runtime row
         // 'failed' so the supervisor recovers it cleanly (fresh relaunch) next tick.
-        try { await this.terminateWithRetainedToken(sess); } catch {}
+        try {
+          await this.terminateWithLifecycleToken(sess, this.masterSessionTokens.get(sess));
+        } catch {}
         try { this.governedDocGuards.get(sess)?.stop(); } catch {}
         this.governedDocGuards.delete(sess);
         try { this.db.prepare("UPDATE master_runtimes SET state='failed', intentional_park_until=NULL WHERE project_id = ?").run(projectId); } catch {}
@@ -1641,7 +1669,7 @@ task_id required in convention (include when known); backend warns but records i
   async terminateAllActiveMasters(): Promise<void> {
     for (const sess of Array.from(this.activeMasterSessions)) {
       try {
-        await this.terminateWithRetainedToken(sess);
+        await this.terminateWithLifecycleToken(sess, this.masterSessionTokens.get(sess));
         this.activeMasterSessions.delete(sess);
       } catch (e) {
         console.warn('[MasterRuntimeService] terminateAllActiveMasters failed', { sess, err: String(e) });

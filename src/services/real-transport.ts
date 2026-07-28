@@ -1,5 +1,6 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { randomBytes } from 'node:crypto';
 import type { ITransport } from './fake-transport.js';
 import { TmuxService } from '../tmux/tmux-service.js';
 import { DispatchService, type DispatchStartParams } from './dispatch-service.js';
@@ -11,6 +12,30 @@ import { matchInterstitial, InterstitialBlockedError } from './cli-interstitials
 import { applyEnvelopeIsolation } from './envelope-isolation.js';
 import type { SeatInspection } from './seat-pane-state.js';
 import type { SessionStatusToken } from './lifecycle-cas.js';
+
+/**
+ * B02 C1 R3: spawn handle embeds a unique lifecycle id so same-name re-spawn cannot overwrite
+ * the retained create-time CAS token for an earlier handle.
+ * Format: `<sessionName>:0.0#<spawnId>` (tmux target is the part before `#`).
+ */
+export function parseLifecycleHandle(handle: string): {
+  sessionName: string;
+  tmuxTarget: string;
+  spawnId: string | null;
+} {
+  const raw = String(handle || '').trim();
+  if (!raw) return { sessionName: '', tmuxTarget: '', spawnId: null };
+  const hash = raw.indexOf('#');
+  const base = hash >= 0 ? raw.slice(0, hash) : raw;
+  const spawnId = hash >= 0 ? raw.slice(hash + 1) : null;
+  const sessionName = base.split(':')[0] || '';
+  const tmuxTarget = base.includes(':') ? base : sessionName ? `${sessionName}:0.0` : '';
+  return { sessionName, tmuxTarget, spawnId: spawnId || null };
+}
+
+export function formatLifecycleHandle(sessionName: string, spawnId: string): string {
+  return `${sessionName}:0.0#${spawnId}`;
+}
 
 // Hard-pin the worker identity when the host CLI supports a system-prompt override (claude).
 // Kept apostrophe-free so it embeds directly inside single quotes in the launch command (no shell escaping).
@@ -42,10 +67,13 @@ export class RealTransport implements ITransport {
   // name, for the fenced agent's lifetime. north-star.md is kernel-fenced; see helm-sandbox.c.
   private readonly governedDocGuards = new Map<string, GovernedDocGuardHandle>();
   /**
-   * B02 C1 fix cycle 2: create-time SessionStatusToken keyed by session name for THIS spawn only.
-   * Reap/cleanup uses this map — never late get-by-name (replacement would match).
+   * B02 C1 R3: create-time SessionStatusToken keyed by **spawnId** (unique per lifecycle), never
+   * by session name alone. Same-name B cannot overwrite A's entry; reap(A-handle) uses token A.
    */
-  private readonly sessionTokens = new Map<string, SessionStatusToken>();
+  private readonly lifecycles = new Map<
+    string,
+    { sessionName: string; token?: SessionStatusToken }
+  >();
 
   constructor(deps: RealTransportDeps = {}) {
     const isFake = process.env.USE_FAKE_TMUX === '1' && process.env.NODE_ENV !== 'production';
@@ -143,8 +171,9 @@ export class RealTransport implements ITransport {
     // Dedicated fresh session per dispatch (clean context; reuse would require explicit /clear before next)
     // Honor explicit sessionName for per-project projcore (from projects.projcore_session or default <slug>-projcore)
     const sessionName = params.sessionName || `helm-${batchId}-${role}-${Date.now().toString(36).slice(-8)}`;
+    // B02 C1 R3: unique spawnId binds the create-time CAS token to this lifecycle handle.
+    const spawnId = randomBytes(8).toString('hex');
     // A2 + S05: projectId/runId + owner=helm (brains/workers via transport) at createSession choke point.
-    // B02 C1: retain create/register CAS token for cleanup/reap (never late capture by name).
     const sessionTokenOut: { token?: SessionStatusToken } = {};
     const target = await this.tmux.createSession(sessionName, fenceDir, {
       projectId: params.projectId ?? null,
@@ -152,7 +181,8 @@ export class RealTransport implements ITransport {
       owner: 'helm',
       sessionTokenOut,
     });
-    if (sessionTokenOut.token) this.sessionTokens.set(sessionName, sessionTokenOut.token);
+    this.lifecycles.set(spawnId, { sessionName, token: sessionTokenOut.token });
+    const lifecycleHandle = formatLifecycleHandle(sessionName, spawnId);
 
     try {
       // Launch the real agent (grok-4.5 etc) under fence + skipSafety (trusted launch path, like WorkerService)
@@ -225,16 +255,18 @@ export class RealTransport implements ITransport {
       // sendAndSubmit already re-presses Enter internally, covering grok's first-paste sensitivity.
       await this.dispatch.start(dispatchParams);
 
-      return { handle: target, role };
+      // Handle embeds spawnId so reap uses THIS lifecycle's create-time token, not a same-name B.
+      return { handle: lifecycleHandle, role };
     } catch (e) {
-      const createTok = this.sessionTokens.get(sessionName);
+      const rec = this.lifecycles.get(spawnId);
+      const createTok = rec?.token ?? sessionTokenOut.token;
       try {
         await this.tmux.terminateSession(
           sessionName,
           createTok ? { sessionToken: createTok } : { noRegistryWrite: true }
         );
       } catch {}
-      this.sessionTokens.delete(sessionName);
+      this.lifecycles.delete(spawnId);
       try { this.governedDocGuards.get(sessionName)?.stop(); } catch {}
       this.governedDocGuards.delete(sessionName);
       throw e;
@@ -243,9 +275,12 @@ export class RealTransport implements ITransport {
 
   /** Read-only liveness inspection. Empty capture remains unknown while sessionAlive stays true. */
   async inspectSeat(target: string, brief: string, _provider?: string): Promise<SeatInspection> {
-    const sessionAlive = await this.tmux.sessionExists(target);
+    // B02 C1 R3: handle may embed #spawnId — tmux only accepts the bare target.
+    const { tmuxTarget } = parseLifecycleHandle(target);
+    const paneTarget = tmuxTarget || target;
+    const sessionAlive = await this.tmux.sessionExists(paneTarget);
     if (!sessionAlive) return { sessionAlive: false, pane: '', composerHoldsBrief: false };
-    const pane = await this.tmux.capturePane(target, 200);
+    const pane = await this.tmux.capturePane(paneTarget, 200);
     return {
       sessionAlive: true,
       pane,
@@ -255,8 +290,10 @@ export class RealTransport implements ITransport {
 
   /** One semantic callback-repair nudge, sent only after the wait loop proves an idle composer. */
   async nudgeSeat(target: string, provider?: string): Promise<boolean> {
+    const { tmuxTarget } = parseLifecycleHandle(target);
+    const paneTarget = tmuxTarget || target;
     const nudge = 'CALLBACK REQUIRED — control returned without your callback. Do NOT redo the task. Append your DONE/BLOCKED/PASS/FAIL now.';
-    return this.tmux.sendAndSubmit(target, nudge, { readySignal: seatReadySignal(provider) });
+    return this.tmux.sendAndSubmit(paneTarget, nudge, { readySignal: seatReadySignal(provider) });
   }
 
   // Compatibility seam for any external caller left from the old kloo-only watchdog. The orchestration
@@ -419,20 +456,21 @@ export class RealTransport implements ITransport {
   }
 
   async reap(handle: string, reason = 'complete'): Promise<void> {
-    const sessionName = (handle || '').split(':')[0];
+    const { sessionName, tmuxTarget, spawnId } = parseLifecycleHandle(handle);
     if (!sessionName) return;
 
-    // Reuse B7 DSP7 clearContext (provider-specific: /clear for grok/codex, clear for claude + verify clean prompt + no residue)
+    // Reuse B7 DSP7 clearContext — use tmux target without lifecycle #suffix.
     try {
       const providerGuess = /claude/i.test(handle) ? 'claude' : 'grok';
-      await this.tmux.clearContext(handle, providerGuess);
+      await this.tmux.clearContext(tmuxTarget, providerGuess);
     } catch {
       // best-effort (matches tmux-service implementation)
     }
 
     try {
-      // B02 C1: create-time token from spawn map only (never late get-by-name).
-      const createTok = this.sessionTokens.get(sessionName);
+      // B02 C1 R3: token bound to spawnId on the handle — never the current name-map entry.
+      const rec = spawnId ? this.lifecycles.get(spawnId) : undefined;
+      const createTok = rec?.token;
       await this.tmux.terminateSession(
         sessionName,
         createTok ? { sessionToken: createTok } : { noRegistryWrite: true }
@@ -440,7 +478,7 @@ export class RealTransport implements ITransport {
     } catch {
       // idempotent / best-effort reap
     }
-    this.sessionTokens.delete(sessionName);
+    if (spawnId) this.lifecycles.delete(spawnId);
     try { this.governedDocGuards.get(sessionName)?.stop(); } catch {}
     this.governedDocGuards.delete(sessionName);
   }
