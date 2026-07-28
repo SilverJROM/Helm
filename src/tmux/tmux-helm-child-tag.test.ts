@@ -67,14 +67,18 @@ describe('ST-R1/R2 @helm_child tmux ownership tag', () => {
     ]);
   });
 
-  it('ST-R1: a failing set-option is swallowed — createSession still succeeds (best-effort)', async () => {
+  it('AC19 / F-07: a failing set-option fails closed — createSession rejects and tears down the just-created session', async () => {
     cpMock.impl = async (_cmd: string, args: string[]) => {
       if (args[0] === 'has-session') throw new Error('no such session');
       if (args[0] === 'set-option') throw new Error('set-option boom');
       return { stdout: '', stderr: '' };
     };
     const tmux: any = new TmuxService();
-    await expect(tmux.createSession('helm-w-tagfail', undefined, { owner: 'helm' })).resolves.toBe('helm-w-tagfail:0.0');
+    await expect(tmux.createSession('helm-w-tagfail', undefined, { owner: 'helm' })).rejects.toThrow(/set-option boom/);
+    const killCall = cpMock.calls.find(
+      (c) => c.args[0] === 'kill-session' && c.args.includes('helm-w-tagfail')
+    );
+    expect(killCall).toBeTruthy();
   });
 
   // A2 (R4.16) + S05: createSession forwards projectId/runId/owner into the registry onCreate choke point.
@@ -438,5 +442,131 @@ describe('ST-R1/R2 @helm_child tmux ownership tag', () => {
     // touch is a no-op on reaped — last_used_at must not advance / resurrect.
     expect(row.last_used_at).toBe(lastUsed);
     db.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AC19 / F-07 — @helm_child tagging and registry owner persistence are mandatory post-create
+// steps. Any failure must (1) propagate — no silent swallow, (2) kill ONLY the just-created
+// session as rollback, (3) leave no active unowned registry row.
+// ---------------------------------------------------------------------------
+
+describe('AC19 / F-07: owner/tag persist fail-closed', () => {
+  beforeEach(() => {
+    cpMock.calls.length = 0;
+    cpMock.impl = async () => ({ stdout: '', stderr: '' });
+  });
+
+  it('tag failure → create rejected + just-created session torn down + no active unowned row', async () => {
+    cpMock.impl = async (_cmd: string, args: string[]) => {
+      if (args[0] === 'has-session') throw new Error('no such session');
+      if (args[0] === 'set-option') throw new Error('set-option boom');
+      return { stdout: '', stderr: '' };
+    };
+    const registered: string[] = [];
+    const tmux: any = new TmuxService({
+      onCreate: (name: string) => { registered.push(name); },
+      onTerminate: () => false,
+      onUse: () => {},
+    });
+    await expect(tmux.createSession('helm-w-ac19tag', undefined, { owner: 'helm' })).rejects.toThrow(/set-option boom/);
+    // The tag failure aborts before publish — registry must never see this session.
+    expect(registered).toEqual([]);
+    const killCall = cpMock.calls.find(
+      (c) => c.args[0] === 'kill-session' && c.args.includes('helm-w-ac19tag')
+    );
+    expect(killCall).toBeTruthy();
+  });
+
+  it('registry/owner persist failure → create rejected + session torn down + no durable unowned row', async () => {
+    cpMock.impl = async (_cmd: string, args: string[]) => {
+      if (args[0] === 'has-session') throw new Error('no such session');
+      return { stdout: '', stderr: '' };
+    };
+    const Database = (await import('better-sqlite3')).default;
+    const { SessionRegistryService } = await import('../services/session-registry-service.js');
+    const db = new Database(':memory:');
+    // Schema intentionally omits the `reason` column so register()'s real INSERT throws a genuine
+    // SQL error (a real persist failure, not a synthetic throw) and rolls back via db.transaction.
+    db.exec(`
+      CREATE TABLE helm_sessions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL UNIQUE,
+        kind TEXT,
+        project_id INTEGER,
+        run_id INTEGER,
+        owner TEXT,
+        status TEXT NOT NULL DEFAULT 'active',
+        generation INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        last_used_at TEXT,
+        ended_at TEXT
+      );
+      CREATE TABLE lifecycle_seq (
+        name TEXT PRIMARY KEY,
+        next INTEGER NOT NULL
+      );
+      INSERT INTO lifecycle_seq (name, next) VALUES ('global', 1);
+    `);
+    const reg = new SessionRegistryService(db as any);
+    const tmux: any = new TmuxService({
+      onCreate: (name: string, opts?: any) => { reg.register(name, opts); },
+      onTerminate: () => false,
+      onUse: () => {},
+    });
+    await expect(tmux.createSession('helm-w-ac19reg', undefined, { owner: 'helm' })).rejects.toThrow(
+      /no column named reason/
+    );
+    const killCall = cpMock.calls.find(
+      (c) => c.args[0] === 'kill-session' && c.args.includes('helm-w-ac19reg')
+    );
+    expect(killCall).toBeTruthy();
+    const row = db.prepare('SELECT * FROM helm_sessions WHERE name = ?').get('helm-w-ac19reg');
+    expect(row).toBeFalsy();
+    db.close();
+  });
+
+  it('successful create has both @helm_child tag and a durable registry owner', async () => {
+    cpMock.impl = async (_cmd: string, args: string[]) => {
+      if (args[0] === 'has-session') throw new Error('no such session');
+      return { stdout: '', stderr: '' };
+    };
+    const Database = (await import('better-sqlite3')).default;
+    const { SessionRegistryService } = await import('../services/session-registry-service.js');
+    const db = new Database(':memory:');
+    db.exec(`
+      CREATE TABLE helm_sessions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL UNIQUE,
+        kind TEXT,
+        project_id INTEGER,
+        run_id INTEGER,
+        owner TEXT,
+        status TEXT NOT NULL DEFAULT 'active',
+        generation INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        last_used_at TEXT,
+        ended_at TEXT,
+        reason TEXT
+      );
+      CREATE TABLE lifecycle_seq (
+        name TEXT PRIMARY KEY,
+        next INTEGER NOT NULL
+      );
+      INSERT INTO lifecycle_seq (name, next) VALUES ('global', 1);
+    `);
+    const reg = new SessionRegistryService(db as any);
+    const { buildTmuxSessionRegistryHook } = await import('./session-registry-hook.js');
+    const tmux: any = new TmuxService(buildTmuxSessionRegistryHook(reg));
+    await expect(tmux.createSession('helm-w-ac19ok', undefined, { owner: 'helm' })).resolves.toBe('helm-w-ac19ok:0.0');
+
+    const setOptCall = cpMock.calls.find(
+      (c) => c.args[0] === 'set-option' && c.args.includes('@helm_child')
+    );
+    expect(setOptCall).toBeTruthy();
+    const row = reg.get('helm-w-ac19ok');
+    expect(row).toBeTruthy();
+    expect(row!.owner).toBe('helm');
+    expect(row!.status).toBe('active');
   });
 });

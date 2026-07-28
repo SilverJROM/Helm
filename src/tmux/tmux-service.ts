@@ -600,7 +600,7 @@ export class TmuxService {
 
     // Provably absent: create under the final name directly (no prior kill).
     await this.spawnTaggedSession(name, cwd);
-    this.publishCreatedSession(name, opts);
+    await this.publishCreatedSession(name, opts);
     return `${name}:0.0`;
   }
 
@@ -698,10 +698,11 @@ export class TmuxService {
     }
 
     // Stage under a unique name FIRST so a create failure never touches the old lifecycle (AC11).
-    // B08 fix1 C1: staging requires a successful @helm_child tag — incomplete stage must not close old.
+    // B08 fix1 C1 / AC19: staging (like every create path) requires a successful @helm_child tag —
+    // incomplete stage must not close old.
     const stagingName = this.makeStagingSessionName(name);
     try {
-      await this.spawnTaggedSession(stagingName, cwd, { requireHelmChildTag: true });
+      await this.spawnTaggedSession(stagingName, cwd);
     } catch (err) {
       // Staging failed (new-session or strict tag) — old session and registry must remain untouched.
       // Orphan staging teardown (if new-session succeeded) is handled inside spawnTaggedSession.
@@ -739,7 +740,7 @@ export class TmuxService {
       throw err;
     }
 
-    this.publishCreatedSession(name, opts);
+    await this.publishCreatedSession(name, opts);
   }
 
   /** B08: lookup existing same-name registry row for replace eligibility (fail-closed if absent). */
@@ -767,16 +768,13 @@ export class TmuxService {
   /**
    * ST-R1: new-session + @helm_child tag. No registry write (caller publishes under the final name).
    *
-   * B08 fix1 C1: `requireHelmChildTag: true` (staging replace path) fail-closes if the tag cannot
-   * be set — tears down the just-created session and throws so callers never treat incomplete
-   * staging as authority to close the old lifecycle. Default (fresh create) keeps best-effort
-   * tag so ST-R1 "set-option swallowed" behavior is preserved for the gone-session path.
+   * AC19 / F-07: @helm_child is mandatory on EVERY create path (fresh-create and staging replace
+   * alike) — the janitor's ownership probe (sessionHasHelmChildTag) fail-safes untagged sessions to
+   * "not ours, never reap", so a swallowed tag failure would leave a permanent unreapable orphan.
+   * Any set-option failure tears down the just-created session and rethrows; callers must never
+   * treat an incompletely-tagged session as a successful create.
    */
-  private async spawnTaggedSession(
-    sessionName: string,
-    cwd?: string,
-    opts?: { requireHelmChildTag?: boolean }
-  ): Promise<void> {
+  private async spawnTaggedSession(sessionName: string, cwd?: string): Promise<void> {
     const args = ['new-session', '-d', '-s', sessionName];
     if (cwd) {
       args.push('-c', cwd);
@@ -786,28 +784,31 @@ export class TmuxService {
     try {
       await execFileAsync('tmux', ['set-option', '-t', sessionName, '@helm_child', '1']);
     } catch (err) {
-      if (opts?.requireHelmChildTag) {
-        // Incomplete staging: remove orphan staging session; rethrow so old lifecycle is not closed.
-        await this.killSessionRaw(sessionName).catch(() => {});
-        throw err;
-      }
-      // Fresh-create path: best-effort tag (ST-R1) — never break create on set-option failure.
-      console.warn('[tmux] set @helm_child failed (best-effort)', { name: sessionName, err: String(err) });
+      // Remove the orphan (tag incomplete); rethrow so the caller never publishes/relies on it.
+      await this.killSessionRaw(sessionName).catch(() => {});
+      throw err;
     }
   }
 
   /**
    * SL-R1 / A2 / S05 / B02: register under the FINAL session name and optionally fill sessionTokenOut.
-   * Best-effort — registry failure must never break a successful tmux create.
+   *
+   * AC19 / F-07: registry/owner persistence is mandatory, not best-effort — a durable unowned active
+   * row is exactly the state AC19 forbids. A throwing onCreate rejects the create: the just-created
+   * tmux session (published under `name`) is torn down (kill-only, no registry write — onCreate never
+   * committed a row) and the failure is rethrown so the caller never treats this as a success.
    */
-  private publishCreatedSession(name: string, opts?: TmuxSessionCreateOpts): void {
+  private async publishCreatedSession(name: string, opts?: TmuxSessionCreateOpts): Promise<void> {
+    let createdToken: TmuxSessionStatusToken | void;
     try {
-      const createdToken = this.registryHook.onCreate(name, opts);
-      if (createdToken && opts?.sessionTokenOut) {
-        opts.sessionTokenOut.token = createdToken;
-      }
+      createdToken = this.registryHook.onCreate(name, opts);
     } catch (err) {
-      console.warn('[tmux] registry onCreate failed', { name, err: String(err) });
+      console.warn('[tmux] registry onCreate failed — rejecting create (AC19 fail-closed)', { name, err: String(err) });
+      await this.terminateSession(name, { noRegistryWrite: true }).catch(() => {});
+      throw err;
+    }
+    if (createdToken && opts?.sessionTokenOut) {
+      opts.sessionTokenOut.token = createdToken;
     }
   }
 

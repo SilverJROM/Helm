@@ -30,6 +30,7 @@ import { PhaseStaffingService } from "./services/phase-staffing.js";
 import { ToolkitService } from "./services/toolkit-service.js";
 import { MasterModelService } from "./services/master-model-service.js";
 import { TmuxService, SessionNameCollisionError } from "./tmux/tmux-service.js";
+import { buildTmuxSessionRegistryHook } from "./tmux/session-registry-hook.js";
 import { AgentEventsService } from "./services/agent-events-service.js";
 import { parseCallbacksMd, toRunChatMessages, mergeChatMessages, CallbackTsCache, tsToMs } from "./services/run-chat-merge.js";
 import { ProviderResolverService } from "./services/provider-resolver-service.js";
@@ -38,7 +39,6 @@ import { MasterRuntimeService } from "./services/master-runtime-service.js";
 import { WorkerService } from "./services/worker-service.js";
 import { HelmIdentityService, requireActiveNativeProject } from "./services/helm-identity-service.js";
 import { SessionRegistryService, sessionStatusTokenFromRow } from "./services/session-registry-service.js";
-import type { SessionStatusToken } from "./services/lifecycle-cas.js";
 import { SessionCloseService } from "./services/session-close-service.js";
 import { registerSessionCloseRoutes } from "./api/routes/session-close-routes.js";
 import { HousekeeperService } from "./services/housekeeper-service.js";
@@ -300,39 +300,11 @@ async function main(): Promise<void> {
   const sessionRegistry = new SessionRegistryService(db);
   // S14a: human manual close (owner=human only). Uses shared tmuxService; tests inject fake via service unit tests.
   const sessionCloseService = new SessionCloseService(sessionRegistry, tmuxService as any);
+  // AC19 / F-07: extracted to buildTmuxSessionRegistryHook (session-registry-hook.ts) — onCreate no
+  // longer swallows a register() failure, since TmuxService.publishCreatedSession now fail-closes the
+  // create and tears down the just-created session on a thrown onCreate.
   if (typeof (tmuxService as any).setRegistryHook === 'function') {
-    (tmuxService as any).setRegistryHook({
-      // A2 + S05: forward projectId/runId/kind/owner from createSession so helm_sessions
-      // rows land linked with decision authority at the choke point. Owner is required pre-spawn
-      // in createSession; register() also refuses missing owner (defensive).
-      onCreate: (name: string, opts?: { projectId?: number | null; runId?: number | null; kind?: string; owner?: 'helm' | 'human' | 'legacy:unknown' }) => {
-        // B02 C1: return create-time CAS token so callers retain it (never late get-by-name).
-        try {
-          const row = sessionRegistry.register(name, opts as any);
-          if (row) return sessionStatusTokenFromRow(row);
-        } catch {}
-        return undefined;
-      },
-      // B02 C1 R4: return true only when markReaped applied — gates kill-session in terminateSession.
-      onTerminate: (_name: string, token?: SessionStatusToken): boolean => {
-        try {
-          if (!token) return false;
-          return sessionRegistry.markReaped(token).applied === true;
-        } catch {
-          return false;
-        }
-      },
-      // SL-R2/R4: active-input refreshes last_used_at so the TTL means "idle for TTL" (in-use sessions kept).
-      onUse: (name: string) => { try { sessionRegistry.touch(name); } catch {} },
-      // B08 / AC9: createSession same-name replace eligibility — read-only registry lookup (no invent).
-      onLookup: (name: string) => {
-        try {
-          return sessionRegistry.get(name) ?? undefined;
-        } catch {
-          return undefined;
-        }
-      },
-    });
+    (tmuxService as any).setRegistryHook(buildTmuxSessionRegistryHook(sessionRegistry));
   }
   // S02 + B02: wire CAS markIdle into shared worker_runtimes finalizer (no SQL dup).
   // First successful terminal transition asserts helm_sessions idle so the janitor later sees ownership truth.
