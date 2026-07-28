@@ -367,4 +367,61 @@ Working on it, gathering the test resul
     expect(r.state).toBe('thinking');
     expect(r.text || '').toBe('');
   });
+
+  it('E6: real Discovery pane with composer echo extracts reply when pending is passed', () => {
+    const pane = readFileSync(
+      new URL('./test-fixtures/panes/discovery-sent-echoed-in-composer-20260728.txt', import.meta.url),
+      'utf8'
+    );
+    const sent = '(a) — recall output is unreadable, keep text mode frozen';
+    const r = extractHelmReply(pane, sent);
+    expect(r.state).toBe('reply');
+    expect(r.text).toContain('Status: INTERVIEWING');
+    expect(r.text).not.toContain('bypass permissions');
+    expect(r.text).not.toContain('─────');
+  });
+
+  it('E6: real Discovery pane still extracts reply when pending is cleared', () => {
+    const pane = readFileSync(
+      new URL('./test-fixtures/panes/discovery-sent-echoed-in-composer-20260728.txt', import.meta.url),
+      'utf8'
+    );
+    const r = extractHelmReply(pane, '');
+    expect(r.state).toBe('reply');
+    expect(r.text).toContain('Status: INTERVIEWING');
+  });
+
+  it('E6: single sent-text occurrence still returns the reply with pending passed', () => {
+    const sent = 'summarize the repo status';
+    const pane = `❯ ${sent}
+
+⟦HELM_REPLY⟧
+Status: READY - all requested checks passed.
+⟦/HELM_REPLY⟧
+
+❯ `;
+    const r = extractHelmReply(pane, sent);
+    expect(r.state).toBe('reply');
+    expect(r.text).toContain('Status: READY');
+  });
+
+  it('E6: genuinely generating pane still returns thinking with pending passed', () => {
+    const sent = 'summarize the repo status';
+    const pane = `❯ ${sent}
+⟦HELM_REPLY⟧
+Gathering the current status
+  esc to interrupt`;
+    const r = extractHelmReply(pane, sent);
+    expect(r.state).toBe('thinking');
+    expect(r.text || '').toBe('');
+  });
+
+  it('E6: E4 real Discovery fixture passes with cleared and plausible pending values', () => {
+    const pane = readFileSync(
+      new URL('./test-fixtures/panes/discovery-finished-turn-20260727.txt', import.meta.url),
+      'utf8'
+    );
+    expect(extractHelmReply(pane, '').state).toBe('reply');
+    expect(extractHelmReply(pane, 'please continue discovery').state).toBe('reply');
+  });
 });

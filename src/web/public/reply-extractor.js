@@ -17,32 +17,64 @@ function findAfterLastUserPromptRobust(pane, afterUserText) {
   if (!sent) {
     return getAfterLastUserPrompt(pane);
   }
-  // 1. try exact lastIndexOf
-  let idx = pane.lastIndexOf(sent);
-  if (idx >= 0) {
-    let after = pane.slice(idx + sent.length);
-    return boundCurrentTurn(after);
-  }
-  // 2. normalize ws to single space in both, find last in norm, but map to original by flexible search
+  // 1. gather exact matches.
+  const exactMatches = findAllLiteralMatches(pane, sent);
+  // 2. normalize ws to single space in both, then map to original by flexible search.
   const normSent = normalizeWs(sent);
   const normPane = normalizeWs(pane);
   const normIdx = normPane.lastIndexOf(normSent);
-  if (normIdx < 0) {
-    return getAfterLastUserPrompt(pane);
+  const flexMatches = [];
+  if (normIdx >= 0) {
+    const words = sent.split(/\s+/).map(w => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+    const flexRe = new RegExp(words.join('\\s+'), 'g');
+    let m;
+    while ((m = flexRe.exec(pane)) !== null) {
+      flexMatches.push({ index: m.index, length: m[0].length });
+    }
   }
-  // flexible regex on original (words with \s+ between)
-  const words = sent.split(/\s+/).map(w => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
-  const flexRe = new RegExp(words.join('\\s+'), 'g');
-  let last = null;
-  let m;
-  while ((m = flexRe.exec(pane)) !== null) {
-    last = m;
-  }
-  if (last) {
-    let after = pane.slice(last.index + last[0].length);
-    return boundCurrentTurn(after);
+  const matches = dedupePromptMatches([...exactMatches, ...flexMatches]);
+  if (matches.length) {
+    return afterBestUserPromptMatch(pane, matches);
   }
   return getAfterLastUserPrompt(pane);
+}
+
+function findAllLiteralMatches(text, needle) {
+  const matches = [];
+  let from = 0;
+  while (from <= text.length) {
+    const index = text.indexOf(needle, from);
+    if (index < 0) break;
+    matches.push({ index, length: needle.length });
+    from = index + needle.length;
+  }
+  return matches;
+}
+
+function dedupePromptMatches(matches) {
+  const seen = new Set();
+  return matches
+    .sort((a, b) => a.index - b.index || a.length - b.length)
+    .filter(match => {
+      const key = `${match.index}:${match.length}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+}
+
+function afterBestUserPromptMatch(pane, matches) {
+  const fallback = matches[matches.length - 1];
+  let best = null;
+  for (const match of matches) {
+    const after = boundCurrentTurn(pane.slice(match.index + match.length));
+    const content = stripChrome(after.replace(/─/g, '')).trim();
+    if (content && !looksLikeChrome(content)) {
+      best = match;
+    }
+  }
+  const chosen = best || fallback;
+  return boundCurrentTurn(pane.slice(chosen.index + chosen.length));
 }
 
 function boundCurrentTurn(after) {
@@ -208,17 +240,17 @@ function extractHelmReply(pane, afterUserText) {
   if (!pane || !pane.trim()) return { state: 'empty', text: '' };
 
   let scope = findAfterLastUserPromptRobust(pane, afterUserText);
-  if (!scope) {
-    return { state: 'thinking', text: '' };
-  }
 
   const scopeHasMarkers = HELM_REPLY_OPEN_RE.test(scope) || HELM_REPLY_CLOSE_RE.test(scope);
   HELM_REPLY_OPEN_RE.lastIndex = 0;
   const paneHasMarkers = pane.includes('⟦HELM_REPLY⟧') || pane.includes('[[HELM_REPLY]]') ||
     pane.includes('⟦/HELM_REPLY⟧') || pane.includes('[[/HELM_REPLY]]');
-  if (!afterUserText && !scopeHasMarkers && paneHasMarkers) {
+  if (!scopeHasMarkers && paneHasMarkers && !paneLooksGenerating(pane)) {
     const footerOnly = stripChrome(scope.replace(/─/g, '')).trim();
     if (!footerOnly) scope = pane;
+  }
+  if (!scope) {
+    return { state: 'thinking', text: '' };
   }
 
   // within bounded scope only
