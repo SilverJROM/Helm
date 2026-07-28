@@ -109,14 +109,6 @@ describe('S14a SessionCloseService (human manual close)', () => {
     expect(terminated).toEqual([]);
   });
 
-  it('null owner refuse → zero terminate', async () => {
-    seed('helm-null-owner', { owner: null });
-    const r = await svc.closeHumanSession('helm-null-owner');
-    expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.reason).toBe('not_human');
-    expect(terminated).toEqual([]);
-  });
-
   it('missing registry row refuse → zero terminate', async () => {
     const r = await svc.closeHumanSession('helm-discovery-ghost');
     expect(r.ok).toBe(false);

@@ -3524,6 +3524,83 @@ CREATE TABLE IF NOT EXISTS lifecycle_seq (
         }
         this.db.prepare('UPDATE schema_version SET version = 107').run();
       }
+
+      // v108 / B15 (janitor-audit-remediation, AC20): helm_sessions.owner becomes NOT NULL. SQLite
+      // cannot ALTER a column to NOT NULL, so rebuild the table INSERT...SELECT preserving every
+      // row + id. Defensively re-run the S07/v102 deriveSessionOwner backfill first — v102 + B14's
+      // fail-closed create should already guarantee zero nulls by the time a DB reaches here, but a
+      // copied/older-shaped fixture must never crash on foreign data; heal instead of fail.
+      // housekeeper_investigations.helm_session_id REFERENCES helm_sessions(id) ON DELETE SET NULL
+      // makes helm_sessions an FK *target* — mirrors the v91 runs rebuild: toggle foreign_keys OFF
+      // before BEGIN (the pragma is a no-op inside a transaction), re-validate with
+      // foreign_key_check filtered to helm_sessions (live DBs may carry unrelated pre-existing
+      // orphans elsewhere — v63 agents rebuild precedent), restore the pragma on both paths.
+      if (current && current.version < 108) {
+        if (hasTable('helm_sessions')) {
+          const preCols = this.db.prepare('PRAGMA table_info(helm_sessions)').all() as any[];
+          if (preCols.some((c) => c.name === 'owner')) {
+            const nullRows = this.db
+              .prepare(`SELECT name, kind FROM helm_sessions WHERE owner IS NULL`)
+              .all() as Array<{ name: string; kind: string | null }>;
+            const setOwner = this.db.prepare(
+              `UPDATE helm_sessions SET owner = ? WHERE name = ? AND owner IS NULL`
+            );
+            for (const row of nullRows) {
+              setOwner.run(deriveSessionOwner(row.name, row.kind), row.name);
+            }
+          }
+
+          const before = (this.db.prepare('SELECT COUNT(*) AS c FROM helm_sessions').get() as { c: number }).c;
+          const fkWasOn = this.db.pragma('foreign_keys', { simple: true }) === 1;
+          this.db.pragma('foreign_keys = OFF');
+          this.db.exec('BEGIN IMMEDIATE;');
+          try {
+            this.db.exec(`
+CREATE TABLE helm_sessions_new (
+  id INTEGER PRIMARY KEY,
+  name TEXT UNIQUE NOT NULL,
+  kind TEXT,
+  project_id INTEGER,
+  run_id INTEGER,
+  owner TEXT NOT NULL CHECK(owner IN ('helm','human','legacy:unknown')),
+  status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','idle','reaped')),
+  generation INTEGER NOT NULL DEFAULT 0 CHECK(generation >= 0),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  last_used_at TEXT,
+  ended_at TEXT,
+  reason TEXT
+);
+INSERT INTO helm_sessions_new (id, name, kind, project_id, run_id, owner, status, generation, created_at, last_used_at, ended_at, reason)
+SELECT id, name, kind, project_id, run_id, owner, status, generation, created_at, last_used_at, ended_at, reason
+FROM helm_sessions;
+DROP TABLE helm_sessions;
+ALTER TABLE helm_sessions_new RENAME TO helm_sessions;
+CREATE INDEX IF NOT EXISTS idx_helm_sessions_status ON helm_sessions(status);
+CREATE INDEX IF NOT EXISTS idx_helm_sessions_run ON helm_sessions(run_id);
+`);
+            const after = (this.db.prepare('SELECT COUNT(*) AS c FROM helm_sessions').get() as { c: number }).c;
+            if (after !== before) {
+              throw new Error(`v108 helm_sessions rebuild row-count mismatch: before=${before} after=${after}`);
+            }
+            this.db.pragma('foreign_keys = ON');
+            const fkProblems = (this.db.prepare('PRAGMA foreign_key_check').all() as any[]).filter(
+              (p: any) => p.table === 'helm_sessions' || p.parent === 'helm_sessions'
+            );
+            if (fkProblems.length > 0) {
+              throw new Error(`foreign_key_check failed during v108 helm_sessions rebuild: ${JSON.stringify(fkProblems.slice(0, 5))}`);
+            }
+            this.db.prepare('UPDATE schema_version SET version = 108').run();
+            this.db.exec('COMMIT;');
+          } catch (e) {
+            try { this.db.exec('ROLLBACK;'); } catch {}
+            this.db.pragma(`foreign_keys = ${fkWasOn ? 'ON' : 'OFF'}`);
+            throw e;
+          }
+          this.db.pragma('foreign_keys = ON');
+        } else {
+          this.db.prepare('UPDATE schema_version SET version = 108').run();
+        }
+      }
     }
   }
 

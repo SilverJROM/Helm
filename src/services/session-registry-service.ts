@@ -26,8 +26,8 @@ export interface HelmSessionRow {
   kind: string | null;
   project_id: number | null;
   run_id: number | null;
-  /** S07 backfills pre-existing nulls; new registers must pass owner (S05 refuses create without it). */
-  owner: SessionOwner | null;
+  /** B15 / AC20: helm_sessions.owner is NOT NULL — every row carries decision authority. */
+  owner: SessionOwner;
   status: HelmSessionStatus;
   /** B01 / D01 / AC4: lifecycle nonce, allocated fresh on every insert and every upsert-conflict. */
   generation: number;

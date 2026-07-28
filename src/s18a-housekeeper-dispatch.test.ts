@@ -313,7 +313,6 @@ describe('S18a/S18b housekeeper dispatch/apply', () => {
     const runId = seedRunFacts();
     seedSession('helm-human-chat', { owner: 'human' });
     seedSession('helm-legacy-seat', { owner: 'legacy:unknown' });
-    seedSession('helm-null-seat', { owner: null });
     seedSession('helm-idle-seat', { owner: 'helm', status: 'idle' });
     seedSession('helm-w-target', { owner: 'helm', status: 'active', runId });
 
@@ -365,7 +364,7 @@ describe('S18a/S18b housekeeper dispatch/apply', () => {
     expect(envelope.last_dispatch.role).toBe('implementer');
     expect(JSON.stringify(envelope).length).toBeLessThanOrEqual(HOUSEKEEPER_ENVELOPE_MAX_CHARS);
 
-    for (const name of ['helm-human-chat', 'helm-legacy-seat', 'helm-null-seat', 'helm-idle-seat']) {
+    for (const name of ['helm-human-chat', 'helm-legacy-seat', 'helm-idle-seat']) {
       expect(svc.listInvestigations().some((r) => r.session_name === name)).toBe(false);
       expect(reg.get(name)?.status).toBe(name === 'helm-idle-seat' ? 'idle' : 'active');
     }

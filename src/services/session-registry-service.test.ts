@@ -388,27 +388,178 @@ describe('S07 owner backfill v102 + listHelmOwnedCandidates (AC5)', () => {
     }
   });
 
-  it('listHelmOwnedCandidates SQL-excludes human, legacy:unknown, and null', () => {
+  it('listHelmOwnedCandidates SQL-excludes human and legacy:unknown', () => {
     const t = makeTempDb();
     try {
       const reg = new SessionRegistryService(t.db);
       reg.register('helm-w-helm-only', { owner: 'helm', kind: 'worker' });
       reg.register('helm-discovery-human', { owner: 'human', kind: 'discovery' });
       reg.register('helm-legacy-x', { owner: 'legacy:unknown', kind: 'other' });
-      // Force a null owner row past register() to prove SQL exclusion.
-      t.db.raw.prepare(
-        `INSERT INTO helm_sessions (name, kind, owner, status) VALUES ('helm-null-owner', 'other', NULL, 'active')`
-      ).run();
 
       const all = reg.list();
-      expect(all.length).toBe(4);
+      expect(all.length).toBe(3);
 
       const helmOnly = reg.listHelmOwnedCandidates();
       expect(helmOnly.map((r) => r.name)).toEqual(['helm-w-helm-only']);
       expect(helmOnly.every((r) => r.owner === 'helm')).toBe(true);
-      expect(helmOnly.some((r) => r.owner === 'human' || r.owner === 'legacy:unknown' || r.owner == null)).toBe(false);
+      expect(helmOnly.some((r) => r.owner === 'human' || r.owner === 'legacy:unknown')).toBe(false);
     } finally {
       t.cleanup();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B15 / AC20 — helm_sessions.owner NOT NULL (two-track: schema.ts + guarded v108 migration).
+// Synthetic/copied fixtures only; HELM_SESSION_JANITOR stays 0; never touch live data/helm.db.
+// ---------------------------------------------------------------------------
+describe('B15 owner NOT NULL (AC20)', () => {
+  let liveMtimeBefore: number | null;
+
+  beforeEach(() => {
+    const livePath = path.join(process.cwd(), 'data', 'helm.db');
+    liveMtimeBefore = fs.existsSync(livePath) ? fs.statSync(livePath).mtimeMs : null;
+  });
+  afterEach(() => {
+    const livePath = path.join(process.cwd(), 'data', 'helm.db');
+    if (liveMtimeBefore != null && fs.existsSync(livePath)) {
+      expect(fs.statSync(livePath).mtimeMs).toBe(liveMtimeBefore);
+    }
+  });
+
+  it('fresh DB: owner column is notnull=1 (schema.ts track)', () => {
+    expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(108);
+    const t = makeTempDb();
+    try {
+      const cols = t.db.raw.prepare('PRAGMA table_info(helm_sessions)').all() as any[];
+      expect(cols.find((c: any) => c.name === 'owner')?.notnull).toBe(1);
+    } finally {
+      t.cleanup();
+    }
+  });
+
+  it('v107→v108 fixture with residual null owner: backfills, notnull=1 both tracks, ids/count/FK preserved, idempotent, null insert rejected', () => {
+    const fixturePath = path.join(os.tmpdir(), `helm-b15-v107-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+    try {
+      const raw = new Database(fixturePath);
+      raw.exec(`
+        CREATE TABLE schema_version (version INTEGER PRIMARY KEY);
+        INSERT INTO schema_version (version) VALUES (107);
+        CREATE TABLE helm_sessions (
+          id INTEGER PRIMARY KEY,
+          name TEXT UNIQUE NOT NULL,
+          kind TEXT,
+          project_id INTEGER,
+          run_id INTEGER,
+          owner TEXT CHECK(owner IS NULL OR owner IN ('helm','human','legacy:unknown')),
+          status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','idle','reaped')),
+          generation INTEGER NOT NULL DEFAULT 0 CHECK(generation >= 0),
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          last_used_at TEXT,
+          ended_at TEXT,
+          reason TEXT
+        );
+        CREATE TABLE housekeeper_investigations (
+          id INTEGER PRIMARY KEY,
+          helm_session_id INTEGER REFERENCES helm_sessions(id) ON DELETE SET NULL,
+          session_name TEXT NOT NULL,
+          owner TEXT NOT NULL CHECK(owner = 'helm'),
+          session_status TEXT NOT NULL DEFAULT 'active' CHECK(session_status IN ('active','idle','reaped')),
+          session_generation INTEGER NOT NULL DEFAULT 0 CHECK(session_generation >= 0),
+          status TEXT NOT NULL CHECK(status IN ('no_dispatch','dispatching','dispatched','applied_done','needs_human','apply_rejected')) DEFAULT 'dispatching',
+          trigger_reason TEXT NOT NULL,
+          state_signature TEXT,
+          observation_json TEXT NOT NULL,
+          pane_tail TEXT NOT NULL,
+          pane_tail_provenance TEXT NOT NULL,
+          envelope_json TEXT NOT NULL,
+          usage_json TEXT NOT NULL,
+          selected_provider TEXT,
+          selected_model TEXT,
+          selected_slug TEXT,
+          selected_rung_index INTEGER,
+          selected_reason TEXT,
+          dispatch_handle TEXT,
+          dispatched_at TEXT,
+          callback_verdict TEXT CHECK(callback_verdict IS NULL OR callback_verdict IN ('done','needs-human')),
+          callback_evidence TEXT,
+          callback_rationale TEXT,
+          applied_at TEXT,
+          apply_error TEXT,
+          created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+      `);
+      // Proven-helm-by-name row with a residual null owner (pre-B14-shaped row) — B15 must backfill
+      // this defensively, not crash, then rebuild NOT NULL under it.
+      raw.prepare(
+        `INSERT INTO helm_sessions (id, name, kind, owner, status, generation) VALUES (1, 'helm-w-residual-null', 'worker', NULL, 'active', 0)`
+      ).run();
+      raw.prepare(
+        `INSERT INTO helm_sessions (id, name, kind, owner, status, generation) VALUES (2, 'helm-legacy-seat', 'other', 'legacy:unknown', 'idle', 1)`
+      ).run();
+      // FK hazard: an investigation row pointing at the null-owner session's id — must still resolve
+      // to the same row after the rebuild (row ids preserved).
+      raw.prepare(`
+        INSERT INTO housekeeper_investigations
+          (id, helm_session_id, session_name, owner, trigger_reason, observation_json, pane_tail, pane_tail_provenance, envelope_json, usage_json)
+        VALUES (1, 1, 'helm-w-residual-null', 'helm', 'test', '{}', 'tail', 'test-fixture', '{}', '{}')
+      `).run();
+      const countBefore = (raw.prepare(`SELECT COUNT(*) AS c FROM helm_sessions`).get() as any).c;
+      raw.close();
+
+      const migrated = new DatabaseService(fixturePath);
+      const ver = (migrated.raw.prepare('SELECT version FROM schema_version').get() as any).version;
+      expect(ver).toBe(SCHEMA_VERSION);
+      expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(108);
+
+      // Both tracks: the migrated table's owner column is notnull=1, same as a fresh SCHEMA_SQL table.
+      const cols = migrated.raw.prepare('PRAGMA table_info(helm_sessions)').all() as any[];
+      expect(cols.find((c: any) => c.name === 'owner')?.notnull).toBe(1);
+
+      // Backfilled via deriveSessionOwner (helm-w- name shape), not left null or dropped.
+      const residual = migrated.raw.prepare(`SELECT id, owner FROM helm_sessions WHERE name = 'helm-w-residual-null'`).get() as any;
+      expect(residual.owner).toBe('helm');
+      expect(residual.id).toBe(1); // row id preserved through the rebuild
+
+      // Row count preserved.
+      const countAfter = (migrated.raw.prepare(`SELECT COUNT(*) AS c FROM helm_sessions`).get() as any).c;
+      expect(countAfter).toBe(countBefore);
+
+      // Pre-existing authority never rewritten by the defensive backfill.
+      expect(
+        (migrated.raw.prepare(`SELECT owner FROM helm_sessions WHERE name = 'helm-legacy-seat'`).get() as any).owner
+      ).toBe('legacy:unknown');
+
+      // FK still resolves: the investigation row's helm_session_id still joins to the same session.
+      const joined = migrated.raw.prepare(`
+        SELECT hi.session_name, hs.owner FROM housekeeper_investigations hi
+        JOIN helm_sessions hs ON hs.id = hi.helm_session_id
+        WHERE hi.id = 1
+      `).get() as any;
+      expect(joined.session_name).toBe('helm-w-residual-null');
+      expect(joined.owner).toBe('helm');
+      expect((migrated.raw.prepare('PRAGMA foreign_key_check').all() as any[]).length).toBe(0);
+
+      // Null insert now rejected by the rebuilt NOT NULL column.
+      expect(() => {
+        migrated.raw.prepare(
+          `INSERT INTO helm_sessions (name, kind, owner, status) VALUES ('helm-bad-null', 'other', NULL, 'active')`
+        ).run();
+      }).toThrow();
+
+      migrated.close();
+
+      // Idempotent: reopening an already-v108 DB is a no-op — version/owners/ids unchanged.
+      const again = new DatabaseService(fixturePath);
+      expect((again.raw.prepare('SELECT version FROM schema_version').get() as any).version).toBe(SCHEMA_VERSION);
+      expect(
+        again.raw.prepare(`SELECT id, owner FROM helm_sessions WHERE name = 'helm-w-residual-null'`).get()
+      ).toEqual({ id: 1, owner: 'helm' });
+      again.close();
+    } finally {
+      for (const suf of ['', '-wal', '-shm']) {
+        try { fs.unlinkSync(fixturePath + suf); } catch {}
+      }
     }
   });
 });
@@ -526,13 +677,6 @@ describe('S12 session reconciler (WorkerService.sessionJanitorTick)', () => {
     await ws.sessionJanitorTick();
     expect(terminated).toEqual([]);
     expect(reg.get('helm-legacy-seat')!.status).toBe('idle');
-  });
-
-  it('KEEP: null owner is never auto-reaped', async () => {
-    seedSession('helm-null-owner', { status: 'idle', owner: null, ageSecs: 10 * 60 * 60 });
-    await ws.sessionJanitorTick();
-    expect(terminated).toEqual([]);
-    expect(reg.get('helm-null-owner')!.status).toBe('idle');
   });
 
   it('KEEP: live worker_runtime vetoes REAP even when idle+live', async () => {

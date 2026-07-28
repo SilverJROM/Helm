@@ -156,13 +156,12 @@ describe('S14a session-close routes (app.inject)', () => {
     }
   });
 
-  it('helm / legacy / null owner → 403 zero terminate', async () => {
+  it('helm / legacy owner → 403 zero terminate', async () => {
     seed('helm-w-1', { owner: 'helm', kind: 'worker' });
     seed('helm-leg', { owner: 'legacy:unknown' });
-    seed('helm-null', { owner: null });
     const { app } = await buildApp({ auth: 'owner', reg, tmux });
     try {
-      for (const name of ['helm-w-1', 'helm-leg', 'helm-null']) {
+      for (const name of ['helm-w-1', 'helm-leg']) {
         const res = await app.inject({
           method: 'POST',
           url: `/api/sessions/${name}/close`,

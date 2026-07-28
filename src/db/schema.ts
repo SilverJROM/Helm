@@ -2,7 +2,7 @@ import type Database from "better-sqlite3";
 import { assertAllRoleTiersInvariants } from "./role-tier-invariants.js";
 import { PROVIDERS } from "../config/providers.js";
 
-export const SCHEMA_VERSION = 107;
+export const SCHEMA_VERSION = 108;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -486,8 +486,9 @@ CREATE TABLE IF NOT EXISTS helm_sessions (
   kind TEXT,
   project_id INTEGER,
   run_id INTEGER,
-  -- S04 / AC1: binary decision authority (+ closed legacy sentinel). S07 backfills nulls via name/kind.
-  owner TEXT CHECK(owner IS NULL OR owner IN ('helm','human','legacy:unknown')),
+  -- S04 / AC1: binary decision authority (+ closed legacy sentinel). S07 backfilled historical nulls;
+  -- B15 / AC20: NOT NULL — every row now carries decision authority at insert time (fail-closed create).
+  owner TEXT NOT NULL CHECK(owner IN ('helm','human','legacy:unknown')),
   status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','idle','reaped')),
   -- B01 / D01 / AC4: lifecycle nonce allocated from lifecycle_seq on every insert and every
   -- upsert-conflict branch of register(). Discriminates a freshly re-registered row from a stale
