@@ -3092,9 +3092,16 @@ ALTER TABLE role_capabilities_v90 RENAME TO role_capabilities;
       // INSERT...SELECT preserving every row and all columns. Because run_tasks/run_events/etc reference
       // runs(id), FKs must be OFF for the DROP+rename (mirrors the v49 project_agents rebuild pattern):
       // toggle off BEFORE BEGIN, re-validate with foreign_key_check, restore on both paths.
+      // Columns absent on pre-v56 shapes (cycle_id, seals, …) are selected as NULL so v85/v88 upgrade
+      // fixtures (and real old DBs) still rebuild cleanly.
       if (current && current.version < 91) {
         if (hasTable('runs')) {
           const before = (this.db.prepare('SELECT COUNT(*) AS c FROM runs').get() as { c: number }).c;
+          const rcols = new Set(
+            (this.db.prepare('PRAGMA table_info(runs)').all() as any[]).map((c) => c.name as string)
+          );
+          const col = (name: string, fallback = 'NULL') =>
+            rcols.has(name) ? name : fallback;
           const fkWasOn = this.db.pragma('foreign_keys', { simple: true }) === 1;
           this.db.pragma('foreign_keys = OFF');
           this.db.exec('BEGIN IMMEDIATE;');
@@ -3119,8 +3126,10 @@ CREATE TABLE runs_new (
 );
 INSERT INTO runs_new (id, project_id, cycle_id, batch_id, north_star_ref, status, phase, started_at,
   ended_at, external_run_id, generation, source, state_revision, register_seal_hash, terminal_seal_hash)
-SELECT id, project_id, cycle_id, batch_id, north_star_ref, status, phase, started_at,
-  ended_at, external_run_id, generation, source, state_revision, register_seal_hash, terminal_seal_hash
+SELECT id, ${col('project_id')}, ${col('cycle_id')}, ${col('batch_id')}, ${col('north_star_ref')},
+  status, phase, ${col('started_at', "datetime('now')")}, ${col('ended_at')}, ${col('external_run_id')},
+  ${col('generation', '0')}, ${col('source', "'native'")}, ${col('state_revision', '0')},
+  ${col('register_seal_hash')}, ${col('terminal_seal_hash')}
 FROM runs;
 DROP TABLE runs;
 ALTER TABLE runs_new RENAME TO runs;
