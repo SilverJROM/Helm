@@ -564,13 +564,32 @@ interface GuardEntry {
   original: string;
   mode: GuardEntryMode;
   /**
-   * S03 fix6: after a fail-closed path-shape denial, stop all future mutate attempts
-   * for this entry (still observable via denials; no recovery spin).
+   * S03 fix6 / S03b: after a **hard** fail-closed path-shape denial, stop all future
+   * mutate attempts for this entry. Soft transient EACCES must NOT set this flag
+   * (recover on next clean poll).
    */
   dead?: boolean;
 }
 
 export type SafeWritePathResult = { ok: true } | { ok: false; reason: string };
+
+/**
+ * S03b / ACs 32–33: soft vs hard assertSafeWritePath failures.
+ *
+ * Soft (transient ancestor EACCES / parent-unreadable): may deny this tick but must NOT
+ * permanently `entry.dead` — re-check on the next clean poll.
+ * Hard (symlink ancestor, outside-fence, parent-not-dir / path-unsafe): fail-closed no-write
+ * + permanent dead (D-02).
+ */
+export function isSoftSafeWriteFailure(reason: string): boolean {
+  const r = String(reason || '');
+  return r === '<parent-unreadable>' || r.startsWith('<parent-unreadable');
+}
+
+export function isHardSafeWriteFailure(reason: string): boolean {
+  if (!reason) return true;
+  return !isSoftSafeWriteFailure(reason);
+}
 
 /**
  * S03 fix6 / D-02: no-follow ancestor walk + fence containment before any guard write.
@@ -778,10 +797,25 @@ export function startGovernedDocGuard(
     });
   };
 
-  /** Fail-closed: record denial and permanently stop mutate attempts for this entry. */
+  /** Hard fail-closed: record denial and permanently stop mutate attempts for this entry. */
   const failClosed = (entry: GuardEntry, reason: string): void => {
     recordDenial(entry, reason);
     entry.dead = true;
+  };
+
+  /**
+   * Soft denial (transient EACCES): record once this tick, leave entry live for next poll.
+   * Never write through an unreadable ancestor.
+   */
+  const softDeny = (entry: GuardEntry, reason: string): void => {
+    recordDenial(entry, reason);
+    // intentionally no entry.dead
+  };
+
+  /** Gate failure: soft vs hard (S03b). */
+  const denyGate = (entry: GuardEntry, reason: string): void => {
+    if (isSoftSafeWriteFailure(reason)) softDeny(entry, reason);
+    else failClosed(entry, reason);
   };
 
   type PathKind = 'file' | 'directory' | 'symlink' | 'non-regular';
@@ -848,7 +882,7 @@ export function startGovernedDocGuard(
   ): void => {
     const gate = assertSafeWritePath(projectDir, entry.abs);
     if (!gate.ok) {
-      failClosed(entry, gate.reason);
+      denyGate(entry, gate.reason);
       return;
     }
 
@@ -926,8 +960,9 @@ export function startGovernedDocGuard(
     // D-02: path-shape gate first — never mutate through unsafe ancestors
     const gate = assertSafeWritePath(projectDir, entry.abs);
     if (!gate.ok) {
-      // Tamper or anomalous parent shape (symlink ancestor, parent-as-file, missing parent, …)
-      failClosed(entry, gate.reason);
+      // Soft (parent-unreadable): deny this tick, re-check next poll (S03b).
+      // Hard (symlink / outside-fence / path-unsafe): permanent dead.
+      denyGate(entry, gate.reason);
       return;
     }
 

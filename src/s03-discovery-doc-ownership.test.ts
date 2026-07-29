@@ -15,6 +15,8 @@ import {
   DISCOVERY_FORBIDDEN_CYCLE_DOC_BASENAMES,
   isDiscoveryDocGuardContext,
   isDiscoveryForbiddenCycleDocPath,
+  isSoftSafeWriteFailure,
+  isHardSafeWriteFailure,
   safeCycleFolderName,
   startGovernedDocGuard,
 } from './services/doc-path-guard.js';
@@ -444,14 +446,16 @@ describe('S03 startGovernedDocGuard Discovery cycle ownership', () => {
       fs.writeFileSync(target, 'EVIL via parent-dir blind', 'utf8');
       fs.chmodSync(parent, 0o000);
 
-      await sleep(450);
+      await sleep(250); // soft deny while unreadable (S03b: not permanent-dead)
 
-      // guard must have restored parent search perms + leaf content
+      // Open parent again — next clean poll must restore (soft recovery)
       try {
         fs.chmodSync(parent, 0o755);
       } catch {
         /* already open */
       }
+      await sleep(400);
+
       try {
         fs.chmodSync(target, 0o644);
       } catch {
@@ -496,13 +500,15 @@ describe('S03 startGovernedDocGuard Discovery cycle ownership', () => {
       fs.writeFileSync(target, 'SNEAK via parent-dir blind', 'utf8');
       fs.chmodSync(parent, 0o000);
 
-      await sleep(450);
+      await sleep(250);
 
       try {
         fs.chmodSync(parent, 0o755);
       } catch {
         /* already open */
       }
+      await sleep(400);
+
       expect(fs.existsSync(target)).toBe(false);
       const denial = handle.denials.find(
         (d) => d.relPath === `cycle/${BOUND}/og-requirements.md`
@@ -667,11 +673,134 @@ describe('S03 startGovernedDocGuard Discovery cycle ownership', () => {
     try {
       const r = assertSafeWritePath(PROJ, boundPath);
       expect(r.ok).toBe(false);
-      if (!r.ok) expect(r.reason).toBe('<symlink-ancestor>');
+      if (!r.ok) {
+        expect(r.reason).toBe('<symlink-ancestor>');
+        expect(isHardSafeWriteFailure(r.reason)).toBe(true);
+        expect(isSoftSafeWriteFailure(r.reason)).toBe(false);
+      }
     } finally {
       fs.rmSync(cycleRoot, { force: true });
       fs.renameSync(path.join(PROJ, '_cycle_bak'), cycleRoot);
       fs.rmSync(realCycle, { recursive: true, force: true });
+    }
+  });
+
+  it('S03b AC32: transient grandparent chmod0 then restore → leaf EVIL→ORIGINAL after clean poll', async () => {
+    // plan.md parent = cycle/BOUND; grandparent = cycle/
+    const grandparent = path.join(PROJ, 'cycle');
+    const target = cyclePath(BOUND, 'plan.md');
+    const handle = startGovernedDocGuard(PROJ, {
+      pollMs: 50,
+      role: 'discovery',
+      phase: 'discovery',
+      cycleFolder: BOUND,
+    });
+    try {
+      fs.writeFileSync(target, 'EVIL via grandparent blind', 'utf8');
+      fs.chmodSync(grandparent, 0o000);
+
+      await sleep(250);
+      // Soft: gate returns parent-unreadable; must not permanent-dead (classifier)
+      const softGate = assertSafeWritePath(PROJ, target);
+      // May still fail while grandparent unreadable
+      if (!softGate.ok) {
+        expect(isSoftSafeWriteFailure(softGate.reason)).toBe(true);
+      }
+
+      // Restore search on grandparent — next clean poll restores leaf
+      try {
+        fs.chmodSync(grandparent, 0o755);
+      } catch {
+        /* already open */
+      }
+      await sleep(500);
+
+      expect(fs.readFileSync(target, 'utf8')).toBe('ORIGINAL plan.md');
+      expect(
+        handle.denials.some((d) => d.relPath === `cycle/${BOUND}/plan.md`)
+      ).toBe(true);
+    } finally {
+      try {
+        fs.chmodSync(grandparent, 0o755);
+      } catch {
+        /* cleanup */
+      }
+      try {
+        fs.chmodSync(target, 0o644);
+      } catch {
+        /* cleanup */
+      }
+      handle.stop();
+    }
+  });
+
+  it('S03b AC33: parent-as-symlink still fail-closed no outside write + permanent dead', async () => {
+    const outside = path.join(os.homedir(), 'helm-s03b-outside-target');
+    const outsidePlan = path.join(outside, 'plan.md');
+    fs.rmSync(outside, { recursive: true, force: true });
+    fs.mkdirSync(outside, { recursive: true });
+    fs.writeFileSync(outsidePlan, 'OUTSIDE SENTINEL', 'utf8');
+
+    const handle = startGovernedDocGuard(PROJ, {
+      pollMs: 50,
+      role: 'discovery',
+      phase: 'discovery',
+      cycleFolder: BOUND,
+    });
+    const parent = path.join(PROJ, 'cycle', BOUND);
+    try {
+      fs.rmSync(parent, { recursive: true, force: true });
+      fs.symlinkSync(outside, parent);
+      fs.writeFileSync(path.join(parent, 'plan.md'), 'EVIL via symlink parent', 'utf8');
+      expect(fs.readFileSync(outsidePlan, 'utf8')).toBe('EVIL via symlink parent');
+
+      await sleep(400);
+
+      // No fence-escaping restore of ORIGINAL into outside
+      expect(fs.readFileSync(outsidePlan, 'utf8')).toBe('EVIL via symlink parent');
+      expect(fs.readFileSync(outsidePlan, 'utf8')).not.toBe('ORIGINAL plan.md');
+      expect(fs.lstatSync(parent).isSymbolicLink()).toBe(true);
+
+      const denialsForPlan = handle.denials.filter(
+        (d) => d.relPath === `cycle/${BOUND}/plan.md`
+      );
+      expect(denialsForPlan.length).toBeGreaterThanOrEqual(1);
+      expect(denialsForPlan[0].attemptedContentSample).toBe('<symlink-ancestor>');
+      expect(isHardSafeWriteFailure('<symlink-ancestor>')).toBe(true);
+
+      // Permanent dead: no denial flood on further polls
+      const afterFirst = handle.denials.length;
+      await sleep(400);
+      expect(handle.denials.length).toBe(afterFirst);
+    } finally {
+      try {
+        fs.rmSync(parent, { force: true });
+      } catch {
+        /* cleanup */
+      }
+      try {
+        fs.rmSync(outside, { recursive: true, force: true });
+      } catch {
+        /* cleanup */
+      }
+      handle.stop();
+    }
+  });
+
+  it('S03b happy path unchanged: normal path still restores content mismatch', async () => {
+    const handle = startGovernedDocGuard(PROJ, {
+      pollMs: 50,
+      role: 'discovery',
+      phase: 'discovery',
+      cycleFolder: BOUND,
+    });
+    try {
+      expect(assertSafeWritePath(PROJ, cyclePath(BOUND, 'plan.md')).ok).toBe(true);
+      fs.writeFileSync(cyclePath(BOUND, 'plan.md'), 'EVIL s03b happy', 'utf8');
+      await sleep(400);
+      expect(fs.readFileSync(cyclePath(BOUND, 'plan.md'), 'utf8')).toBe('ORIGINAL plan.md');
+    } finally {
+      handle.stop();
     }
   });
 });
