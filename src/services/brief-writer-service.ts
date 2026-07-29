@@ -2,6 +2,13 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { workerFaceRole } from './role-alias.js';
 import { BRAIN_BLOCKER_OWNERS, BRAIN_EDGE_CLASSES, BRAIN_ROUTE_TO, MACHINE_COMPLEXITIES } from './plan-schema.js';
+import {
+  DISCOVERY_READY_ASK,
+  DISCOVERY_ROLE,
+  discoveryStatesEnumLine,
+  discoveryTerminalEnumLine,
+  PLANNING_FORBIDDEN_FOR_DISCOVERY,
+} from './discovery-contract.js';
 
 /** Helm-owned deferral policy path (product tree). Never builder-side JROM style scaffolding. */
 export const DEFERRAL_POLICY_RELPATH = 'policy/deferral-policy.md';
@@ -160,8 +167,7 @@ You are **${faceRole}**, a WORKER dispatched by Helm's deterministic orchestrato
 
 Batch ID: ${batchId}
 Dispatch nonce: ${dispatchNonce}
-Plan: ${planPath}
-Branch: ${branch}
+${planPath ? `Plan: ${planPath}\n` : ''}Branch: ${branch}
 Requirements assigned: ${requirementsAssigned}
 North-star anchors: ${northStarAnchors}
 Lifecycle: ${lifecycle}
@@ -242,7 +248,7 @@ End your reply with \`STATUS: <STATE> — <same short note>\`. The callbacks.md 
       return 'validator states: PROPOSED | REVISE-PLAN | WORKING | DONE | BLOCKED | NEEDS-INFO | PASS | FAIL | REPRO-CONFIRMED | REPRO-SATISFIED | REPRO-FAILED';
     }
     if (r === 'discovery') {
-      return 'discovery states: INTERVIEWING | NORTH-STAR-READY | IDLE | BLOCKED';
+      return discoveryStatesEnumLine();
     }
     if (r === 'plancore' || r === 'ibrain') {
       return 'helm_pm states: PLANNING | PLAN-READY | NORTH-STAR-READY | IDLE | DECIDING | DECISION-READY | BLOCKED';
@@ -345,6 +351,7 @@ CRITICAL — AFTER emitting PLAN-READY, STOP COMPLETELY. Do NOT implement, do NO
 
   // Contract-compliant north-star INTERVIEW brief (discovery role). Mirrors generatePlanningBrief so the
   // dispatch brief-contract check (callback_format / helper / paths / streaming etc.) passes under RealTransport.
+  // S01: consumes shared Discovery contract — no Plan: header; canonical enum; exact ready ASK.
   generateInterviewBrief(params: {
     batchId: string;
     prompt: string;
@@ -356,8 +363,9 @@ CRITICAL — AFTER emitting PLAN-READY, STOP COMPLETELY. Do NOT implement, do NO
     const canonicalArtifactRoot = params.canonicalArtifactRoot || params.runDir || '.';
     const base = this.generateBrief({
       batchId: params.batchId,
-      role: 'discovery',
-      planPath: path.join(canonicalArtifactRoot, 'plan.md'),
+      role: DISCOVERY_ROLE,
+      // AC5: do not print Plan: <canonical-root>/plan.md for Discovery (omit Planning path advertise).
+      planPath: '',
       runDir: params.runDir || '.',
       branch: 'main',
       requirementsAssigned: 'NORTH-STAR-INTERVIEW',
@@ -368,9 +376,19 @@ CRITICAL — AFTER emitting PLAN-READY, STOP COMPLETELY. Do NOT implement, do NO
       callbacksFile: params.callbacksFile || '<abs-path-to-callbacks.md>',
       taskType: 'feature',
     });
+    const forbidden = PLANNING_FORBIDDEN_FOR_DISCOVERY.map((f) => `\`${f}\``).join(', ');
     const instructions = `
-You are **discovery** conducting the Command Center **Discovery INTERVIEW** before any planning or autonomous execution. You are the **sole CC-chat interlocutor** for Discovery (R-H3) — the operator talks only to you in this phase.
+You are **${DISCOVERY_ROLE}** conducting the Command Center **Discovery INTERVIEW** before any planning or autonomous execution. You are the **sole CC-chat interlocutor** for Discovery (R-H3) — the operator talks only to you in this phase.
 Initial prompt: ${params.prompt}
+
+## Shared Discovery contract (S01 — authoritative)
+- Role: \`${DISCOVERY_ROLE}\`
+- ${discoveryStatesEnumLine()}
+- ${discoveryTerminalEnumLine()}
+- \`HANDOFF\` is NOT a Discovery state.
+- Discovery-owned artifacts only: \`north-star.md\`, \`conversation-log.md\`, \`decisions/\`, \`attachments/\`, \`mockups/\`.
+- Do NOT author ${forbidden}. Discovery never plans and never claims Planning complete.
+- When docs are ready, ask exactly: ${DISCOVERY_READY_ASK}
 
 ## CC-redesign Discovery mandate (R-C4 / R-H2 / R-H3)
 
@@ -380,7 +398,7 @@ Initial prompt: ${params.prompt}
   - **north-star.md** — full synthesized north-star (multiple substantive sections; not a thin copy of the raw prompt).
   - **decisions/*.md** — one file per key decision captured during the interview.
   - **conversation-log.md** — full transcript (your questions + owner's verbatim answers).
-  - **og-requirements.md** is the planning-phase requirements contract (authored later in Planning); do NOT write it during Discovery — but note its eventual path in the same canonical artifact root.
+  - Do NOT write ${forbidden} during Discovery (Planning owns those later).
 
 **3. MOCKUPS + attachments (optional Discovery deliverables)** — When UI work is in scope or the operator attaches reference images:
   - Save attached images into the canonical artifact root under **attachments/** or **mockups/** (path-referenced in docs — not transient chat paste).
@@ -400,7 +418,8 @@ Interview protocol (persistence gate):
   4. Create decisions/*.md for key decisions.
   5. Save any operator-attached images / mockup deliverables under the canonical artifact-root paths above.
 - Do NOT emit NORTH-STAR-READY until north-star.md actually contains the full synthesized spec on disk (re-read it to confirm). Emitting READY with a thin north-star forces the planner to re-interview — do not do it.
-- Do NOT emit PLAN-READY yet. Do not author plan.json or og-requirements.md. Do not start autonomous work. Wait for Helm to advance to planning.
+- Do NOT emit PLAN-READY. Do not author ${forbidden}. Do not start autonomous work. Wait for operator confirmation via the ready ASK; Helm advances Planning only after owner confirm.
+- When ready, ask exactly: ${DISCOVERY_READY_ASK}
 - First tool call every reply: the callbacks.md append (via the shell append below per the streaming mandate).
 
 Emit exactly:

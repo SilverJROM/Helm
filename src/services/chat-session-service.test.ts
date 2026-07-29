@@ -554,14 +554,14 @@ describe('B5 bootstrap injection (R-15, R-17)', () => {
     const block = formatActiveCycleBlock(cycle);
     expect(block).toContain('/tmp/example-project/cycle/any-project-cycle_0706');
     expect(block).toContain('All Helm work for this selected cycle');
-    expect(block).toContain('north-star.md');
-    expect(block).toContain('decisions/*.md');
+    // S01: planning phase keeps Planning contract only (no Discovery dual-block leak)
     expect(block).toContain('og-requirements.md');
     expect(block).toContain('plan.md');
     expect(block).toContain('do not use legacy names like `north_star.md`, `og_req.md`, or `execution_plan.md`');
     expect(block).not.toContain('do not use legacy names like `north-star.md`');
     expect(block).not.toContain('write exactly these files in the cycle folder:\n- `og_req.md`');
     expect(block).toContain('fenced ```json task array');
+    expect(block).not.toContain('Initial Discovery docs are ready');
 
     const msg = composeAgentSidecar(fakeAgent.definition_md, [], undefined,
       { name: 'example-project', directory: '/tmp/example-project', dev_url: null }, null, cycle);

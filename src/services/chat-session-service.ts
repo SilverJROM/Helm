@@ -22,6 +22,12 @@ import {
   waitForClaudeConversationId,
   type ChatIdentityKey,
 } from './chat-session-identity.js';
+import {
+  formatDiscoveryPhaseContract,
+  formatPlanningPhaseContract,
+  isDiscoveryPhase,
+  isPlanningPhase,
+} from './discovery-contract.js';
 
 // C1 KEY-C1: agent test-chat transport (SSE+POST, DELIB consensus 2026-06-21).
 // Ephemeral in-memory session store — a test-chat session is a tmux pane running the
@@ -295,25 +301,21 @@ export function formatActiveCycleBlock(activeCycle?: ActiveCycleContext | null):
     '',
     'All Helm work for this selected cycle must be created or moved inside that cycle folder. Treat project-level `plan/` folders as legacy/scratch unless the operator explicitly names them.',
     '',
-    'For active-cycle Discovery / intake artifacts, write standardized files in the cycle folder:',
-    '- `north-star.md` — normalized source of truth from the operator file/brief/notes.',
-    '- `conversation-log.md` — relevant operator answers or source-file summary when available.',
-    '- `decisions/*.md` — concrete planning assumptions and decisions.',
-    '- `attachments/` and `mockups/` — referenced source files/images when applicable.',
-    '',
-    'For active-cycle Planning artifacts, write exactly these files in the cycle folder:',
-    '- `og-requirements.md` — requirements contract rendered by Helm Planning.',
-    '- `plan.md` — Helm-algo machine contract rendered by Helm Planning and consumed by Implementation.',
-    '',
-    '`plan.md` must contain a fenced ```json task array. Each task needs `id`, `batch`, `title`, `req_refs`, `assignee`, `validator_lane`, `effort`, and `type`.',
-    '`assignee` is the implementer lane: `L1`, `L2`, or `L3`. Use `L2`/`L3` directly for complex work; do not force everything through `L1`. `validator_lane` is the independent validator counterpart: `L1`, `L2`, or `L3`.',
-    '`effort` MUST be exactly one of `low`, `med`, `high`, or `xhigh` — NOT T-shirt sizes like `S`/`M`/`L`/`XL` (a non-enum effort is rejected at ingest and blocks the run). `type` MUST be exactly `feature` or `issue`.',
-    '`batch` MUST be a non-empty STRING (e.g. "B1", "B2") — NOT a bare number (`1` is rejected and disables Start Implementation; write "B1"). `id`/`title` are strings and `req_refs` is a string array.',
-    'Copy this EXACT example task (every field, correct JSON types): {"id":"T01","batch":"B1","title":"Project scaffold","req_refs":["R-1"],"assignee":"L1","validator_lane":"L1","effort":"med","type":"feature"}.',
-    'Only use a literal model slug in `assignee` or `validator` when deliberately overriding Helm project bindings. Prefer lane labels so the harness stays project-agnostic.',
-    '',
     'Do not write cycle artifacts to generic phase-brain run folders, and do not use legacy names like `north_star.md`, `og_req.md`, or `execution_plan.md` for the active cycle.'
   );
+
+  // S01: phase-scoped artifact contract. Discovery omits Planning schema/writes.
+  // Planning keeps its schema. Unknown/empty phase: cycle facts only (fail-closed — no Planning leak).
+  if (isDiscoveryPhase(activeCycle.phase)) {
+    // Phase contract body is appended last by composeAgentSidecar (last-authority wins).
+    // Here we only keep cycle identity + folder rules; Discovery artifact/ASK live in
+    // formatDiscoveryPhaseContract so they appear last in the sidecar.
+    return lines.join('\n');
+  }
+  if (isPlanningPhase(activeCycle.phase)) {
+    lines.push('', formatPlanningPhaseContract());
+    return lines.join('\n');
+  }
   return lines.join('\n');
 }
 
@@ -369,7 +371,14 @@ export function composeAgentSidecar(
     ? HELM_PROJECT_WORKSPACE_RULES
     : (agentType === 'house' || agentType === 'helm') ? HELM_WORKSPACE_RULES : HELM_INFRA_RULES;
   const memoryBlock = formatAppMemoryBlock(appMemories);
-  return [projectBlock, cycleBlock, def, infraRules, memoryBlock].filter((p) => p.length > 0).join('\n\n');
+  // S01: phase contract last in precedence (last-authority wins).
+  // Discovery phase contract carries role/status/artifacts/ASK; Planning keeps its schema block
+  // (already inlined in formatActiveCycleBlock for planning phase — no second copy here).
+  const phaseContractLast =
+    activeCycle && isDiscoveryPhase(activeCycle.phase) ? formatDiscoveryPhaseContract() : '';
+  return [projectBlock, cycleBlock, def, infraRules, memoryBlock, phaseContractLast]
+    .filter((p) => p.length > 0)
+    .join('\n\n');
 }
 
 /**
