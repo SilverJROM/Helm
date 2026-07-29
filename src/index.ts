@@ -60,6 +60,7 @@ import { PlumbingWatcherService } from "./services/plumbing-watcher-service.js";
 import { ProjectService, serializeProjectTags } from "./services/project-service.js";
 import { ProjectAgentService } from "./services/project-agent-service.js";
 import { PlannerPanelService } from "./services/planner-panel-service.js";
+import { buildCycleSeatReadiness } from "./services/cycle-seat-preview.js";
 import { ProjectDocsService } from "./services/project-docs-service.js";
 import { ProjectStatusService } from "./services/project-status-service.js";
 import { TaskService } from "./services/task-service.js";
@@ -1873,14 +1874,15 @@ async function main(): Promise<void> {
     }
   });
 
-  // A3 SEAM-1 (R4.17): GET /api/cycles/:id/seats — every worker_runtimes seat for runs of this cycle,
-  // live OR historical (reaped/done/failed kept). Pane key = persisted worker_runtimes.id.
-  // live = state launching|running AND tmux target still exists. No schema migration; join via runs.
+  // A3 SEAM-1 (R4.17) + S07: GET /api/cycles/:id/seats — runtime worker_runtimes (live/historical)
+  // PLUS S05 PlanningStaffingService preview (pre-start) and digest-mapped roster (post-start).
+  // Read-only: no writes, spawns, or credentials. Pane key = worker_runtimes.id when present.
   app.get('/api/cycles/:id/seats', { preHandler: [authMiddleware, requireOwnerPre] }, async (request: any, reply: any) => {
     const id = Number(request.params.id);
     if (!Number.isInteger(id) || id <= 0) return reply.code(400).send({ error: 'invalid cycle id' });
-    const cycle: any = db.prepare('SELECT id FROM cycles WHERE id = ?').get(id);
+    const cycle: any = db.prepare('SELECT id, project_id FROM cycles WHERE id = ?').get(id);
     if (!cycle) return reply.code(404).send({ error: 'unknown cycle' });
+    const projectId = Number(cycle.project_id);
     const rows: any[] = db.prepare(
       `SELECT wr.id, wr.role, wr.provider, wr.model, wr.session, wr.state,
               wr.run_id AS runId, wr.correlation_id AS batchId,
@@ -1890,7 +1892,7 @@ async function main(): Promise<void> {
        WHERE runs.cycle_id = ?
        ORDER BY wr.id ASC`
     ).all(id);
-    const seats = [];
+    const runtimeBase = [];
     for (const r of rows) {
       const stateLive = r.state === 'launching' || r.state === 'running';
       let tmuxAlive = false;
@@ -1901,7 +1903,7 @@ async function main(): Promise<void> {
           tmuxAlive = false;
         }
       }
-      seats.push({
+      runtimeBase.push({
         id: r.id,
         role: r.role,
         provider: r.provider,
@@ -1909,14 +1911,52 @@ async function main(): Promise<void> {
         session: r.session || null,
         state: r.state,
         runId: r.runId,
-        cycleId: id,
         batchId: r.batchId || null,
         startedAt: r.startedAt || null,
         endedAt: r.endedAt || null,
         live: !!(stateLive && tmuxAlive)
       });
     }
-    return { seats };
+
+    // S07: S05 manifest preview + map runtimes against digest/identities (no side effects).
+    const readiness = buildCycleSeatReadiness({
+      db,
+      assignments: assignmentService,
+      plannerPanel: plannerPanelService,
+      cycleId: id,
+      projectId,
+      runtimeSeats: runtimeBase,
+    });
+
+    // Backward-compatible `seats` = runtime list (A3); enriched fields for Planning tab / handoff card.
+    return {
+      seats: readiness.runtime.seats.length
+        ? readiness.runtime.seats.map((s) => ({
+            id: s.id,
+            role: s.role,
+            provider: s.provider,
+            model: s.model,
+            session: s.session,
+            state: s.state,
+            runId: s.runId,
+            cycleId: id,
+            batchId: s.batchId,
+            startedAt: s.startedAt,
+            endedAt: s.endedAt,
+            live: s.live,
+            matchesPreview: s.matchesPreview,
+            previewRole: s.previewRole,
+            previewSlot: s.previewSlot,
+          }))
+        : [],
+      mode: readiness.mode,
+      digest: readiness.digest,
+      blocked: readiness.blocked,
+      blockReasons: readiness.blockReasons,
+      emptyPanelMessage: readiness.emptyPanelMessage,
+      preview: readiness.preview,
+      runtime: readiness.runtime,
+    };
   });
 
   // A3 SEAM-1 path-safe capture: session resolved ONLY from (cycleId, runtimeId) in DB.
