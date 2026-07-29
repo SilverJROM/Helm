@@ -1134,6 +1134,22 @@ export class RunOrchestratorService {
       const NS_TIMEOUT = parseInt(process.env.HELM_PLANNING_TIMEOUT_MS || (isFake ? '4000' : '300000'), 10);
       const nsReady = await this.waitForNorthStarReady(cbPath, batchId, NS_TIMEOUT, runId);
 
+      // S04 / AC18: waitForNorthStarReady() === false is a typed blocked transition BEFORE Discovery
+      // reap, phase mutation to planning, or runPlanningPhase. Success path below stays byte-compatible.
+      if (!nsReady) {
+        // R5a first: stopped/failed/aborted runs keep the existing active-run assertion (throws).
+        this.assertRunActive(runId, 'post-interview');
+        const reason =
+          'NORTH-STAR-READY wait returned false: Discovery interview did not signal ready; refusing Planning advance (AC18 fail-closed)';
+        console.warn(`[RunOrchestrator] run ${runId} BLOCKED post-interview: ${reason}`);
+        try {
+          await this.deps.artifacts.persistState(runDir, ['interview', 'blocked'], 'blocked', runId);
+        } catch { /* best-effort */ }
+        this.transitionRunToBlocked(runId, reason, project, 'failure', runGenToken);
+        // Leave Discovery session unreaped; do not set phase=planning; do not call runPlanningPhase.
+        return runId;
+      }
+
       // R5a: phase boundary (interview → planning). A run stopped/failed during the interview
       // must not advance into planning (the guarded UPDATE below is belt-and-braces).
       this.assertRunActive(runId, 'post-interview');
