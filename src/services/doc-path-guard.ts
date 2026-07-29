@@ -516,6 +516,11 @@ export function assertProjectWriteAllowed(relPath: string): void {
 // cycle/<folder>/{og-requirements.md,plan.md,plan.json} (create/replace/unlink/rename).
 // north-star.md and conversation-log.md under that folder remain writable. Other cycle
 // folders and non-Discovery phases are not over-blocked.
+//
+// S03 fix6 / D-02: FAIL-CLOSED — never write unless path shape is provably safe.
+// No-follow lstat every ancestor; containment before ANY write; on failure record denial
+// and stop that entry (no unlink/mkdir/write through agent-reshaped paths). The guard is
+// unsandboxed; recovery-through-repair is a confused-deputy hazard.
 
 /** Basenames Discovery may not create/replace/unlink/rename under its bound cycle/ folder. */
 export const DISCOVERY_FORBIDDEN_CYCLE_DOC_BASENAMES = [
@@ -558,6 +563,66 @@ interface GuardEntry {
   /** Snapshot bytes for restore mode; empty string for forbid-create. */
   original: string;
   mode: GuardEntryMode;
+  /**
+   * S03 fix6: after a fail-closed path-shape denial, stop all future mutate attempts
+   * for this entry (still observable via denials; no recovery spin).
+   */
+  dead?: boolean;
+}
+
+export type SafeWritePathResult = { ok: true } | { ok: false; reason: string };
+
+/**
+ * S03 fix6 / D-02: no-follow ancestor walk + fence containment before any guard write.
+ * Pure assertion — never creates, removes, or writes.
+ *
+ * Every ancestor from `projectDir` to the leaf parent must be a **real directory**
+ * (not a symlink, not a file). Relative containment under the fence is required.
+ */
+export function assertSafeWritePath(
+  projectDir: string,
+  leafAbs: string
+): SafeWritePathResult {
+  const fenceRoot = path.resolve(projectDir);
+  const leaf = path.resolve(leafAbs);
+
+  const relToFence = path.relative(fenceRoot, leaf);
+  if (!relToFence || relToFence.startsWith('..') || path.isAbsolute(relToFence)) {
+    return { ok: false, reason: '<outside-fence>' };
+  }
+
+  try {
+    const rootSt = fsSync.lstatSync(fenceRoot);
+    if (rootSt.isSymbolicLink()) return { ok: false, reason: '<symlink-ancestor>' };
+    if (!rootSt.isDirectory()) return { ok: false, reason: '<path-unsafe>' };
+  } catch (err: any) {
+    return { ok: false, reason: `<path-unsafe:${err?.code || 'ERR'}>` };
+  }
+
+  const parts = relToFence.split(path.sep).filter((p) => p.length > 0 && p !== '.');
+  if (parts.length === 0 || parts.some((p) => p === '..')) {
+    return { ok: false, reason: parts.some((p) => p === '..') ? '<outside-fence>' : '<path-unsafe>' };
+  }
+
+  let cur = fenceRoot;
+  for (let i = 0; i < parts.length - 1; i++) {
+    cur = path.join(cur, parts[i]);
+    try {
+      const st = fsSync.lstatSync(cur);
+      if (st.isSymbolicLink()) return { ok: false, reason: '<symlink-ancestor>' };
+      if (!st.isDirectory()) return { ok: false, reason: '<path-unsafe>' };
+    } catch (err: any) {
+      if (err?.code === 'ENOENT' || err?.code === 'ENOTDIR') {
+        return { ok: false, reason: '<path-unsafe>' };
+      }
+      if (err?.code === 'EACCES' || err?.code === 'EPERM') {
+        return { ok: false, reason: '<parent-unreadable>' };
+      }
+      return { ok: false, reason: `<path-unsafe:${err?.code || 'ERR'}>` };
+    }
+  }
+
+  return { ok: true };
 }
 
 /** True when role or phase indicates a Discovery-owned chat (case-insensitive). */
@@ -713,11 +778,13 @@ export function startGovernedDocGuard(
     });
   };
 
+  /** Fail-closed: record denial and permanently stop mutate attempts for this entry. */
+  const failClosed = (entry: GuardEntry, reason: string): void => {
+    recordDenial(entry, reason);
+    entry.dead = true;
+  };
+
   type PathKind = 'file' | 'directory' | 'symlink' | 'non-regular';
-  /**
-   * S03 fix4/fix5: distinguish missing (ENOENT), access-denied (EACCES/EPERM),
-   * parent-not-dir (ENOTDIR — identity: parent is a file), and present kinds.
-   */
   type PathProbe =
     | { result: 'missing' }
     | { result: 'access-denied'; code: string }
@@ -726,9 +793,6 @@ export function startGovernedDocGuard(
 
   const isAccessErrno = (code: unknown): boolean =>
     code === 'EACCES' || code === 'EPERM';
-
-  const isParentIdentityErrno = (code: unknown): boolean =>
-    code === 'ENOTDIR' || code === 'EEXIST';
 
   /**
    * Probe a protected abs with lstat (never follow).
@@ -755,200 +819,146 @@ export function startGovernedDocGuard(
   };
 
   /**
-   * Best-effort remove of whatever sits at abs without following symlinks.
-   * rmSync on a symlink unlinks the link; on a directory removes recursively.
+   * Remove leaf without following symlinks. Caller MUST have passed assertSafeWritePath.
+   * Returns null on success, or an error code string on failure (never silent).
    */
-  const removePathWithoutFollowing = (abs: string): boolean => {
+  const removeLeafNoFollow = (abs: string): string | null => {
     try {
-      fsSync.rmSync(abs, { recursive: true, force: true });
-      return true;
-    } catch {
-      return false;
-    }
-  };
-
-  /** Best-effort restore search+read on the parent of a protected leaf (class: parent chmod 0). */
-  const ensureParentSearchable = (leafAbs: string): void => {
-    try {
-      fsSync.chmodSync(path.dirname(leafAbs), 0o755);
-    } catch {
-      // best-effort; enforce still attempts remove/restore
-    }
-  };
-
-  /**
-   * S03 fix5: ensure parent of a protected leaf is a real directory.
-   * If parent exists and is NOT a directory (file/symlink/fifo — e.g. rm -rf cycle/folder; touch folder),
-   * remove it (non-recursive) and mkdir. Returns whether a non-dir parent was repaired.
-   */
-  const ensureParentDirectory = (
-    leafAbs: string
-  ): 'ok' | 'repaired-not-dir' | 'failed' => {
-    const parent = path.dirname(leafAbs);
-    let st: fsSync.Stats;
-    try {
-      st = fsSync.lstatSync(parent);
+      const st = fsSync.lstatSync(abs);
+      if (st.isDirectory() && !st.isSymbolicLink()) {
+        fsSync.rmSync(abs, { recursive: true, force: true });
+      } else {
+        // file, symlink, fifo — unlink without following
+        fsSync.rmSync(abs, { force: true });
+      }
+      return null;
     } catch (err: any) {
-      if (err?.code === 'ENOENT') {
-        try {
-          fsSync.mkdirSync(parent, { recursive: true });
-          return 'ok';
-        } catch {
-          return 'failed';
-        }
-      }
-      return 'failed';
-    }
-    if (st.isDirectory()) return 'ok';
-    // Identity error: parent path exists but is not a directory
-    try {
-      fsSync.rmSync(parent, { force: true }); // non-recursive — parent is a leaf node, not a dir
-      fsSync.mkdirSync(parent, { recursive: true });
-      return 'repaired-not-dir';
-    } catch {
-      return 'failed';
-    }
-  };
-
-  /** Restore leaf original bytes after ensuring parent is a directory. */
-  const writeRestoredLeaf = (entry: GuardEntry): 'ok' | 'repaired-not-dir' | 'failed' => {
-    const parentState = ensureParentDirectory(entry.abs);
-    if (parentState === 'failed') return 'failed';
-    try {
-      fsSync.writeFileSync(entry.abs, entry.original, 'utf8');
-      return parentState === 'repaired-not-dir' ? 'repaired-not-dir' : 'ok';
-    } catch {
-      return 'failed';
+      if (err?.code === 'ENOENT') return null;
+      return String(err?.code || 'ERR');
     }
   };
 
   /**
-   * Corrective action for a protected entry after any confirmed tamper class:
-   * remove path without following; restore original bytes (restore) or leave absent (forbid-create);
-   * always recordDenial. Shared by non-regular, leaf-unreadable, and parent-unreadable paths.
+   * After assertSafeWritePath OK: optional parent search-perm repair (mode only, shape already proven),
+   * then restore leaf bytes (restore) or ensure absent (forbid-create). Explicit error branches only.
    */
-  const enforceProtectedEntry = (entry: GuardEntry, sample: string): void => {
-    removePathWithoutFollowing(entry.abs);
-    if (entry.mode === 'restore') {
-      const written = writeRestoredLeaf(entry);
-      if (written === 'repaired-not-dir' && sample === '<parent-unreadable>') {
-        sample = '<parent-not-dir>';
-      }
-    } else {
-      // forbid-create: parent may still be a file blocking a future honest mkdir — repair identity
-      ensureParentDirectory(entry.abs);
-    }
-    recordDenial(entry, sample);
-  };
-
-  /**
-   * S03 fix5: parent path is a non-directory (rm -rf cycle/folder; touch folder).
-   * Recreate parent as directory, restore leaf (or leave absent), single denial class.
-   */
-  const handleParentNotDir = (entry: GuardEntry): void => {
-    const parentState = ensureParentDirectory(entry.abs);
-    if (entry.mode === 'restore') {
-      try {
-        if (parentState !== 'failed') {
-          fsSync.writeFileSync(entry.abs, entry.original, 'utf8');
-        }
-      } catch {
-        // poll may retry
-      }
-    } else {
-      // forbid-create: parent is a dir again; ensure leaf stays absent
-      removePathWithoutFollowing(entry.abs);
-    }
-    recordDenial(entry, '<parent-not-dir>');
-  };
-
-  /**
-   * S03 fix3+fix4 class-wide access recovery.
-   * Leaf chmod(0) or parent cycle-folder chmod(0) (or any EACCES/EPERM on probe/read):
-   * 1) restore parent search perms 2) sample if possible 3) enforce leaf + denial.
-   * Never a silent no-op — always denial + corrective action.
-   */
-  const handleAccessError = (
+  const safeMutateLeaf = (
     entry: GuardEntry,
-    preferredSample: string = '<unreadable>'
+    sample: string
   ): void => {
-    // fix5: identity before permission — ENOTDIR masquerading as access noise
-    const parentProbe = probePath(path.dirname(entry.abs));
-    if (
-      parentProbe.result === 'present' &&
-      parentProbe.kind !== 'directory'
-    ) {
-      handleParentNotDir(entry);
+    const gate = assertSafeWritePath(projectDir, entry.abs);
+    if (!gate.ok) {
+      failClosed(entry, gate.reason);
       return;
     }
 
-    ensureParentSearchable(entry.abs);
+    // Parent is a real directory inside the fence — chmod for search is shape-safe (fix3/fix4 class).
+    try {
+      fsSync.chmodSync(path.dirname(entry.abs), 0o755);
+    } catch (err: any) {
+      // non-fatal if already searchable; write may still succeed
+      if (isAccessErrno(err?.code)) {
+        // continue; write path records failure explicitly
+      }
+    }
 
-    let sample = preferredSample;
-    const after = probePath(entry.abs);
-    if (after.result === 'parent-not-dir') {
-      handleParentNotDir(entry);
+    if (entry.mode === 'forbid-create') {
+      const rmErr = removeLeafNoFollow(entry.abs);
+      if (rmErr) {
+        failClosed(entry, `<remove-failed:${rmErr}>`);
+        return;
+      }
+      recordDenial(entry, sample);
       return;
     }
-    if (after.result === 'present' && after.kind === 'file') {
+
+    // restore mode: clear non-file leaf if present, then write original bytes
+    const leafProbe = probePath(entry.abs);
+    if (leafProbe.result === 'present' && leafProbe.kind !== 'file') {
+      const rmErr = removeLeafNoFollow(entry.abs);
+      if (rmErr) {
+        failClosed(entry, `<remove-failed:${rmErr}>`);
+        return;
+      }
+      // sample for non-regular leaf if caller did not already specialize
+      if (sample === '<unreadable>' || sample === '') {
+        sample = denialSampleForKind(leafProbe.kind);
+      }
+    } else if (leafProbe.result === 'present' && leafProbe.kind === 'file') {
       try {
         fsSync.chmodSync(entry.abs, 0o644);
-        const body = fsSync.readFileSync(entry.abs, 'utf8');
-        if (body.length > 0) sample = body.slice(0, 500);
-      } catch {
-        sample = preferredSample;
+      } catch (err: any) {
+        // best-effort; writeFile may still replace via unlink+create if needed
+        if (err?.code && !isAccessErrno(err.code) && err.code !== 'ENOENT') {
+          failClosed(entry, `<chmod-failed:${err.code}>`);
+          return;
+        }
       }
-    } else if (after.result === 'present' && after.kind !== 'file') {
-      sample = denialSampleForKind(after.kind);
-    } else if (after.result === 'access-denied') {
-      // parent chmod may have failed; still enforce below
-      sample =
-        preferredSample === '<unreadable>' ? '<parent-unreadable>' : preferredSample;
     }
 
-    enforceProtectedEntry(entry, sample);
+    try {
+      fsSync.writeFileSync(entry.abs, entry.original, 'utf8');
+      recordDenial(entry, sample);
+    } catch (err: any) {
+      // Last resort on unreadable-but-undeletable file: try unlink then rewrite (parent still safe)
+      if (isAccessErrno(err?.code) || err?.code === 'EPERM') {
+        const rmErr = removeLeafNoFollow(entry.abs);
+        if (rmErr) {
+          failClosed(entry, `<restore-failed:${err?.code || rmErr}>`);
+          return;
+        }
+        try {
+          fsSync.writeFileSync(entry.abs, entry.original, 'utf8');
+          recordDenial(entry, sample || '<unreadable>');
+          return;
+        } catch (err2: any) {
+          failClosed(entry, `<restore-failed:${err2?.code || 'ERR'}>`);
+          return;
+        }
+      }
+      failClosed(entry, `<restore-failed:${err?.code || 'ERR'}>`);
+    }
   };
 
   const checkOne = (entry: GuardEntry) => {
-    if (stopped) return;
+    if (stopped || entry.dead) return;
+
+    // D-02: path-shape gate first — never mutate through unsafe ancestors
+    const gate = assertSafeWritePath(projectDir, entry.abs);
+    if (!gate.ok) {
+      // Tamper or anomalous parent shape (symlink ancestor, parent-as-file, missing parent, …)
+      failClosed(entry, gate.reason);
+      return;
+    }
 
     const probe = probePath(entry.abs);
 
-    // S03 fix5: parent is a file/symlink (identity) — recreate dir + restore leaf
+    // parent-not-dir should already fail gate; belt-and-suspenders
     if (probe.result === 'parent-not-dir') {
-      handleParentNotDir(entry);
+      failClosed(entry, '<path-unsafe>');
       return;
     }
 
-    // S03 fix4: parent (or leaf) access-denied must never bare-return
     if (probe.result === 'access-denied') {
-      handleAccessError(
-        entry,
-        isAccessErrno(probe.code) ? '<parent-unreadable>' : '<unreadable>'
-      );
+      // Leaf or intermediate unreadable but ancestors asserted OK → attempt safe restore
+      if (entry.mode === 'forbid-create') {
+        safeMutateLeaf(entry, isAccessErrno(probe.code) ? '<unreadable>' : '<unreadable>');
+        return;
+      }
+      safeMutateLeaf(entry, isAccessErrno(probe.code) ? '<unreadable>' : '<unreadable>');
       return;
     }
 
-    // S03 fix1/fix2: non-regular type-change (dir/symlink/fifo/…) is tampering
+    // non-regular leaf (dir/symlink/fifo) — parent chain safe, remove+restore or remove
     if (probe.result === 'present' && probe.kind !== 'file') {
-      enforceProtectedEntry(entry, denialSampleForKind(probe.kind));
+      safeMutateLeaf(entry, denialSampleForKind(probe.kind));
       return;
     }
 
     // missing
     if (probe.result === 'missing') {
       if (entry.mode === 'forbid-create') return; // still absent — allowed
-      // restore: rewrite original (B22b FIX1 unlink/rename-away)
-      const written = writeRestoredLeaf(entry);
-      if (written === 'ok' || written === 'repaired-not-dir') {
-        recordDenial(
-          entry,
-          written === 'repaired-not-dir' ? '<parent-not-dir>' : ''
-        );
-      } else {
-        // parent unsearchable / unwritable — class-wide access recovery, not bare return
-        handleAccessError(entry, '<parent-unreadable>');
-      }
+      safeMutateLeaf(entry, '');
       return;
     }
 
@@ -958,46 +968,27 @@ export function startGovernedDocGuard(
       current = fsSync.readFileSync(entry.abs, 'utf8');
     } catch (err: any) {
       if (err?.code === 'ENOENT') {
-        // raced to missing
         if (entry.mode === 'forbid-create') return;
-        const written = writeRestoredLeaf(entry);
-        if (written === 'ok' || written === 'repaired-not-dir') {
-          recordDenial(
-            entry,
-            written === 'repaired-not-dir' ? '<parent-not-dir>' : ''
-          );
-        } else {
-          handleAccessError(entry, '<parent-unreadable>');
-        }
+        safeMutateLeaf(entry, '');
         return;
       }
-      if (err?.code === 'ENOTDIR' || isParentIdentityErrno(err?.code)) {
-        handleParentNotDir(entry);
+      if (err?.code === 'ENOTDIR') {
+        failClosed(entry, '<path-unsafe>');
         return;
       }
-      // S03 fix3: leaf EACCES/EPERM (chmod 0 on file); fix4: any non-ENOENT read fail
-      handleAccessError(entry, '<unreadable>');
+      // EACCES/EPERM leaf (chmod 0) — shape OK, safe restore
+      safeMutateLeaf(entry, '<unreadable>');
       return;
     }
 
     if (entry.mode === 'forbid-create') {
-      // File appeared (create) — Discovery must not own it
-      enforceProtectedEntry(entry, current.slice(0, 500));
+      safeMutateLeaf(entry, current.slice(0, 500));
       return;
     }
 
     // restore mode: content mismatch
     if (current !== entry.original) {
-      try {
-        fsSync.writeFileSync(entry.abs, entry.original, 'utf8');
-        recordDenial(entry, current.slice(0, 500));
-      } catch (err: any) {
-        if (err?.code === 'ENOTDIR' || isParentIdentityErrno(err?.code)) {
-          handleParentNotDir(entry);
-        } else if (isAccessErrno(err?.code)) {
-          handleAccessError(entry, current.slice(0, 500) || '<unreadable>');
-        }
-      }
+      safeMutateLeaf(entry, current.slice(0, 500));
     }
   };
 

@@ -11,6 +11,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import {
+  assertSafeWritePath,
   DISCOVERY_FORBIDDEN_CYCLE_DOC_BASENAMES,
   isDiscoveryDocGuardContext,
   isDiscoveryForbiddenCycleDocPath,
@@ -530,8 +531,8 @@ describe('S03 startGovernedDocGuard Discovery cycle ownership', () => {
     }
   });
 
-  it('fix5 restore: rm-rf bound cycle folder then touch as file → plan.md ORIGINAL + parent is dir', async () => {
-    // Seed + start guard first so restore-mode snapshots ORIGINAL, then destroy parent identity.
+  it('fix5/D-02 fail-closed: rm-rf bound cycle folder then touch as file → denial, no repair, no spin', async () => {
+    // D-02: parent-as-file is path-unsafe — do NOT mkdir/repair; record denial and stop the entry.
     const handle = startGovernedDocGuard(PROJ, {
       pollMs: 50,
       role: 'discovery',
@@ -547,25 +548,22 @@ describe('S03 startGovernedDocGuard Discovery cycle ownership', () => {
 
       await sleep(450);
 
-      expect(fs.statSync(parent).isDirectory()).toBe(true);
-      expect(fs.readFileSync(target, 'utf8')).toBe('ORIGINAL plan.md');
+      // fail-closed: parent remains a file; leaf is not rewritten through ENOTDIR
+      expect(fs.statSync(parent).isFile()).toBe(true);
+      expect(fs.existsSync(target)).toBe(false);
 
       const denialsForPlan = handle.denials.filter(
         (d) => d.relPath === `cycle/${BOUND}/plan.md`
       );
       expect(denialsForPlan.length).toBeGreaterThanOrEqual(1);
-      expect(
-        denialsForPlan.some(
-          (d) =>
-            d.attemptedContentSample === '<parent-not-dir>' ||
-            d.attemptedContentSample === ''
-        )
-      ).toBe(true);
+      expect(denialsForPlan[0].attemptedContentSample).toMatch(
+        /path-unsafe|parent-unreadable|outside-fence/
+      );
 
-      // No unbounded spin: after restore settles, a second poll window does not flood denials
+      // dead entry: no denial flood
       const afterFirst = handle.denials.length;
       await sleep(450);
-      expect(handle.denials.length - afterFirst).toBeLessThanOrEqual(3);
+      expect(handle.denials.length).toBe(afterFirst);
     } finally {
       try {
         if (fs.existsSync(parent) && fs.statSync(parent).isFile()) {
@@ -575,6 +573,105 @@ describe('S03 startGovernedDocGuard Discovery cycle ownership', () => {
         /* cleanup */
       }
       handle.stop();
+    }
+  });
+
+  it('fix6 D-02: parent as symlink to outside dir + content tamper → no write outside fence + denial', async () => {
+    const outside = path.join(os.homedir(), 'helm-s03-fix6-outside-target');
+    const outsidePlan = path.join(outside, 'plan.md');
+    fs.rmSync(outside, { recursive: true, force: true });
+    fs.mkdirSync(outside, { recursive: true });
+    fs.writeFileSync(outsidePlan, 'OUTSIDE SENTINEL', 'utf8');
+
+    const handle = startGovernedDocGuard(PROJ, {
+      pollMs: 50,
+      role: 'discovery',
+      phase: 'discovery',
+      cycleFolder: BOUND,
+    });
+    const parent = path.join(PROJ, 'cycle', BOUND);
+    try {
+      // Snapshot already taken; replace parent with symlink pointing outside the fence
+      fs.rmSync(parent, { recursive: true, force: true });
+      fs.symlinkSync(outside, parent);
+
+      // Agent-style tamper follows the symlink into outside (sandbox may allow)
+      fs.writeFileSync(path.join(parent, 'plan.md'), 'EVIL via symlink parent', 'utf8');
+      expect(fs.readFileSync(outsidePlan, 'utf8')).toBe('EVIL via symlink parent');
+
+      await sleep(450);
+
+      // CRITICAL: guard must NOT restore ORIGINAL through the symlink (fence escape)
+      expect(fs.readFileSync(outsidePlan, 'utf8')).toBe('EVIL via symlink parent');
+      expect(fs.readFileSync(outsidePlan, 'utf8')).not.toBe('ORIGINAL plan.md');
+      // parent remains a symlink (fail-closed does not "repair" it)
+      expect(fs.lstatSync(parent).isSymbolicLink()).toBe(true);
+
+      const denialsForPlan = handle.denials.filter(
+        (d) => d.relPath === `cycle/${BOUND}/plan.md`
+      );
+      expect(denialsForPlan.length).toBeGreaterThanOrEqual(1);
+      expect(denialsForPlan[0].attemptedContentSample).toBe('<symlink-ancestor>');
+
+      const afterFirst = handle.denials.length;
+      await sleep(450);
+      expect(handle.denials.length).toBe(afterFirst);
+    } finally {
+      try {
+        fs.rmSync(parent, { force: true });
+      } catch {
+        /* cleanup */
+      }
+      try {
+        fs.rmSync(outside, { recursive: true, force: true });
+      } catch {
+        /* cleanup */
+      }
+      handle.stop();
+    }
+  });
+
+  it('fix6 happy path still restores leaf content when path shape is normal', async () => {
+    const handle = startGovernedDocGuard(PROJ, {
+      pollMs: 50,
+      role: 'discovery',
+      phase: 'discovery',
+      cycleFolder: BOUND,
+    });
+    try {
+      expect(assertSafeWritePath(PROJ, cyclePath(BOUND, 'plan.md')).ok).toBe(true);
+      fs.writeFileSync(cyclePath(BOUND, 'plan.md'), 'EVIL normal path', 'utf8');
+      await sleep(450);
+      expect(fs.readFileSync(cyclePath(BOUND, 'plan.md'), 'utf8')).toBe('ORIGINAL plan.md');
+      expect(
+        handle.denials.some((d) => d.relPath === `cycle/${BOUND}/plan.md`)
+      ).toBe(true);
+    } finally {
+      handle.stop();
+    }
+  });
+
+  it('fix6 optional: intermediate symlink ancestor blocks write', () => {
+    const cycleRoot = path.join(PROJ, 'cycle');
+    const realCycle = path.join(PROJ, '_real_cycle_elsewhere');
+    fs.rmSync(realCycle, { recursive: true, force: true });
+    fs.mkdirSync(realCycle, { recursive: true });
+    // Replace cycle/ with a symlink (intermediate ancestor of cycle/<folder>/plan.md)
+    // Only assertSafeWritePath — no guard session required
+    const boundPath = path.join(PROJ, 'cycle', BOUND, 'plan.md');
+    // If cycle is a real dir from setupBoundCycle, assert OK first
+    expect(assertSafeWritePath(PROJ, boundPath).ok).toBe(true);
+
+    fs.renameSync(cycleRoot, path.join(PROJ, '_cycle_bak'));
+    fs.symlinkSync(realCycle, cycleRoot);
+    try {
+      const r = assertSafeWritePath(PROJ, boundPath);
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.reason).toBe('<symlink-ancestor>');
+    } finally {
+      fs.rmSync(cycleRoot, { force: true });
+      fs.renameSync(path.join(PROJ, '_cycle_bak'), cycleRoot);
+      fs.rmSync(realCycle, { recursive: true, force: true });
     }
   });
 });
