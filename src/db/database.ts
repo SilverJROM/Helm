@@ -3682,6 +3682,40 @@ CREATE TABLE IF NOT EXISTS chat_session_identities (
 
         this.db.prepare('UPDATE schema_version SET version = 110').run();
       }
+
+      // v111 / S08 (discovery-planning-handoff): durable Discovery→Planning handoff CAS store.
+      // Fresh DBs get the table via SCHEMA_SQL; this upgrades live/pre-existing DBs.
+      // Migration tests only — never open data/helm.db here.
+      if (current && current.version < 111) {
+        this.db.exec(`
+CREATE TABLE IF NOT EXISTS discovery_handoffs (
+  id INTEGER PRIMARY KEY,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  cycle_id INTEGER NOT NULL REFERENCES cycles(id) ON DELETE CASCADE,
+  chat_session_id TEXT,
+  agent_id INTEGER REFERENCES agents(id),
+  credential_hash TEXT NOT NULL,
+  credential_consumed_at TEXT,
+  callback_role TEXT,
+  callback_status TEXT,
+  state TEXT NOT NULL CHECK(state IN (
+    'pending', 'declined', 'starting', 'started', 'quarantined', 'failed'
+  )),
+  manifest_json TEXT,
+  manifest_digest TEXT,
+  planning_run_id INTEGER REFERENCES runs(id),
+  reason TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_discovery_handoffs_cycle ON discovery_handoffs(cycle_id);
+CREATE INDEX IF NOT EXISTS idx_discovery_handoffs_project ON discovery_handoffs(project_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_discovery_handoffs_one_live
+  ON discovery_handoffs(cycle_id)
+  WHERE state IN ('pending', 'starting');
+`);
+        this.db.prepare('UPDATE schema_version SET version = 111').run();
+      }
     }
   }
 

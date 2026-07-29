@@ -2,7 +2,7 @@ import type Database from "better-sqlite3";
 import { assertAllRoleTiersInvariants } from "./role-tier-invariants.js";
 import { PROVIDERS } from "../config/providers.js";
 
-export const SCHEMA_VERSION = 110;
+export const SCHEMA_VERSION = 111;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -348,6 +348,35 @@ CREATE INDEX IF NOT EXISTS idx_runs_cycle ON runs(cycle_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_project_external_generation
   ON runs(project_id, external_run_id, generation)
   WHERE project_id IS NOT NULL AND external_run_id IS NOT NULL;
+
+-- S08 v111: durable Discovery→Planning handoff / CAS repository.
+-- Raw one-use credential is NEVER stored — only credential_hash (sha256 hex).
+-- One live handoff per cycle: state IN (pending, starting) via partial unique index.
+CREATE TABLE IF NOT EXISTS discovery_handoffs (
+  id INTEGER PRIMARY KEY,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  cycle_id INTEGER NOT NULL REFERENCES cycles(id) ON DELETE CASCADE,
+  chat_session_id TEXT,
+  agent_id INTEGER REFERENCES agents(id),
+  credential_hash TEXT NOT NULL,
+  credential_consumed_at TEXT,
+  callback_role TEXT,
+  callback_status TEXT,
+  state TEXT NOT NULL CHECK(state IN (
+    'pending', 'declined', 'starting', 'started', 'quarantined', 'failed'
+  )),
+  manifest_json TEXT,
+  manifest_digest TEXT,
+  planning_run_id INTEGER REFERENCES runs(id),
+  reason TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_discovery_handoffs_cycle ON discovery_handoffs(cycle_id);
+CREATE INDEX IF NOT EXISTS idx_discovery_handoffs_project ON discovery_handoffs(project_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_discovery_handoffs_one_live
+  ON discovery_handoffs(cycle_id)
+  WHERE state IN ('pending', 'starting');
 
 -- O5.1: immutable deduplication receipts for sealed run-ingest transitions.
 CREATE TABLE IF NOT EXISTS run_ingest_receipts (
