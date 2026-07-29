@@ -51,7 +51,8 @@ export interface DiscoveryHandoffIngressDeps {
   plannerPanel?: PlannerPanelService;
 }
 
-async function validateDiscoveryDocs(
+/** Shared by S09 ready ingress and S11 owner confirm revalidation. */
+export async function validateDiscoveryDocs(
   cycleDocDir: string
 ): Promise<{ ok: true } | { ok: false; reason: string }> {
   const nsPath = path.join(cycleDocDir, 'north-star.md');

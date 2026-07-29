@@ -2092,11 +2092,17 @@ async function main(): Promise<void> {
   });
 
   // S09: Discovery structured ready callback (credential auth; no owner browser token; no Planning start).
+  // S11: owner+loopback confirm/decline bridge (CAS pending→starting → S10 once; 202 after durable run).
   registerDiscoveryHandoffRoutes(app, {
     db,
     assignmentService,
     cycleService,
     plannerPanelService,
+    artifacts: runArtifactService,
+    orchestrator: runOrchestratorService,
+    authMiddleware,
+    requireOwnerPre,
+    requireLocalLaunchPre,
   });
 
   // B8a / AC-12 + AC-12b: opt-in project role roster override + team unbind.
@@ -2907,6 +2913,22 @@ async function main(): Promise<void> {
     const pid = Number(cycle.project_id);
     if (!projectService.getProject(pid)) return reply.code(404).send({ error: 'unknown project' });
     const body = request.body || {};
+
+    // S11 / AC29: bodyless (and any direct) start-planning cannot bypass a live owner handoff.
+    // Owner must confirm via POST /api/cycles/:id/discovery-handoff/confirm.
+    try {
+      const { DiscoveryHandoffService } = await import('./services/discovery-handoff-service.js');
+      const handoffs = new DiscoveryHandoffService(db);
+      const live = handoffs.getLive(cid);
+      if (live && (live.state === 'pending' || live.state === 'starting')) {
+        return reply.code(409).send({
+          error:
+            'pending discovery handoff requires owner confirm at /api/cycles/:id/discovery-handoff/confirm',
+          code: 'HANDOFF_CONFIRM_REQUIRED',
+          handoffId: live.id,
+        });
+      }
+    } catch { /* if handoff store unavailable, fall through */ }
 
     // Never two concurrent runs for a cycle (mirrors IS-R4; makes a double-click idempotent).
     try {

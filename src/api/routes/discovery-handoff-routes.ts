@@ -1,17 +1,24 @@
 /**
- * S09 — Discovery ready-callback HTTP boundary.
- * Credential-authenticated only (not owner browser token). Never starts Planning.
+ * S09 — Discovery ready-callback HTTP boundary (credential-auth; never starts Planning).
+ * S11 — Owner confirm/decline (owner + loopback; CAS + S10 once; 202 after durable run).
  */
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, preHandlerHookHandler } from 'fastify';
 import type { DatabaseService } from '../../db/database.js';
 import type { AgentAssignmentService } from '../../services/agent-assignment-service.js';
 import type { CycleService } from '../../services/cycle-service.js';
 import type { PlannerPanelService } from '../../services/planner-panel-service.js';
+import type { RunArtifactService } from '../../services/run-artifact-service.js';
+import type { RunOrchestratorService } from '../../services/run-orchestrator-service.js';
 import { DiscoveryHandoffService } from '../../services/discovery-handoff-service.js';
 import {
   processDiscoveryReadyCallback,
   type DiscoveryReadyBody,
 } from '../../services/discovery-handoff-ingress.js';
+import {
+  confirmDiscoveryHandoff,
+  declineDiscoveryHandoff,
+  ownerBridgeHttpStatus,
+} from '../../services/discovery-handoff-owner-bridge.js';
 
 export interface DiscoveryHandoffRouteDeps {
   db: DatabaseService;
@@ -19,6 +26,14 @@ export interface DiscoveryHandoffRouteDeps {
   cycleService: CycleService;
   plannerPanelService?: PlannerPanelService;
   handoffs?: DiscoveryHandoffService;
+  /** S11: required for owner confirm/decline routes. */
+  artifacts?: RunArtifactService;
+  orchestrator?: Pick<RunOrchestratorService, 'startPlanningFromConfirmedHandoff'>;
+  authMiddleware?: preHandlerHookHandler | ((...args: any[]) => any);
+  requireOwnerPre?: preHandlerHookHandler | ((...args: any[]) => any);
+  requireLocalLaunchPre?: preHandlerHookHandler | ((...args: any[]) => any);
+  /** Test seam: await S10 inline when false. Default true (202 before model). */
+  detachS10?: boolean;
 }
 
 export function registerDiscoveryHandoffRoutes(
@@ -28,7 +43,7 @@ export function registerDiscoveryHandoffRoutes(
   const handoffs = deps.handoffs ?? new DiscoveryHandoffService(deps.db);
 
   // Callback credential path — deliberately NOT behind owner browser auth.
-  // Owner confirm / start-planning remain separate (S11) with owner+loopback guards.
+  // Owner confirm / start-planning remain separate with owner+loopback guards.
   app.post('/api/discovery/handoff/ready', async (request: any, reply: any) => {
     const body = (request.body || {}) as DiscoveryReadyBody;
     const result = await processDiscoveryReadyCallback(body, {
@@ -59,4 +74,106 @@ export function registerDiscoveryHandoffRoutes(
       runCreated: false,
     });
   });
+
+  // S11 owner confirm / decline — only when auth + orchestrator wired.
+  if (
+    deps.authMiddleware &&
+    deps.requireOwnerPre &&
+    deps.requireLocalLaunchPre &&
+    deps.artifacts &&
+    deps.orchestrator
+  ) {
+    const ownerPres = [
+      deps.authMiddleware,
+      deps.requireOwnerPre,
+      deps.requireLocalLaunchPre,
+    ];
+
+    app.post(
+      '/api/cycles/:id/discovery-handoff/confirm',
+      { preHandler: ownerPres as any },
+      async (request: any, reply: any) => {
+        const cycleId = Number(request.params.id);
+        const body = (request.body || {}) as {
+          expectedDigest?: string;
+          handoffId?: number;
+          batchId?: string;
+        };
+        const result = await confirmDiscoveryHandoff(
+          {
+            cycleId,
+            expectedDigest: body.expectedDigest,
+            handoffId: body.handoffId,
+            batchId: body.batchId,
+          },
+          {
+            db: deps.db,
+            handoffs,
+            cycleService: deps.cycleService,
+            artifacts: deps.artifacts,
+            assignments: deps.assignmentService,
+            plannerPanel: deps.plannerPanelService,
+            orchestrator: deps.orchestrator!,
+            detachS10: deps.detachS10,
+          }
+        );
+        if (!result.ok) {
+          return reply.code(ownerBridgeHttpStatus(result.code)).send({
+            ok: false,
+            code: result.code,
+            error: result.reason,
+            handoffId: result.handoffId,
+            runCreated: false,
+          });
+        }
+        // 202 after durable run creation — not after model startup (AC30)
+        return reply.code(202).send({
+          ok: true,
+          status: result.state,
+          handoffId: result.handoffId,
+          runId: result.runId,
+          cycleId,
+          digest: result.digest,
+          already: result.already,
+          runCreated: !result.already,
+        });
+      }
+    );
+
+    app.post(
+      '/api/cycles/:id/discovery-handoff/decline',
+      { preHandler: ownerPres as any },
+      async (request: any, reply: any) => {
+        const cycleId = Number(request.params.id);
+        const body = (request.body || {}) as {
+          handoffId?: number;
+          reason?: string;
+        };
+        const result = declineDiscoveryHandoff(
+          {
+            cycleId,
+            handoffId: body.handoffId,
+            reason: body.reason,
+          },
+          { handoffs }
+        );
+        if (!result.ok) {
+          return reply.code(ownerBridgeHttpStatus(result.code)).send({
+            ok: false,
+            code: result.code,
+            error: result.reason,
+            handoffId: result.handoffId,
+            runCreated: false,
+          });
+        }
+        return reply.code(200).send({
+          ok: true,
+          status: 'declined',
+          handoffId: result.handoffId,
+          cycleId,
+          runCreated: false,
+        });
+      }
+    );
+  }
 }
