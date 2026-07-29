@@ -811,6 +811,13 @@ function App() {
   const [ccDiscAttachErr, setCcDiscAttachErr] = useState('');
   const [ccDiscImageUrl, setCcDiscImageUrl] = useState({}); // "cycleId::relPath" -> blob object URL
   const ccDiscAttachInputRef = useRef(null);
+  // S12: Discovery → Planning handoff card (load/reconcile GET; confirm/decline POSTs).
+  // cycleId -> undefined(loading) | 'absent'(error empty) | payload object from GET.
+  const [ccDiscHandoff, setCcDiscHandoff] = useState({});
+  const [ccDiscHandoffBusy, setCcDiscHandoffBusy] = useState({}); // cycleId -> 'confirm' | 'decline' | falsy
+  const [ccDiscHandoffNotice, setCcDiscHandoffNotice] = useState({}); // cycleId -> status/error string
+  const [ccDiscHandoffBubbles, setCcDiscHandoffBubbles] = useState({}); // cycleId -> [{id,text}]
+  const discHandoffSubmitRef = useRef({}); // cycleId -> true while POST in flight (double-click guard)
 
   // B8-T01: Planning tab — og-requirements.md + plan.md doc cards (R-D1/D3). cycleId ->
   // {ogreq, execplan}, each undefined (loading), 'absent' (404, doc not produced yet), or the
@@ -965,6 +972,13 @@ function App() {
     if (ccWsTab !== 'discovery' || !ccWsProjectId || !ccWsCycleId || !token) return;
     if (!ccAgents[ccWsProjectId]) loadCcAgents(ccWsProjectId);
   }, [ccWsTab, ccWsProjectId, ccWsCycleId, token]);
+  // S12: load/reconcile Discovery handoff state for the active cycle (no free-text parser).
+  useEffect(() => {
+    if (ccWsTab !== 'discovery' || !ccWsCycleId || !token) return;
+    loadDiscHandoff(ccWsCycleId);
+    const id = setInterval(() => { loadDiscHandoff(ccWsCycleId, { quiet: true }); }, 5000);
+    return () => clearInterval(id);
+  }, [ccWsTab, ccWsCycleId, token]);
   // LIVE-ATTACH / E8 FIX1: auto-attach (and RE-attach) the discovery chat to an ALREADY-RUNNING seat,
   // so the app reflects the live conversation instead of "Session Off / no messages" whenever a seat
   // exists but this browser's live feed is missing — fresh reload, a different browser (the operator's),
@@ -5627,6 +5641,302 @@ function App() {
   // an empty body — the server uses the project's role bindings + ingests the cycle's own
   // plan.md (no seedPlan). On success, refresh run-state so the 4s Impl poll shows progress.
   // 400 => "author a plan first"; 409 => already running (both surfaced inline, never a crash).
+  // S12: Discovery handoff load/reconcile + owner confirm/decline (no free-text intent parser).
+  const DISCOVERY_READY_ASK_UI =
+    'Initial Discovery docs are ready. May I ask Helm to start the configured Planning team?';
+  const HANDOFF_CONFIRM_BUBBLE = 'Yes — start the planning team';
+  const HANDOFF_DECLINE_BUBBLE = 'Not yet';
+
+  const loadDiscHandoff = async (cycleId, opts = {}) => {
+    if (!cycleId) return;
+    if (!opts.quiet) {
+      setCcDiscHandoff((p) => (p[cycleId] === undefined ? { ...p } : p));
+    }
+    try {
+      const r = await authedFetch(`/api/cycles/${cycleId}/discovery-handoff`, {
+        allowStatuses: [404, 400],
+      });
+      if (!r.ok) {
+        if (r.status === 404) {
+          setCcDiscHandoff((p) => ({ ...p, [cycleId]: 'absent' }));
+        } else {
+          setCcDiscHandoff((p) => ({ ...p, [cycleId]: 'error' }));
+          setCcDiscHandoffNotice((p) => ({
+            ...p,
+            [cycleId]: 'Could not load handoff state. Retry.',
+          }));
+        }
+        return;
+      }
+      const data = await r.json();
+      setCcDiscHandoff((p) => ({ ...p, [cycleId]: data }));
+      if (!opts.quiet) {
+        setCcDiscHandoffNotice((p) => {
+          const n = { ...p };
+          // Keep error notices from confirm until next action; clear pure load errors
+          if (n[cycleId] && String(n[cycleId]).startsWith('Could not load')) delete n[cycleId];
+          return n;
+        });
+      }
+    } catch (e) {
+      setCcDiscHandoff((p) => ({ ...p, [cycleId]: 'error' }));
+      setCcDiscHandoffNotice((p) => ({
+        ...p,
+        [cycleId]: 'Could not load handoff state. Retry.',
+      }));
+    }
+  };
+
+  const appendHandoffUserBubble = (cycleId, text) => {
+    const bubble = { id: nextChatMsgId(), text };
+    setCcDiscHandoffBubbles((p) => ({
+      ...p,
+      [cycleId]: [...(p[cycleId] || []), bubble],
+    }));
+  };
+
+  const confirmDiscHandoff = async (cycleId) => {
+    if (!cycleId || discHandoffSubmitRef.current[cycleId]) return;
+    const payload = ccDiscHandoff[cycleId];
+    if (!payload || payload === 'absent' || payload === 'error') return;
+    const handoffId = payload.handoff && payload.handoff.id;
+    const digest = payload.digest || (payload.handoff && payload.handoff.digest);
+    discHandoffSubmitRef.current[cycleId] = true;
+    setCcDiscHandoffBusy((p) => ({ ...p, [cycleId]: 'confirm' }));
+    setCcDiscHandoffNotice((p) => ({ ...p, [cycleId]: '' }));
+    appendHandoffUserBubble(cycleId, HANDOFF_CONFIRM_BUBBLE);
+    try {
+      const r = await authedFetch(`/api/cycles/${cycleId}/discovery-handoff/confirm`, {
+        method: 'POST',
+        body: JSON.stringify({
+          expectedDigest: digest || undefined,
+          handoffId: handoffId || undefined,
+        }),
+        allowStatuses: [400, 401, 403, 404, 409, 500, 202],
+      });
+      const body = await r.json().catch(() => ({}));
+      if (r.status === 202 && body.ok) {
+        setCcDiscHandoffNotice((p) => ({
+          ...p,
+          [cycleId]: body.already
+            ? `Planning run #${body.runId} already started.`
+            : `Planning run #${body.runId} created.`,
+        }));
+        // Optimistically mark starting/started so actions stay disabled
+        setCcDiscHandoff((p) => ({
+          ...p,
+          [cycleId]: {
+            ...(typeof p[cycleId] === 'object' ? p[cycleId] : {}),
+            uiState: body.status === 'started' ? 'started' : 'starting',
+            handoff: {
+              ...((typeof p[cycleId] === 'object' && p[cycleId].handoff) || {}),
+              id: body.handoffId,
+              state: body.status || 'starting',
+              planningRunId: body.runId,
+              digest: body.digest,
+            },
+            digest: body.digest || digest,
+          },
+        }));
+        loadRunState(cycleId);
+        loadDiscHandoff(cycleId, { quiet: true });
+        return;
+      }
+      setCcDiscHandoffNotice((p) => ({
+        ...p,
+        [cycleId]:
+          body.error ||
+          body.code ||
+          'Confirmation failed. Refresh seats and retry.',
+      }));
+      await loadDiscHandoff(cycleId);
+    } catch (e) {
+      setCcDiscHandoffNotice((p) => ({
+        ...p,
+        [cycleId]: 'Confirmation request failed to send — retry.',
+      }));
+    } finally {
+      discHandoffSubmitRef.current[cycleId] = false;
+      setCcDiscHandoffBusy((p) => ({ ...p, [cycleId]: false }));
+    }
+  };
+
+  const declineDiscHandoff = async (cycleId) => {
+    if (!cycleId || discHandoffSubmitRef.current[cycleId]) return;
+    const payload = ccDiscHandoff[cycleId];
+    if (!payload || payload === 'absent' || payload === 'error') return;
+    const handoffId = payload.handoff && payload.handoff.id;
+    discHandoffSubmitRef.current[cycleId] = true;
+    setCcDiscHandoffBusy((p) => ({ ...p, [cycleId]: 'decline' }));
+    setCcDiscHandoffNotice((p) => ({ ...p, [cycleId]: '' }));
+    appendHandoffUserBubble(cycleId, HANDOFF_DECLINE_BUBBLE);
+    try {
+      const r = await authedFetch(`/api/cycles/${cycleId}/discovery-handoff/decline`, {
+        method: 'POST',
+        body: JSON.stringify({
+          handoffId: handoffId || undefined,
+          reason: 'Not yet',
+        }),
+        allowStatuses: [400, 401, 403, 404, 409, 500],
+      });
+      const body = await r.json().catch(() => ({}));
+      if (r.ok && body.ok) {
+        setCcDiscHandoffNotice((p) => ({
+          ...p,
+          [cycleId]: 'Declined — Discovery can offer a fresh confirmation later.',
+        }));
+        setCcDiscHandoff((p) => ({
+          ...p,
+          [cycleId]: {
+            ...(typeof p[cycleId] === 'object' ? p[cycleId] : {}),
+            uiState: 'declined',
+            handoff: {
+              ...((typeof p[cycleId] === 'object' && p[cycleId].handoff) || {}),
+              id: body.handoffId,
+              state: 'declined',
+            },
+          },
+        }));
+        await loadDiscHandoff(cycleId, { quiet: true });
+        return;
+      }
+      setCcDiscHandoffNotice((p) => ({
+        ...p,
+        [cycleId]: body.error || body.code || 'Decline failed. Retry.',
+      }));
+      await loadDiscHandoff(cycleId);
+    } catch (e) {
+      setCcDiscHandoffNotice((p) => ({
+        ...p,
+        [cycleId]: 'Decline request failed to send — retry.',
+      }));
+    } finally {
+      discHandoffSubmitRef.current[cycleId] = false;
+      setCcDiscHandoffBusy((p) => ({ ...p, [cycleId]: false }));
+    }
+  };
+
+  const renderDiscHandoffCard = (cycleId) => {
+    const payload = ccDiscHandoff[cycleId];
+    const busy = ccDiscHandoffBusy[cycleId];
+    const notice = ccDiscHandoffNotice[cycleId] || '';
+    const bubbles = ccDiscHandoffBubbles[cycleId] || [];
+
+    if (payload === undefined) {
+      return html`<div class="cc-disc-handoff" data-testid="ws-disc-handoff" data-state="loading" role="status" aria-live="polite"
+          style="margin:6px 0;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
+          <div data-testid="ws-disc-handoff-loading" style="font-size:12px">Resolving Planning seats…</div>
+        </div>`;
+    }
+    if (payload === 'error' || payload === 'absent') {
+      return html`<div class="cc-disc-handoff" data-testid="ws-disc-handoff" data-state="error" role="status" aria-live="assertive"
+          style="margin:6px 0;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
+          <div data-testid="ws-disc-handoff-error" style="font-size:12px;color:#f85149">${notice || 'Handoff state unavailable.'}</div>
+          <button class="btn btn-sm" data-testid="ws-disc-handoff-retry" style="margin-top:6px;min-height:44px"
+            onclick=${() => { setCcDiscHandoff((p) => ({ ...p, [cycleId]: undefined })); loadDiscHandoff(cycleId); }}>Retry</button>
+        </div>`;
+    }
+
+    const uiState = payload.uiState || 'empty';
+    const ask = payload.ask || DISCOVERY_READY_ASK_UI;
+    const preview = payload.preview || { plancore: null, coPlanners: [] };
+    const seats = [];
+    if (preview.plancore) {
+      seats.push({
+        key: 'plancore',
+        role: 'plancore',
+        provider: preview.plancore.provider,
+        model: preview.plancore.model,
+        source: preview.plancore.source,
+        ready: preview.plancore.ready,
+        reason: preview.plancore.reason,
+      });
+    }
+    (preview.coPlanners || []).forEach((s, i) => {
+      seats.push({
+        key: `cp-${s.slot ?? i}`,
+        role: 'co-planner',
+        provider: s.provider,
+        model: s.model,
+        source: s.source,
+        ready: s.ready,
+        reason: s.reason,
+      });
+    });
+    // pending = confirm/decline; starting keeps buttons visible but disabled; other states use Retry
+    const canAct = uiState === 'pending' && !busy;
+    const showActions = uiState === 'pending' || uiState === 'starting';
+
+    const statusLine =
+      uiState === 'empty'
+        ? 'No Discovery handoff yet — waiting for docs ready.'
+        : uiState === 'blocked'
+          ? (payload.emptyPanelMessage ||
+              (payload.blockReasons && payload.blockReasons[0]) ||
+              'Planning seats blocked — configure co-planners in Agent Studio.')
+          : uiState === 'starting'
+            ? 'Starting Planning team…'
+            : uiState === 'started'
+              ? `Planning started${payload.handoff && payload.handoff.planningRunId ? ` · run #${payload.handoff.planningRunId}` : ''}.`
+              : uiState === 'declined'
+                ? 'Declined. Discovery can offer a fresh confirmation later.'
+                : uiState === 'failed'
+                  ? (payload.handoff && payload.handoff.reason) || 'Handoff failed.'
+                  : 'Documents ready. Confirm to start the Planning team.';
+
+    return html`<div class="cc-disc-handoff" data-testid="ws-disc-handoff" data-state=${uiState}
+        role="region" aria-label="Discovery planning handoff" style="margin:6px 0;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2);max-width:100%;box-sizing:border-box">
+        <div data-testid="ws-disc-handoff-status" role="status" aria-live="polite" style="font-size:11px;margin-bottom:4px;color:var(--text-sec)">${statusLine}</div>
+        ${uiState === 'pending' || uiState === 'blocked' || uiState === 'starting' || uiState === 'started'
+          ? html`<div data-testid="ws-disc-handoff-ask" style="font-size:13px;font-weight:500;margin:4px 0 8px;line-height:1.35">${ask}</div>`
+          : null}
+        <div data-testid="ws-disc-handoff-seats" style="display:flex;flex-direction:column;gap:3px;margin-bottom:8px">
+          ${seats.length
+            ? seats.map(
+                (s) => html`<div class="cc-disc-handoff-seat" data-testid=${`ws-disc-handoff-seat-${s.key}`}
+                    style="font-size:11px;display:flex;flex-wrap:wrap;gap:4px 8px;align-items:baseline">
+                    <span style="font-weight:600">${s.role}</span>
+                    <span data-testid=${`ws-disc-handoff-seat-model-${s.key}`}>${s.provider}/${s.model}</span>
+                    <span class="text-sec">${s.source || ''}${s.ready === false ? ' · blocked' : ''}</span>
+                    ${s.reason ? html`<span class="text-sec" style="color:#d29922">${s.reason}</span>` : null}
+                  </div>`
+              )
+            : uiState === 'empty'
+              ? html`<div class="text-sec" data-testid="ws-disc-handoff-seats-empty" style="font-size:11px">Seats appear when Discovery is ready.</div>`
+              : html`<div class="text-sec" data-testid="ws-disc-handoff-seats-empty" style="font-size:11px">${payload.emptyPanelMessage || 'Configure co-planners in Agent Studio'}</div>`}
+        </div>
+        ${payload.digest
+          ? html`<div data-testid="ws-disc-handoff-digest" class="text-sec" style="font-size:10px;word-break:break-all;margin-bottom:6px">digest ${String(payload.digest).slice(0, 16)}…</div>`
+          : null}
+        ${bubbles.map(
+          (b) => html`<div class="cc-bubble user" data-testid="ws-disc-handoff-user-bubble" key=${b.id}
+              style="margin:4px 0;padding:6px 8px;border-radius:6px;background:var(--surface-1);font-size:12px">
+              <span class="who" style="font-size:10px;opacity:0.8">JROM</span>
+              <div style="white-space:pre-wrap">${b.text}</div>
+            </div>`
+        )}
+        ${notice
+          ? html`<div data-testid="ws-disc-handoff-notice" role="status" aria-live="assertive"
+              style="font-size:11px;margin:4px 0;color:${/fail|error|refused|mismatch|Could not|blocked/i.test(notice) ? '#f85149' : 'var(--text-sec)'}">${notice}</div>`
+          : null}
+        <div data-testid="ws-disc-handoff-actions" style="display:flex;flex-wrap:wrap;gap:8px;margin-top:6px">
+          ${showActions
+            ? html`<button class="btn btn-primary btn-sm" data-testid="ws-disc-handoff-confirm"
+                  disabled=${!canAct}
+                  style="min-height:44px;min-width:44px"
+                  onclick=${() => confirmDiscHandoff(cycleId)}>${busy === 'confirm' ? 'Starting…' : 'Start planning team'}</button>
+                <button class="btn btn-sm" data-testid="ws-disc-handoff-decline"
+                  disabled=${!canAct}
+                  style="min-height:44px;min-width:44px"
+                  onclick=${() => declineDiscHandoff(cycleId)}>${busy === 'decline' ? '…' : 'Not yet'}</button>`
+            : null}
+          <button class="btn btn-sm" data-testid="ws-disc-handoff-retry" style="min-height:44px"
+            disabled=${!!busy}
+            onclick=${() => loadDiscHandoff(cycleId)}>Retry</button>
+        </div>
+      </div>`;
+  };
+
   // Manual Start Planning. POST /api/cycles/:id/start-planning with an empty body — planning is what
   // PRODUCES plan.md, so unlike start-implementation there is no plan gate. 409 => a run is already
   // active for this cycle. Mirrors startImplementation's error handling exactly.
@@ -5787,6 +6097,7 @@ function App() {
                 <button class="btn btn-sm" data-testid="ws-disc-chat-minimize" onclick=${() => setCcDiscChatMin(true)}>Minimize</button>
               </div>
             </div>
+            ${renderDiscHandoffCard(cycleId)}
             <div class="cc-disc-pane-body cc-chat-scroll" data-testid="ws-disc-chat-body"
               ref=${(el) => {
                 discChatBodyRef.current = el;
