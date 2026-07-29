@@ -223,4 +223,63 @@ describe('S03 startGovernedDocGuard Discovery cycle ownership', () => {
       handle.stop();
     }
   });
+
+  it('fix1 restore: unlink plan.md then mkdir same path → file restored with original + denial', async () => {
+    const handle = startGovernedDocGuard(PROJ, {
+      pollMs: 50,
+      role: 'discovery',
+      phase: 'discovery',
+      cycleFolder: BOUND,
+    });
+    try {
+      const target = cyclePath(BOUND, 'plan.md');
+      fs.unlinkSync(target);
+      fs.mkdirSync(target);
+      fs.writeFileSync(path.join(target, 'nested.txt'), 'inside-dir', 'utf8');
+
+      expect(fs.statSync(target).isDirectory()).toBe(true);
+
+      await sleep(450);
+
+      expect(fs.statSync(target).isFile()).toBe(true);
+      expect(fs.readFileSync(target, 'utf8')).toBe('ORIGINAL plan.md');
+      const denial = handle.denials.find((d) => d.relPath === `cycle/${BOUND}/plan.md`);
+      expect(denial).toBeTruthy();
+      expect(denial!.attemptedContentSample).toBe('<directory>');
+    } finally {
+      handle.stop();
+    }
+  });
+
+  it('fix1 forbid-create: mkdir og-requirements.md path → removed (absent) + denial', async () => {
+    setupBoundCycle({ seedForbidden: false });
+    // only plan.md exists (restore); og-requirements is forbid-create
+    fs.writeFileSync(cyclePath(BOUND, 'plan.md'), 'ORIGINAL plan.md', 'utf8');
+
+    const handle = startGovernedDocGuard(PROJ, {
+      pollMs: 50,
+      role: 'discovery',
+      phase: 'discovery',
+      cycleFolder: BOUND,
+    });
+    try {
+      const target = cyclePath(BOUND, 'og-requirements.md');
+      fs.mkdirSync(target);
+      fs.writeFileSync(path.join(target, 'sneak.txt'), 'x', 'utf8');
+      expect(fs.statSync(target).isDirectory()).toBe(true);
+
+      await sleep(450);
+
+      expect(fs.existsSync(target)).toBe(false);
+      const denial = handle.denials.find(
+        (d) => d.relPath === `cycle/${BOUND}/og-requirements.md`
+      );
+      expect(denial).toBeTruthy();
+      expect(denial!.attemptedContentSample).toBe('<directory>');
+      // restore-mode plan.md still intact / not over-touched
+      expect(fs.readFileSync(cyclePath(BOUND, 'plan.md'), 'utf8')).toBe('ORIGINAL plan.md');
+    } finally {
+      handle.stop();
+    }
+  });
 });

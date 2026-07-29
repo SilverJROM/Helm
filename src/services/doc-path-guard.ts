@@ -713,8 +713,52 @@ export function startGovernedDocGuard(
     });
   };
 
+  /** True when abs exists as a directory (symlink to dir counts). ENOENT → false. */
+  const pathIsDirectory = (abs: string): boolean => {
+    try {
+      return fsSync.lstatSync(abs).isDirectory();
+    } catch {
+      return false;
+    }
+  };
+
+  /** Best-effort recursive remove of a directory that replaced a protected file path. */
+  const removeDirectoryAt = (abs: string): boolean => {
+    try {
+      fsSync.rmSync(abs, { recursive: true, force: true });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  /**
+   * S03 fix1: path-as-directory (EISDIR / type-change) is tampering.
+   * - restore: remove dir, rewrite original file bytes, recordDenial
+   * - forbid-create: remove dir, leave absent, recordDenial
+   * Returns true when a directory was found and handled (caller should return).
+   */
+  const handleDirectoryReplace = (entry: GuardEntry): boolean => {
+    if (!pathIsDirectory(entry.abs)) return false;
+    removeDirectoryAt(entry.abs);
+    if (entry.mode === 'restore') {
+      try {
+        fsSync.mkdirSync(path.dirname(entry.abs), { recursive: true });
+        fsSync.writeFileSync(entry.abs, entry.original, 'utf8');
+      } catch {
+        // still record; poll may retry
+      }
+    }
+    // forbid-create: leave absent after remove
+    recordDenial(entry, '<directory>');
+    return true;
+  };
+
   const checkOne = (entry: GuardEntry) => {
     if (stopped) return;
+
+    // S03 fix1: type-change (file → directory) must not silently skip — poll and watch both hit this.
+    if (handleDirectoryReplace(entry)) return;
 
     if (entry.mode === 'forbid-create') {
       let current: string;
@@ -722,6 +766,8 @@ export function startGovernedDocGuard(
         current = fsSync.readFileSync(entry.abs, 'utf8');
       } catch (err: any) {
         if (err?.code === 'ENOENT') return; // still absent — allowed
+        // EISDIR or other: if still a dir, handle; else best-effort leave for next poll
+        if (err?.code === 'EISDIR' && handleDirectoryReplace(entry)) return;
         return;
       }
       // File appeared (create) or was written — Discovery must not own it: remove and record.
@@ -750,7 +796,10 @@ export function startGovernedDocGuard(
           return; // can't restore (e.g. dir also gone); nothing more to do safely
         }
         recordDenial(entry, '');
+        return;
       }
+      // S03 fix1: EISDIR after type-change — remove dir and restore original file
+      if (err?.code === 'EISDIR' && handleDirectoryReplace(entry)) return;
       return;
     }
     if (current !== entry.original) {
