@@ -41,6 +41,12 @@ import type { PlannerPanel } from './adaptive-planning-phase.js';
 import { makeGrokAwareProviderModelAvailability } from './grok-auth-availability.js';
 import { finalizeBrainSessionRow } from './worker-runtime-finalize.js';
 import type { LifecycleToken } from './lifecycle-cas.js';
+import {
+  PlanningStaffingService,
+  toCorePlanningStaffingArgs,
+  type CorePlanningStaffingArgs,
+} from './planning-staffing-service.js';
+import type { DatabaseService } from '../db/database.js';
 
 // CYCLE-BUILDDIR: a cycle-plan run builds the deliverable in this subdir OF the cycle workspace (never the
 // workspace root — that holds north-star.md, which puts helm-sandbox in PROTECTED-ROOT mode and blocks
@@ -198,10 +204,8 @@ export class RunOrchestratorService {
     }
   }
 
-  // A10 (R1.3): read the project's core (non-adaptive) planning panel size — total seats including
-  // plancore, default 2 (fail-safe on any read error) — threaded into runPlanningPhase so it spawns
-  // exactly that many seats instead of the removed north-star-regex guess. Independent of
-  // isAdaptivePlanning: this config only applies on the default/OFF path.
+  // S05 / AC20: planning_panel_size = N co-planners excluding plancore (default 2).
+  // Independent of adaptive_planning. Callers that need A10 total-seat panelSize use N+1.
   private resolvePlanningPanelSize(projectId?: number): number {
     if (projectId == null) return 2;
     try {
@@ -212,6 +216,40 @@ export class RunOrchestratorService {
       return Number.isFinite(n) && n >= 1 ? Math.trunc(n) : 2;
     } catch {
       return 2;
+    }
+  }
+
+  /**
+   * S05 fix1: resolve core-path Planning seats via PlanningStaffingService when a panel is
+   * configured (adaptive ON or OFF). Never substitutes generic `planner` for configured seats.
+   * Empty panel → legacy partner binding + N co-planner count from DB.
+   * S06 will replace partnerModel with ordered per-seat identities; until then count + first
+   * ready co-planner model are wired so N partners are spawned from the panel.
+   */
+  private resolveCorePlanningStaffing(projectId: number): CorePlanningStaffingArgs {
+    const legacyN = this.resolvePlanningPanelSize(projectId);
+    const legacy: CorePlanningStaffingArgs = {
+      usedPanel: false,
+      panelSizeTotal: Math.max(1, legacyN + 1),
+    };
+    if (!this.deps.assignmentService) return legacy;
+    try {
+      const db = this.deps.artifacts['db'] as DatabaseService;
+      const svc = new PlanningStaffingService(
+        db,
+        this.deps.assignmentService,
+        this.deps.plannerPanelService
+      );
+      const manifest = svc.resolveManifest(projectId, {
+        throwOnEmpty: false,
+        throwOnMismatch: false,
+      });
+      return toCorePlanningStaffingArgs(manifest);
+    } catch (e: any) {
+      console.warn(
+        `[RunOrchestrator] PlanningStaffingService resolve failed for project ${projectId}: ${e?.message || e}`
+      );
+      return legacy;
     }
   }
 
@@ -1059,9 +1097,28 @@ export class RunOrchestratorService {
       try { this.deps.artifacts['db'].raw.prepare("UPDATE runs SET phase = 'executing' WHERE id = ? AND phase NOT IN ('complete','failed','blocked')").run(runId); } catch {}
     } else if (planPreexists) {
       // Autonomous/skip-interview path (existing tests with pre-seed continue to work)
+      // S05: core path resolves panel via PlanningStaffingService even when adaptive_planning=0.
+      const coreStaffing = this.resolveCorePlanningStaffing(projectId);
+      if (coreStaffing.blockReasons?.length) {
+        runId =
+          input.precreatedRunId ??
+          this.deps.artifacts.createRun(projectId, batchId, path.join(runDir, CANONICAL_CYCLE_ARTIFACTS.northStar));
+        const reason = `PLANNING-STAFFING-BLOCKED: ${coreStaffing.blockReasons.join('; ')}`;
+        console.warn(`[RunOrchestrator] run ${runId} BLOCKED pre-planning: ${reason}`);
+        this.transitionRunToBlocked(runId, reason, project, 'failure', runGenToken);
+        return runId;
+      }
       const planningSeat = resolveBrain('planning');
       // v93: when adaptive_planning ON, load per-project panel + backup-fallback probe.
       const adaptivePanel = await this.resolveAdaptivePlannerPanel(projectId, effectiveProjectDir);
+      const effPartnerModel = coreStaffing.usedPanel ? coreStaffing.partnerModel : partnerModel;
+      const effPartnerProvider = coreStaffing.usedPanel ? coreStaffing.partnerProvider : partnerProvider;
+      const effBrainModel = coreStaffing.usedPanel && coreStaffing.planningBrainModel
+        ? coreStaffing.planningBrainModel
+        : planningSeat.agent.model;
+      const effBrainProvider = coreStaffing.usedPanel && coreStaffing.planningBrainProvider
+        ? coreStaffing.planningBrainProvider
+        : planningSeat.agent.provider;
       planningRes = await this.deps.planning.runPlanningPhase({
         runDir,
         batchId,
@@ -1072,13 +1129,14 @@ export class RunOrchestratorService {
         projectId,
         projectDir: effectiveProjectDir,
         brainRole: planningSeat.role,
-        planningBrainModel: planningSeat.agent.model,
-        partnerModel,
-        planningBrainProvider: planningSeat.agent.provider,
-        partnerProvider,
+        planningBrainModel: effBrainModel,
+        partnerModel: effPartnerModel,
+        planningBrainProvider: effBrainProvider,
+        partnerProvider: effPartnerProvider,
         strictReadAllow: runStrictAllow,  // B-ISO1: run-scoped strict read fence for the planning seats
         adaptivePlanning: this.isAdaptivePlanning(projectId),  // v92: opt-in adaptive tiered planner
-        panelSize: this.resolvePlanningPanelSize(projectId),  // A10: core-path planning panel size (total seats)
+        // S05 AC20: DB size is N co-planners; A10 API wants total seats (N+1)
+        panelSize: coreStaffing.panelSizeTotal,
         roundCap: this.resolvePlanningRoundCap(projectId),  // A11: co-planner agreement round cap
         runId: input.precreatedRunId,  // CC-CHAT-1 B2: reuse the detached-precreated run row (no duplicate)
         canonicalArtifactRoot,
@@ -1168,8 +1226,24 @@ export class RunOrchestratorService {
       try { convForPlan = await fs.readFile(path.join(canonicalArtifactRoot, 'conversation-log.md'), 'utf8'); } catch {}
 
       const planningSeat = resolveBrain('planning');
+      // S05: resolve panel on core path (adaptive ON or OFF); never generic planner for configured seats.
+      const coreStaffing = this.resolveCorePlanningStaffing(projectId);
+      if (coreStaffing.blockReasons?.length) {
+        const reason = `PLANNING-STAFFING-BLOCKED: ${coreStaffing.blockReasons.join('; ')}`;
+        console.warn(`[RunOrchestrator] run ${runId} BLOCKED pre-planning: ${reason}`);
+        this.transitionRunToBlocked(runId, reason, project, 'failure', runGenToken);
+        return runId;
+      }
       // v93: when adaptive_planning ON, load per-project panel + backup-fallback probe.
       const adaptivePanel = await this.resolveAdaptivePlannerPanel(projectId, effectiveProjectDir);
+      const effPartnerModel = coreStaffing.usedPanel ? coreStaffing.partnerModel : partnerModel;
+      const effPartnerProvider = coreStaffing.usedPanel ? coreStaffing.partnerProvider : partnerProvider;
+      const effBrainModel = coreStaffing.usedPanel && coreStaffing.planningBrainModel
+        ? coreStaffing.planningBrainModel
+        : planningSeat.agent.model;
+      const effBrainProvider = coreStaffing.usedPanel && coreStaffing.planningBrainProvider
+        ? coreStaffing.planningBrainProvider
+        : planningSeat.agent.provider;
       planningRes = await this.deps.planning.runPlanningPhase({
         runDir,
         canonicalArtifactRoot,
@@ -1181,13 +1255,14 @@ export class RunOrchestratorService {
         projectId,
         projectDir: effectiveProjectDir,
         brainRole: planningSeat.role,
-        planningBrainModel: planningSeat.agent.model,
-        partnerModel,
-        planningBrainProvider: planningSeat.agent.provider,
-        partnerProvider,
+        planningBrainModel: effBrainModel,
+        partnerModel: effPartnerModel,
+        planningBrainProvider: effBrainProvider,
+        partnerProvider: effPartnerProvider,
         strictReadAllow: runStrictAllow,  // B-ISO1: run-scoped strict read fence for the planning seats
         adaptivePlanning: this.isAdaptivePlanning(projectId),  // v92: opt-in adaptive tiered planner
-        panelSize: this.resolvePlanningPanelSize(projectId),  // A10: core-path planning panel size (total seats)
+        // S05 AC20: DB size is N co-planners; A10 API wants total seats (N+1)
+        panelSize: coreStaffing.panelSizeTotal,
         roundCap: this.resolvePlanningRoundCap(projectId),  // A11: co-planner agreement round cap
         runId,  // D-b1: reuse the interview-created run (prevents duplicate run row); phase already advanced to planning
         ...(adaptivePanel?.panel ? { panel: adaptivePanel.panel } : {}),

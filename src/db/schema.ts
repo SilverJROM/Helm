@@ -127,8 +127,9 @@ CREATE TABLE IF NOT EXISTS projects (
   adaptive_planning INTEGER NOT NULL DEFAULT 0 CHECK(adaptive_planning IN (0, 1)),
   -- v93: default effort for adaptive planner panel slots that omit a per-slot effort override.
   planner_default_effort TEXT DEFAULT 'med' CHECK(planner_default_effort IS NULL OR planner_default_effort IN ('low','med','high','xhigh')),
-  -- v99 / A10 (R1.3): core (non-adaptive) planning panel size — total seats (plancore + partners).
-  -- Default 2 preserves today's plancore+1-partner behavior; config replaces the removed north-star guess.
+  -- v99 / A10 + S05 AC20: N co-planners excluding plancore (Agent Studio panel member count).
+  -- Default 2. Orchestrator converts to A10 total seats via N+1 until S06 ordered seat specs.
+  -- Panel save (PlannerPanelService.replaceConfig) sets this to members.length transactionally.
   planning_panel_size INTEGER NOT NULL DEFAULT 2 CHECK(planning_panel_size >= 1),
   -- v100 / A11 (R1.6 + D7): per-project agreement round cap for the co-planner gate, default 3.
   planning_round_cap INTEGER NOT NULL DEFAULT 3 CHECK(planning_round_cap >= 1),

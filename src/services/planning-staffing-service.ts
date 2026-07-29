@@ -120,6 +120,62 @@ export class PlanningStaffingEmptyError extends Error {
   }
 }
 
+/**
+ * Convert AC20 co-planner count N into the A10 `panelSize` total-seat argument
+ * consumed by `runPlanningPhase` today (plancore + N partners). S06 will replace
+ * that API with ordered seat specs; until then this is the bridge.
+ */
+export function corePlanningPanelSizeTotal(coPlannerCount: number): number {
+  const n = Number.isFinite(coPlannerCount) ? Math.trunc(coPlannerCount) : 0;
+  return Math.max(1, n + 1);
+}
+
+/** Inputs the orchestrator threads into runPlanningPhase on the core (non-adaptive) path. */
+export interface CorePlanningStaffingArgs {
+  /** Whether project_planner_panel had ≥1 member (authoritative). */
+  usedPanel: boolean;
+  /** A10 panelSize = plancore + N co-planners. */
+  panelSizeTotal: number;
+  partnerModel?: string;
+  partnerProvider?: string;
+  planningBrainModel?: string;
+  planningBrainProvider?: string;
+  brainRole?: string;
+  digest?: string;
+  /** When set, orchestrator must typed-block before Planning spawn. */
+  blockReasons?: string[];
+}
+
+/**
+ * Map a resolved S05 manifest to core-path Planning inputs.
+ * When the panel is configured, never use generic `planner` binding models.
+ */
+export function toCorePlanningStaffingArgs(manifest: PlanningStaffingManifest): CorePlanningStaffingArgs {
+  if (manifest.panelMemberCount === 0) {
+    return {
+      usedPanel: false,
+      panelSizeTotal: corePlanningPanelSizeTotal(manifest.planningPanelSize),
+      digest: manifest.digest,
+    };
+  }
+  const ready = manifest.coPlanners.filter((s) => s.ready);
+  const first = ready[0] ?? manifest.coPlanners[0];
+  const args: CorePlanningStaffingArgs = {
+    usedPanel: true,
+    panelSizeTotal: corePlanningPanelSizeTotal(manifest.coPlanners.length),
+    partnerModel: first?.model,
+    partnerProvider: first?.provider,
+    planningBrainModel: manifest.plancore.model,
+    planningBrainProvider: manifest.plancore.provider,
+    brainRole: 'plancore',
+    digest: manifest.digest,
+  };
+  if (manifest.blocked) {
+    args.blockReasons = [...manifest.blockReasons];
+  }
+  return args;
+}
+
 export class PlanningStaffingService {
   private readonly panel: PlannerPanelService;
   private readonly phaseStaffing: PhaseStaffingService;

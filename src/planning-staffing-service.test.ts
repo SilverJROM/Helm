@@ -15,6 +15,8 @@ import {
   PlanningStaffingService,
   computeManifestDigest,
   buildManifestDigestPayload,
+  corePlanningPanelSizeTotal,
+  toCorePlanningStaffingArgs,
 } from './services/planning-staffing-service.js';
 
 function seedModel(
@@ -205,5 +207,35 @@ describe('S05 PlanningStaffingService', () => {
 
     const payload = buildManifestDigestPayload(a);
     expect(computeManifestDigest(payload)).toBe(a.digest);
+  });
+
+  it('fix1: core path wiring args — N co-planners → panelSizeTotal N+1; excludes generic planner model', () => {
+    expect(corePlanningPanelSizeTotal(2)).toBe(3);
+    expect(corePlanningPanelSizeTotal(0)).toBe(1);
+
+    panel.replaceConfig(projectId, {
+      members: [
+        { model_id: opusId, is_lead: true },
+        { model_id: codexId, is_lead: false },
+      ],
+      default_effort: 'med',
+    });
+    const plannerAgent = dbs.raw
+      .prepare(
+        `INSERT INTO agents (name, provider, model, default_effort, definition_md, spawn_pref, agent_type)
+         VALUES ('wire-planner-gpt55', 'codex', 'gpt-5.5', 'med', '# p', 'tmux', 'project')
+         RETURNING id`
+      )
+      .get() as { id: number };
+    assignments.setProjectBinding(projectId, 'planner', plannerAgent.id);
+
+    const m = staffing.resolveManifest(projectId);
+    const args = toCorePlanningStaffingArgs(m);
+    expect(args.usedPanel).toBe(true);
+    expect(args.panelSizeTotal).toBe(3); // plancore + 2 co-planners
+    expect(args.partnerModel).toBe('claude-opus-4-8');
+    expect(args.partnerModel).not.toBe('gpt-5.5');
+    expect(args.planningBrainModel).toBeTruthy();
+    expect(args.blockReasons).toBeUndefined();
   });
 });
