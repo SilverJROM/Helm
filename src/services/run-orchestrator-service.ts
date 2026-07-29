@@ -1137,6 +1137,10 @@ export class RunOrchestratorService {
         adaptivePlanning: this.isAdaptivePlanning(projectId),  // v92: opt-in adaptive tiered planner
         // S05 AC20: DB size is N co-planners; A10 API wants total seats (N+1)
         panelSize: coreStaffing.panelSizeTotal,
+        // S06: ordered exact co-planner identities from S05 manifest
+        ...(coreStaffing.coPlannerSeats?.length
+          ? { coPlannerSeats: coreStaffing.coPlannerSeats }
+          : {}),
         roundCap: this.resolvePlanningRoundCap(projectId),  // A11: co-planner agreement round cap
         runId: input.precreatedRunId,  // CC-CHAT-1 B2: reuse the detached-precreated run row (no duplicate)
         canonicalArtifactRoot,
@@ -1263,6 +1267,10 @@ export class RunOrchestratorService {
         adaptivePlanning: this.isAdaptivePlanning(projectId),  // v92: opt-in adaptive tiered planner
         // S05 AC20: DB size is N co-planners; A10 API wants total seats (N+1)
         panelSize: coreStaffing.panelSizeTotal,
+        // S06: ordered exact co-planner identities from S05 manifest
+        ...(coreStaffing.coPlannerSeats?.length
+          ? { coPlannerSeats: coreStaffing.coPlannerSeats }
+          : {}),
         roundCap: this.resolvePlanningRoundCap(projectId),  // A11: co-planner agreement round cap
         runId,  // D-b1: reuse the interview-created run (prevents duplicate run row); phase already advanced to planning
         ...(adaptivePanel?.panel ? { panel: adaptivePanel.panel } : {}),

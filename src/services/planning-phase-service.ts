@@ -122,12 +122,26 @@ export interface PlanningInputs {
   partnerModel?: string;       // POCFIX4: bound model from role_bindings for the auto-chosen co-planner partner role (planner or deliberation)
   planningBrainProvider?: string; // Provider from the plancore role binding.
   partnerProvider?: string;    // POCFIX5: provider for the co-planner partner
+  /**
+   * S06: ordered configured co-planner seat specs from S05 PlanningStaffingService.
+   * When non-empty, each partner spawn uses that seat's exact model/provider/effort
+   * (never a single repeated partnerModel). Partner count = length. Legacy partnerModel
+   * + panelSize path remains when absent/empty.
+   */
+  coPlannerSeats?: Array<{
+    slot: number;
+    provider: string;
+    model: string;
+    effort?: string;
+    source?: string;
+  }>;
   runId?: number;              // D-b1: if provided (interview path pre-created the run), reuse for ingest instead of createRun
   strictReadAllow?: string[];  // B-ISO1 (sol wiring review fix #4): run-scoped opt-in strict read allowlist, threaded from RunOrchestrator to the projcore + partner planning seats. undefined => read-all (unchanged).
   adaptivePlanning?: boolean;  // v92: project.adaptive_planning — when true, runPlanningPhase delegates to the adaptive tiered planner module. Default/undefined => existing single-author path.
   /** A10 (R1.3): core (non-adaptive) planning panel size — total seats (plancore + partners), from
    *  project.planning_panel_size. Default/undefined => 2 (today's plancore+1-partner behavior).
-   *  Distinct from the adaptive planner's own `panel.size` (only consulted when adaptivePlanning is on). */
+   *  Distinct from the adaptive planner's own `panel.size` (only consulted when adaptivePlanning is on).
+   *  S06: ignored for partner count when coPlannerSeats is non-empty. */
   panelSize?: number;
   /** v93: per-project adaptive planner panel (size / lead / members / backups / default effort). */
   panel?: import('./adaptive-planning-phase.js').PlannerPanel;
@@ -472,16 +486,26 @@ export class PlanningPhaseService {
     // function only ever chose the partner's review *lens* (planner vs deliberation), never seat count.
     // Default/undefined panelSize => 2 total seats (plancore + 1 partner), byte-identical to pre-A10
     // behavior and correlation-id-compatible with every existing fixture hardcoding `${batchId}-partner`.
+    // S06: when coPlannerSeats is non-empty, partner count and per-seat model/provider/effort come
+    // from the S05 manifest (ordered configured seats), not a repeated partnerModel.
+    const configuredSeats = Array.isArray(inputs.coPlannerSeats) ? inputs.coPlannerSeats : [];
+    const useConfiguredSeats = configuredSeats.length > 0;
     const panelSize = Math.max(1, Math.trunc(inputs.panelSize ?? 2) || 2);
-    const partnerCount = Math.max(0, panelSize - 1);
+    const partnerCount = useConfiguredSeats
+      ? configuredSeats.length
+      : Math.max(0, panelSize - 1);
     const partnerBatchIds: string[] = [];
     for (let i = 0; i < partnerCount; i++) {
       // Seat 0 keeps the EXACT legacy correlation id (`${batchId}-partner`, no numeric suffix) so the
       // default 2-seat case never changes wire format for any existing consumer/fixture. Additional
-      // seats (panelSize >= 3) are numbered from 2.
+      // seats (panelSize >= 3 / coPlannerSeats[i>0]) are numbered from 2.
       const partnerBatchId = i === 0 ? `${batchId}-partner` : `${batchId}-partner-${i + 1}`;
       const seatLabel = i === 0 ? 'partner' : `partner-${i + 1}`;
       partnerBatchIds.push(partnerBatchId);
+      const seatSpec = useConfiguredSeats ? configuredSeats[i] : null;
+      const seatModel = seatSpec?.model ?? inputs.partnerModel;
+      const seatProvider = seatSpec?.provider ?? inputs.partnerProvider;
+      const seatEffort = seatSpec?.effort;
       const partnerBrief = briefWriter.generatePanelBrief({
         role: partner,
         batchId: partnerBatchId,
@@ -492,9 +516,32 @@ export class PlanningPhaseService {
         callbacksFile: path.join(runDir, 'callbacks.md'),
       });
       await this.artifacts.writeBrief(runDir, i === 0 ? partner : `${partner}-${i + 1}`, partnerBrief);
-      const partnerSpawned = await this.transport.spawn({ role: partner, brief: partnerBrief, runDir, batchId: partnerBatchId, model: inputs.partnerModel, provider: inputs.partnerProvider, attemptId: 0, projectDir: effectiveProjectDir, projectId: inputs.projectId, runId: inputs.runId, ...(inputs.strictReadAllow ? { strictReadAllow: inputs.strictReadAllow } : {}) });  // B-ISO1 + A2: projectId/runId → helm_sessions via createSession
-      // A1 (R4.16): record each partner seat so it is DB-observable with run+cycle linkage.
-      partnerRuntimeIds.push(this.registerWorkerRuntime(inputs.projectId, inputs.runId, partner, partnerBatchId, partnerSpawned.handle, inputs.partnerProvider, inputs.partnerModel));
+      const partnerSpawned = await this.transport.spawn({
+        role: partner,
+        brief: partnerBrief,
+        runDir,
+        batchId: partnerBatchId,
+        model: seatModel,
+        provider: seatProvider,
+        ...(seatEffort ? { effort: seatEffort } : {}),
+        attemptId: 0,
+        projectDir: effectiveProjectDir,
+        projectId: inputs.projectId,
+        runId: inputs.runId,
+        ...(inputs.strictReadAllow ? { strictReadAllow: inputs.strictReadAllow } : {}),
+      });  // B-ISO1 + A2: projectId/runId → helm_sessions via createSession
+      // A1 (R4.16) + S06 AC25: record each partner seat with its exact identity.
+      partnerRuntimeIds.push(
+        this.registerWorkerRuntime(
+          inputs.projectId,
+          inputs.runId,
+          partner,
+          partnerBatchId,
+          partnerSpawned.handle,
+          seatProvider,
+          seatModel
+        )
+      );
     }
 
     // Fixture drive: simulate the exchange + agreement (tests append real [helm callback] lines + sleep).

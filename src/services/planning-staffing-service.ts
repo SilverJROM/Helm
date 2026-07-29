@@ -130,6 +130,15 @@ export function corePlanningPanelSizeTotal(coPlannerCount: number): number {
   return Math.max(1, n + 1);
 }
 
+/** Ordered co-planner identity for S06 runPlanningPhase. */
+export interface CoPlannerSeatSpec {
+  slot: number;
+  provider: string;
+  model: string;
+  effort?: string;
+  source?: string;
+}
+
 /** Inputs the orchestrator threads into runPlanningPhase on the core (non-adaptive) path. */
 export interface CorePlanningStaffingArgs {
   /** Whether project_planner_panel had ≥1 member (authoritative). */
@@ -142,6 +151,8 @@ export interface CorePlanningStaffingArgs {
   planningBrainProvider?: string;
   brainRole?: string;
   digest?: string;
+  /** S06: full ordered ready co-planner roster (exact identities). */
+  coPlannerSeats?: CoPlannerSeatSpec[];
   /** When set, orchestrator must typed-block before Planning spawn. */
   blockReasons?: string[];
 }
@@ -149,6 +160,7 @@ export interface CorePlanningStaffingArgs {
 /**
  * Map a resolved S05 manifest to core-path Planning inputs.
  * When the panel is configured, never use generic `planner` binding models.
+ * S06: includes coPlannerSeats for per-seat spawn identities.
  */
 export function toCorePlanningStaffingArgs(manifest: PlanningStaffingManifest): CorePlanningStaffingArgs {
   if (manifest.panelMemberCount === 0) {
@@ -158,8 +170,19 @@ export function toCorePlanningStaffingArgs(manifest: PlanningStaffingManifest): 
       digest: manifest.digest,
     };
   }
-  const ready = manifest.coPlanners.filter((s) => s.ready);
-  const first = ready[0] ?? manifest.coPlanners[0];
+  // Prefer ready seats; if blocked, still surface configured identities for diagnostics
+  // but orchestrator will typed-block before spawn when blockReasons is set.
+  const seatsForSpawn = manifest.blocked
+    ? manifest.coPlanners
+    : manifest.coPlanners.filter((s) => s.ready);
+  const roster = (seatsForSpawn.length ? seatsForSpawn : manifest.coPlanners).map((s) => ({
+    slot: s.slot ?? 0,
+    provider: s.provider,
+    model: s.model,
+    effort: String(s.effort || ''),
+    source: String(s.source || 'primary'),
+  }));
+  const first = roster[0];
   const args: CorePlanningStaffingArgs = {
     usedPanel: true,
     panelSizeTotal: corePlanningPanelSizeTotal(manifest.coPlanners.length),
@@ -169,6 +192,7 @@ export function toCorePlanningStaffingArgs(manifest: PlanningStaffingManifest): 
     planningBrainProvider: manifest.plancore.provider,
     brainRole: 'plancore',
     digest: manifest.digest,
+    coPlannerSeats: roster,
   };
   if (manifest.blocked) {
     args.blockReasons = [...manifest.blockReasons];
