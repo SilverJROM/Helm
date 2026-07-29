@@ -713,26 +713,34 @@ export function startGovernedDocGuard(
     });
   };
 
+  type PathKind = 'file' | 'directory' | 'symlink' | 'non-regular';
+  /** S03 fix4: distinguish missing (ENOENT) from access-denied (EACCES/EPERM/…) — never conflate. */
+  type PathProbe =
+    | { result: 'missing' }
+    | { result: 'access-denied'; code: string }
+    | { result: 'present'; kind: PathKind };
+
+  const isAccessErrno = (code: unknown): boolean =>
+    code === 'EACCES' || code === 'EPERM';
+
   /**
-   * Classify a path that exists at a protected abs (lstat, never follow).
-   * null = ENOENT / unreadable; 'file' = regular file; otherwise non-regular kind for denial sample.
+   * Probe a protected abs with lstat (never follow).
+   * ENOENT → missing; EACCES/EPERM (and other non-ENOENT lstat failures) → access-denied.
    */
-  const classifyProtectedPath = (
-    abs: string
-  ): null | 'file' | 'directory' | 'symlink' | 'non-regular' => {
-    let st: fsSync.Stats;
+  const probePath = (abs: string): PathProbe => {
     try {
-      st = fsSync.lstatSync(abs);
-    } catch {
-      return null;
+      const st = fsSync.lstatSync(abs);
+      if (st.isSymbolicLink()) return { result: 'present', kind: 'symlink' };
+      if (st.isDirectory()) return { result: 'present', kind: 'directory' };
+      if (st.isFile()) return { result: 'present', kind: 'file' };
+      return { result: 'present', kind: 'non-regular' };
+    } catch (err: any) {
+      if (err?.code === 'ENOENT') return { result: 'missing' };
+      return { result: 'access-denied', code: String(err?.code || 'UNKNOWN') };
     }
-    if (st.isSymbolicLink()) return 'symlink';
-    if (st.isDirectory()) return 'directory';
-    if (st.isFile()) return 'file';
-    return 'non-regular';
   };
 
-  const denialSampleForKind = (kind: 'directory' | 'symlink' | 'non-regular'): string => {
+  const denialSampleForKind = (kind: Exclude<PathKind, 'file'>): string => {
     if (kind === 'directory') return '<directory>';
     if (kind === 'symlink') return '<symlink>';
     return '<non-regular>';
@@ -751,122 +759,146 @@ export function startGovernedDocGuard(
     }
   };
 
-  /**
-   * S03 fix1+fix2: any non-regular path at a protected abs is tampering
-   * (directory, symlink-to-file/dir, fifo, etc. — not only lstat.isDirectory).
-   * - restore: remove without following, rewrite original file bytes, recordDenial
-   * - forbid-create: remove without following, leave absent, recordDenial
-   * Returns true when a non-regular path was found and handled (caller should return).
-   */
-  const handleNonRegularReplace = (entry: GuardEntry): boolean => {
-    const kind = classifyProtectedPath(entry.abs);
-    if (kind === null || kind === 'file') return false;
-    removePathWithoutFollowing(entry.abs);
-    if (entry.mode === 'restore') {
-      try {
-        fsSync.mkdirSync(path.dirname(entry.abs), { recursive: true });
-        fsSync.writeFileSync(entry.abs, entry.original, 'utf8');
-      } catch {
-        // still record; poll may retry
-      }
+  /** Best-effort restore search+read on the parent of a protected leaf (class: parent chmod 0). */
+  const ensureParentSearchable = (leafAbs: string): void => {
+    try {
+      fsSync.chmodSync(path.dirname(leafAbs), 0o755);
+    } catch {
+      // best-effort; enforce still attempts remove/restore
     }
-    // forbid-create: leave absent after remove
-    recordDenial(entry, denialSampleForKind(kind));
-    return true;
   };
 
   /**
-   * S03 fix3: non-ENOENT read failure on a protected path that still exists (e.g. chmod 0 → EACCES)
-   * is permanent-tamper, not a skip. lstat still reports regular file so fix2 does not cover this.
-   * - best-effort chmod+re-read for sample, then rm without following
-   * - restore: rewrite original; forbid-create: leave absent
-   * - always recordDenial
-   * Returns true when the path existed and was handled.
+   * Corrective action for a protected entry after any confirmed tamper class:
+   * remove path without following; restore original bytes (restore) or leave absent (forbid-create);
+   * always recordDenial. Shared by non-regular, leaf-unreadable, and parent-unreadable paths.
    */
-  const handleUnreadableFile = (entry: GuardEntry): boolean => {
-    const kind = classifyProtectedPath(entry.abs);
-    if (kind === null) return false; // truly gone — caller handles ENOENT separately
-
-    let sample = '<unreadable>';
-    if (kind === 'file') {
-      try {
-        fsSync.chmodSync(entry.abs, 0o644);
-        const body = fsSync.readFileSync(entry.abs, 'utf8');
-        sample = body.slice(0, 500) || '<unreadable>';
-      } catch {
-        sample = '<unreadable>';
-      }
-    } else {
-      sample = denialSampleForKind(kind);
-    }
-
+  const enforceProtectedEntry = (entry: GuardEntry, sample: string): void => {
     removePathWithoutFollowing(entry.abs);
     if (entry.mode === 'restore') {
       try {
         fsSync.mkdirSync(path.dirname(entry.abs), { recursive: true });
         fsSync.writeFileSync(entry.abs, entry.original, 'utf8');
       } catch {
-        // still record; poll may retry
+        // still record; poll may retry after further parent recovery
       }
     }
     recordDenial(entry, sample);
-    return true;
+  };
+
+  /**
+   * S03 fix3+fix4 class-wide access recovery.
+   * Leaf chmod(0) or parent cycle-folder chmod(0) (or any EACCES/EPERM on probe/read):
+   * 1) restore parent search perms 2) sample if possible 3) enforce leaf + denial.
+   * Never a silent no-op — always denial + corrective action.
+   */
+  const handleAccessError = (
+    entry: GuardEntry,
+    preferredSample: string = '<unreadable>'
+  ): void => {
+    ensureParentSearchable(entry.abs);
+
+    let sample = preferredSample;
+    const after = probePath(entry.abs);
+    if (after.result === 'present' && after.kind === 'file') {
+      try {
+        fsSync.chmodSync(entry.abs, 0o644);
+        const body = fsSync.readFileSync(entry.abs, 'utf8');
+        if (body.length > 0) sample = body.slice(0, 500);
+      } catch {
+        sample = preferredSample;
+      }
+    } else if (after.result === 'present' && after.kind !== 'file') {
+      sample = denialSampleForKind(after.kind);
+    } else if (after.result === 'access-denied') {
+      // parent chmod may have failed; still enforce below
+      sample =
+        preferredSample === '<unreadable>' ? '<parent-unreadable>' : preferredSample;
+    }
+
+    enforceProtectedEntry(entry, sample);
   };
 
   const checkOne = (entry: GuardEntry) => {
     if (stopped) return;
 
-    // S03 fix1/fix2: non-regular type-change must not silently skip — poll and watch both hit this.
-    if (handleNonRegularReplace(entry)) return;
+    const probe = probePath(entry.abs);
 
-    if (entry.mode === 'forbid-create') {
-      let current: string;
-      try {
-        current = fsSync.readFileSync(entry.abs, 'utf8');
-      } catch (err: any) {
-        if (err?.code === 'ENOENT') return; // still absent — allowed
-        // EISDIR / ELOOP / non-regular first; else unreadable regular file (EACCES/EPERM)
-        if (handleNonRegularReplace(entry)) return;
-        if (handleUnreadableFile(entry)) return;
-        // path vanished mid-check or unrecoverable — do not bare-skip forever; next poll retries
-        return;
-      }
-      // File appeared (create) or was written — Discovery must not own it: remove and record.
-      try {
-        fsSync.unlinkSync(entry.abs);
-      } catch {
-        // best-effort delete; still record the denial
-      }
-      recordDenial(entry, current.slice(0, 500));
+    // S03 fix4: parent (or leaf) access-denied must never bare-return
+    if (probe.result === 'access-denied') {
+      handleAccessError(
+        entry,
+        isAccessErrno(probe.code) ? '<parent-unreadable>' : '<unreadable>'
+      );
       return;
     }
 
-    // restore mode (legacy plan/ docs + pre-existing Discovery-forbidden cycle docs)
+    // S03 fix1/fix2: non-regular type-change (dir/symlink/fifo/…) is tampering
+    if (probe.result === 'present' && probe.kind !== 'file') {
+      enforceProtectedEntry(entry, denialSampleForKind(probe.kind));
+      return;
+    }
+
+    // missing
+    if (probe.result === 'missing') {
+      if (entry.mode === 'forbid-create') return; // still absent — allowed
+      // restore: rewrite original (B22b FIX1 unlink/rename-away)
+      try {
+        fsSync.mkdirSync(path.dirname(entry.abs), { recursive: true });
+        fsSync.writeFileSync(entry.abs, entry.original, 'utf8');
+        recordDenial(entry, '');
+      } catch (err: any) {
+        // parent unsearchable / unwritable — class-wide access recovery, not bare return
+        if (isAccessErrno(err?.code) || err?.code !== 'ENOENT') {
+          handleAccessError(entry, '<parent-unreadable>');
+        }
+      }
+      return;
+    }
+
+    // present regular file — read content
     let current: string;
     try {
       current = fsSync.readFileSync(entry.abs, 'utf8');
     } catch (err: any) {
       if (err?.code === 'ENOENT') {
-        // FIX1 (B22b-fix1): unlink or rename-away is the most complete form of tampering — the
-        // prior code silently `return`ed here, leaving no denial evidence. Restore the file and
-        // record the denial the same as a content mismatch.
+        // raced to missing
+        if (entry.mode === 'forbid-create') return;
         try {
           fsSync.mkdirSync(path.dirname(entry.abs), { recursive: true });
           fsSync.writeFileSync(entry.abs, entry.original, 'utf8');
-        } catch {
-          return; // can't restore (e.g. dir also gone); nothing more to do safely
+          recordDenial(entry, '');
+        } catch (err2: any) {
+          if (isAccessErrno(err2?.code) || err2?.code !== 'ENOENT') {
+            handleAccessError(entry, '<parent-unreadable>');
+          }
         }
-        recordDenial(entry, '');
         return;
       }
-      // S03 fix1/fix2: non-regular type-change; fix3: unreadable regular file (chmod 0 / EACCES)
-      if (handleNonRegularReplace(entry)) return;
-      if (handleUnreadableFile(entry)) return;
+      // S03 fix3: leaf EACCES/EPERM (chmod 0 on file); fix4: any non-ENOENT read fail
+      handleAccessError(
+        entry,
+        isAccessErrno(err?.code) ? '<unreadable>' : '<unreadable>'
+      );
       return;
     }
+
+    if (entry.mode === 'forbid-create') {
+      // File appeared (create) — Discovery must not own it
+      enforceProtectedEntry(entry, current.slice(0, 500));
+      return;
+    }
+
+    // restore mode: content mismatch
     if (current !== entry.original) {
-      fsSync.writeFileSync(entry.abs, entry.original, 'utf8');
-      recordDenial(entry, current.slice(0, 500));
+      try {
+        fsSync.writeFileSync(entry.abs, entry.original, 'utf8');
+        recordDenial(entry, current.slice(0, 500));
+      } catch (err: any) {
+        if (isAccessErrno(err?.code)) {
+          handleAccessError(entry, current.slice(0, 500) || '<unreadable>');
+        }
+      }
     }
   };
 
