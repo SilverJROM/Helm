@@ -838,6 +838,23 @@ function App() {
   // B8-T04: Approve Planning gate (R-E3/F1) — busy + inline notice for approve POST outcomes.
   const [ccPlanApproving, setCcPlanApproving] = useState(false);
   const [ccPlanApproveNotice, setCcPlanApproveNotice] = useState('');
+  // B1 (planning-live-panes): give Planning the Implementation treatment, generalised to N seats
+  // (plancore + planner1/2/... — Implementation's math is hardcoded for exactly two, this is not).
+  // Auto-focus: when ON (default), the seat that is actively streaming right now gets a larger
+  // flex share and the rest share the remainder equally but stay visible/readable; OFF = all equal.
+  const [ccPlanAutoFocus, setCcPlanAutoFocus] = useState(() => localStorage.getItem('helm_plan_autofocus') !== '0');
+  const togglePlanAutoFocus = () => setCcPlanAutoFocus(v => { const n = !v; localStorage.setItem('helm_plan_autofocus', n ? '1' : '0'); return n; });
+  // Per-pane manual full-collapse-to-rail (runtimeId -> true), independent of auto-focus — a manual
+  // rail always overrides the auto-resize share for that seat.
+  const [ccPlanCollapsedPanes, setCcPlanCollapsedPanes] = useState({});
+  // The seat currently streaming, derived live from which pane's captured content changed most
+  // recently (see effect below) — drives auto-focus. runtimeId or null.
+  const [ccPlanActiveSeat, setCcPlanActiveSeat] = useState(null);
+  const planPanePrevRef = useRef({}); // runtimeId -> last-seen content (for change detection)
+  const planActiveSeatRef = useRef(null);
+  // B4 (planning-live-panes): prior-run (historical) seats default collapsed behind a disclosure so
+  // the live seats are not buried — the full honest roster stays one click away.
+  const [ccPlanShowHistorical, setCcPlanShowHistorical] = useState(false);
 
   // B9-T02: Implementation tab per-task detail (R-F4/F5/F6) — id of the row expanded for the
   // detail block (one-expanded-at-a-time, mirrors the mockup's single running-task detail).
@@ -942,7 +959,42 @@ function App() {
   .cc-impl-term-row.impl-focus-validator,
   .cc-impl-term-row.impl-collapsed-implementer,
   .cc-impl-term-row.impl-collapsed-validator{grid-template-columns:1fr;height:auto;min-height:0}
-}`;
+}
+/* B1 (planning-live-panes): N-seat side-by-side panes — flex-basis per seat (not Implementation's
+   fixed-2 grid-template-columns %, which does not generalise past exactly two panes). */
+.cc-plan-pane-controls{display:flex;align-items:center;gap:8px;padding:2px 0 8px;flex-wrap:wrap}
+.cc-plan-panes{display:flex;gap:8px;align-items:stretch;flex-wrap:wrap}
+.cc-plan-panes .sp-pane{flex:1 1 0%;min-width:220px;min-height:180px;max-height:420px;display:flex;flex-direction:column;transition:flex-grow .28s ease}
+.cc-plan-panes .sp-pane .sp-pane-body{min-height:0;flex:1 1 auto}
+/* auto-focus: the actively-streaming seat grows (flex-grow:3), the rest share the remainder equally
+   but stay visible/readable — generalises Impl-UI's ~68/32 two-pane split to any seat count. */
+.cc-plan-panes .sp-pane.cc-plan-pane-focus{flex-grow:3}
+/* manual full-collapse: this seat becomes a thin rail, others keep their existing share */
+.cc-plan-panes .sp-pane.cc-plan-pane-rail{flex:0 0 46px;min-width:46px;max-width:46px;min-height:120px;overflow:hidden;cursor:pointer}
+.cc-plan-pane-rail .sp-pane-header{flex-direction:column;height:100%;justify-content:flex-start;gap:10px;padding:8px 4px;border-bottom:none;align-items:center}
+.cc-plan-pane-rail-label{writing-mode:vertical-rl;transform:rotate(180deg);font-size:11px;font-weight:700;color:var(--text-sec);letter-spacing:.04em;text-transform:capitalize}
+@media (max-width:760px){
+  .cc-plan-panes{flex-direction:column}
+  .cc-plan-panes .sp-pane,
+  .cc-plan-panes .sp-pane.cc-plan-pane-focus,
+  .cc-plan-panes .sp-pane.cc-plan-pane-rail{flex:1 1 auto;max-width:none;min-width:0}
+}
+/* B2 (planning-live-panes) — scroll fix, diagnosed not guessed: workspace mode turns off the OUTER
+   page scroll for every CC tab uniformly (.main-content-scroll--workspace, index.html — overflow:
+   hidden whenever a cycle workspace is open) so live-updating panes with their own bottom-stick
+   (Discovery chat, these seat panes) never fight a page-level scrollbar for the same gesture.
+   Discovery already compensates with its own flex/overflow chain (.cc-ws-body-disc, index.html).
+   Planning's tab body never got the same treatment — it is the PLAIN .cc-ws-body block (no flex, no
+   overflow), so once its content (seats + event trail + live panes + doc cards + task table)
+   exceeds the viewport, the excess has no scroll owner anywhere in the chain and is silently clipped
+   by the ancestor's overflow:hidden. This is not two scroll owners fighting each other — it's zero.
+   Fix: give Planning's body the same "becomes the scroll owner for this tab" treatment Discovery
+   already has, scoped ONLY to Planning (via the body's own data-testid, so this cannot outrank the
+   equal-specificity .cc-ws-body-disc rule for Discovery — an attribute+class selector always beats a
+   lone class selector regardless of source order). Nested overflow:auto regions inside (session-pane
+   bodies, MdViewer's own maxHeight scrollbox) remain normal nested scroll areas under this one owner.
+   Implementation is intentionally left untouched — out of scope for this fix. */
+.cc-ws-body[data-testid="ws-body-planning"]{flex:1 1 auto;min-height:0;overflow-y:auto}`;
     document.head.appendChild(el);
   }, []);
 
@@ -1067,6 +1119,33 @@ function App() {
     const id = setInterval(tick, 2000);
     return () => clearInterval(id);
   }, [ccWsTab, ccWsCycleId, token, ccPlanSeats[ccWsCycleId]]);
+  // B1 (planning-live-panes): derive the actively-streaming seat live from the 2s pane-capture poll
+  // above, generalised N-seat version of the Impl-UI implementer/validator heuristic (effect near
+  // ccImplActiveWorker): whichever live seat's captured content changed since the last tick wins;
+  // ties / no change keep the previous active seat so auto-focus does not flicker between polls.
+  useEffect(() => {
+    const cid = ccWsCycleId;
+    const payload = ccPlanSeats[cid];
+    const seats = payload && payload !== 'absent' && Array.isArray(payload.seats) ? payload.seats : [];
+    const live = seats.filter((s) => s && s.live);
+    if (!cid || live.length === 0) {
+      if (planActiveSeatRef.current !== null) { planActiveSeatRef.current = null; setCcPlanActiveSeat(null); }
+      return;
+    }
+    const prev = planPanePrevRef.current;
+    let changed = null;
+    for (const s of live) {
+      const rid = Number(s.id);
+      const key = `${cid}::${rid}`;
+      const snap = ccPlanSeatPanes[key];
+      const content = snap && snap.content != null ? String(snap.content) : '';
+      if (content && content !== prev[key]) { changed = rid; }
+      prev[key] = content;
+    }
+    const stillLive = live.some((s) => Number(s.id) === planActiveSeatRef.current);
+    const next = changed != null ? changed : (stillLive ? planActiveSeatRef.current : Number(live[0].id));
+    if (next !== planActiveSeatRef.current) { planActiveSeatRef.current = next; setCcPlanActiveSeat(next); }
+  }, [ccPlanSeatPanes, ccPlanSeats, ccWsCycleId]);
   // A4 (R4.18): step-level event trail from run_events (not full transcripts).
   useEffect(() => {
     if (ccWsTab !== 'planning' || !ccWsCycleId || !token) return;
@@ -5164,7 +5243,11 @@ function App() {
     setCcDiscDocEditDraft('');
     setCcDiscDocEditErr('');
     setCcPlanSelectedTaskId(null);
-    setCcPlanWatchLiveOpen(false);
+    // B1 (planning-live-panes): this used to force-collapse the live panes on every workspace open,
+    // contradicting the state's own documented default (B4: "default open so SEAM-1 panes are
+    // visible", useState(true) above) — the N-seat panes this fix builds would never be visible on
+    // first open. Reset to the documented default instead of hiding it.
+    setCcPlanWatchLiveOpen(true);
     setCcPlanApproveNotice('');
     setCcImplExpandedTaskId(null);
   };
@@ -6395,11 +6478,22 @@ function App() {
       // B8-T03: planner-progress line (R-D1/D3/H4) — derived from the REAL cycle.phase +
       // awaiting_approval columns (no task-count denominator exists anywhere yet, so no
       // "task N/M" claim — that lands with the B10 helm-algo planner integration).
-      const progressLine = cycle.phase === 'discovery'
-        ? 'Planning not started'
-        : cycle.phase === 'planning'
-          ? (cycle.awaiting_approval ? 'Planning docs ready — awaiting approval' : 'Planning in progress — plancore × co-planner')
-          : 'Planning complete';
+      // B3 (planning-live-panes, run 32): cycle.phase lagged the live run — header read "Planning not
+      // started" while the run-state chip (renderStartPlanningRow, sourced from ccRunState.runActive)
+      // said "Run in progress" with three seats running. Root cause: this line trusted ONLY the
+      // (occasionally stale) cycles.phase column while the chip trusts the live runs-table row for
+      // this cycle — two different sources that can disagree in the window right after a run starts.
+      // Fix: when a run is actively running AND no tasks have been ingested yet (run_tasks only exist
+      // post-agreement, so this can only be true while planning itself is still in flight), trust the
+      // live run state over the possibly-stale phase column — never contradict the chip it sits next to.
+      const runActiveForProgress = !!(planRunLoaded && planRunState.hasRun && planRunState.runActive);
+      const progressLine = (runActiveForProgress && tasks.length === 0)
+        ? 'Planning in progress — plancore × co-planner'
+        : cycle.phase === 'discovery'
+          ? 'Planning not started'
+          : cycle.phase === 'planning'
+            ? (cycle.awaiting_approval ? 'Planning docs ready — awaiting approval' : 'Planning in progress — plancore × co-planner')
+            : 'Planning complete';
 
       const tableSection = () => {
         if (!planRunLoaded) {
@@ -6450,24 +6544,47 @@ function App() {
         }
         // Runtime rows when a run has recorded worker_runtimes
         if (seatsList.length > 0) {
+          // B4 (planning-live-panes): prior-run (historical) seats default collapsed behind a
+          // disclosure — run 32 showed 4 dead historical rows above 3 live ones, burying the live
+          // seats and reading a dead run's `≠ preview` badges as current problems. Live rows always
+          // render; the full honest roster (incl. historical) is one click away, never dropped.
+          const liveSeats = seatsList.filter((s) => s && s.live);
+          const historicalSeats = seatsList.filter((s) => s && !s.live);
+          const seatRow = (s, idx) => {
+            const label = `${s.role || 'seat'}${seatsList.filter(x => x.role === s.role).length > 1 ? ` #${idx + 1}` : ''}`;
+            const liveChip = s.live
+              ? html`<span class="chip chip-green" data-testid=${`ws-plan-seat-live-${s.id}`}>live</span>`
+              : html`<span class="chip chip-orange" data-testid=${`ws-plan-seat-historical-${s.id}`}>historical</span>`;
+            const matchChip = s.matchesPreview === false
+              ? html`<span class="chip chip-orange" data-testid=${`ws-plan-seat-mismatch-${s.id}`}>≠ preview</span>`
+              : null;
+            return html`<div class="cc-plan-seat-row" key=${s.id} data-testid=${`ws-plan-seat-${s.id}`}
+                style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px;padding:4px 6px;border:1px solid var(--border, #30363d);border-radius:4px">
+              <span data-testid=${`ws-plan-seat-role-${s.id}`} style="font-weight:600">${label}</span>
+              <span class="text-sec" data-testid=${`ws-plan-seat-model-${s.id}`}>${s.provider ? `${s.provider}/` : ''}${s.model || '—'}</span>
+              <span class="text-sec" data-testid=${`ws-plan-seat-state-${s.id}`}>${s.state || '—'}</span>
+              ${liveChip}
+              ${matchChip}
+            </div>`;
+          };
           return html`<div class="cc-plan-seats-list" data-testid="ws-plan-seats" data-mode="runtime" style="display:flex;flex-direction:column;gap:4px;padding:4px 0 8px">
-            ${seatsList.map((s, idx) => {
-              const label = `${s.role || 'seat'}${seatsList.filter(x => x.role === s.role).length > 1 ? ` #${idx + 1}` : ''}`;
-              const liveChip = s.live
-                ? html`<span class="chip chip-green" data-testid=${`ws-plan-seat-live-${s.id}`}>live</span>`
-                : html`<span class="chip chip-orange" data-testid=${`ws-plan-seat-historical-${s.id}`}>historical</span>`;
-              const matchChip = s.matchesPreview === false
-                ? html`<span class="chip chip-orange" data-testid=${`ws-plan-seat-mismatch-${s.id}`}>≠ preview</span>`
-                : null;
-              return html`<div class="cc-plan-seat-row" data-testid=${`ws-plan-seat-${s.id}`}
-                  style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px;padding:4px 6px;border:1px solid var(--border, #30363d);border-radius:4px">
-                <span data-testid=${`ws-plan-seat-role-${s.id}`} style="font-weight:600">${label}</span>
-                <span class="text-sec" data-testid=${`ws-plan-seat-model-${s.id}`}>${s.provider ? `${s.provider}/` : ''}${s.model || '—'}</span>
-                <span class="text-sec" data-testid=${`ws-plan-seat-state-${s.id}`}>${s.state || '—'}</span>
-                ${liveChip}
-                ${matchChip}
-              </div>`;
-            })}
+            ${liveSeats.length === 0
+              ? html`<div class="text-sec" data-testid="ws-plan-seats-no-live" style="font-size:11px;padding:2px 0">No live seats for this run.</div>`
+              : liveSeats.map(seatRow)}
+            ${historicalSeats.length
+              ? html`<div data-testid="ws-plan-seats-historical-block">
+                  <button type="button" class="btn btn-sm" data-testid="ws-plan-seats-historical-toggle"
+                    aria-expanded=${ccPlanShowHistorical ? 'true' : 'false'}
+                    onclick=${() => setCcPlanShowHistorical(v => !v)}>
+                    ${ccPlanShowHistorical ? 'Hide' : 'Show'} ${historicalSeats.length} previous-attempt seat${historicalSeats.length === 1 ? '' : 's'}
+                  </button>
+                  ${ccPlanShowHistorical
+                    ? html`<div data-testid="ws-plan-seats-historical-list" style="display:flex;flex-direction:column;gap:4px;margin-top:4px">
+                        ${historicalSeats.map(seatRow)}
+                      </div>`
+                    : null}
+                </div>`
+              : null}
           </div>`;
         }
         // Pre-start preview (S07 / S14): plancore + configured co-planners
@@ -6524,6 +6641,11 @@ function App() {
         </div>`;
       };
       // B4: one shared session-pane per seat (B3 .sp-pane shell + path-safe capture + bottom-stick).
+      // B1 (planning-live-panes): side-by-side sized panes generalised to N seats (plancore +
+      // planner1/2/... as planning_panel_size grows) — Auto-focus (weight the streaming seat),
+      // Show both (force equal), per-pane collapse-to-rail. Implementation's math is hardcoded for
+      // exactly two (implementer | validator) via fixed grid-template-columns %; this uses flex-basis
+      // per seat instead, which scales to any N without a per-count table of layouts.
       const renderPlanPanes = () => {
         if (!seatsPayload) {
           return html`<div class="text-sec" data-testid="ws-plan-panes-loading" style="font-size:11px;padding:4px 0">Loading panes…</div>`;
@@ -6532,37 +6654,82 @@ function App() {
           return html`<div class="text-sec" data-testid="ws-plan-panes-empty" style="font-size:11px;padding:6px">No seat panes for this cycle yet. Start Planning to record co-planner seats.</div>`;
         }
         // B4 send-back: data-pane-count = all seats (honest roster); data-live-pane-count = live only
-        // so e2e can fail if only historical rows satisfy a count contract (HIGH-2).
+        // so e2e can fail if only historical rows satisfy a count contract (HIGH-2). B1 does not hide
+        // historical panes here (only the seats-LIST rows collapse by default, see renderSeatsList) —
+        // B4.live.spec.ts asserts a historical pane stays directly visible with its own chip/testid.
         const livePaneCount = seatsList.filter((s) => s && s.live).length;
-        return html`<div class="cc-plan-panes" data-testid="ws-plan-panes"
-            data-pane-count=${seatsList.length}
-            data-live-pane-count=${livePaneCount}>
-          ${seatsList.map((s) => {
-            const rid = Number(s.id);
-            const key = `${cycleId}::${rid}`;
-            const snap = ccPlanSeatPanes[key];
-            const content = snap && snap.content != null ? String(snap.content) : '';
-            const title = `${s.role || 'seat'}${s.model ? ` · ${s.model}` : ''}`;
-            const liveChip = s.live
-              ? html`<span class="chip chip-green" data-testid=${`ws-plan-pane-live-${rid}`}>live</span>`
-              : html`<span class="chip chip-orange" data-testid=${`ws-plan-pane-historical-${rid}`}>historical</span>`;
-            return html`<div class=${SESSION_PANE_CLASSES.pane} data-testid=${`ws-plan-pane-${rid}`}
-                data-runtime-id=${rid} data-role=${s.role || ''} data-live=${s.live ? '1' : '0'}>
-              <div class=${SESSION_PANE_CLASSES.header}>
-                <span class="sp-pane-title" data-testid=${`ws-plan-pane-title-${rid}`}>${title}</span>
-                ${liveChip}
-              </div>
-              <div class="${SESSION_PANE_CLASSES.body} ${SESSION_PANE_CLASSES.scrollOwner}"
-                data-testid=${`ws-plan-pane-body-${rid}`}
-                ref=${(el) => { if (el) ccPlanPaneBodyRefs.current[rid] = el; else delete ccPlanPaneBodyRefs.current[rid]; }}>
-                ${content
-                  ? html`<pre class=${SESSION_PANE_CLASSES.payload} data-testid=${`ws-plan-pane-payload-${rid}`}>${content}</pre>`
-                  : html`<div class="${SESSION_PANE_CLASSES.empty} text-sec" data-testid=${`ws-plan-pane-empty-${rid}`}>
-                      ${s.live ? 'Waiting for live pane output…' : 'No live terminal — historical / session unavailable.'}
-                    </div>`}
-              </div>
-            </div>`;
-          })}
+        const autoOn = ccPlanAutoFocus;
+        const active = ccPlanActiveSeat;
+        const showBothEqual = () => {
+          setCcPlanCollapsedPanes({});
+          setCcPlanAutoFocus(false);
+          localStorage.setItem('helm_plan_autofocus', '0');
+        };
+        const focusedRole = (() => {
+          if (!autoOn || active == null) return '';
+          const s = seatsList.find((x) => Number(x.id) === active);
+          return s ? (s.role || 'seat') : '';
+        })();
+        return html`<div>
+          ${seatsList.length > 1 ? html`<div class="cc-plan-pane-controls" data-testid="ws-plan-pane-controls">
+            <span class="text-sec" style="font-size:11px">Seats</span>
+            <button type="button" class=${`cc-impl-pane-toolbtn ${autoOn ? 'cc-impl-toolbtn-on' : ''}`.trim()}
+              data-testid="ws-plan-pane-focus-active" aria-pressed=${autoOn ? 'true' : 'false'}
+              title="Auto-focus: grow whoever is actively streaming and share the rest evenly (all stay visible); follows the run live"
+              onclick=${togglePlanAutoFocus}>${autoOn ? 'Auto-focus: On' : 'Auto-focus: Off'}</button>
+            <button type="button" class="cc-impl-pane-toolbtn" data-testid="ws-plan-pane-show-both"
+              title="Show all panes at equal size" onclick=${showBothEqual}>Show both</button>
+            ${focusedRole ? html`<span class="text-sec" data-testid="ws-plan-pane-active-role" style="font-size:11px">· ${focusedRole} active</span>` : null}
+          </div>` : null}
+          <div class="cc-plan-panes" data-testid="ws-plan-panes"
+              data-pane-count=${seatsList.length}
+              data-live-pane-count=${livePaneCount}>
+            ${seatsList.map((s) => {
+              const rid = Number(s.id);
+              const key = `${cycleId}::${rid}`;
+              const snap = ccPlanSeatPanes[key];
+              const content = snap && snap.content != null ? String(snap.content) : '';
+              const title = `${s.role || 'seat'}${s.model ? ` · ${s.model}` : ''}`;
+              const liveChip = s.live
+                ? html`<span class="chip chip-green" data-testid=${`ws-plan-pane-live-${rid}`}>live</span>`
+                : html`<span class="chip chip-orange" data-testid=${`ws-plan-pane-historical-${rid}`}>historical</span>`;
+              const collapsed = !!ccPlanCollapsedPanes[rid];
+              const focused = autoOn && !collapsed && active === rid;
+              const paneCls = `${SESSION_PANE_CLASSES.pane} ${collapsed ? 'cc-plan-pane-rail' : ''} ${focused ? 'cc-plan-pane-focus' : ''}`.trim();
+              if (collapsed) {
+                return html`<div class=${paneCls} data-testid=${`ws-plan-pane-${rid}`}
+                    data-runtime-id=${rid} data-role=${s.role || ''} data-live=${s.live ? '1' : '0'} data-collapsed="1"
+                    role="button" tabindex="0" title=${`Expand ${s.role || 'seat'} pane`}
+                    onclick=${() => setCcPlanCollapsedPanes(p => ({ ...p, [rid]: false }))}>
+                  <div class=${SESSION_PANE_CLASSES.header}>
+                    <button type="button" class="cc-impl-pane-toolbtn" data-testid=${`ws-plan-pane-collapse-${rid}`}
+                      title=${`Expand ${s.role || 'seat'} pane`}
+                      onclick=${(e) => { e.stopPropagation(); setCcPlanCollapsedPanes(p => ({ ...p, [rid]: false })); }}>⇔</button>
+                    <span class="cc-plan-pane-rail-label" data-testid=${`ws-plan-pane-title-${rid}`}>${title}</span>
+                  </div>
+                </div>`;
+              }
+              return html`<div class=${paneCls} data-testid=${`ws-plan-pane-${rid}`}
+                  data-runtime-id=${rid} data-role=${s.role || ''} data-live=${s.live ? '1' : '0'} data-collapsed="0">
+                <div class=${SESSION_PANE_CLASSES.header}>
+                  <span class="sp-pane-title" data-testid=${`ws-plan-pane-title-${rid}`}>${title}</span>
+                  ${liveChip}
+                  <button type="button" class="cc-impl-pane-toolbtn" data-testid=${`ws-plan-pane-collapse-${rid}`}
+                    title=${`Minimize ${s.role || 'seat'} pane fully to a rail (manual)`}
+                    onclick=${() => setCcPlanCollapsedPanes(p => ({ ...p, [rid]: true }))}>–</button>
+                </div>
+                <div class="${SESSION_PANE_CLASSES.body} ${SESSION_PANE_CLASSES.scrollOwner}"
+                  data-testid=${`ws-plan-pane-body-${rid}`}
+                  ref=${(el) => { if (el) ccPlanPaneBodyRefs.current[rid] = el; else delete ccPlanPaneBodyRefs.current[rid]; }}>
+                  ${content
+                    ? html`<pre class=${SESSION_PANE_CLASSES.payload} data-testid=${`ws-plan-pane-payload-${rid}`}>${content}</pre>`
+                    : html`<div class="${SESSION_PANE_CLASSES.empty} text-sec" data-testid=${`ws-plan-pane-empty-${rid}`}>
+                        ${s.live ? 'Waiting for live pane output…' : 'No live terminal — historical / session unavailable.'}
+                      </div>`}
+                </div>
+              </div>`;
+            })}
+          </div>
         </div>`;
       };
 
