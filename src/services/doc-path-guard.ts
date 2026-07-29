@@ -714,18 +714,25 @@ export function startGovernedDocGuard(
   };
 
   type PathKind = 'file' | 'directory' | 'symlink' | 'non-regular';
-  /** S03 fix4: distinguish missing (ENOENT) from access-denied (EACCES/EPERM/…) — never conflate. */
+  /**
+   * S03 fix4/fix5: distinguish missing (ENOENT), access-denied (EACCES/EPERM),
+   * parent-not-dir (ENOTDIR — identity: parent is a file), and present kinds.
+   */
   type PathProbe =
     | { result: 'missing' }
     | { result: 'access-denied'; code: string }
+    | { result: 'parent-not-dir' }
     | { result: 'present'; kind: PathKind };
 
   const isAccessErrno = (code: unknown): boolean =>
     code === 'EACCES' || code === 'EPERM';
 
+  const isParentIdentityErrno = (code: unknown): boolean =>
+    code === 'ENOTDIR' || code === 'EEXIST';
+
   /**
    * Probe a protected abs with lstat (never follow).
-   * ENOENT → missing; EACCES/EPERM (and other non-ENOENT lstat failures) → access-denied.
+   * ENOENT → missing; ENOTDIR → parent-not-dir; EACCES/EPERM/other → access-denied.
    */
   const probePath = (abs: string): PathProbe => {
     try {
@@ -736,6 +743,7 @@ export function startGovernedDocGuard(
       return { result: 'present', kind: 'non-regular' };
     } catch (err: any) {
       if (err?.code === 'ENOENT') return { result: 'missing' };
+      if (err?.code === 'ENOTDIR') return { result: 'parent-not-dir' };
       return { result: 'access-denied', code: String(err?.code || 'UNKNOWN') };
     }
   };
@@ -769,6 +777,52 @@ export function startGovernedDocGuard(
   };
 
   /**
+   * S03 fix5: ensure parent of a protected leaf is a real directory.
+   * If parent exists and is NOT a directory (file/symlink/fifo — e.g. rm -rf cycle/folder; touch folder),
+   * remove it (non-recursive) and mkdir. Returns whether a non-dir parent was repaired.
+   */
+  const ensureParentDirectory = (
+    leafAbs: string
+  ): 'ok' | 'repaired-not-dir' | 'failed' => {
+    const parent = path.dirname(leafAbs);
+    let st: fsSync.Stats;
+    try {
+      st = fsSync.lstatSync(parent);
+    } catch (err: any) {
+      if (err?.code === 'ENOENT') {
+        try {
+          fsSync.mkdirSync(parent, { recursive: true });
+          return 'ok';
+        } catch {
+          return 'failed';
+        }
+      }
+      return 'failed';
+    }
+    if (st.isDirectory()) return 'ok';
+    // Identity error: parent path exists but is not a directory
+    try {
+      fsSync.rmSync(parent, { force: true }); // non-recursive — parent is a leaf node, not a dir
+      fsSync.mkdirSync(parent, { recursive: true });
+      return 'repaired-not-dir';
+    } catch {
+      return 'failed';
+    }
+  };
+
+  /** Restore leaf original bytes after ensuring parent is a directory. */
+  const writeRestoredLeaf = (entry: GuardEntry): 'ok' | 'repaired-not-dir' | 'failed' => {
+    const parentState = ensureParentDirectory(entry.abs);
+    if (parentState === 'failed') return 'failed';
+    try {
+      fsSync.writeFileSync(entry.abs, entry.original, 'utf8');
+      return parentState === 'repaired-not-dir' ? 'repaired-not-dir' : 'ok';
+    } catch {
+      return 'failed';
+    }
+  };
+
+  /**
    * Corrective action for a protected entry after any confirmed tamper class:
    * remove path without following; restore original bytes (restore) or leave absent (forbid-create);
    * always recordDenial. Shared by non-regular, leaf-unreadable, and parent-unreadable paths.
@@ -776,14 +830,36 @@ export function startGovernedDocGuard(
   const enforceProtectedEntry = (entry: GuardEntry, sample: string): void => {
     removePathWithoutFollowing(entry.abs);
     if (entry.mode === 'restore') {
-      try {
-        fsSync.mkdirSync(path.dirname(entry.abs), { recursive: true });
-        fsSync.writeFileSync(entry.abs, entry.original, 'utf8');
-      } catch {
-        // still record; poll may retry after further parent recovery
+      const written = writeRestoredLeaf(entry);
+      if (written === 'repaired-not-dir' && sample === '<parent-unreadable>') {
+        sample = '<parent-not-dir>';
       }
+    } else {
+      // forbid-create: parent may still be a file blocking a future honest mkdir — repair identity
+      ensureParentDirectory(entry.abs);
     }
     recordDenial(entry, sample);
+  };
+
+  /**
+   * S03 fix5: parent path is a non-directory (rm -rf cycle/folder; touch folder).
+   * Recreate parent as directory, restore leaf (or leave absent), single denial class.
+   */
+  const handleParentNotDir = (entry: GuardEntry): void => {
+    const parentState = ensureParentDirectory(entry.abs);
+    if (entry.mode === 'restore') {
+      try {
+        if (parentState !== 'failed') {
+          fsSync.writeFileSync(entry.abs, entry.original, 'utf8');
+        }
+      } catch {
+        // poll may retry
+      }
+    } else {
+      // forbid-create: parent is a dir again; ensure leaf stays absent
+      removePathWithoutFollowing(entry.abs);
+    }
+    recordDenial(entry, '<parent-not-dir>');
   };
 
   /**
@@ -796,10 +872,24 @@ export function startGovernedDocGuard(
     entry: GuardEntry,
     preferredSample: string = '<unreadable>'
   ): void => {
+    // fix5: identity before permission — ENOTDIR masquerading as access noise
+    const parentProbe = probePath(path.dirname(entry.abs));
+    if (
+      parentProbe.result === 'present' &&
+      parentProbe.kind !== 'directory'
+    ) {
+      handleParentNotDir(entry);
+      return;
+    }
+
     ensureParentSearchable(entry.abs);
 
     let sample = preferredSample;
     const after = probePath(entry.abs);
+    if (after.result === 'parent-not-dir') {
+      handleParentNotDir(entry);
+      return;
+    }
     if (after.result === 'present' && after.kind === 'file') {
       try {
         fsSync.chmodSync(entry.abs, 0o644);
@@ -824,6 +914,12 @@ export function startGovernedDocGuard(
 
     const probe = probePath(entry.abs);
 
+    // S03 fix5: parent is a file/symlink (identity) — recreate dir + restore leaf
+    if (probe.result === 'parent-not-dir') {
+      handleParentNotDir(entry);
+      return;
+    }
+
     // S03 fix4: parent (or leaf) access-denied must never bare-return
     if (probe.result === 'access-denied') {
       handleAccessError(
@@ -843,15 +939,15 @@ export function startGovernedDocGuard(
     if (probe.result === 'missing') {
       if (entry.mode === 'forbid-create') return; // still absent — allowed
       // restore: rewrite original (B22b FIX1 unlink/rename-away)
-      try {
-        fsSync.mkdirSync(path.dirname(entry.abs), { recursive: true });
-        fsSync.writeFileSync(entry.abs, entry.original, 'utf8');
-        recordDenial(entry, '');
-      } catch (err: any) {
+      const written = writeRestoredLeaf(entry);
+      if (written === 'ok' || written === 'repaired-not-dir') {
+        recordDenial(
+          entry,
+          written === 'repaired-not-dir' ? '<parent-not-dir>' : ''
+        );
+      } else {
         // parent unsearchable / unwritable — class-wide access recovery, not bare return
-        if (isAccessErrno(err?.code) || err?.code !== 'ENOENT') {
-          handleAccessError(entry, '<parent-unreadable>');
-        }
+        handleAccessError(entry, '<parent-unreadable>');
       }
       return;
     }
@@ -864,22 +960,23 @@ export function startGovernedDocGuard(
       if (err?.code === 'ENOENT') {
         // raced to missing
         if (entry.mode === 'forbid-create') return;
-        try {
-          fsSync.mkdirSync(path.dirname(entry.abs), { recursive: true });
-          fsSync.writeFileSync(entry.abs, entry.original, 'utf8');
-          recordDenial(entry, '');
-        } catch (err2: any) {
-          if (isAccessErrno(err2?.code) || err2?.code !== 'ENOENT') {
-            handleAccessError(entry, '<parent-unreadable>');
-          }
+        const written = writeRestoredLeaf(entry);
+        if (written === 'ok' || written === 'repaired-not-dir') {
+          recordDenial(
+            entry,
+            written === 'repaired-not-dir' ? '<parent-not-dir>' : ''
+          );
+        } else {
+          handleAccessError(entry, '<parent-unreadable>');
         }
         return;
       }
+      if (err?.code === 'ENOTDIR' || isParentIdentityErrno(err?.code)) {
+        handleParentNotDir(entry);
+        return;
+      }
       // S03 fix3: leaf EACCES/EPERM (chmod 0 on file); fix4: any non-ENOENT read fail
-      handleAccessError(
-        entry,
-        isAccessErrno(err?.code) ? '<unreadable>' : '<unreadable>'
-      );
+      handleAccessError(entry, '<unreadable>');
       return;
     }
 
@@ -895,7 +992,9 @@ export function startGovernedDocGuard(
         fsSync.writeFileSync(entry.abs, entry.original, 'utf8');
         recordDenial(entry, current.slice(0, 500));
       } catch (err: any) {
-        if (isAccessErrno(err?.code)) {
+        if (err?.code === 'ENOTDIR' || isParentIdentityErrno(err?.code)) {
+          handleParentNotDir(entry);
+        } else if (isAccessErrno(err?.code)) {
           handleAccessError(entry, current.slice(0, 500) || '<unreadable>');
         }
       }

@@ -529,4 +529,52 @@ describe('S03 startGovernedDocGuard Discovery cycle ownership', () => {
       handle.stop();
     }
   });
+
+  it('fix5 restore: rm-rf bound cycle folder then touch as file → plan.md ORIGINAL + parent is dir', async () => {
+    // Seed + start guard first so restore-mode snapshots ORIGINAL, then destroy parent identity.
+    const handle = startGovernedDocGuard(PROJ, {
+      pollMs: 50,
+      role: 'discovery',
+      phase: 'discovery',
+      cycleFolder: BOUND,
+    });
+    const parent = path.join(PROJ, 'cycle', BOUND);
+    const target = cyclePath(BOUND, 'plan.md');
+    try {
+      fs.rmSync(parent, { recursive: true, force: true });
+      fs.writeFileSync(parent, 'not-a-directory', 'utf8'); // touch cycle/<folder> as plain file
+      expect(fs.statSync(parent).isFile()).toBe(true);
+
+      await sleep(450);
+
+      expect(fs.statSync(parent).isDirectory()).toBe(true);
+      expect(fs.readFileSync(target, 'utf8')).toBe('ORIGINAL plan.md');
+
+      const denialsForPlan = handle.denials.filter(
+        (d) => d.relPath === `cycle/${BOUND}/plan.md`
+      );
+      expect(denialsForPlan.length).toBeGreaterThanOrEqual(1);
+      expect(
+        denialsForPlan.some(
+          (d) =>
+            d.attemptedContentSample === '<parent-not-dir>' ||
+            d.attemptedContentSample === ''
+        )
+      ).toBe(true);
+
+      // No unbounded spin: after restore settles, a second poll window does not flood denials
+      const afterFirst = handle.denials.length;
+      await sleep(450);
+      expect(handle.denials.length - afterFirst).toBeLessThanOrEqual(3);
+    } finally {
+      try {
+        if (fs.existsSync(parent) && fs.statSync(parent).isFile()) {
+          fs.rmSync(parent, { force: true });
+        }
+      } catch {
+        /* cleanup */
+      }
+      handle.stop();
+    }
+  });
 });
