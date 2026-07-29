@@ -2,7 +2,7 @@ import type Database from "better-sqlite3";
 import { assertAllRoleTiersInvariants } from "./role-tier-invariants.js";
 import { PROVIDERS } from "../config/providers.js";
 
-export const SCHEMA_VERSION = 109;
+export const SCHEMA_VERSION = 110;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -1673,6 +1673,53 @@ export const V89_KNOWN_CANONICAL_PLANCORE_HASHES = new Set([
 ]);
 
 /**
+ * S02 / AC2–4: canonical Discovery persona (aligned with discovery-contract.ts).
+ * No HANDOFF; no Planning artifact authorship; exact ready ASK.
+ */
+export const V110_DISCOVERY_DEFINITION_MD = `---
+role: discovery
+kind: project
+agent_type: project
+lifecycle: per-effort
+default_provider: claude
+default_model: claude-opus-5
+default_effort: high
+spawn_pref: tmux
+callback_contract: "[helm callback] discovery <run-id> STATUS: <INTERVIEWING|NORTH-STAR-READY|IDLE|BLOCKED>"
+---
+# discovery — strategy front-end
+
+Author Discovery-owned documents only: north-star.md, conversation-log.md, decisions/, attachments/, and mockups/.
+Interview and thin-context archaeology. You do not implement and you never plan.
+
+Do NOT author, replace, or claim ownership of og-requirements.md, plan.md, or plan.json.
+Do not write plan schema, task arrays, or claim Planning is complete. HANDOFF is NOT a Discovery state.
+
+When Discovery documents are ready, emit STATUS: NORTH-STAR-READY and ask exactly:
+Initial Discovery docs are ready. May I ask Helm to start the configured Planning team?
+`;
+
+/**
+ * S02: SHA-256 of known-stale Discovery / north fingerprints that may be rewritten.
+ * Only empty definitions or these exact hashes are repaired; any other body is preserved.
+ * - pre-S02 B09a discovery seed (HANDOFF + og-requirements)
+ * - same body with role: north in frontmatter
+ * - full north-named legacy persona (callback role north + HANDOFF)
+ */
+export const V110_KNOWN_STALE_DISCOVERY_HASHES = new Set([
+  '51f44f887aee4d74d69921af8dc17eb3ac778e5d5abb9fe260186cb3c3641f61',
+  '0c9100a6fa6ae9cdf18563747e419281bb173822b2ad53cc7871ad9e98070ce2',
+  'c0da12364a3c4d790d14238def7089669e1f3e3dc78f63baa8578ff8ea4d1d9b',
+]);
+
+/** S02: canonical discovery role_capabilities (matches discovery-contract enums). */
+export const V110_DISCOVERY_ALLOWED_STATUSES =
+  '["INTERVIEWING","NORTH-STAR-READY","IDLE","BLOCKED"]';
+export const V110_DISCOVERY_TERMINAL_STATUSES = '["NORTH-STAR-READY","BLOCKED"]';
+export const V110_DISCOVERY_REQUIRED_ARTIFACTS =
+  '["north-star.md","conversation-log.md","decisions/"]';
+
+/**
  * B09a / c01 R2.8–R2.9: canonical project + house roster seed set.
  * Project: discovery, plancore, ibrain, planner, implementer, validator, panelist.
  * House: agent-master, overseer, jkage, housekeeper (S15).
@@ -1751,23 +1798,7 @@ export const B09A_CANONICAL_AGENT_SEEDS: readonly B09aCanonicalAgentSeed[] = [
     model: 'claude-opus-5',
     default_effort: 'high',
     spawn_pref: 'tmux',
-    definition_md: `---
-role: discovery
-kind: project
-agent_type: project
-lifecycle: per-effort
-default_provider: claude
-default_model: claude-opus-5
-default_effort: high
-spawn_pref: tmux
-callback_contract: "[helm callback] discovery <run-id> STATUS: <INTERVIEWING|NORTH-STAR-READY|HANDOFF>"
----
-# discovery — strategy front-end
-
-Author project/effort north-star, decisions/, og-requirements.md, and topology.yaml.
-Interview, thin-context archaeology, stamp Team Topology Contract. Hand off to plancore only on
-explicit user cue. You do not implement.
-`,
+    definition_md: V110_DISCOVERY_DEFINITION_MD,
   },
   {
     name: 'plancore',
@@ -3483,7 +3514,7 @@ When invoked for a project, you will:
   // role_capabilities (AG2): derived from the 9 mds (frontmatter + semantics in body + ladders-spec).
   // E2: seed sensible checkin_ms (ms) for enforcement on task workers (impl/val use short; brain/coord longer). null = no enforcement.
   const capSeeds = [
-    { role: 'discovery', allowed_statuses: '["INTERVIEWING","NORTH-STAR-READY","HANDOFF","BLOCKED"]', terminal_statuses: '["NORTH-STAR-READY","HANDOFF","BLOCKED"]', can_write_code: 0, requires_repro_first: 0, panel_participant: 0, can_escalate: 0, session_policy: 'fresh', required_artifacts: '["north-star.md","decisions/"]', timeout_ms: null, checkin_ms: null },
+    { role: 'discovery', allowed_statuses: V110_DISCOVERY_ALLOWED_STATUSES, terminal_statuses: V110_DISCOVERY_TERMINAL_STATUSES, can_write_code: 0, requires_repro_first: 0, panel_participant: 0, can_escalate: 0, session_policy: 'fresh', required_artifacts: V110_DISCOVERY_REQUIRED_ARTIFACTS, timeout_ms: null, checkin_ms: null },
     { role: 'plancore', allowed_statuses: '["PLANNING","PLAN-READY","IDLE","BLOCKED"]', terminal_statuses: '["PLAN-READY","BLOCKED"]', can_write_code: 0, requires_repro_first: 0, panel_participant: 0, can_escalate: 1, session_policy: 'clear+rehydrate', required_artifacts: '["north-star.md","og-requirements.md","plan.md","decisions/"]', timeout_ms: null, checkin_ms: 300000 },
     { role: 'ibrain', allowed_statuses: '["DECIDING","DECISION-READY","IDLE","HANDHOLD-DIRECTIONS","BLOCKED"]', terminal_statuses: '["DECISION-READY","BLOCKED"]', can_write_code: 0, requires_repro_first: 0, panel_participant: 0, can_escalate: 1, session_policy: 'clear+rehydrate', required_artifacts: '["plan.md","decisions/","failure-history"]', timeout_ms: null, checkin_ms: 300000 },
     { role: 'implementer', allowed_statuses: '["PROPOSED","WORKING","DONE","BLOCKED"]', terminal_statuses: '["DONE","BLOCKED"]', can_write_code: 1, requires_repro_first: 0, panel_participant: 0, can_escalate: 1, session_policy: 'fresh', required_artifacts: '["changes.md"]', timeout_ms: null, checkin_ms: 180000 },

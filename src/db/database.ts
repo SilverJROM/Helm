@@ -2,7 +2,7 @@ import Database from "better-sqlite3";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import fs from "node:fs";
-import { SCHEMA_VERSION, SCHEMA_SQL, V89_IBRAIN_DEFINITION_MD, V89_KNOWN_CANONICAL_PLANCORE_HASHES, V89_PLANCORE_DEFINITION_MD, applyFreshDbExtras, applyB04CanonicalModelSeeds, applyB12bRoleTierSeeds, applyB17TeamTierSeeds, applyB1TeamsSeeds, applyB3AgentRoleCapabilitySeeds, applyB2HelmAgentSeeds, applyB09aCanonicalRosterSeeds, applyB09bPruneNonCanonicalAgents, applyB25OrphanModelHygiene, applyB25dDeleteUnknownProviderMasterRuntimes, applyB6AgentMemorySeeds, applyB11PanelistRetirement, applyHousekeeperSeed, seedRoutingRules } from "./schema.js";
+import { SCHEMA_VERSION, SCHEMA_SQL, V89_IBRAIN_DEFINITION_MD, V89_KNOWN_CANONICAL_PLANCORE_HASHES, V89_PLANCORE_DEFINITION_MD, V110_DISCOVERY_ALLOWED_STATUSES, V110_DISCOVERY_DEFINITION_MD, V110_DISCOVERY_REQUIRED_ARTIFACTS, V110_DISCOVERY_TERMINAL_STATUSES, V110_KNOWN_STALE_DISCOVERY_HASHES, applyFreshDbExtras, applyB04CanonicalModelSeeds, applyB12bRoleTierSeeds, applyB17TeamTierSeeds, applyB1TeamsSeeds, applyB3AgentRoleCapabilitySeeds, applyB2HelmAgentSeeds, applyB09aCanonicalRosterSeeds, applyB09bPruneNonCanonicalAgents, applyB25OrphanModelHygiene, applyB25dDeleteUnknownProviderMasterRuntimes, applyB6AgentMemorySeeds, applyB11PanelistRetirement, applyHousekeeperSeed, seedRoutingRules } from "./schema.js";
 import { deriveSessionOwner } from "../services/session-registry-service.js";
 import { allocateLifecycleGeneration } from "../services/lifecycle-cas.js";
 
@@ -3618,6 +3618,69 @@ CREATE TABLE IF NOT EXISTS chat_session_identities (
 );
 `);
         this.db.prepare('UPDATE schema_version SET version = 109').run();
+      }
+
+      // v110 / S02 (discovery-planning-handoff): align Discovery seed + role_capabilities with
+      // discovery-contract (no HANDOFF; no Planning artifacts). Guarded definition repair rewrites
+      // only empty or known-stale north/old-canonical fingerprints; user-edited bodies stay
+      // byte-identical. Migration tests only — never open data/helm.db here.
+      if (current && current.version < 110) {
+        if (hasTable('agents')) {
+          const agentColumns = new Set(
+            (this.db.prepare('PRAGMA table_info(agents)').all() as any[]).map((column) => column.name)
+          );
+          if (agentColumns.has('definition_md')) {
+            const discovery = this.db
+              .prepare("SELECT id, definition_md FROM agents WHERE name = 'discovery' LIMIT 1")
+              .get() as { id: number; definition_md: string | null } | undefined;
+            if (discovery) {
+              const currentDefinition = discovery.definition_md || '';
+              const definitionHash = createHash('sha256').update(currentDefinition, 'utf8').digest('hex');
+              if (!currentDefinition.trim() || V110_KNOWN_STALE_DISCOVERY_HASHES.has(definitionHash)) {
+                const timestampSet = agentColumns.has('updated_at') ? ", updated_at = datetime('now')" : '';
+                this.db
+                  .prepare(`UPDATE agents SET definition_md = ?${timestampSet} WHERE id = ?`)
+                  .run(V110_DISCOVERY_DEFINITION_MD, discovery.id);
+              } else if (currentDefinition !== V110_DISCOVERY_DEFINITION_MD) {
+                console.warn(
+                  `[v110] custom discovery definition_md preserved (agent_id=${discovery.id}, sha256=${definitionHash})`
+                );
+              }
+            }
+          }
+        }
+
+        if (hasTable('role_capabilities')) {
+          // System table (not a user persona): force discovery caps to S01 contract enums.
+          this.db
+            .prepare(
+              `UPDATE role_capabilities
+               SET allowed_statuses = ?,
+                   terminal_statuses = ?,
+                   required_artifacts = ?,
+                   updated_at = datetime('now')
+               WHERE role = 'discovery'`
+            )
+            .run(
+              V110_DISCOVERY_ALLOWED_STATUSES,
+              V110_DISCOVERY_TERMINAL_STATUSES,
+              V110_DISCOVERY_REQUIRED_ARTIFACTS
+            );
+          this.db
+            .prepare(
+              `INSERT OR IGNORE INTO role_capabilities (
+                 role, allowed_statuses, terminal_statuses, can_write_code, requires_repro_first,
+                 panel_participant, can_escalate, session_policy, required_artifacts, timeout_ms, checkin_ms
+               ) VALUES ('discovery', ?, ?, 0, 0, 0, 0, 'fresh', ?, NULL, NULL)`
+            )
+            .run(
+              V110_DISCOVERY_ALLOWED_STATUSES,
+              V110_DISCOVERY_TERMINAL_STATUSES,
+              V110_DISCOVERY_REQUIRED_ARTIFACTS
+            );
+        }
+
+        this.db.prepare('UPDATE schema_version SET version = 110').run();
       }
     }
   }
