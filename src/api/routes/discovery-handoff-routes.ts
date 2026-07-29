@@ -75,24 +75,36 @@ export function registerDiscoveryHandoffRoutes(
     });
   });
 
-  // S11 owner confirm / decline — only when auth + orchestrator wired.
+  // S11 owner confirm / decline — only when auth + bridge deps are fully wired.
+  // Capture locals so TS narrows optional deps (deps.artifacts stays optional on the bag).
+  const authMiddleware = deps.authMiddleware;
+  const requireOwnerPre = deps.requireOwnerPre;
+  const requireLocalLaunchPre = deps.requireLocalLaunchPre;
+  const artifacts = deps.artifacts;
+  const orchestrator = deps.orchestrator;
+
   if (
-    deps.authMiddleware &&
-    deps.requireOwnerPre &&
-    deps.requireLocalLaunchPre &&
-    deps.artifacts &&
-    deps.orchestrator
+    authMiddleware &&
+    requireOwnerPre &&
+    requireLocalLaunchPre &&
+    artifacts &&
+    orchestrator
   ) {
-    const ownerPres = [
-      deps.authMiddleware,
-      deps.requireOwnerPre,
-      deps.requireLocalLaunchPre,
-    ];
+    const ownerPres = [authMiddleware, requireOwnerPre, requireLocalLaunchPre];
 
     app.post(
       '/api/cycles/:id/discovery-handoff/confirm',
       { preHandler: ownerPres as any },
       async (request: any, reply: any) => {
+        // Fail-closed if wiring was stripped after register (should not happen).
+        if (!artifacts || !orchestrator) {
+          return reply.code(500).send({
+            ok: false,
+            code: 'INTERNAL',
+            error: 'owner confirm bridge not configured (artifacts/orchestrator)',
+            runCreated: false,
+          });
+        }
         const cycleId = Number(request.params.id);
         const body = (request.body || {}) as {
           expectedDigest?: string;
@@ -110,10 +122,10 @@ export function registerDiscoveryHandoffRoutes(
             db: deps.db,
             handoffs,
             cycleService: deps.cycleService,
-            artifacts: deps.artifacts,
+            artifacts,
             assignments: deps.assignmentService,
             plannerPanel: deps.plannerPanelService,
-            orchestrator: deps.orchestrator!,
+            orchestrator,
             detachS10: deps.detachS10,
           }
         );
