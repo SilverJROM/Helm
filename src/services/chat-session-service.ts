@@ -760,11 +760,21 @@ export class ChatSessionService {
       const spawnStartMs = Date.now();
       // trusted launch path (skipSafetyCheck) — mirrors RealTransport + WorkerService.
       await this.deps.tmux.sendCommand(target, fencedLaunch, true, true);
-      // R7.26/B22b-cont: start the userspace guard as soon as the fenced process exists (not
-      // gated on ready-probe success). Project-fenced sessions only — test-chat sandbox dirs
-      // have no plan/<cycle> governed docs.
+      // R7.26/B22b-cont + S03: start the userspace guard as soon as the fenced process exists
+      // (not gated on ready-probe success). Project-fenced sessions only — test-chat sandbox
+      // dirs have no plan/<cycle> or cycle/<folder> governed docs. Pass phase/role/cycle so
+      // Discovery chats also fence cycle/<folder>/{og-requirements.md,plan.md,plan.json}.
       if (projectFenceDir) {
-        this.governedDocGuards.set(sessionName, startGovernedDocGuard(fenceDir));
+        const ac = opts?.activeCycle;
+        const discoveryOwned = isDiscoveryPhase(ac?.phase);
+        this.governedDocGuards.set(
+          sessionName,
+          startGovernedDocGuard(fenceDir, {
+            role: discoveryOwned ? 'discovery' : null,
+            phase: ac?.phase ?? null,
+            cycleFolder: ac?.folder_name ?? null,
+          })
+        );
       }
 
       // 4. Wait for genuine composer-ready (mirrors RealTransport POCFIX11/18/T2 — flat readyProbe alone
