@@ -775,6 +775,44 @@ export function startGovernedDocGuard(
     return true;
   };
 
+  /**
+   * S03 fix3: non-ENOENT read failure on a protected path that still exists (e.g. chmod 0 → EACCES)
+   * is permanent-tamper, not a skip. lstat still reports regular file so fix2 does not cover this.
+   * - best-effort chmod+re-read for sample, then rm without following
+   * - restore: rewrite original; forbid-create: leave absent
+   * - always recordDenial
+   * Returns true when the path existed and was handled.
+   */
+  const handleUnreadableFile = (entry: GuardEntry): boolean => {
+    const kind = classifyProtectedPath(entry.abs);
+    if (kind === null) return false; // truly gone — caller handles ENOENT separately
+
+    let sample = '<unreadable>';
+    if (kind === 'file') {
+      try {
+        fsSync.chmodSync(entry.abs, 0o644);
+        const body = fsSync.readFileSync(entry.abs, 'utf8');
+        sample = body.slice(0, 500) || '<unreadable>';
+      } catch {
+        sample = '<unreadable>';
+      }
+    } else {
+      sample = denialSampleForKind(kind);
+    }
+
+    removePathWithoutFollowing(entry.abs);
+    if (entry.mode === 'restore') {
+      try {
+        fsSync.mkdirSync(path.dirname(entry.abs), { recursive: true });
+        fsSync.writeFileSync(entry.abs, entry.original, 'utf8');
+      } catch {
+        // still record; poll may retry
+      }
+    }
+    recordDenial(entry, sample);
+    return true;
+  };
+
   const checkOne = (entry: GuardEntry) => {
     if (stopped) return;
 
@@ -787,8 +825,10 @@ export function startGovernedDocGuard(
         current = fsSync.readFileSync(entry.abs, 'utf8');
       } catch (err: any) {
         if (err?.code === 'ENOENT') return; // still absent — allowed
-        // EISDIR / ELOOP / etc.: non-regular may still be present — handle and return
+        // EISDIR / ELOOP / non-regular first; else unreadable regular file (EACCES/EPERM)
         if (handleNonRegularReplace(entry)) return;
+        if (handleUnreadableFile(entry)) return;
+        // path vanished mid-check or unrecoverable — do not bare-skip forever; next poll retries
         return;
       }
       // File appeared (create) or was written — Discovery must not own it: remove and record.
@@ -819,8 +859,9 @@ export function startGovernedDocGuard(
         recordDenial(entry, '');
         return;
       }
-      // S03 fix1/fix2: EISDIR / symlink-to-dir / other non-regular after type-change
+      // S03 fix1/fix2: non-regular type-change; fix3: unreadable regular file (chmod 0 / EACCES)
       if (handleNonRegularReplace(entry)) return;
+      if (handleUnreadableFile(entry)) return;
       return;
     }
     if (current !== entry.original) {

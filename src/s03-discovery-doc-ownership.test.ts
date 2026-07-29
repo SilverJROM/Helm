@@ -350,4 +350,83 @@ describe('S03 startGovernedDocGuard Discovery cycle ownership', () => {
       handle.stop();
     }
   });
+
+  it('fix3 restore: write EVIL + chmod 0 on plan.md → ORIGINAL restored + denial', async () => {
+    const handle = startGovernedDocGuard(PROJ, {
+      pollMs: 50,
+      role: 'discovery',
+      phase: 'discovery',
+      cycleFolder: BOUND,
+    });
+    const target = cyclePath(BOUND, 'plan.md');
+    try {
+      fs.writeFileSync(target, 'EVIL CONTENT injected by discovery', 'utf8');
+      fs.chmodSync(target, 0o000);
+
+      await sleep(450);
+
+      // ensure readable for assertion (guard should already have restored with normal perms)
+      try {
+        fs.chmodSync(target, 0o644);
+      } catch {
+        /* already readable */
+      }
+      expect(fs.readFileSync(target, 'utf8')).toBe('ORIGINAL plan.md');
+      const denial = handle.denials.find((d) => d.relPath === `cycle/${BOUND}/plan.md`);
+      expect(denial).toBeTruthy();
+      // sample is EVIL content if chmod+re-read worked, else <unreadable>
+      expect(
+        denial!.attemptedContentSample === 'EVIL CONTENT injected by discovery' ||
+          denial!.attemptedContentSample === '<unreadable>'
+      ).toBe(true);
+    } finally {
+      try {
+        fs.chmodSync(target, 0o644);
+      } catch {
+        /* cleanup */
+      }
+      handle.stop();
+    }
+  });
+
+  it('fix3 forbid-create: write SNEAK + chmod 0 on og-requirements → absent + denial', async () => {
+    setupBoundCycle({ seedForbidden: false });
+    fs.writeFileSync(cyclePath(BOUND, 'plan.md'), 'ORIGINAL plan.md', 'utf8');
+
+    const handle = startGovernedDocGuard(PROJ, {
+      pollMs: 50,
+      role: 'discovery',
+      phase: 'discovery',
+      cycleFolder: BOUND,
+    });
+    const target = cyclePath(BOUND, 'og-requirements.md');
+    try {
+      fs.writeFileSync(target, 'SNEAK unreadable create', 'utf8');
+      fs.chmodSync(target, 0o000);
+
+      await sleep(450);
+
+      expect(fs.existsSync(target)).toBe(false);
+      const denial = handle.denials.find(
+        (d) => d.relPath === `cycle/${BOUND}/og-requirements.md`
+      );
+      expect(denial).toBeTruthy();
+      expect(
+        denial!.attemptedContentSample === 'SNEAK unreadable create' ||
+          denial!.attemptedContentSample === '<unreadable>'
+      ).toBe(true);
+    } finally {
+      try {
+        if (fs.existsSync(target)) fs.chmodSync(target, 0o644);
+      } catch {
+        /* cleanup */
+      }
+      try {
+        fs.rmSync(target, { force: true, recursive: true });
+      } catch {
+        /* cleanup */
+      }
+      handle.stop();
+    }
+  });
 });
