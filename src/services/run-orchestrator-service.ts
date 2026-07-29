@@ -44,6 +44,8 @@ import type { LifecycleToken } from './lifecycle-cas.js';
 import {
   PlanningStaffingService,
   toCorePlanningStaffingArgs,
+  buildManifestDigestPayload,
+  computeManifestDigest,
   type CorePlanningStaffingArgs,
   type PlanningStaffingManifest,
   type CoPlannerSeatSpec,
@@ -779,17 +781,47 @@ export class RunOrchestratorService {
       );
     }
 
-    // Frozen seats from S09 pending create
+    // Frozen seats from handoff.manifest_json — recompute S05 digest from the JSON that will
+    // drive Planning seats and require it equals handoff.manifest_digest (RT R1: digest A +
+    // JSON seats B must not start Planning with B).
     let coPlannerSeats: CoPlannerSeatSpec[] = [];
     let planningBrainModel: string | undefined;
     let planningBrainProvider: string | undefined;
     try {
       const frozen = JSON.parse(String(handoff.manifest_json || '{}')) as Partial<PlanningStaffingManifest>;
-      if (frozen.plancore?.model) {
+      if (!frozen.plancore || !Array.isArray(frozen.coPlanners)) {
+        throw new ConfirmedHandoffPlanningError(
+          'frozen manifest_json missing plancore or coPlanners',
+          'MISMATCH'
+        );
+      }
+      const recomputedDigest = computeManifestDigest(
+        buildManifestDigestPayload({
+          plancore: frozen.plancore,
+          coPlanners: frozen.coPlanners,
+        })
+      );
+      if (recomputedDigest !== String(handoff.manifest_digest)) {
+        throw new ConfirmedHandoffPlanningError(
+          'frozen manifest_json does not recompute to handoff.manifest_digest (digest/JSON mismatch)',
+          'MISMATCH'
+        );
+      }
+      if (
+        input.expectedDigest != null &&
+        recomputedDigest !== String(input.expectedDigest)
+      ) {
+        throw new ConfirmedHandoffPlanningError(
+          'recomputed frozen-JSON digest does not match expectedDigest',
+          'MISMATCH'
+        );
+      }
+      // Prefer verified frozen JSON seats only after digest match (never live seats here).
+      if (frozen.plancore.model) {
         planningBrainModel = String(frozen.plancore.model);
         planningBrainProvider = String(frozen.plancore.provider || '');
       }
-      const rawSeats = Array.isArray(frozen.coPlanners) ? frozen.coPlanners : [];
+      const rawSeats = frozen.coPlanners;
       coPlannerSeats = rawSeats
         .filter((s) => s && (s.ready !== false))
         .map((s, i) => ({
@@ -800,9 +832,9 @@ export class RunOrchestratorService {
           source: String(s.source || 'primary'),
         }))
         .filter((s) => s.model);
-      if (!coPlannerSeats.length && Array.isArray(frozen.coPlanners) && frozen.coPlanners.length) {
+      if (!coPlannerSeats.length && rawSeats.length) {
         // fall back to all configured identities if ready flags missing
-        coPlannerSeats = frozen.coPlanners.map((s: any, i: number) => ({
+        coPlannerSeats = rawSeats.map((s: any, i: number) => ({
           slot: s.slot ?? i,
           provider: String(s.provider || ''),
           model: String(s.model || ''),
@@ -811,6 +843,7 @@ export class RunOrchestratorService {
         }));
       }
     } catch (e: any) {
+      if (e instanceof ConfirmedHandoffPlanningError) throw e;
       throw new ConfirmedHandoffPlanningError(
         `frozen manifest_json unreadable: ${e?.message || e}`,
         'MISMATCH'

@@ -238,6 +238,41 @@ describe('S10 startPlanningFromConfirmedHandoff', () => {
     expect(planningCalls).toHaveLength(0);
   });
 
+  it('test4: digest A + JSON seats B (recompute mismatch) creates no run', async () => {
+    const runsBefore = (dbs.raw.prepare('SELECT COUNT(*) AS c FROM runs').get() as any).c;
+    const { handoffId, manifest } = await makeStartingHandoff();
+
+    // Tamper: keep frozen digest A (matches live), swap JSON to different seats B
+    const tampered = JSON.parse(JSON.stringify(manifest));
+    expect(tampered.coPlanners.length).toBeGreaterThan(0);
+    tampered.coPlanners[0] = {
+      ...tampered.coPlanners[0],
+      model: 'evil-model-not-in-digest',
+      provider: 'evil-provider',
+    };
+    // Leave handoff.manifest_digest as original A
+    dbs.raw
+      .prepare(
+        `UPDATE discovery_handoffs SET manifest_json = ?, updated_at = datetime('now') WHERE id = ?`
+      )
+      .run(JSON.stringify(tampered), handoffId);
+
+    await expect(
+      orch.startPlanningFromConfirmedHandoff({
+        projectId,
+        cycleId,
+        handoffId,
+        expectedDigest: manifest.digest,
+        batchId: 's10-ab-mismatch',
+      })
+    ).rejects.toMatchObject({ code: 'MISMATCH' });
+
+    expect(handoffs.getById(handoffId)!.state).toBe('starting');
+    const runsAfter = (dbs.raw.prepare('SELECT COUNT(*) AS c FROM runs').get() as any).c;
+    expect(runsAfter).toBe(runsBefore);
+    expect(planningCalls).toHaveLength(0);
+  });
+
   it('test3: pause_after_planning parks only after successful agreement', async () => {
     const { handoffId, manifest } = await makeStartingHandoff();
 
