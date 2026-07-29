@@ -28,6 +28,10 @@ import {
   isDiscoveryPhase,
   isPlanningPhase,
 } from './discovery-contract.js';
+import {
+  formatDiscoveryReadyCallbackInstruction,
+  issueDiscoveryCallbackCredential,
+} from './discovery-callback-credentials.js';
 
 // C1 KEY-C1: agent test-chat transport (SSE+POST, DELIB consensus 2026-06-21).
 // Ephemeral in-memory session store — a test-chat session is a tmux pane running the
@@ -362,7 +366,9 @@ export function composeAgentSidecar(
   agentType?: string,
   projectContext?: Pick<Project, 'name' | 'directory' | 'dev_url'> | null,
   projectDocs?: { techStack?: string | null; docPaths?: string[] } | null,
-  activeCycle?: ActiveCycleContext | null
+  activeCycle?: ActiveCycleContext | null,
+  /** S09: structured ready-callback instruction (credential + POST); Discovery cycle chats only. */
+  discoveryReadyCallbackBlock?: string | null
 ): string {
   const def = (definitionMd ?? '').trim();
   const projectBlock = formatProjectDefinitionBlock(projectContext, projectDocs);
@@ -376,7 +382,9 @@ export function composeAgentSidecar(
   // (already inlined in formatActiveCycleBlock for planning phase — no second copy here).
   const phaseContractLast =
     activeCycle && isDiscoveryPhase(activeCycle.phase) ? formatDiscoveryPhaseContract() : '';
-  return [projectBlock, cycleBlock, def, infraRules, memoryBlock, phaseContractLast]
+  // S09: ready POST instruction sits with the Discovery phase contract (still last-authority zone).
+  const readyBlock = (discoveryReadyCallbackBlock || '').trim();
+  return [projectBlock, cycleBlock, def, infraRules, memoryBlock, phaseContractLast, readyBlock]
     .filter((p) => p.length > 0)
     .join('\n\n');
 }
@@ -821,13 +829,37 @@ export class ChatSessionService {
         // SIDECAR: write the full role brief (persona + project authority + rules + memories) to a file
         // the agent reads, and paste only a LEAN prompt into the composer. A single ~8.5KB paste dropped
         // intermittently in the TUI (persona never landed); the lean prompt is small + reliable.
+        // S09: Discovery cycle chats get a one-use ready-callback credential + exact POST instruction.
+        let discoveryReadyBlock: string | null = null;
+        const ac = opts?.activeCycle ?? null;
+        if (
+          projectFenceDir &&
+          projectId != null &&
+          ac &&
+          isDiscoveryPhase(ac.phase)
+        ) {
+          const issued = issueDiscoveryCallbackCredential({
+            projectId,
+            cycleId: ac.id,
+            chatSessionId: sessionId,
+            agentId,
+          });
+          discoveryReadyBlock = formatDiscoveryReadyCallbackInstruction({
+            rawCredential: issued.rawCredential,
+            projectId,
+            cycleId: ac.id,
+            chatSessionId: sessionId,
+            agentId,
+          });
+        }
         const sidecarContent = composeAgentSidecar(
           bootstrapDefinitionMd,
           appMemories,
           agent.agent_type,
           projectContext,
           projectDocs,
-          opts?.activeCycle ?? null
+          opts?.activeCycle ?? null,
+          discoveryReadyBlock
         );
         const sidecarPath = path.join(os.tmpdir(), 'helm-agent-briefs', `${sessionId}.md`);
         try {

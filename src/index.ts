@@ -17,6 +17,7 @@ import { registerAuthRoutes } from "./api/routes/auth-routes.js";
 import { registerProjectAgentRoutes } from "./api/routes/project-agent-routes.js";
 import { registerPhaseAgentRoutes } from "./api/routes/phase-agent-routes.js";
 import { registerPlannerPanelRoutes } from "./api/routes/planner-panel-routes.js";
+import { registerDiscoveryHandoffRoutes } from "./api/routes/discovery-handoff-routes.js";
 import { registerProjectRoleRosterRoutes } from "./api/routes/project-role-roster-routes.js";
 import {
   isLoopbackAddress,
@@ -2088,6 +2089,14 @@ async function main(): Promise<void> {
     authMiddleware,
     requireOwnerPre,
     requireLocalLaunchPre,
+  });
+
+  // S09: Discovery structured ready callback (credential auth; no owner browser token; no Planning start).
+  registerDiscoveryHandoffRoutes(app, {
+    db,
+    assignmentService,
+    cycleService,
+    plannerPanelService,
   });
 
   // B8a / AC-12 + AC-12b: opt-in project role roster override + team unbind.
