@@ -855,6 +855,12 @@ function App() {
   // so this ONLY records that a stop was requested; it never calls any network/kill/exec path.
   // B10 is the single place that will replace requestGracefulStop()'s body with a real call.
   const [ccGracefulStopNote, setCcGracefulStopNote] = useState({});
+  // Complete Cycle (JROM 2026-07-29): retire a finished cycle so it leaves the active cycle list and
+  // appears under Completed. POST /api/cycles/:id/complete has existed since B2-T04 but NO UI control
+  // ever called it, so finished cycles accumulated in the switcher forever (11 greenfield / 12 A8 were
+  // phase=complete but still status=active). cycleId -> busy flag / inline outcome note.
+  const [ccCompleting, setCcCompleting] = useState({});
+  const [ccCompleteNote, setCcCompleteNote] = useState({});
   // IS-R2 (impl-start): Start Implementation button. cycleId -> busy flag / inline notice for the
   // POST /start-implementation outcome. The button is enabled purely on (valid plan.md
   // exists AND no active run) — never gated behind Approve-Planning. Clicking it starts the run.
@@ -5637,6 +5643,45 @@ function App() {
       setCcGracefulStopNote(p => ({ ...p, [cycleId]: 'Stop request failed to send — check the run panel and retry.' }));
     }
   };
+  // Complete Cycle (JROM 2026-07-29): retire a finished cycle. POST /api/cycles/:id/complete MOVES the
+  // on-disk folder cycle/<name> -> cycle/completed/<name> and only then sets status='completed'
+  // (server rolls the move back if the status write fails, and 409s on a destination collision rather
+  // than overwriting). Because it renames a live directory, refuse while a run is active — otherwise
+  // the folder moves out from under running agents. The server has no such guard, so it is enforced
+  // here at the only caller.
+  const completeCycleAction = async (cycleId) => {
+    if (ccCompleting[cycleId]) return;
+    const rs = ccRunState[cycleId];
+    const active = (rs && typeof rs === 'object') ? rs.runActive : false;
+    if (active) {
+      setCcCompleteNote(p => ({ ...p, [cycleId]: 'This cycle has an active run. Stop the run first — completing moves the cycle folder on disk.' }));
+      return;
+    }
+    const c = (cycles || []).find(x => x.id === cycleId);
+    const label = c ? c.name : `cycle ${cycleId}`;
+    if (!confirm(`Complete "${label}"?\n\nIts folder moves to cycle/completed/ and it leaves the active cycle list. Artifacts are kept, not deleted.`)) return;
+    setCcCompleting(p => ({ ...p, [cycleId]: true }));
+    setCcCompleteNote(p => ({ ...p, [cycleId]: '' }));
+    try {
+      const r = await authedFetch(`/api/cycles/${cycleId}/complete`, { method: 'POST', allowStatuses: [400, 403, 404, 409] });
+      if (r.ok) {
+        setCcCompleteNote(p => ({ ...p, [cycleId]: 'Cycle completed — moved to Completed.' }));
+        // The cycle list is derived from ccOvData (active/pending/completed), so the overview is the
+        // store that must be re-read for the cycle to move out of the active list.
+        loadCcOverview();
+        loadCompleted();
+      } else {
+        let msg = 'Complete failed.';
+        try { const d = await r.json(); if (d && d.error) msg = d.error; } catch {}
+        if (r.status === 409) msg = 'A folder with this name already exists under completed/ — rename it first (nothing was overwritten).';
+        setCcCompleteNote(p => ({ ...p, [cycleId]: msg }));
+      }
+    } catch (e) {
+      setCcCompleteNote(p => ({ ...p, [cycleId]: 'Complete request failed to send — retry.' }));
+    } finally {
+      setCcCompleting(p => ({ ...p, [cycleId]: false }));
+    }
+  };
   // IS-R2 (impl-start): manual Start Implementation. POST /api/cycles/:id/start-implementation with
   // an empty body — the server uses the project's role bindings + ingests the cycle's own
   // plan.md (no seedPlan). On success, refresh run-state so the 4s Impl poll shows progress.
@@ -7109,6 +7154,10 @@ function App() {
           </div>
           ${ccWsTab === 'implementation' ? html`<button type="button" class="btn btn-sm btn-danger" data-testid="ws-graceful-stop"
             onclick=${() => requestGracefulStop(cycle.id)}>Graceful Stop</button>` : null}
+          ${cycle.status !== 'completed' ? html`<button type="button" class="btn btn-sm" data-testid="ws-complete-cycle"
+            disabled=${!!ccCompleting[cycle.id]}
+            title="Retire this cycle: its folder moves to cycle/completed/ and it leaves the active cycle list"
+            onclick=${() => completeCycleAction(cycle.id)}>${ccCompleting[cycle.id] ? 'Completing…' : 'Complete cycle'}</button>` : null}
           <div class="cc-ws-switcher-wrap">
             <button class="btn btn-sm" data-testid="ws-cycle-switcher-btn" onclick=${() => setCcWsSwitcherOpen(!ccWsSwitcherOpen)}>Cycle switcher</button>
             ${ccWsSwitcherOpen ? html`<div class="cc-ws-switcher-menu" data-testid="ws-cycle-switcher-menu">
@@ -7126,6 +7175,7 @@ function App() {
         </div>
         ${ccWsTab === 'implementation' ? html`<div class="cc-ws-impl-subtitle text-sec" data-testid="ws-impl-subtitle">${implementationSubtitle()}</div>` : null}
         ${ccWsTab === 'implementation' && ccGracefulStopNote[cycle.id] ? html`<div class="cc-ws-impl-subtitle text-sec" data-testid="ws-graceful-stop-note">${ccGracefulStopNote[cycle.id]}</div>` : null}
+        ${ccCompleteNote[cycle.id] ? html`<div class="cc-ws-impl-subtitle text-sec" data-testid="ws-complete-cycle-note">${ccCompleteNote[cycle.id]}</div>` : null}
       </div>
 
       <div class="tab-strip" data-testid="ws-phase-tabs">

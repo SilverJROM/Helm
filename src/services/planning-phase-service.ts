@@ -511,7 +511,24 @@ export class PlanningPhaseService {
         batchId: partnerBatchId,
         seat: seatLabel,
         lens: 'plan atomicity, deps, fields, complexity/recommended_model, validation_criteria',
-        requirement: 'Review canonical plan.md and north-star.md. Pressure-test atomicity, deps, fields, complexity/recommended_model. Return agreement or concrete gaps.',
+        // CONVENE-RACE FIX (run 31, cycle 13, 2026-07-30 04:45 PHT): partners are spawned HERE, while
+        // plancore is still AUTHORING plan.md/og-requirements.md — they do not exist yet. Both seats
+        // dutifully reported "plan.md and og-requirements.md absent" as BROKEN within ~60s; plancore
+        // wrote the files a minute later and emitted PLAN-READY; waitForAgreement treats ANY BROKEN as
+        // dispositive fail-fast (R1.4/N11), so the run was blocked before the plan had ever been read.
+        // One partner literally wrote "Re-review after plan artifacts land" — it wanted to wait.
+        // Absence of the artifacts is NOT-YET, never a negative verdict. Engine-side suppression alone
+        // would deadlock (a seat that already emitted VERDICT-READY does not re-emit), so the wait must
+        // live in the brief, before the seat ever forms a verdict.
+        requirement:
+          'FIRST: confirm the canonical plan.md AND og-requirements.md exist and are non-empty. ' +
+          'plancore authors them AFTER you are spawned, so on your first look they are very likely ABSENT — ' +
+          'that is expected and is NOT a finding. If either is missing, empty, or truncated mid-write: do NOT ' +
+          'emit VERDICT-READY at all. Wait and re-check (re-read every ~15s, up to ~8 minutes). Emit a verdict ' +
+          'ONLY once you have actually read a complete plan.md. Never return BROKEN because an artifact was ' +
+          'absent — BROKEN is reserved for defects in a plan you have genuinely read. ' +
+          'THEN: review canonical plan.md and north-star.md. Pressure-test atomicity, deps, fields, ' +
+          'complexity/recommended_model, validation_criteria. Return agreement or concrete gaps.',
         projectDir: effectiveProjectDir,
         callbacksFile: path.join(runDir, 'callbacks.md'),
       });
@@ -554,7 +571,13 @@ export class PlanningPhaseService {
     // A8 (R1.2): waitForAgreement requires BOTH the partner agreement signal AND projcore PLAN-READY in
     // every mode — 'planner' no longer fast-paths on PLAN-READY alone. real path adds explicit file poll
     // below for BOTH before ingest.
-    const agreed = await this.waitForAgreement(cbPath, batchId, partner, brainRole, effectiveTimeoutMs, agreementFenceOffset, partnerBatchIds);
+    // CONVENE-RACE safety net (see the partner-brief comment above). The brief is the primary fix; this
+    // is the deterministic backstop for a seat that ignores it. A BROKEN verdict cannot be a genuine
+    // plan defect while the plan does not exist on disk, so the fail-fast is suppressed until it does.
+    // fs existence only — never parses the verdict prose. Suppression alone would deadlock a seat that
+    // never re-emits, which is exactly why the brief change ships with it and why the outer timeout
+    // still governs.
+    const agreed = await this.waitForAgreement(cbPath, batchId, partner, brainRole, effectiveTimeoutMs, agreementFenceOffset, partnerBatchIds, path.join(canonicalArtifactRoot, CANONICAL_CYCLE_ARTIFACTS.plan));
 
     // Short grace for plancore to flush canonical documents before the PLAN-READY callback is consumed.
     await new Promise((r) => setTimeout(r, 120));
@@ -965,7 +988,11 @@ export class PlanningPhaseService {
     brainRole: string,
     timeoutMs: number,
     sinceOffset = 0,
-    partnerBatchIds: string[] = [`${batchId}-partner`]
+    partnerBatchIds: string[] = [`${batchId}-partner`],
+    /** Canonical plan.md. When given, a BROKEN verdict is not dispositive until this file exists
+     *  and is non-empty — absence means plancore has not authored it yet, so no seat can have
+     *  legitimately reviewed it. Omitted by existing callers/fixtures, which keep prior behaviour. */
+    planMdPathForRaceGuard?: string
   ): Promise<boolean> {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
@@ -996,8 +1023,22 @@ export class PlanningPhaseService {
         // yet. It has already arrived and is negative, so there is nothing left to wait for (never
         // byte-identical to a silent CLEAN pass, and never forced to burn the full 10min production
         // timeout to reach the same conclusion).
-        if ([...verdicts.values()].some((v) => v === 'BROKEN')) return false;
-        if (sawPlanReady && partnerBatchIds.every((id) => verdicts.get(id) === 'CLEAN')) return true;
+        if ([...verdicts.values()].some((v) => v === 'BROKEN')) {
+          // Race guard: a BROKEN cannot be a real plan defect if plan.md does not exist yet. Keep
+          // waiting so the (brief-instructed) re-review can supersede it — the reversed scan already
+          // takes each seat's LATEST verdict, so a later CLEAN legitimately replaces this one. The
+          // outer timeout still bounds the wait, so a seat that never re-emits still fails, just not
+          // instantly and not on evidence it could not have had.
+          let planPresent = true;
+          if (planMdPathForRaceGuard) {
+            try {
+              planPresent = (await fs.stat(planMdPathForRaceGuard)).size > 0;
+            } catch {
+              planPresent = false;
+            }
+          }
+          if (planPresent) return false;
+        } else if (sawPlanReady && partnerBatchIds.every((id) => verdicts.get(id) === 'CLEAN')) return true;
       } catch {}
       await new Promise((r) => setTimeout(r, 20));
     }
