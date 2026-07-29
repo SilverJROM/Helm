@@ -45,8 +45,12 @@ import {
   PlanningStaffingService,
   toCorePlanningStaffingArgs,
   type CorePlanningStaffingArgs,
+  type PlanningStaffingManifest,
+  type CoPlannerSeatSpec,
 } from './planning-staffing-service.js';
 import type { DatabaseService } from '../db/database.js';
+import { DiscoveryHandoffService } from './discovery-handoff-service.js';
+import { isDiscoveryPhase } from './discovery-contract.js';
 
 // CYCLE-BUILDDIR: a cycle-plan run builds the deliverable in this subdir OF the cycle workspace (never the
 // workspace root — that holds north-star.md, which puts helm-sandbox in PROTECTED-ROOT mode and blocks
@@ -93,6 +97,36 @@ export interface RunStatus {
   status: string;
   tasks: any[];
   current: any | null;
+}
+
+/** S10: owner-confirmed handoff → Planning from existing Discovery docs (no interview). */
+export interface ConfirmedHandoffPlanningInput {
+  projectId: number;
+  cycleId: number;
+  /** S08 handoff id; must be state=starting (S11 CAS pending→starting). */
+  handoffId: number;
+  /** Optional UI digest; must match frozen handoff digest and live revalidation. */
+  expectedDigest?: string | null;
+  batchId?: string;
+  precreatedRunId?: number;
+  strictReadAllow?: string[];
+}
+
+export class ConfirmedHandoffPlanningError extends Error {
+  constructor(
+    message: string,
+    public readonly code:
+      | 'MISSING_HANDOFF'
+      | 'BAD_STATE'
+      | 'MISMATCH'
+      | 'MISSING_DOCS'
+      | 'NO_CYCLE'
+      | 'UNKNOWN_PROJECT'
+      | 'STAFFING'
+  ) {
+    super(message);
+    this.name = 'ConfirmedHandoffPlanningError';
+  }
 }
 
 export class RunOrchestratorService {
@@ -663,6 +697,287 @@ export class RunOrchestratorService {
       }
       throw e;
     }
+  }
+
+  /**
+   * S10 — Explicit existing-doc Planning start from a confirmed Discovery handoff.
+   *
+   * Requires handoff state=`starting` and frozen manifest digest. Precreates a Planning run,
+   * reads existing cycle-folder Discovery docs (never overwrites them), skips Discovery
+   * interview spawn/wait, and calls runPlanningPhase with exact S06 co-planner seats.
+   * Missing/mismatched handoff or digest → throw before any run is created.
+   * pause_after_planning: park only after successful Planning agreement (same gate as startRun).
+   */
+  async startPlanningFromConfirmedHandoff(
+    input: ConfirmedHandoffPlanningInput
+  ): Promise<number> {
+    const projectId = Number(input.projectId);
+    const cycleId = Number(input.cycleId);
+    const handoffId = Number(input.handoffId);
+    const project = this.deps.projectService.getProject(projectId);
+    if (!project) {
+      throw new ConfirmedHandoffPlanningError('unknown project', 'UNKNOWN_PROJECT');
+    }
+    if (!this.deps.cycleService?.getCycleDocDir) {
+      throw new ConfirmedHandoffPlanningError('cycleService required for confirmed-handoff Planning', 'NO_CYCLE');
+    }
+
+    const db = this.deps.artifacts['db'] as DatabaseService;
+    const handoffs = new DiscoveryHandoffService(db);
+    const handoff = handoffs.getById(handoffId);
+    if (!handoff) {
+      throw new ConfirmedHandoffPlanningError(`handoff ${handoffId} not found`, 'MISSING_HANDOFF');
+    }
+    if (Number(handoff.project_id) !== projectId || Number(handoff.cycle_id) !== cycleId) {
+      throw new ConfirmedHandoffPlanningError(
+        'handoff project/cycle binding mismatch',
+        'MISMATCH'
+      );
+    }
+    if (handoff.state !== 'starting') {
+      throw new ConfirmedHandoffPlanningError(
+        `handoff state is ${handoff.state}, expected starting`,
+        'BAD_STATE'
+      );
+    }
+    if (!handoff.manifest_digest || !String(handoff.manifest_digest).trim()) {
+      throw new ConfirmedHandoffPlanningError('handoff missing frozen manifest_digest', 'MISMATCH');
+    }
+    if (
+      input.expectedDigest != null &&
+      String(input.expectedDigest) !== String(handoff.manifest_digest)
+    ) {
+      throw new ConfirmedHandoffPlanningError(
+        'expectedDigest does not match frozen handoff digest',
+        'MISMATCH'
+      );
+    }
+
+    // AC24: revalidate live staffing digest against frozen handoff before creating a run
+    let liveDigest: string;
+    try {
+      const staffing = new PlanningStaffingService(
+        db,
+        this.deps.assignmentService,
+        this.deps.plannerPanelService
+      );
+      const live = staffing.resolveManifest(projectId, {
+        throwOnEmpty: false,
+        throwOnMismatch: false,
+      });
+      liveDigest = live.digest;
+    } catch (e: any) {
+      throw new ConfirmedHandoffPlanningError(
+        `live staffing resolve failed: ${e?.message || e}`,
+        'STAFFING'
+      );
+    }
+    if (liveDigest !== handoff.manifest_digest) {
+      throw new ConfirmedHandoffPlanningError(
+        'live seat-manifest digest changed since handoff was frozen; refresh preview',
+        'MISMATCH'
+      );
+    }
+
+    // Frozen seats from S09 pending create
+    let coPlannerSeats: CoPlannerSeatSpec[] = [];
+    let planningBrainModel: string | undefined;
+    let planningBrainProvider: string | undefined;
+    try {
+      const frozen = JSON.parse(String(handoff.manifest_json || '{}')) as Partial<PlanningStaffingManifest>;
+      if (frozen.plancore?.model) {
+        planningBrainModel = String(frozen.plancore.model);
+        planningBrainProvider = String(frozen.plancore.provider || '');
+      }
+      const rawSeats = Array.isArray(frozen.coPlanners) ? frozen.coPlanners : [];
+      coPlannerSeats = rawSeats
+        .filter((s) => s && (s.ready !== false))
+        .map((s, i) => ({
+          slot: s.slot ?? i,
+          provider: String(s.provider || ''),
+          model: String(s.model || ''),
+          effort: String(s.effort || ''),
+          source: String(s.source || 'primary'),
+        }))
+        .filter((s) => s.model);
+      if (!coPlannerSeats.length && Array.isArray(frozen.coPlanners) && frozen.coPlanners.length) {
+        // fall back to all configured identities if ready flags missing
+        coPlannerSeats = frozen.coPlanners.map((s: any, i: number) => ({
+          slot: s.slot ?? i,
+          provider: String(s.provider || ''),
+          model: String(s.model || ''),
+          effort: String(s.effort || ''),
+          source: String(s.source || 'primary'),
+        }));
+      }
+    } catch (e: any) {
+      throw new ConfirmedHandoffPlanningError(
+        `frozen manifest_json unreadable: ${e?.message || e}`,
+        'MISMATCH'
+      );
+    }
+    if (!coPlannerSeats.length) {
+      throw new ConfirmedHandoffPlanningError(
+        'frozen manifest has no co-planner seats',
+        'STAFFING'
+      );
+    }
+
+    const cycleRow: any = db
+      .prepare('SELECT id, project_id, phase, status FROM cycles WHERE id = ?')
+      .get(cycleId);
+    if (!cycleRow || Number(cycleRow.project_id) !== projectId) {
+      throw new ConfirmedHandoffPlanningError('cycle not found or project mismatch', 'NO_CYCLE');
+    }
+    // Prefer discovery phase; allow already-planning only if recovering (still no interview)
+    if (
+      !isDiscoveryPhase(cycleRow.phase) &&
+      String(cycleRow.phase).toLowerCase() !== 'planning'
+    ) {
+      throw new ConfirmedHandoffPlanningError(
+        `cycle phase is ${cycleRow.phase}, expected discovery`,
+        'BAD_STATE'
+      );
+    }
+
+    const cycleDocDir = this.deps.cycleService.getCycleDocDir(cycleId);
+    const nsPath = path.join(cycleDocDir, CANONICAL_CYCLE_ARTIFACTS.northStar);
+    const logPath = path.join(cycleDocDir, 'conversation-log.md');
+    let northStar: string;
+    let conversationLog: string;
+    try {
+      northStar = await fs.readFile(nsPath, 'utf8');
+      conversationLog = await fs.readFile(logPath, 'utf8');
+    } catch (e: any) {
+      throw new ConfirmedHandoffPlanningError(
+        `existing Discovery docs unreadable: ${e?.message || e}`,
+        'MISSING_DOCS'
+      );
+    }
+    if (!northStar.trim() || !conversationLog.trim()) {
+      throw new ConfirmedHandoffPlanningError(
+        'existing Discovery docs are empty (north-star.md / conversation-log.md)',
+        'MISSING_DOCS'
+      );
+    }
+    // Snapshot bytes so later accidental writes are not confused with "we overwrote" — we never write these paths.
+
+    const batchId =
+      (input.batchId && String(input.batchId).trim()) ||
+      `handoff-${handoffId}-${Date.now().toString(36)}`;
+    const runDir = resolveRunDir(projectId, batchId);
+    await fs.mkdir(runDir, { recursive: true });
+
+    // Create run ONLY after all validations passed
+    let runId =
+      input.precreatedRunId != null && Number.isFinite(Number(input.precreatedRunId))
+        ? Number(input.precreatedRunId)
+        : this.deps.artifacts.createRun(projectId, batchId, nsPath, cycleId);
+
+    try {
+      this.deps.artifacts['db'].raw
+        .prepare(
+          "UPDATE runs SET phase = 'planning', cycle_id = ?, status = 'active' WHERE id = ? AND phase NOT IN ('complete','failed','blocked')"
+        )
+        .run(cycleId, runId);
+    } catch { /* best-effort */ }
+
+    try {
+      this.deps.cycleService.setCyclePhase?.(cycleId, 'planning');
+    } catch {
+      try {
+        db.prepare(
+          "UPDATE cycles SET phase = 'planning' WHERE id = ? AND phase = 'discovery'"
+        ).run(cycleId);
+      } catch { /* best-effort */ }
+    }
+
+    const slug = String(project.name || 'project')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-|-$/g, '') || 'project';
+    const planningSessionName =
+      (project as any).plancore_session || `helm-plancore-${slug}`;
+
+    const phaseStaffing = new PhaseStaffingService(this.deps.assignmentService);
+    const planningBrain = phaseStaffing.resolvePhaseAgents(projectId, 'planning').brain;
+    const brainRole = planningBrain?.role || 'plancore';
+    const effBrainModel = planningBrainModel || planningBrain?.agent?.model;
+    const effBrainProvider = planningBrainProvider || planningBrain?.agent?.provider;
+
+    const runStrictAllow = input.strictReadAllow ?? resolveDeploymentStrictReadAllow();
+    if (runStrictAllow !== undefined) makeStrictReadProfileEnv(runStrictAllow);
+
+    const adaptivePanel = await this.resolveAdaptivePlannerPanel(
+      projectId,
+      project.directory
+    );
+
+    // S10: NO discovery spawn, NO waitForNorthStarReady — Planning only, existing doc bytes + frozen seats
+    const planningRes = await this.deps.planning.runPlanningPhase({
+      runDir,
+      canonicalArtifactRoot: cycleDocDir,
+      batchId,
+      northStar,
+      conversationLog,
+      mode: 'auto',
+      sessionName: planningSessionName,
+      projectId,
+      projectDir: project.directory,
+      brainRole,
+      planningBrainModel: effBrainModel,
+      planningBrainProvider: effBrainProvider,
+      partnerModel: coPlannerSeats[0]?.model,
+      partnerProvider: coPlannerSeats[0]?.provider,
+      coPlannerSeats,
+      panelSize: coPlannerSeats.length + 1,
+      roundCap: this.resolvePlanningRoundCap(projectId),
+      runId,
+      strictReadAllow: runStrictAllow,
+      adaptivePlanning: this.isAdaptivePlanning(projectId),
+      ...(adaptivePanel?.panel ? { panel: adaptivePanel.panel } : {}),
+      ...(adaptivePanel?.isModelAvailable
+        ? { isModelAvailable: adaptivePanel.isModelAvailable }
+        : {}),
+    });
+
+    if (planningRes?.runId) runId = planningRes.runId;
+
+    // Persist started + run id on the handoff (S11 may also CAS; idempotent if already started)
+    const casStarted = handoffs.casTransition(handoffId, 'starting', 'started', {
+      planningRunId: runId,
+    });
+    if (casStarted === 0 && handoffs.getById(handoffId)?.state === 'starting') {
+      // leave as-is; still return runId
+    }
+
+    const notAgreed = !!(planningRes && planningRes.agreed === false);
+    if (notAgreed) {
+      const reason =
+        planningRes?.blockedReason ||
+        'PLANNING-NOT-AGREED: co-planner verdict never arrived (gate blocked); plan not ingested';
+      this.transitionRunToBlocked(runId, reason, project, 'failure');
+      return runId;
+    }
+
+    // Planning-done: finishPlanning + pause_after_planning park (no implementation queue yet)
+    this.finishPlanningAtPlanningDone(cycleId);
+    if (this.isCycleGateParked(cycleId)) {
+      await this.parkRunAwaitingApproval(runId, runDir, cycleId, project);
+      return runId;
+    }
+
+    // Non-gate projects: leave run in planning/executing boundary without starting implementation
+    // loop from this method — S10 scope is Planning start only. Mark phase complete of planning.
+    try {
+      this.deps.artifacts['db'].raw
+        .prepare(
+          "UPDATE runs SET phase = 'executing' WHERE id = ? AND phase NOT IN ('complete','failed','blocked','paused')"
+        )
+        .run(runId);
+    } catch { /* best-effort */ }
+
+    return runId;
   }
 
   private async startRunInner(input: StartRunInput): Promise<number> {
