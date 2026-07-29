@@ -5986,7 +5986,28 @@ function App() {
         setCcImplStartNotice(p => ({ ...p, [cycleId]: 'Implementation is already running for this cycle.' }));
         loadRunState(cycleId);
       } else if (r.status === 400) {
-        setCcImplStartNotice(p => ({ ...p, [cycleId]: 'Author a valid plan.md first — the plan is not ready yet.' }));
+        // S14 / S13: surface provenance-specific refusal when present (not only "author a plan").
+        let msg = 'Author a valid plan.md first — the plan is not ready yet.';
+        try {
+          const body = await r.json();
+          const code = body && body.code ? String(body.code) : '';
+          const err = body && body.error ? String(body.error) : '';
+          if (
+            code === 'PLANNING_REQUIRED' ||
+            code === 'PLAN_CHANGED' ||
+            code === 'MANIFEST_CHANGED' ||
+            /Helm Planning must complete|changed after Planning|Planning seat manifest/i.test(err)
+          ) {
+            msg = err || 'Helm Planning must complete first before Start Implementation.';
+          } else if (err && /author a valid plan/i.test(err)) {
+            msg = err;
+          } else if (err) {
+            msg = err;
+          }
+        } catch {
+          /* keep default */
+        }
+        setCcImplStartNotice(p => ({ ...p, [cycleId]: msg }));
       } else {
         setCcImplStartNotice(p => ({ ...p, [cycleId]: 'Could not start implementation (cycle not found). Refresh and retry.' }));
       }
@@ -6361,34 +6382,100 @@ function App() {
         </table>`;
       };
 
-      // A3 (R4.17) + B4 (R5.19/R5.20): seats list + one shared B3 pane per seat (keyed by worker_runtimes.id).
+      // A3 (R4.17) + B4 (R5.19/R5.20) + S14: seats list with S07 preview before start and runtime after.
       const seatsPayload = ccPlanSeats[cycleId];
       const seatsList = (seatsPayload && seatsPayload !== 'absent' && Array.isArray(seatsPayload.seats))
         ? seatsPayload.seats : [];
+      const seatsPreview = (seatsPayload && seatsPayload !== 'absent' && seatsPayload.preview)
+        ? seatsPayload.preview
+        : null;
+      const seatsBlocked = !!(seatsPayload && seatsPayload !== 'absent' && seatsPayload.blocked);
+      const seatsBlockReasons = (seatsPayload && seatsPayload !== 'absent' && Array.isArray(seatsPayload.blockReasons))
+        ? seatsPayload.blockReasons
+        : [];
+      const seatsEmptyMsg = (seatsPayload && seatsPayload !== 'absent' && seatsPayload.emptyPanelMessage)
+        ? seatsPayload.emptyPanelMessage
+        : null;
       const renderSeatsList = () => {
         if (!seatsPayload) {
-          return html`<div class="text-sec" data-testid="ws-plan-seats-loading" style="font-size:11px;padding:4px 0">Loading seats…</div>`;
+          return html`<div class="text-sec" data-testid="ws-plan-seats-loading" role="status" aria-live="polite" style="font-size:11px;padding:4px 0">Resolving Planning seats…</div>`;
         }
         if (seatsPayload === 'absent') {
-          return html`<div class="text-sec" data-testid="ws-plan-seats-empty" style="font-size:11px;padding:4px 0">No seats recorded for this cycle yet.</div>`;
+          return html`<div class="text-sec" data-testid="ws-plan-seats-empty" role="status" style="font-size:11px;padding:4px 0">Could not load seats. Retry from the Planning tab.</div>`;
         }
-        if (seatsList.length === 0) {
-          return html`<div class="text-sec" data-testid="ws-plan-seats-empty" style="font-size:11px;padding:4px 0">No seats recorded for this cycle yet.</div>`;
+        // Runtime rows when a run has recorded worker_runtimes
+        if (seatsList.length > 0) {
+          return html`<div class="cc-plan-seats-list" data-testid="ws-plan-seats" data-mode="runtime" style="display:flex;flex-direction:column;gap:4px;padding:4px 0 8px">
+            ${seatsList.map((s, idx) => {
+              const label = `${s.role || 'seat'}${seatsList.filter(x => x.role === s.role).length > 1 ? ` #${idx + 1}` : ''}`;
+              const liveChip = s.live
+                ? html`<span class="chip chip-green" data-testid=${`ws-plan-seat-live-${s.id}`}>live</span>`
+                : html`<span class="chip chip-orange" data-testid=${`ws-plan-seat-historical-${s.id}`}>historical</span>`;
+              const matchChip = s.matchesPreview === false
+                ? html`<span class="chip chip-orange" data-testid=${`ws-plan-seat-mismatch-${s.id}`}>≠ preview</span>`
+                : null;
+              return html`<div class="cc-plan-seat-row" data-testid=${`ws-plan-seat-${s.id}`}
+                  style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px;padding:4px 6px;border:1px solid var(--border, #30363d);border-radius:4px">
+                <span data-testid=${`ws-plan-seat-role-${s.id}`} style="font-weight:600">${label}</span>
+                <span class="text-sec" data-testid=${`ws-plan-seat-model-${s.id}`}>${s.provider ? `${s.provider}/` : ''}${s.model || '—'}</span>
+                <span class="text-sec" data-testid=${`ws-plan-seat-state-${s.id}`}>${s.state || '—'}</span>
+                ${liveChip}
+                ${matchChip}
+              </div>`;
+            })}
+          </div>`;
         }
-        return html`<div class="cc-plan-seats-list" data-testid="ws-plan-seats" style="display:flex;flex-direction:column;gap:4px;padding:4px 0 8px">
-          ${seatsList.map((s, idx) => {
-            const label = `${s.role || 'seat'}${seatsList.filter(x => x.role === s.role).length > 1 ? ` #${idx + 1}` : ''}`;
-            const liveChip = s.live
-              ? html`<span class="chip chip-green" data-testid=${`ws-plan-seat-live-${s.id}`}>live</span>`
-              : html`<span class="chip chip-orange" data-testid=${`ws-plan-seat-historical-${s.id}`}>historical</span>`;
-            return html`<div class="cc-plan-seat-row" data-testid=${`ws-plan-seat-${s.id}`}
-                style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px;padding:4px 6px;border:1px solid var(--border, #30363d);border-radius:4px">
-              <span data-testid=${`ws-plan-seat-role-${s.id}`} style="font-weight:600">${label}</span>
-              <span class="text-sec" data-testid=${`ws-plan-seat-model-${s.id}`}>${s.model || '—'}</span>
-              <span class="text-sec" data-testid=${`ws-plan-seat-state-${s.id}`}>${s.state || '—'}</span>
-              ${liveChip}
-            </div>`;
-          })}
+        // Pre-start preview (S07 / S14): plancore + configured co-planners
+        const previewRows = [];
+        if (seatsPreview && seatsPreview.plancore) {
+          const pc = seatsPreview.plancore;
+          previewRows.push({
+            key: 'plancore',
+            role: 'plancore',
+            provider: pc.provider,
+            model: pc.model,
+            source: pc.source || 'phase-owner',
+            ready: pc.ready !== false,
+            reason: pc.reason || null,
+          });
+        }
+        if (seatsPreview && Array.isArray(seatsPreview.coPlanners)) {
+          seatsPreview.coPlanners.forEach((s, i) => {
+            previewRows.push({
+              key: `cp-${s.slot != null ? s.slot : i}`,
+              role: 'co-planner',
+              provider: s.provider,
+              model: s.model,
+              source: s.source || 'primary',
+              ready: s.ready !== false,
+              reason: s.reason || null,
+            });
+          });
+        }
+        if (previewRows.length === 0) {
+          return html`<div class="text-sec" data-testid="ws-plan-seats-empty" role="status" style="font-size:11px;padding:4px 0">
+            ${seatsEmptyMsg || 'Configure co-planners in Agent Studio'}
+          </div>`;
+        }
+        return html`<div class="cc-plan-seats-list" data-testid="ws-plan-seats" data-mode="preview" style="display:flex;flex-direction:column;gap:4px;padding:4px 0 8px">
+          <div class="text-sec" data-testid="ws-plan-seats-preview-label" style="font-size:10px;margin-bottom:2px">Configured preview (before start)</div>
+          ${previewRows.map((s) => html`<div class="cc-plan-seat-row" data-testid=${`ws-plan-seat-preview-${s.key}`}
+              style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px;padding:4px 6px;border:1px solid var(--border, #30363d);border-radius:4px">
+              <span data-testid=${`ws-plan-seat-preview-role-${s.key}`} style="font-weight:600">${s.role}</span>
+              <span class="text-sec" data-testid=${`ws-plan-seat-preview-model-${s.key}`}>${s.provider ? `${s.provider}/` : ''}${s.model || '—'}</span>
+              <span class="text-sec" data-testid=${`ws-plan-seat-preview-source-${s.key}`}>${s.source || ''}</span>
+              ${s.ready
+                ? html`<span class="chip chip-green" data-testid=${`ws-plan-seat-preview-ready-${s.key}`}>ready</span>`
+                : html`<span class="chip chip-orange" data-testid=${`ws-plan-seat-preview-blocked-${s.key}`}>blocked</span>`}
+              ${s.reason
+                ? html`<span class="text-sec" data-testid=${`ws-plan-seat-preview-reason-${s.key}`} style="color:#d29922">${s.reason}</span>`
+                : null}
+            </div>`)}
+          ${seatsBlocked || seatsBlockReasons.length
+            ? html`<div data-testid="ws-plan-seats-blocked" role="status" aria-live="polite" style="font-size:11px;color:#d29922;padding:4px 0">
+                ${(seatsBlockReasons[0] || seatsEmptyMsg || 'Planning seats blocked — configure co-planners in Agent Studio')}
+              </div>`
+            : null}
         </div>`;
       };
       // B4: one shared session-pane per seat (B3 .sp-pane shell + path-safe capture + bottom-stick).
@@ -6468,8 +6555,8 @@ function App() {
             onclick=${() => setCcPlanWatchLiveOpen(!ccPlanWatchLiveOpen)}>${ccPlanWatchLiveOpen ? 'Hide live' : 'Watch live'}</button>
         </div>
         ${renderStartPlanningRow('ws')}
-        <div class="cc-plan-seats-block" data-testid="ws-plan-seats-block" style="margin:4px 0 8px">
-          <div class="card-title" style="margin-bottom:4px;font-size:12px">Seats</div>
+        <div class="cc-plan-seats-block" data-testid="ws-plan-seats-block" style="margin:4px 0 8px" role="region" aria-label="Planning seats">
+          <div class="card-title" style="margin-bottom:4px;font-size:12px" data-testid="ws-plan-seats-heading">Planning Seats</div>
           ${renderSeatsList()}
         </div>
         <div class="cc-plan-event-trail-block" data-testid="ws-plan-event-trail-block" style="margin:4px 0 8px">
@@ -6580,7 +6667,8 @@ function App() {
           ? html`<span class="text-sec" data-testid="ws-impl-start-hint" style="font-size:11px">Start enables once the plan is ready — use Start Planning below.</span>`
           : null}
         ${implStartNotice
-          ? html`<span class="text-sec" data-testid="ws-impl-start-notice" style="font-size:11px">${implStartNotice}</span>`
+          ? html`<span class="text-sec" data-testid="ws-impl-start-notice" role="status" aria-live="assertive"
+              style=${`font-size:11px;${/Helm Planning must complete|changed after Planning|PLANNING_REQUIRED|plan\.md changed|manifest changed/i.test(implStartNotice) ? 'color:#f85149' : ''}`}>${implStartNotice}</span>`
           : null}
       </div>
       ${renderStartPlanningRow('ws-impl')}`;
@@ -9014,9 +9102,10 @@ function App() {
       const status = m.validation_status || 'untested';
       return html`<option value=${m.id} disabled=${!valid}>${m.name} (${m.provider})${!valid ? ` — ${status}` : ''}</option>`;
     });
+    // S14: Agent Studio wording — co-planners exclude plancore; one Lead co-planner.
     const plannerPanelBlock = html`<div data-testid="planner-panel-config" style="margin-top:6px;padding-top:8px;border-top:1px dashed var(--border)">
       <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px">
-        <div class="text-sec" style="font-size:11px;font-weight:600">Planner Panel <span class="inline-note" style="font-weight:400">(adaptive planner)</span></div>
+        <div class="text-sec" style="font-size:11px;font-weight:600" data-testid="planner-panel-title">Co-planners (excluding plancore)</div>
         <div style="display:flex;align-items:center;gap:6px">
           ${plannerPanelFlash ? html`<span class="chip chip-green" data-testid="planner-panel-save-flash" style="font-size:10px">Saved ✓</span>` : null}
           <button data-testid="planner-panel-save" class="btn btn-primary btn-sm" disabled=${!activeProjectId || plannerPanelSaving || !plannerPanelDirty} onclick=${() => activeProjectId && savePlannerPanel(activeProjectId)}>
@@ -9027,11 +9116,11 @@ function App() {
       ${!activeProjectId
         ? html`<div class="text-sec" style="font-size:12px;padding:8px">Select a project</div>`
         : html`<div style="display:grid;gap:10px;font-size:12px;padding-top:4px">
-            <div class="text-sec" style="font-size:11px">Agent count, lead planner, backup planners (used when a slot CLI is unavailable), and default effort for the adaptive planner panel.</div>
+            <div class="text-sec" style="font-size:11px" data-testid="planner-panel-help">Co-planner count (N, excluding plancore), lead co-planner, ordered backups when a slot is unavailable, and default effort. Plancore is resolved separately as the planning phase brain.</div>
             ${plannerPanelErr ? html`<div data-testid="planner-panel-err" style="color:#f85149;font-size:11px">${plannerPanelErr}</div>` : null}
             <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
               <label style="display:flex;align-items:center;gap:6px">
-                <span class="text-sec" style="font-size:11px">Agent count</span>
+                <span class="text-sec" style="font-size:11px">Co-planner count</span>
                 <input data-testid="planner-panel-agent-count" type="number" min="1" max="8" style="width:56px;font-size:11px" value=${(plannerPanel.members || []).length || 2}
                   oninput=${(e) => setPlannerPanelMemberCount(e.target.value)} />
               </label>
@@ -9044,23 +9133,23 @@ function App() {
               </label>
             </div>
             <div>
-              <div class="text-sec" style="font-size:11px;margin-bottom:4px">Members <span class="inline-note">(exactly one Lead)</span></div>
+              <div class="text-sec" style="font-size:11px;margin-bottom:4px">Co-planner seats <span class="inline-note">(exactly one Lead co-planner)</span></div>
               <div style="display:grid;gap:6px" data-testid="planner-panel-members">
                 ${(plannerPanel.members || []).map((m, idx) => html`<div data-testid=${`planner-panel-member-${idx}`} style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;padding:6px 8px;background:var(--bg-elevated, rgba(255,255,255,.02));border:1px solid var(--border);border-radius:6px">
                   <span class="text-sec" style="font-size:10px;width:28px">#${idx + 1}</span>
-                  <select data-testid=${`planner-panel-member-model-${idx}`} aria-label=${`Panel member ${idx + 1} model`} style="flex:1;min-width:140px;font-size:11px"
+                  <select data-testid=${`planner-panel-member-model-${idx}`} aria-label=${`Co-planner ${idx + 1} model`} style="flex:1;min-width:140px;font-size:11px"
                     value=${m.model_id !== '' && m.model_id != null ? String(m.model_id) : ''}
                     onchange=${(e) => updatePlannerPanelMember(idx, { model_id: e.target.value ? Number(e.target.value) : '' })}>
                     <option value="">— model —</option>
                     ${plannerPanelModelOpts()}
                   </select>
-                  <label style="display:flex;align-items:center;gap:4px;font-size:11px;cursor:pointer" title="Lead planner">
+                  <label style="display:flex;align-items:center;gap:4px;font-size:11px;cursor:pointer" title="Lead co-planner">
                     <input type="radio" name="planner-panel-lead" data-testid=${`planner-panel-member-lead-${idx}`}
                       checked=${!!m.is_lead}
                       onchange=${() => updatePlannerPanelMember(idx, { is_lead: true })} />
-                    Lead
+                    Lead co-planner
                   </label>
-                  <select data-testid=${`planner-panel-member-effort-${idx}`} aria-label=${`Panel member ${idx + 1} effort`} style="width:90px;font-size:11px"
+                  <select data-testid=${`planner-panel-member-effort-${idx}`} aria-label=${`Co-planner ${idx + 1} effort`} style="width:90px;font-size:11px"
                     value=${m.effort || ''}
                     onchange=${(e) => updatePlannerPanelMember(idx, { effort: e.target.value })}>
                     <option value="">default</option>
@@ -9071,7 +9160,7 @@ function App() {
             </div>
             <div>
               <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
-                <span class="text-sec" style="font-size:11px">Backup planners <span class="inline-note">(ordered fallback)</span></span>
+                <span class="text-sec" style="font-size:11px">Backup co-planners <span class="inline-note">(ordered fallback for slot)</span></span>
                 <button data-testid="planner-panel-add-backup" class="btn btn-sm" onclick=${addPlannerPanelBackup}>+ Backup</button>
               </div>
               <div style="display:grid;gap:4px" data-testid="planner-panel-backups">
