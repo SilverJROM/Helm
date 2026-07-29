@@ -109,6 +109,19 @@ const RUNTIME_FIXTURE = {
       matchesPreview: true,
       runId: 99,
     },
+    // B4 (planning-live-panes): one seat from a dead prior run, to prove historical seats collapse
+    // behind a disclosure in the SEATS LIST by default, while staying directly visible (never hidden)
+    // in the live PANE grid (B4.live.spec.ts already asserts the pane-grid half stays honest/visible).
+    {
+      id: 504,
+      role: 'co-planner',
+      provider: 'grok',
+      model: 'grok-4.5',
+      state: 'reaped',
+      live: false,
+      matchesPreview: false,
+      runId: 98,
+    },
   ],
   preview: PREVIEW_FIXTURE.preview,
   runtime: { runId: 99, seats: [], digestMatch: true, allIdentitiesMatch: true },
@@ -209,6 +222,20 @@ test.describe('S14 live: Planning seats + Studio copy + provenance (cap :3110)',
     let seatsFixture: typeof PREVIEW_FIXTURE | typeof BLOCKED_FIXTURE | typeof RUNTIME_FIXTURE =
       PREVIEW_FIXTURE;
     let implFail = true;
+    // B3 (planning-live-panes): null = let the real server answer; set to a fixture object to force
+    // an active-run state (used below to reproduce the reported header/chip contradiction — the
+    // progress line and the "Run in progress" chip must never disagree once the run is active).
+    let runStateFixture: { hasRun: boolean; runId: number; runActive: boolean; tasks: unknown[] } | null =
+      null;
+
+    await page.route(`**/api/cycles/${cycleId}/run-state**`, async (route) => {
+      if (!runStateFixture) return route.continue();
+      return route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify(runStateFixture),
+      });
+    });
 
     await page.route(`**/api/cycles/${cycleId}/seats**`, async (route) => {
       const url = route.request().url();
@@ -329,6 +356,34 @@ test.describe('S14 live: Planning seats + Studio copy + provenance (cap :3110)',
     await expect(page.getByTestId('ws-plan-seat-model-502')).toContainText('claude-opus-4-8');
     await expect(page.getByTestId('ws-plan-seat-model-503')).toContainText('gpt-5.3-codex');
     await expect(page.getByTestId('ws-plan-seat-live-501')).toBeVisible();
+
+    // --- B1 (planning-live-panes): N-seat side-by-side panes — Auto-focus / Show both controls ---
+    await expect(page.getByTestId('ws-plan-pane-controls')).toBeVisible({ timeout: 10000 });
+    const autoFocusBtn = page.getByTestId('ws-plan-pane-focus-active');
+    await expect(autoFocusBtn).toHaveText(/Auto-focus: On/);
+    await page.getByTestId('ws-plan-pane-show-both').click();
+    await expect(autoFocusBtn).toHaveText(/Auto-focus: Off/);
+    await autoFocusBtn.click(); // restore On for the rest of the test
+    await expect(autoFocusBtn).toHaveText(/Auto-focus: On/);
+    // Per-pane collapse-to-rail (seat 503), then expand it back.
+    await page.getByTestId('ws-plan-pane-collapse-503').click();
+    await expect(page.getByTestId('ws-plan-pane-503')).toHaveAttribute('data-collapsed', '1');
+    await page.getByTestId('ws-plan-pane-collapse-503').click();
+    await expect(page.getByTestId('ws-plan-pane-503')).toHaveAttribute('data-collapsed', '0');
+
+    // --- B4 (planning-live-panes): historical seat 504 collapses in the SEATS LIST by default... ---
+    await expect(page.getByTestId('ws-plan-seats-historical-toggle')).toBeVisible();
+    await expect(page.getByTestId('ws-plan-seats-historical-toggle')).toHaveAttribute(
+      'aria-expanded',
+      'false'
+    );
+    await expect(page.getByTestId('ws-plan-seat-historical-504')).toHaveCount(0);
+    await page.getByTestId('ws-plan-seats-historical-toggle').click();
+    await expect(page.getByTestId('ws-plan-seat-historical-504')).toBeVisible();
+    // ...but the live PANE GRID never hides it (B4.live.spec.ts already proves this for the pane
+    // grid; assert it holds under B1's N-seat layout too — honest roster, always).
+    await expect(page.getByTestId('ws-plan-pane-historical-504')).toBeVisible();
+    await expect(page.getByTestId('ws-plan-pane-empty-504')).toBeVisible();
 
     // Provenance Start Implementation refusal (Implementation tab)
     await page.getByTestId('ws-tab-implementation').click();
@@ -457,6 +512,59 @@ test.describe('S14 live: Planning seats + Studio copy + provenance (cap :3110)',
       'aria-label',
       /Planning seats/i
     );
+
+    // --- B3 (planning-live-panes): progress line must never contradict the run-state chip ---
+    // Reproduces the reported bug: header read "Planning not started" while the chip said "Run in
+    // progress" with seats running. cycle.phase is still 'discovery' here (planning was never really
+    // started server-side in this test — everything above is route-intercepted), so this is exactly
+    // the stale-phase / live-runState disagreement window the fix closes.
+    // A hash-only page.goto (as used above) is a same-document navigation — it does NOT reset React
+    // state, so the Implementation tab visit in the "Provenance..." section earlier in this test
+    // already cached ccRunState[cycleId] = {hasRun:false,...} from the real (non-intercepted) server,
+    // and loadRunState only (re)fetches when that cache is empty. A real page.reload() is required to
+    // actually clear it so the fixture below is the one loadRunState observes.
+    runStateFixture = { hasRun: true, runId: 4242, runActive: true, tasks: [] };
+    seatsFixture = PREVIEW_FIXTURE;
+    await page.reload();
+    const cred2 = page.locator('input[placeholder="owner credential"]');
+    if (await cred2.count()) {
+      try {
+        await cred2.fill(CRED, { timeout: 5000 });
+        await page.click('button:has-text("Login")');
+      } catch {
+        /* already */
+      }
+    }
+    await page.getByTestId('nav-project-setup').waitFor({ state: 'visible', timeout: 20000 });
+    await page.goto(`${BASE}/#07-command-center-overview`);
+    opened = false;
+    const d3 = Date.now() + 20000;
+    while (Date.now() < d3 && !opened) {
+      for (const tab of ['ov-tab-pending', 'ov-tab-active'] as const) {
+        const t = page.getByTestId(tab);
+        if (await t.count()) await t.click();
+        const card = page.getByTestId(`ov-card-${projectId}`);
+        if ((await card.count()) && (await card.isVisible())) {
+          await card.click();
+          opened = true;
+          break;
+        }
+      }
+      if (!opened) {
+        await page.goto(`${BASE}/#07-command-center-overview`);
+        await page.waitForTimeout(600);
+      }
+    }
+    expect(opened).toBe(true);
+    // loadRunState is only wired to fire on the Implementation tab; visiting it once (fresh, uncached
+    // after the reload above) populates the shared ccRunState[cycleId] that the Planning tab itself
+    // reads (state persists across tab switches within the same page).
+    await page.getByTestId('ws-tab-implementation').click();
+    await expect(page.getByTestId('ws-impl-subtitle')).toBeVisible({ timeout: 10000 });
+    await page.getByTestId('ws-tab-planning').click();
+    await expect(page.getByTestId('ws-plan-running')).toBeVisible({ timeout: 10000 });
+    await expect(page.getByTestId('ws-plan-progress-line')).not.toContainText(/not started/i);
+    await expect(page.getByTestId('ws-plan-progress-line')).toContainText(/in progress/i);
 
     fs.mkdirSync('validation/S14', { recursive: true });
     await page.screenshot({
