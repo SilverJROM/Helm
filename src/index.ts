@@ -2989,6 +2989,33 @@ async function main(): Promise<void> {
         planValid = doc.valid === true;
       } catch { planValid = false; }
       if (!planValid) return reply.code(400).send({ error: 'author a valid plan.md first' });
+      // S13 / AC27–28: valid plan.md alone is not enough — require cycle-linked Planning agreement
+      // with byte-matching plan + confirmed manifest digest.
+      try {
+        const {
+          assertPlanningProvenanceForImplementation,
+          PLANNING_REQUIRED_CODE,
+        } = await import('./services/planning-provenance-service.js');
+        const gate = await assertPlanningProvenanceForImplementation({
+          db,
+          cycleService,
+          projectId: pid,
+          cycleId: cid,
+          assignments: assignmentService,
+          plannerPanel: plannerPanelService,
+        });
+        if (!gate.ok) {
+          return reply.code(400).send({
+            error: gate.message,
+            code: gate.code || PLANNING_REQUIRED_CODE,
+          });
+        }
+      } catch (e: any) {
+        return reply.code(400).send({
+          error: e?.message || 'Planning provenance check failed',
+          code: 'PLANNING_REQUIRED',
+        });
+      }
       cyclePlan = true;
       prompt = (body.prompt || `implement cycle ${cid} from plan.md`).trim();
     }

@@ -2,7 +2,7 @@ import type Database from "better-sqlite3";
 import { assertAllRoleTiersInvariants } from "./role-tier-invariants.js";
 import { PROVIDERS } from "../config/providers.js";
 
-export const SCHEMA_VERSION = 111;
+export const SCHEMA_VERSION = 112;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -377,6 +377,22 @@ CREATE INDEX IF NOT EXISTS idx_discovery_handoffs_project ON discovery_handoffs(
 CREATE UNIQUE INDEX IF NOT EXISTS idx_discovery_handoffs_one_live
   ON discovery_handoffs(cycle_id)
   WHERE state IN ('pending', 'starting');
+
+-- S13 v112: durable Planning agreement provenance (cycle-linked).
+-- Written only on whole-plan agreement; Start Implementation rechecks run id + digest + plan SHA.
+CREATE TABLE IF NOT EXISTS planning_provenance (
+  id INTEGER PRIMARY KEY,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  cycle_id INTEGER NOT NULL UNIQUE REFERENCES cycles(id) ON DELETE CASCADE,
+  planning_run_id INTEGER NOT NULL REFERENCES runs(id),
+  manifest_digest TEXT NOT NULL,
+  plan_sha256 TEXT NOT NULL,
+  agreed_at TEXT NOT NULL DEFAULT (datetime('now')),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_planning_provenance_project ON planning_provenance(project_id);
+CREATE INDEX IF NOT EXISTS idx_planning_provenance_run ON planning_provenance(planning_run_id);
 
 -- O5.1: immutable deduplication receipts for sealed run-ingest transitions.
 CREATE TABLE IF NOT EXISTS run_ingest_receipts (

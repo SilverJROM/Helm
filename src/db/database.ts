@@ -3725,6 +3725,28 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_discovery_handoffs_one_live
 `);
         this.db.prepare('UPDATE schema_version SET version = 111').run();
       }
+
+      // v112 / S13: durable Planning agreement provenance (cycle-linked success record).
+      // Fresh DBs get the table via SCHEMA_SQL; this upgrades pre-existing DBs.
+      // Migration tests only — never open data/helm.db here.
+      if (current && current.version < 112) {
+        this.db.exec(`
+CREATE TABLE IF NOT EXISTS planning_provenance (
+  id INTEGER PRIMARY KEY,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  cycle_id INTEGER NOT NULL UNIQUE REFERENCES cycles(id) ON DELETE CASCADE,
+  planning_run_id INTEGER NOT NULL REFERENCES runs(id),
+  manifest_digest TEXT NOT NULL,
+  plan_sha256 TEXT NOT NULL,
+  agreed_at TEXT NOT NULL DEFAULT (datetime('now')),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_planning_provenance_project ON planning_provenance(project_id);
+CREATE INDEX IF NOT EXISTS idx_planning_provenance_run ON planning_provenance(planning_run_id);
+`);
+        this.db.prepare('UPDATE schema_version SET version = 112').run();
+      }
     }
   }
 

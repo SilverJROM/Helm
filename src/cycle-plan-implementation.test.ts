@@ -19,6 +19,11 @@ import { PanelService } from './services/panel-service.js';
 import { RunOrchestratorService } from './services/run-orchestrator-service.js';
 import { maybeAutoStartCycleImplementation } from './services/cycle-auto-start.js';
 import { createRequireOwner } from './auth/auth-middleware.js';
+import {
+  PlanningProvenanceService,
+  sha256Hex,
+} from './services/planning-provenance-service.js';
+import { PlanningStaffingService } from './services/planning-staffing-service.js';
 
 // IS-R1..IS-R5 (impl-start): a cycle with an authored plan.md starts an IMPLEMENTATION-ONLY
 // run that INGESTS the cycle's own plan (no re-interview/re-plan), linked via runs.cycle_id. Plus the
@@ -27,6 +32,37 @@ import { createRequireOwner } from './auth/auth-middleware.js';
 function validPlanMd(id = 'T1'): string {
   const tasks = [{ id, batch: 'one', title: `implement ${id}`, req_refs: ['IS-R1'], assignee: 'grok-4.5', validator_lane: 'L1', effort: 'low', type: 'feature' }];
   return '# Execution Plan\n\n```json\n' + JSON.stringify(tasks) + '\n```\n';
+}
+/** S13: seed cycle-linked Planning agreement so Start Implementation can proceed. */
+function seedProvenance(
+  dbs: DatabaseService,
+  projectId: number,
+  cycleId: number,
+  planMd: string,
+  artifactsSvc: RunArtifactService,
+  assignmentsSvc: AgentAssignmentService
+) {
+  const runId = artifactsSvc.createRun(projectId, `prov-${cycleId}`, null, cycleId);
+  // Mark planning run terminal so it does not trip active-run 409
+  dbs.raw
+    .prepare("UPDATE runs SET phase = 'complete', status = 'complete' WHERE id = ?")
+    .run(runId);
+  let digest = 'test-manifest-digest-' + cycleId;
+  try {
+    digest = new PlanningStaffingService(dbs, assignmentsSvc).resolveManifest(projectId, {
+      throwOnEmpty: false,
+      throwOnMismatch: false,
+    }).digest;
+  } catch {
+    /* keep fallback */
+  }
+  new PlanningProvenanceService(dbs).recordSuccess({
+    projectId,
+    cycleId,
+    planningRunId: runId,
+    manifestDigest: digest,
+    planSha256: sha256Hex(planMd),
+  });
 }
 function seedCompletingCallbacks(runDir: string, batch: string): void {
   fs.mkdirSync(runDir, { recursive: true });
@@ -51,6 +87,7 @@ describe.sequential('cycle-plan implementation-only run (IS-R1..IS-R5)', () => {
   let queue: TaskQueueService;
   let fakeT: FakeTransport;
   let orch: RunOrchestratorService;
+  let assignSvc: AgentAssignmentService;
   let projectId: number;
   let cycleId: number;
 
@@ -67,7 +104,7 @@ describe.sequential('cycle-plan implementation-only run (IS-R1..IS-R5)', () => {
     parser = new PlanParserService(artifacts);
     queue = new TaskQueueService(artifacts);
     fakeT = new FakeTransport();
-    const assignSvc = new AgentAssignmentService(db);
+    assignSvc = new AgentAssignmentService(db);
     const planning = new PlanningPhaseService(fakeT, artifacts, queue);
     const esc = new EscalationService(db);
     const panelSvc = new PanelService(fakeT, artifacts, 'cptest');
@@ -93,7 +130,9 @@ describe.sequential('cycle-plan implementation-only run (IS-R1..IS-R5)', () => {
   });
 
   it('IS-R1: ingests cycle plan.md and runs implementation-only without discovery/plancore spawns, linked via runs.cycle_id', async () => {
-    await fsp.writeFile(path.join(cycleService.getCycleDocDir(cycleId), 'plan.md'), validPlanMd('T1'), 'utf8');
+    const planMd = validPlanMd('T1');
+    await fsp.writeFile(path.join(cycleService.getCycleDocDir(cycleId), 'plan.md'), planMd, 'utf8');
+    seedProvenance(db, projectId, cycleId, planMd, artifacts, assignSvc);
     const batch = 'cycleplan1';
     seedCompletingCallbacks(path.join(os.tmpdir(), `helm-run-${projectId}-${batch}`), batch);
 
@@ -164,13 +203,17 @@ describe.sequential('cycle-plan implementation-only run (IS-R1..IS-R5)', () => {
   }
 
   it('IS-R2/R5 endpoint: with a valid plan → 200, cycle-linked run created (runs.cycle_id) + run_tasks ingested', async () => {
-    await fsp.writeFile(path.join(cycleService.getCycleDocDir(cycleId), 'plan.md'), validPlanMd('T1'), 'utf8');
+    const planMd = validPlanMd('T1');
+    await fsp.writeFile(path.join(cycleService.getCycleDocDir(cycleId), 'plan.md'), planMd, 'utf8');
+    seedProvenance(db, projectId, cycleId, planMd, artifacts, assignSvc);
     const batch = 'endpoint200';
     seedCompletingCallbacks(path.join(os.tmpdir(), `helm-run-${projectId}-${batch}`), batch);
     const app = mountEndpoint();
     await app.ready();
     try {
       const res = await app.inject({ method: 'POST', url: `/api/cycles/${cycleId}/start-implementation`, remoteAddress: '127.0.0.1', payload: { batchId: batch } });
+      // Mount mirror lacks S13 gate; orchestrator seedFromCyclePlan enforces provenance (throws → 400 unless caught).
+      // This mount does not wrap startRunDetached errors as 400 — seed provenance so start succeeds.
       expect(res.statusCode).toBe(200);
       const bodyJson = res.json();
       expect(bodyJson.status).toBe('started');

@@ -107,7 +107,7 @@ describe('S08 discovery_handoffs store', () => {
     const ver = upgraded.raw.prepare('SELECT MAX(version) v FROM schema_version').get() as {
       v: number;
     };
-    expect(ver.v).toBe(111);
+    expect(ver.v).toBe(SCHEMA_VERSION);
     const t = upgraded.raw
       .prepare(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='discovery_handoffs'"

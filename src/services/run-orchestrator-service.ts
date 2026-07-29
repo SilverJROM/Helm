@@ -53,6 +53,11 @@ import {
 import type { DatabaseService } from '../db/database.js';
 import { DiscoveryHandoffService } from './discovery-handoff-service.js';
 import { isDiscoveryPhase } from './discovery-contract.js';
+import {
+  assertPlanningProvenanceForImplementation,
+  recordProvenanceAfterAgreement,
+  PLANNING_REQUIRED_MESSAGE,
+} from './planning-provenance-service.js';
 
 // CYCLE-BUILDDIR: a cycle-plan run builds the deliverable in this subdir OF the cycle workspace (never the
 // workspace root — that holds north-star.md, which puts helm-sandbox in PROTECTED-ROOT mode and blocks
@@ -993,6 +998,24 @@ export class RunOrchestratorService {
       return runId;
     }
 
+    // S13: whole-plan agreement only — never on failed/BROKEN/round-cap (gated above).
+    try {
+      await recordProvenanceAfterAgreement({
+        db,
+        cycleService: this.deps.cycleService as any,
+        projectId,
+        cycleId,
+        planningRunId: runId,
+        planMdPath: path.join(cycleDocDir, CANONICAL_CYCLE_ARTIFACTS.plan),
+        assignments: this.deps.assignmentService,
+        plannerPanel: this.deps.plannerPanelService,
+      });
+    } catch (e: any) {
+      console.warn(
+        `[RunOrchestrator] S13 provenance record non-fatal: ${e?.message || e}`
+      );
+    }
+
     // Planning-done: finishPlanning + pause_after_planning park (no implementation queue yet)
     this.finishPlanningAtPlanningDone(cycleId);
     if (this.isCycleGateParked(cycleId)) {
@@ -1731,6 +1754,28 @@ export class RunOrchestratorService {
             .get(runId) as any;
           if (r?.cycle_id != null) planningDoneCycleId = Number(r.cycle_id);
         } catch { /* leave null */ }
+      }
+      // S13: record provenance only when planning agreed (notAgreed already returned above).
+      if (planningRes && planningRes.agreed !== false && planningDoneCycleId != null) {
+        try {
+          const cycleDocDir = this.deps.cycleService?.getCycleDocDir?.(planningDoneCycleId);
+          await recordProvenanceAfterAgreement({
+            db: this.deps.artifacts['db'] as DatabaseService,
+            cycleService: this.deps.cycleService as any,
+            projectId,
+            cycleId: planningDoneCycleId,
+            planningRunId: runId,
+            planMdPath: cycleDocDir
+              ? path.join(cycleDocDir, CANONICAL_CYCLE_ARTIFACTS.plan)
+              : planningRes.planMdPath || null,
+            assignments: this.deps.assignmentService,
+            plannerPanel: this.deps.plannerPanelService,
+          });
+        } catch (e: any) {
+          console.warn(
+            `[RunOrchestrator] S13 provenance record non-fatal: ${e?.message || e}`
+          );
+        }
       }
       this.finishPlanningAtPlanningDone(planningDoneCycleId);
 
@@ -2509,6 +2554,18 @@ export class RunOrchestratorService {
     const parsed = parseExecutionPlan(md);
     if (!parsed.ok) {
       throw new Error(`author a valid plan.md first: ${parsed.errors.join('; ')}`);
+    }
+    // S13 / AC27–28: after plan is schema-valid, require cycle-linked Planning agreement + matching bytes.
+    const gate = await assertPlanningProvenanceForImplementation({
+      db: this.deps.artifacts['db'] as DatabaseService,
+      cycleService: this.deps.cycleService as any,
+      projectId,
+      cycleId,
+      assignments: this.deps.assignmentService,
+      plannerPanel: this.deps.plannerPanelService,
+    });
+    if (!gate.ok) {
+      throw new Error(gate.message || PLANNING_REQUIRED_MESSAGE);
     }
     // The complete canonical set was materialized from the cycle workspace before this seed runs.
     const nsPath = path.join(runDir, CANONICAL_CYCLE_ARTIFACTS.northStar);
