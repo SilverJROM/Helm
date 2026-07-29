@@ -30,6 +30,7 @@ import { registerDiscoveryHandoffRoutes } from './api/routes/discovery-handoff-r
 import {
   issueDiscoveryCallbackCredential,
 } from './services/discovery-callback-credentials.js';
+import { confirmDiscoveryHandoff } from './services/discovery-handoff-owner-bridge.js';
 
 function seedModel(dbs: DatabaseService, name: string, provider: string, modelId: string): number {
   return Number(
@@ -251,6 +252,76 @@ describe('S11 owner confirm/decline bridge', () => {
     } finally {
       await app.close();
     }
+  });
+
+  it('test1b: double confirm while starting (no planning_run_id) creates no second run/S10', async () => {
+    const { handoffId, manifest } = makePendingHandoff();
+    // Simulate CAS gap: winner flipped pending→starting but has not written planning_run_id yet
+    expect(handoffs.casTransition(handoffId, 'pending', 'starting')).toBe(1);
+    expect(handoffs.getById(handoffId)!.state).toBe('starting');
+    expect(handoffs.getById(handoffId)!.planning_run_id).toBeNull();
+
+    const app = mountApp();
+    await app.ready();
+    try {
+      const res = await app.inject({
+        method: 'POST',
+        url: `/api/cycles/${cycleId}/discovery-handoff/confirm`,
+        remoteAddress: '127.0.0.1',
+        payload: { expectedDigest: manifest.digest, handoffId },
+      });
+      // In-flight starting without run id must refuse — never second durable run/S10
+      expect(res.statusCode).toBe(409);
+      expect(res.json().code).toBe('CAS_LOST');
+      expect(s10Calls).toHaveLength(0);
+      expect((dbs.raw.prepare('SELECT COUNT(*) AS c FROM runs').get() as any).c).toBe(0);
+      expect(handoffs.getById(handoffId)!.state).toBe('starting');
+      expect(handoffs.getById(handoffId)!.planning_run_id).toBeNull();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('test1c: concurrent double confirm from pending yields exactly one run and one S10', async () => {
+    const { handoffId, manifest } = makePendingHandoff();
+    const deps = {
+      db: dbs,
+      handoffs,
+      cycleService: cycles,
+      artifacts,
+      assignments,
+      plannerPanel: panel,
+      orchestrator,
+      detachS10: false as boolean,
+    };
+    const input = {
+      cycleId,
+      handoffId,
+      expectedDigest: manifest.digest,
+      batchId: 's11-concurrent',
+    };
+
+    const [a, b] = await Promise.all([
+      confirmDiscoveryHandoff(input, deps),
+      confirmDiscoveryHandoff(input, deps),
+    ]);
+
+    const oks = [a, b].filter((r) => r.ok) as Array<Extract<typeof a, { ok: true }>>;
+    const fails = [a, b].filter((r) => !r.ok);
+
+    // At least one success; loser is already-same-run or CAS_LOST — never two distinct runs
+    expect(oks.length).toBeGreaterThanOrEqual(1);
+    if (oks.length === 2) {
+      expect(oks[0].runId).toBe(oks[1].runId);
+      expect(oks.some((r) => r.already)).toBe(true);
+    } else {
+      expect(fails[0].code === 'CAS_LOST' || fails[0].code === 'ACTIVE_RUN').toBe(true);
+    }
+
+    const runCount = (dbs.raw.prepare('SELECT COUNT(*) AS c FROM runs').get() as any).c;
+    expect(runCount).toBe(1);
+    expect(s10Calls).toHaveLength(1);
+    expect(handoffs.getById(handoffId)!.planning_run_id).toBe(oks[0].runId);
   });
 
   it('test2: decline starts none and permits a fresh pending handoff', async () => {

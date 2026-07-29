@@ -190,7 +190,7 @@ export async function confirmDiscoveryHandoff(
     return err('NO_HANDOFF', 'no live discovery handoff for this cycle');
   }
 
-  // Double/stale: already starting/started with a durable run id → return same, no second S10
+  // Idempotent: starting/started with a durable run id → same run, never a second S10.
   if (
     (handoff.state === 'starting' || handoff.state === 'started') &&
     handoff.planning_run_id != null &&
@@ -206,10 +206,21 @@ export async function confirmDiscoveryHandoff(
     };
   }
 
-  if (handoff.state !== 'pending' && handoff.state !== 'starting') {
+  // RT R1 / fix1: state=starting without planning_run_id is an in-flight CAS gap.
+  // Do NOT fall through to create another durable run / second S10.
+  if (handoff.state === 'starting') {
+    return err(
+      'CAS_LOST',
+      'handoff already starting; confirm in flight — retry shortly (no second run)',
+      handoff.id
+    );
+  }
+
+  // Only pending may be consumed (via atomic CAS pending→starting below).
+  if (handoff.state !== 'pending') {
     return err(
       'BAD_STATE',
-      `handoff state is ${handoff.state}; confirm requires pending (or in-flight starting)`,
+      `handoff state is ${handoff.state}; confirm requires pending`,
       handoff.id
     );
   }
@@ -289,44 +300,41 @@ export async function confirmDiscoveryHandoff(
     );
   }
 
-  // CAS pending → starting (first confirm wins)
-  if (handoff.state === 'pending') {
-    const cas = deps.handoffs.casTransition(handoff.id, 'pending', 'starting');
-    if (cas === 0) {
-      // Lost race — re-read; if peer already has run id, return it
-      const again = deps.handoffs.getById(handoff.id);
-      if (
-        again &&
-        (again.state === 'starting' || again.state === 'started') &&
-        again.planning_run_id != null
-      ) {
-        return {
-          ok: true,
-          handoffId: again.id,
-          runId: Number(again.planning_run_id),
-          state: again.state === 'started' ? 'started' : 'starting',
-          digest: String(again.manifest_digest || ''),
-          already: true,
-        };
-      }
-      if (again?.state === 'starting' && again.planning_run_id == null) {
-        // Peer in-flight without run yet — do not start a second S10
-        return err(
-          'CAS_LOST',
-          'handoff already starting; retry shortly',
-          handoff.id
-        );
-      }
+  // Atomic consume: only pending→starting wins the right to create a run + call S10.
+  const cas = deps.handoffs.casTransition(handoff.id, 'pending', 'starting');
+  if (cas === 0) {
+    // Lost race — re-read; never create a second run from here.
+    const again = deps.handoffs.getById(handoff.id);
+    if (
+      again &&
+      (again.state === 'starting' || again.state === 'started') &&
+      again.planning_run_id != null
+    ) {
+      return {
+        ok: true,
+        handoffId: again.id,
+        runId: Number(again.planning_run_id),
+        state: again.state === 'started' ? 'started' : 'starting',
+        digest: String(again.manifest_digest || ''),
+        already: true,
+      };
+    }
+    if (again?.state === 'starting') {
       return err(
         'CAS_LOST',
-        'handoff is no longer pending (stale confirm)',
+        'handoff already starting; confirm in flight — retry shortly (no second run)',
         handoff.id
       );
     }
-    handoff = deps.handoffs.getById(handoff.id) || handoff;
+    return err(
+      'CAS_LOST',
+      'handoff is no longer pending (stale confirm)',
+      handoff.id
+    );
   }
+  handoff = deps.handoffs.getById(handoff.id) || handoff;
 
-  // Durable run creation BEFORE model startup (AC30 / 202)
+  // Durable run creation BEFORE model startup (AC30 / 202) — only the CAS winner reaches here.
   const batchId =
     (input.batchId && String(input.batchId).trim()) ||
     `handoff-confirm-${handoff.id}-${Date.now().toString(36)}`;
