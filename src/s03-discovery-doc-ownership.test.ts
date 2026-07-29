@@ -282,4 +282,72 @@ describe('S03 startGovernedDocGuard Discovery cycle ownership', () => {
       handle.stop();
     }
   });
+
+  it('fix2 restore: replace plan.md with symlink→dir → file restored + denial', async () => {
+    const handle = startGovernedDocGuard(PROJ, {
+      pollMs: 50,
+      role: 'discovery',
+      phase: 'discovery',
+      cycleFolder: BOUND,
+    });
+    try {
+      const target = cyclePath(BOUND, 'plan.md');
+      const realDir = path.join(PROJ, 'cycle', BOUND, '_evil_dir_target');
+      fs.mkdirSync(realDir, { recursive: true });
+      fs.writeFileSync(path.join(realDir, 'nested.txt'), 'via-symlink', 'utf8');
+      fs.unlinkSync(target);
+      fs.symlinkSync(realDir, target);
+
+      expect(fs.lstatSync(target).isSymbolicLink()).toBe(true);
+      expect(fs.statSync(target).isDirectory()).toBe(true);
+
+      await sleep(450);
+
+      expect(fs.lstatSync(target).isFile()).toBe(true);
+      expect(fs.lstatSync(target).isSymbolicLink()).toBe(false);
+      expect(fs.readFileSync(target, 'utf8')).toBe('ORIGINAL plan.md');
+      // symlink target dir must survive (we must not follow/rm the target)
+      expect(fs.existsSync(path.join(realDir, 'nested.txt'))).toBe(true);
+
+      const denial = handle.denials.find((d) => d.relPath === `cycle/${BOUND}/plan.md`);
+      expect(denial).toBeTruthy();
+      expect(denial!.attemptedContentSample).toBe('<symlink>');
+    } finally {
+      handle.stop();
+    }
+  });
+
+  it('fix2 forbid-create: symlink at missing og-requirements.md → removed + denial', async () => {
+    setupBoundCycle({ seedForbidden: false });
+    fs.writeFileSync(cyclePath(BOUND, 'plan.md'), 'ORIGINAL plan.md', 'utf8');
+
+    const handle = startGovernedDocGuard(PROJ, {
+      pollMs: 50,
+      role: 'discovery',
+      phase: 'discovery',
+      cycleFolder: BOUND,
+    });
+    try {
+      const target = cyclePath(BOUND, 'og-requirements.md');
+      const realDir = path.join(PROJ, 'cycle', BOUND, '_evil_og_target');
+      fs.mkdirSync(realDir, { recursive: true });
+      fs.symlinkSync(realDir, target);
+
+      expect(fs.lstatSync(target).isSymbolicLink()).toBe(true);
+
+      await sleep(450);
+
+      expect(fs.existsSync(target)).toBe(false);
+      // did not follow the link and delete the real target
+      expect(fs.existsSync(realDir)).toBe(true);
+
+      const denial = handle.denials.find(
+        (d) => d.relPath === `cycle/${BOUND}/og-requirements.md`
+      );
+      expect(denial).toBeTruthy();
+      expect(denial!.attemptedContentSample).toBe('<symlink>');
+    } finally {
+      handle.stop();
+    }
+  });
 });

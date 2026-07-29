@@ -713,17 +713,36 @@ export function startGovernedDocGuard(
     });
   };
 
-  /** True when abs exists as a directory (symlink to dir counts). ENOENT → false. */
-  const pathIsDirectory = (abs: string): boolean => {
+  /**
+   * Classify a path that exists at a protected abs (lstat, never follow).
+   * null = ENOENT / unreadable; 'file' = regular file; otherwise non-regular kind for denial sample.
+   */
+  const classifyProtectedPath = (
+    abs: string
+  ): null | 'file' | 'directory' | 'symlink' | 'non-regular' => {
+    let st: fsSync.Stats;
     try {
-      return fsSync.lstatSync(abs).isDirectory();
+      st = fsSync.lstatSync(abs);
     } catch {
-      return false;
+      return null;
     }
+    if (st.isSymbolicLink()) return 'symlink';
+    if (st.isDirectory()) return 'directory';
+    if (st.isFile()) return 'file';
+    return 'non-regular';
   };
 
-  /** Best-effort recursive remove of a directory that replaced a protected file path. */
-  const removeDirectoryAt = (abs: string): boolean => {
+  const denialSampleForKind = (kind: 'directory' | 'symlink' | 'non-regular'): string => {
+    if (kind === 'directory') return '<directory>';
+    if (kind === 'symlink') return '<symlink>';
+    return '<non-regular>';
+  };
+
+  /**
+   * Best-effort remove of whatever sits at abs without following symlinks.
+   * rmSync on a symlink unlinks the link; on a directory removes recursively.
+   */
+  const removePathWithoutFollowing = (abs: string): boolean => {
     try {
       fsSync.rmSync(abs, { recursive: true, force: true });
       return true;
@@ -733,14 +752,16 @@ export function startGovernedDocGuard(
   };
 
   /**
-   * S03 fix1: path-as-directory (EISDIR / type-change) is tampering.
-   * - restore: remove dir, rewrite original file bytes, recordDenial
-   * - forbid-create: remove dir, leave absent, recordDenial
-   * Returns true when a directory was found and handled (caller should return).
+   * S03 fix1+fix2: any non-regular path at a protected abs is tampering
+   * (directory, symlink-to-file/dir, fifo, etc. — not only lstat.isDirectory).
+   * - restore: remove without following, rewrite original file bytes, recordDenial
+   * - forbid-create: remove without following, leave absent, recordDenial
+   * Returns true when a non-regular path was found and handled (caller should return).
    */
-  const handleDirectoryReplace = (entry: GuardEntry): boolean => {
-    if (!pathIsDirectory(entry.abs)) return false;
-    removeDirectoryAt(entry.abs);
+  const handleNonRegularReplace = (entry: GuardEntry): boolean => {
+    const kind = classifyProtectedPath(entry.abs);
+    if (kind === null || kind === 'file') return false;
+    removePathWithoutFollowing(entry.abs);
     if (entry.mode === 'restore') {
       try {
         fsSync.mkdirSync(path.dirname(entry.abs), { recursive: true });
@@ -750,15 +771,15 @@ export function startGovernedDocGuard(
       }
     }
     // forbid-create: leave absent after remove
-    recordDenial(entry, '<directory>');
+    recordDenial(entry, denialSampleForKind(kind));
     return true;
   };
 
   const checkOne = (entry: GuardEntry) => {
     if (stopped) return;
 
-    // S03 fix1: type-change (file → directory) must not silently skip — poll and watch both hit this.
-    if (handleDirectoryReplace(entry)) return;
+    // S03 fix1/fix2: non-regular type-change must not silently skip — poll and watch both hit this.
+    if (handleNonRegularReplace(entry)) return;
 
     if (entry.mode === 'forbid-create') {
       let current: string;
@@ -766,8 +787,8 @@ export function startGovernedDocGuard(
         current = fsSync.readFileSync(entry.abs, 'utf8');
       } catch (err: any) {
         if (err?.code === 'ENOENT') return; // still absent — allowed
-        // EISDIR or other: if still a dir, handle; else best-effort leave for next poll
-        if (err?.code === 'EISDIR' && handleDirectoryReplace(entry)) return;
+        // EISDIR / ELOOP / etc.: non-regular may still be present — handle and return
+        if (handleNonRegularReplace(entry)) return;
         return;
       }
       // File appeared (create) or was written — Discovery must not own it: remove and record.
@@ -798,8 +819,8 @@ export function startGovernedDocGuard(
         recordDenial(entry, '');
         return;
       }
-      // S03 fix1: EISDIR after type-change — remove dir and restore original file
-      if (err?.code === 'EISDIR' && handleDirectoryReplace(entry)) return;
+      // S03 fix1/fix2: EISDIR / symlink-to-dir / other non-regular after type-change
+      if (handleNonRegularReplace(entry)) return;
       return;
     }
     if (current !== entry.original) {
