@@ -37,6 +37,67 @@ export function formatLifecycleHandle(sessionName: string, spawnId: string): str
   return `${sessionName}:0.0#${spawnId}`;
 }
 
+/**
+ * C1 / AC13 — identity used to resolve the on-disk brief basename under prompts/.
+ * External `role` semantics stay on the spawn `role` field; uniqueness is additive here.
+ */
+export type SpawnBriefIdentity = {
+  role: string;
+  batchId?: string;
+  attemptId?: number;
+  /** Seat label (e.g. partner, partner-2). Later planning slices pass this. */
+  seatId?: string;
+  /** Review round number. Later round-loop slices pass this. */
+  round?: number;
+  /** Explicit basename override (with or without .brief.md). Wins over composition. */
+  briefFileName?: string;
+};
+
+/** Sanitize one path segment for prompts/*.brief.md (no path separators, bounded length). */
+export function sanitizeBriefToken(raw: string): string {
+  const cleaned = String(raw || '')
+    .trim()
+    .replace(/[^a-zA-Z0-9._+-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 120);
+  return cleaned || 'seat';
+}
+
+/**
+ * C1 / AC13 — pure brief basename under prompts/.
+ *
+ * - Default (role only, no disambiguators): `${role}.brief.md` — backward compatible.
+ * - With batchId / seatId / round / attemptId: include segments so concurrent same-role
+ *   seats (e.g. two deliberation partners with distinct partner batchIds) cannot collide.
+ * - briefFileName override: sanitized basename, forced `.brief.md` suffix.
+ *
+ * Note: artifacts.writeBrief already writes unique partner names in planning; the remaining
+ * collision is RealTransport always rewriting prompts/${role}.brief.md — this helper is that seam.
+ */
+export function resolveSpawnBriefFileName(id: SpawnBriefIdentity): string {
+  if (id.briefFileName != null && String(id.briefFileName).trim()) {
+    const base = path.basename(String(id.briefFileName).trim());
+    const withoutSuffix = base.replace(/\.brief\.md$/i, '');
+    return `${sanitizeBriefToken(withoutSuffix)}.brief.md`;
+  }
+  const role = sanitizeBriefToken(id.role);
+  const segs: string[] = [role];
+  if (id.seatId != null && String(id.seatId).trim()) {
+    segs.push(sanitizeBriefToken(String(id.seatId)));
+  }
+  if (id.round != null && Number.isFinite(Number(id.round))) {
+    segs.push(`r${Math.trunc(Number(id.round))}`);
+  }
+  if (id.attemptId != null && Number.isFinite(Number(id.attemptId)) && Number(id.attemptId) > 0) {
+    segs.push(`a${Math.trunc(Number(id.attemptId))}`);
+  }
+  if (id.batchId != null && String(id.batchId).trim()) {
+    segs.push(sanitizeBriefToken(String(id.batchId)));
+  }
+  if (segs.length === 1) return `${role}.brief.md`;
+  return `${segs.join('--')}.brief.md`;
+}
+
 // Hard-pin the worker identity when the host CLI supports a system-prompt override (claude).
 // Kept apostrophe-free so it embeds directly inside single quotes in the launch command (no shell escaping).
 // Reinforces the helm_pm role alias + brief: even if any global config leaked, the model must not become
@@ -127,6 +188,10 @@ export class RealTransport implements ITransport {
     // for planning seats). Absent → register(name) with NULL ids (byte-identical to pre-A2).
     projectId?: number;
     runId?: number;
+    // C1 / AC13: additive seat identity for unique prompts/*.brief.md (external role unchanged).
+    seatId?: string;
+    round?: number;
+    briefFileName?: string;
   }): Promise<{ handle: string; role: string }> {
     const role = params.role;
     const runDir = params.runDir;
@@ -232,12 +297,23 @@ export class RealTransport implements ITransport {
       try { await this.tmux.sendKeys(target, '\x1b'); } catch {} // Esc safe after ready
       await new Promise((r) => setTimeout(r, 900));
 
-      // Write the brief param (passed by planning/panel/loop callers) to prompts/<role>.brief.md BEFORE
-      // dispatch reads the path. mkdir + write honors the 'brief' arg for any role (projcore etc).
-      // Fixes live POST /runs ENOENT (run-orchestrator wrote 'prompt.brief.md'; planning passed
-      // projcore brief string but real-transport did not persist role file; Fake used param in-mem).
+      // C1 / AC13: write prompts/<unique>.brief.md BEFORE dispatch reads the path.
+      // Legacy `${role}.brief.md` when no batchId/seat/round/attempt disambiguators; concurrent
+      // same-role reviewers (partner batchIds differ) get distinct basenames so seat-2 cannot
+      // clobber seat-1. External role passed to dispatch/return stays params.role unchanged.
+      // mkdir + write honors the 'brief' arg for any role (projcore etc).
       await fs.mkdir(path.join(runDir, 'prompts'), { recursive: true });
-      const briefPath = path.join(runDir, 'prompts', `${role}.brief.md`);
+      const briefFileName = resolveSpawnBriefFileName({
+        role,
+        // Use caller-supplied batchId only (not the dispatch default) so bare-role spawns keep
+        // prompts/${role}.brief.md; partner seats already pass distinct batchIds today.
+        batchId: params.batchId,
+        attemptId: params.attemptId,
+        seatId: params.seatId,
+        round: params.round,
+        briefFileName: params.briefFileName,
+      });
+      const briefPath = path.join(runDir, 'prompts', briefFileName);
       await fs.writeFile(briefPath, params.brief, 'utf8');
 
       const callbacksFile = path.join(runDir, 'callbacks.md');

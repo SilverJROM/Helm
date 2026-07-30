@@ -247,6 +247,20 @@ export class PlanningPhaseService {
     }
   }
 
+  // A5 (AC5/AC23): reap a retained planning seat transport handle. Best-effort/never-throw, same
+  // contract as finalizeWorkerRuntime and the existing retry-loop reap (above) — a transport-level
+  // failure to tear down a session must never block the DB finalize that follows it. Both FakeTransport
+  // and RealTransport's own reap() are already no-ops on an already-reaped handle, so calling this twice
+  // for the same handle (e.g. a respawned seat whose earlier attempt was reaped in-loop) is idempotent.
+  private async reapPlanningHandle(handle: string | null, reason: string): Promise<void> {
+    if (!handle) return;
+    try {
+      await this.transport.reap(handle, reason);
+    } catch {
+      /* best-effort — see comment above */
+    }
+  }
+
   // A9 (N11): resolve the deliberation team's consensus_rule and log it as the consensus source for
   // this planning run — "wire it or delete it" (og-requirements §5) for the two decided clauses.
   // Best-effort/never-throw (same bracket-idiom DB access as registerWorkerRuntime): a missing
@@ -431,7 +445,32 @@ export class PlanningPhaseService {
     // A10: partner seats are now N (>= 0), one runtime id per spawned partner.
     let plancoreRuntimeId: number | null = null;
     const partnerRuntimeIds: (number | null)[] = [];
+    // A5 (AC5/AC23): retain each seat's transport handle too — the runtime id alone finalizes the DB
+    // row, but never reaps the live transport session. A normal terminal exit (agreed or blocked) must
+    // reap before it finalizes, or the session leaks and can poison a retry. plancoreHandle tracks only
+    // the LAST successful spawn attempt; an earlier failed-attempt handle is already reaped in-loop below.
+    let plancoreHandle: string | null = null;
+    const partnerHandles: string[] = [];
 
+    // A6 (AC5/AC23): ONE terminal owner for this call. Success, blocked, AND thrown planning exits all
+    // route through this same reap-then-finalize routine (A5 order preserved: every retained handle is
+    // reaped before any worker_runtimes row is finalized) instead of each exit duplicating its own
+    // cleanup — the prior asymmetry where only the pre-partner-spawn spawn-retry throw had any cleanup
+    // at all, while every later thrown exit (after partner seats exist) had none. terminalReason /
+    // terminalState are set by whichever exit is actually taken; the catch below's default covers any
+    // exception this try region raises, so a thrown exit can no longer bypass reap+finalize. Both
+    // reapPlanningHandle and finalizeWorkerRuntime are already best-effort/never-throw/idempotent, so
+    // this owner itself can never throw and never masks the real error.
+    let terminalReason = 'planning-thrown-exit';
+    let terminalState: 'done' | 'reaped' | 'failed' = 'failed';
+    const runPlanningTerminal = async (): Promise<void> => {
+      await this.reapPlanningHandle(plancoreHandle, terminalReason);
+      for (const h of partnerHandles) await this.reapPlanningHandle(h, terminalReason);
+      this.finalizeWorkerRuntime(plancoreRuntimeId, terminalState, terminalReason);
+      for (const id of partnerRuntimeIds) this.finalizeWorkerRuntime(id, terminalState, terminalReason);
+    };
+
+    try {
     // POCFIX20: projcore spawn-retry. Helm's claude spawn is intermittently flaky (empty pane / brief never
     // lands → no plan → dead run), while grok's is reliable; root cause is a hard-to-pin spawn timing/race.
     // Cause-agnostic robustness: if projcore emits NO callback within a window, reap + respawn (up to 3x).
@@ -454,6 +493,9 @@ export class PlanningPhaseService {
         const spawned = await this.transport.spawn({ role: brainRole, brief: dispatchBrief, runDir, batchId, sessionName: inputs.sessionName, model: inputs.planningBrainModel, provider: inputs.planningBrainProvider, attemptId: 0, projectDir: effectiveProjectDir, projectId: inputs.projectId, runId: inputs.runId, ...(inputs.strictReadAllow ? { strictReadAllow: inputs.strictReadAllow } : {}) });  // B-ISO1 + A2: projectId/runId → helm_sessions via createSession
         // A1 (R4.16): record this plancore seat so it is DB-observable with run+cycle linkage.
         plancoreRuntimeId = this.registerWorkerRuntime(inputs.projectId, inputs.runId, brainRole, batchId, spawned.handle, inputs.planningBrainProvider, inputs.planningBrainModel);
+        // A5: latest surviving spawn's handle — overwritten every attempt (a failed attempt's own
+        // handle is reaped inline just below, before the loop moves on).
+        plancoreHandle = spawned.handle;
         if (isFakeP) break;
         // R8: pass the live handle+brief so the first-callback wait can watchdog a brief that is
         // still sitting un-submitted in the composer (variable codex Enter-drop window) instead of
@@ -559,6 +601,8 @@ export class PlanningPhaseService {
           seatModel
         )
       );
+      // A5: retain this partner's handle too — one entry per spawned partner, parallel to partnerRuntimeIds.
+      partnerHandles.push(partnerSpawned.handle);
     }
 
     // Fixture drive: simulate the exchange + agreement (tests append real [helm callback] lines + sleep).
@@ -665,9 +709,10 @@ export class PlanningPhaseService {
 
     if (!agreed) {
       // Gate blocked — do not ingest or hand off.
-      // A15: finalize planning seats so they do not stick as running after a failed gate.
-      this.finalizeWorkerRuntime(plancoreRuntimeId, 'reaped', 'planning-not-agreed');
-      for (const id of partnerRuntimeIds) this.finalizeWorkerRuntime(id, 'reaped', 'planning-not-agreed');
+      // A6: route through the one terminal owner — reason/state feed runPlanningTerminal(), which the
+      // finally below runs (reap BEFORE finalize, same A5 order as every other exit).
+      terminalReason = 'planning-not-agreed';
+      terminalState = 'reaped';
       await this.advanceAgreementFence(runDir, batchId, path.join(runDir, 'callbacks.md'));
       // A11 (R1.6 + D7): a mechanism-level reason naming the missing partner batch id(s) and the
       // round-cap budget exhausted — never a generic/silent message. Bounded exit, visible BLOCKED
@@ -706,10 +751,11 @@ export class PlanningPhaseService {
       ? await this.reconveneConflictingTasks(taskConflicts, batchId, partner, runDir, effectiveProjectDir, briefWriter, rid, this.resolveCycleId(rid), inputs)
       : [];
 
-    // A15: planning phase exit (success) — mark seats done. Orchestrator also finalizes at
-    // planning-done-yield (idempotent). Partner no longer depends on the generic janitor alone.
-    this.finalizeWorkerRuntime(plancoreRuntimeId, 'done', 'planning-phase-complete');
-    for (const id of partnerRuntimeIds) this.finalizeWorkerRuntime(id, 'done', 'planning-phase-complete');
+    // A6: route through the one terminal owner — same reason/state pattern as the blocked exit, same
+    // A5 reap-before-finalize order, run by the finally below (orchestrator also finalizes at
+    // planning-done-yield; idempotent).
+    terminalReason = 'planning-phase-complete';
+    terminalState = 'done';
     await this.advanceAgreementFence(runDir, batchId, path.join(runDir, 'callbacks.md'));
 
     return {
@@ -725,6 +771,14 @@ export class PlanningPhaseService {
       runId: rid,
       reconvenedTaskKeys
     };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      terminalReason = `planning-thrown-exit: ${msg}`;
+      terminalState = 'failed';
+      throw err;
+    } finally {
+      await runPlanningTerminal();
+    }
   }
 
   // POCFIX20: poll for the agent's FIRST callback (any STATUS) — proves the brief landed + the agent is alive.

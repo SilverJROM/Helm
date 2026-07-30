@@ -49,11 +49,16 @@ function assertRegistryIdle(db: FinalizeDb, id: number, reason: string): void {
   if (!markIdleHook) return;
   try {
     // Capture session token at the finalize decision boundary (one shot — no refresh/retry).
+    // A3: bind to run-owned identity, not name alone — a persistent helm_sessions row (e.g.
+    // helm-ibrain-<slug>) can be re-registered onto a later, unrelated, still-live run between
+    // this runtime row's creation and its finalize. `IS` (not `=`) is null-safe: worker_runtimes.run_id
+    // can legitimately be NULL for ad-hoc no-run-context workers, and plain `=` against NULL is never
+    // true, which would wrongly no-op that existing case.
     const row = db
       .prepare(
         `SELECT s.id AS id, s.name AS name, s.owner AS owner, s.status AS status, s.generation AS generation
          FROM worker_runtimes wr
-         JOIN helm_sessions s ON s.name = wr.session
+         JOIN helm_sessions s ON s.name = wr.session AND s.run_id IS wr.run_id
          WHERE wr.id = ?`
       )
       .get(id) as
@@ -158,9 +163,10 @@ export async function finalizeRunWorkerRuntimes(
 }
 
 /**
- * S03 — assert completion for a named brain session that may not already have a
- * worker_runtimes row (ibrain/master path). Register-if-needed, then finalize via the
- * shared chokepoint so S02 markIdle propagates.
+ * S03 — assert completion for a named brain session (ibrain/master path). Update-only: finalizes
+ * an existing non-terminal run-linked worker_runtimes row via the shared chokepoint so S02 markIdle
+ * propagates. Never synthesizes a runtime row — a missing row means no runtime was ever registered
+ * for this run+session, and this function must not paper over that with an `unknown/unknown` insert.
  *
  * Does NOT reap/terminate tmux — preserves D-a3 keep-alive / close-confirm.
  * Call only at true run/phase terminals, never intermediate yields.
@@ -203,14 +209,12 @@ export function finalizeBrainSessionRow(
     }
   }
 
-  const role = (opts.role && String(opts.role).trim()) || 'ibrain';
   const state: WorkerTerminalState = opts.state ?? 'done';
   const reason = opts.reason || 'brain-phase-complete';
-  const provider = opts.provider || 'unknown';
-  const model = opts.model || 'unknown';
 
   try {
-    // Prefer an existing non-terminal ledger row for this run+session.
+    // Update-only: require an existing non-terminal ledger row for this run+session. No existing
+    // row — whether none was ever registered or it is already terminal — means nothing to update.
     const existing = db
       .prepare(
         `SELECT id FROM worker_runtimes
@@ -219,40 +223,9 @@ export function finalizeBrainSessionRow(
       )
       .get(opts.runId, session) as { id?: number } | undefined;
 
-    let id = existing?.id != null ? Number(existing.id) : null;
-
-    // Already terminal for this run+session → idempotent no-op (do not insert a second ledger row).
-    if (id == null || !Number.isFinite(id)) {
-      const prior = db
-        .prepare(
-          `SELECT id FROM worker_runtimes
-           WHERE run_id = ? AND session = ? AND state IN ('done','failed','reaped')
-           ORDER BY id DESC LIMIT 1`
-        )
-        .get(opts.runId, session) as { id?: number } | undefined;
-      if (prior?.id != null) return false;
-    }
-
-    // Register-if-needed only when no ledger row exists for this run+session.
-    if (id == null || !Number.isFinite(id)) {
-      const info = db
-        .prepare(
-          `INSERT INTO worker_runtimes
-             (project_id, role, provider, model, session, correlation_id, state, spawned_by, run_id, started_at)
-           VALUES (?,?,?,?,?,?,'running','brain-phase-end',?, datetime('now'))`
-        )
-        .run(
-          opts.projectId,
-          role,
-          provider,
-          model,
-          session,
-          `brain:${role}:${opts.runId}`,
-          opts.runId
-        );
-      id = Number((info as { lastInsertRowid?: number | bigint }).lastInsertRowid);
-    }
+    const id = existing?.id != null ? Number(existing.id) : null;
     if (id == null || !Number.isFinite(id)) return false;
+
     return finalizeWorkerRuntimeRow(db, id, state, reason);
   } catch {
     return false;

@@ -348,6 +348,28 @@ export class RunOrchestratorService {
     }
   }
 
+  /**
+   * A1 / AC1: true once a run has genuinely left planning — read BEFORE any terminal UPDATE
+   * overwrites runs.phase, since transitionRunToBlocked/detached-start-failed both stamp the row
+   * blocked/failed first. Mirrors stopRun's own priorPhase gate (`['starting','interview','planning']`
+   * = pre-executing), plus a run_tasks count as a second signal (belt-and-suspenders against a phase
+   * write and the run_tasks ingest landing on either side of a crash). Defaults to true (assume
+   * started) on any read ambiguity/error — this predicate must never suppress genuine execution-
+   * failure cleanup, only skip assertImplementationBrainComplete when planning-only failure is certain.
+   */
+  private hasExecutionStarted(runId: number): boolean {
+    try {
+      const db = this.deps.artifacts['db'].raw;
+      const run: any = db.prepare('SELECT phase FROM runs WHERE id = ?').get(runId);
+      const phase = String(run?.phase ?? '');
+      if (phase && !['starting', 'interview', 'planning'].includes(phase)) return true;
+      const taskRow: any = db.prepare('SELECT COUNT(*) AS n FROM run_tasks WHERE run_id = ?').get(runId);
+      return Number(taskRow?.n ?? 0) > 0;
+    } catch {
+      return true;
+    }
+  }
+
   // #52: `kind` distinguishes a genuine FAILURE (status=failed) from an operator-recoverable PAUSE
   // (status=paused) — both set phase=blocked, but a run that merely halted for missing config or a
   // grok relogin is NOT failed, and recording it as such contradicted its own completion summary and
@@ -369,6 +391,9 @@ export class RunOrchestratorService {
     const db = this.deps.artifacts['db'].raw;
     const status = kind === 'operator-pause' ? 'paused' : 'failed';
     const gated = expectedGeneration != null && Number.isFinite(Number(expectedGeneration));
+    // A1: snapshot pre-terminal execution state BEFORE the blocked/failed UPDATE below overwrites
+    // runs.phase — assertImplementationBrainComplete below must not run on a planning-only failure.
+    const executionStarted = kind === 'failure' ? this.hasExecutionStarted(runId) : true;
     try {
       const changed = gated
         ? db.prepare(
@@ -390,7 +415,12 @@ export class RunOrchestratorService {
       // A7 / R3.15: true blocked-failure terminalizes the cycle board. Operator-pause (A6 park,
       // missing deploy/final-test config) is recoverable — leave cycles.phase alone.
       if (kind === 'failure') {
-        this.terminalizeCycleAtRunEnd({ runId });
+        // A4 / AC4: a planning-only failure must not terminalize the cycle (no phase='complete',
+        // no topology freeze) — it must land retryable. Reuse the executionStarted snapshot taken
+        // above, before the terminal UPDATE overwrote runs.phase.
+        if (executionStarted) {
+          this.terminalizeCycleAtRunEnd({ runId });
+        }
         // A15 + S03: finalize workers first, THEN assert ibrain (no race where a just-registered
         // ibrain ledger row is picked up by finalizeRunWorkerRuntimes and reaped — D-a3 keep-alive).
         const projId =
@@ -402,7 +432,7 @@ export class RunOrchestratorService {
         void (async () => {
           try {
             await this.finalizeRunWorkerRuntimes(runId, 'run-blocked-failure', expectedGeneration);
-            if (Number.isFinite(projId)) {
+            if (Number.isFinite(projId) && executionStarted) {
               this.assertImplementationBrainComplete({
                 projectId: projId,
                 runId,
@@ -464,6 +494,9 @@ export class RunOrchestratorService {
       // is already terminal, gone, or a new occupant recycled this id; the old chain must no-op
       // rather than mark the recycled row failed or reap/finalize its live workers (D01: changes===0
       // is stale/KEEP, never refresh-and-retry).
+      // A1: snapshot pre-terminal execution state BEFORE the CAS UPDATE below overwrites runs.phase
+      // to 'failed' — assertImplementationBrainComplete below must not run on a planning-only failure.
+      const executionStarted = this.hasExecutionStarted(runToken.id);
       let casApplied = false;
       try {
         const result = this.deps.artifacts['db'].raw
@@ -480,8 +513,12 @@ export class RunOrchestratorService {
         );
         return;
       }
-      // A7 / R3.15: detached failure is a true terminal — advance cycle board if linked.
-      this.terminalizeCycleAtRunEnd({ runId: runToken.id, cycleId: input.cycleId ?? null });
+      // A7 / R3.15: detached failure advances the cycle board if linked — but only when it is a
+      // genuine execution failure. A4 / AC4: a detached start that never left planning must not
+      // terminalize the cycle; reuse the executionStarted snapshot taken above the CAS UPDATE.
+      if (executionStarted) {
+        this.terminalizeCycleAtRunEnd({ runId: runToken.id, cycleId: input.cycleId ?? null });
+      }
       // A15 + S03: finalize workers first, then ibrain assert (true terminal; no reap — D-a3).
       // B04: both independently re-compare runs.generation against runToken at their own pre-reap/
       // pre-mutate selection — defense against recycling in the window between the CAS above and
@@ -489,13 +526,15 @@ export class RunOrchestratorService {
       void (async () => {
         try {
           await this.finalizeRunWorkerRuntimes(runToken.id, 'detached-start-failed', runToken.generation);
-          this.assertImplementationBrainComplete({
-            projectId: input.projectId,
-            runId: runToken.id,
-            reason: 'detached-start-failed',
-            state: 'failed',
-            expectedGeneration: runToken.generation,
-          });
+          if (executionStarted) {
+            this.assertImplementationBrainComplete({
+              projectId: input.projectId,
+              runId: runToken.id,
+              reason: 'detached-start-failed',
+              state: 'failed',
+              expectedGeneration: runToken.generation,
+            });
+          }
         } catch { /* best-effort terminal bookkeeping */ }
       })();
     });
@@ -553,7 +592,8 @@ export class RunOrchestratorService {
 
   /**
    * S03 / AC24 brains: assert the named implementation brain (helm-ibrain-*) complete at a true
-   * run terminal only. Register-if-needed worker_runtimes + finalizeWorkerRuntimeRow → S02 markIdle.
+   * run terminal only. A2 keeps finalizeBrainSessionRow update-only; this assertion owns creating
+   * the real run-linked ibrain runtime row at the true terminal boundary when execution began.
    * Does NOT reap/terminate — preserves D-a3 close-confirm keep-alive. Never call on intermediate yield.
    */
   private assertImplementationBrainComplete(opts: {
@@ -576,6 +616,40 @@ export class RunOrchestratorService {
         const slug = String(proj.name).toLowerCase().replace(/[^a-z0-9]+/g, '_');
         session = `helm-ibrain-${slug}`;
       }
+      let provider = String(opts.provider ?? '').trim();
+      let model = String(opts.model ?? '').trim();
+      if ((!provider || !model) && this.deps.assignmentService) {
+        try {
+          const resolved = this.deps.assignmentService.resolveProjectRole(opts.projectId, 'ibrain');
+          provider ||= String(resolved?.agent?.provider ?? '').trim();
+          model ||= String(resolved?.agent?.model ?? '').trim();
+        } catch {
+          /* best-effort: fall through to the update-only finalizer if no concrete binding exists */
+        }
+      }
+      if (provider && model) {
+        const existing: any = db
+          .prepare(
+            `SELECT id FROM worker_runtimes
+             WHERE run_id = ? AND session = ?
+             ORDER BY id DESC LIMIT 1`
+          )
+          .get(opts.runId, session);
+        if (!existing?.id) {
+          db.prepare(
+            `INSERT INTO worker_runtimes
+               (project_id, role, provider, model, session, correlation_id, state, spawned_by, run_id, started_at)
+             VALUES (?, 'ibrain', ?, ?, ?, ?, 'running', 'run-orchestrator', ?, datetime('now'))`
+          ).run(
+            opts.projectId,
+            provider,
+            model,
+            session,
+            `ibrain:${opts.runId}:${opts.reason}`,
+            opts.runId
+          );
+        }
+      }
       finalizeBrainSessionRow(db, {
         projectId: opts.projectId,
         runId: opts.runId,
@@ -583,8 +657,8 @@ export class RunOrchestratorService {
         role: 'ibrain',
         reason: opts.reason,
         state: opts.state ?? 'done',
-        provider: opts.provider,
-        model: opts.model,
+        provider,
+        model,
         expectedGeneration: opts.expectedGeneration,
       });
     } catch {
