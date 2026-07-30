@@ -11,6 +11,7 @@ import { classifySeatPane } from './seat-pane-state.js';
 import { CANONICAL_CYCLE_ARTIFACTS, materializeCanonicalArtifactSet } from './cycle-artifact-paths.js';
 import { validateExecutionPlan } from './execution-plan-parser.js';
 import { finalizeWorkerRuntimeRow } from './worker-runtime-finalize.js';
+import { readPlanRevision } from './plan-revision.js';
 
 /**
  * B9 PLN1: Planning-phase orchestration (projcore-brain + co-planner).
@@ -621,14 +622,58 @@ export class PlanningPhaseService {
     // fs existence only — never parses the verdict prose. Suppression alone would deadlock a seat that
     // never re-emits, which is exactly why the brief change ships with it and why the outer timeout
     // still governs.
-    const agreed = await this.waitForAgreement(cbPath, batchId, partner, brainRole, effectiveTimeoutMs, agreementFenceOffset, partnerBatchIds, path.join(canonicalArtifactRoot, CANONICAL_CYCLE_ARTIFACTS.plan));
+    // B5 (AC7/AC23): planMdPath is hoisted here (was previously first computed below, after the wait)
+    // so it can be passed BOTH as the existing race-guard path param (BROKEN-vs-not-yet-written guard,
+    // untouched) and as the new currentPlanPath (CLEAN-vs-current-bytes SHA binding, this row's fix) —
+    // two deliberately separate parameters for two separate concerns on the same underlying file.
+    // currentPlanPath is real-path-only (matches this file's existing isFake/!isFake convention, e.g.
+    // PLANNING_TIMEOUT_MS above): under the FAKE fixture harness plan.md is synthesized AFTER the gate
+    // (see the fake-synthesis branch below), so it is never yet on disk during this wait, and the whole
+    // pre-existing fixture suite (A8/A9/A10/A13/POCFIX3/POCFIX8) drives CLEAN lines with no `plan=` at
+    // all — wiring the SHA bind there would fail every one of those already-verified fixtures closed,
+    // not just the ones this row is meant to change. Real plancore genuinely authors plan.md before its
+    // partner can emit a `plan=`-bearing CLEAN, so the bind is live exactly where B5 requires it.
+    const planMdPath = path.join(canonicalArtifactRoot, CANONICAL_CYCLE_ARTIFACTS.plan);
+    const agreed = await this.waitForAgreement(cbPath, batchId, partner, brainRole, effectiveTimeoutMs, agreementFenceOffset, partnerBatchIds, planMdPath, isFake ? undefined : planMdPath);
+
+    const planJsonPath = path.join(runDir, 'plan.json');
+    const reqPath = path.join(canonicalArtifactRoot, CANONICAL_CYCLE_ARTIFACTS.requirements);
+
+    // B6 (AC9): check non-agreement BEFORE any canonical-plan polling/read/ingest. A `false` result
+    // here can mean round-cap exhaustion, a confirmed BROKEN verdict, or (B5) a current-plan-SHA
+    // mismatch — whatever the cause, it is a planning-agreement outcome, not a plan-read outcome, so
+    // it must never fall through into the poll/read block below (which can itself throw a
+    // PLANCORE-DID-NOT-PRODUCE-CANONICAL-PLAN error and mask the real, mechanism-level reason).
+    if (!agreed) {
+      // Gate blocked — do not ingest or hand off.
+      // A6: route through the one terminal owner — reason/state feed runPlanningTerminal(), which the
+      // finally below runs (reap BEFORE finalize, same A5 order as every other exit).
+      terminalReason = 'planning-not-agreed';
+      terminalState = 'reaped';
+      await this.advanceAgreementFence(runDir, batchId, path.join(runDir, 'callbacks.md'));
+      // A11 (R1.6 + D7): a mechanism-level reason naming the missing partner batch id(s) and the
+      // round-cap budget exhausted — never a generic/silent message. Bounded exit, visible BLOCKED
+      // (the caller, RunOrchestratorService, turns this into phase='blocked' + operator notification).
+      const blockedReason = `ROUND-CAP-EXHAUSTED (R1.6/D7): no unanimous CLEAN verdict within ${roundCap} round(s) (~${effectiveTimeoutMs}ms budget); partner batch(es) [${partnerBatchIds.join(', ') || 'none configured'}] never confirmed agreement — bounded exit, never a silent pass.`;
+      return {
+        agreed: false,
+        coPlannerUsed: partner,
+        northStarPath: nsPath,
+        reqPath,
+        planJsonPath,
+        planMdPath,
+        // B6: no canonical-plan read is attempted on the blocked path, so there is no ingested plan
+        // to return — an empty task list, never a stale/partial read of a plan that was not agreed.
+        plan: { tasks: [] },
+        createdTaskIds: [],
+        keyToId: {},
+        runId: 0,
+        blockedReason
+      };
+    }
 
     // Short grace for plancore to flush canonical documents before the PLAN-READY callback is consumed.
     await new Promise((r) => setTimeout(r, 120));
-
-    const planJsonPath = path.join(runDir, 'plan.json');
-    const planMdPath = path.join(canonicalArtifactRoot, CANONICAL_CYCLE_ARTIFACTS.plan);
-    const reqPath = path.join(canonicalArtifactRoot, CANONICAL_CYCLE_ARTIFACTS.requirements);
 
     const readCanonicalPlan = async (): Promise<{ markdown: string; plan: Plan }> => {
       const markdown = await fs.readFile(planMdPath, 'utf8');
@@ -705,32 +750,6 @@ export class PlanningPhaseService {
         const errMsg = `[${batchId}] PLANCORE-DID-NOT-PRODUCE-CANONICAL-PLAN: plancore must write valid ${reqPath} then ${planMdPath} before PLAN-READY. plan.json is Helm-derived and is not an authored fallback. ${(e as Error).message || e}`;
         throw new Error(errMsg);
       }
-    }
-
-    if (!agreed) {
-      // Gate blocked — do not ingest or hand off.
-      // A6: route through the one terminal owner — reason/state feed runPlanningTerminal(), which the
-      // finally below runs (reap BEFORE finalize, same A5 order as every other exit).
-      terminalReason = 'planning-not-agreed';
-      terminalState = 'reaped';
-      await this.advanceAgreementFence(runDir, batchId, path.join(runDir, 'callbacks.md'));
-      // A11 (R1.6 + D7): a mechanism-level reason naming the missing partner batch id(s) and the
-      // round-cap budget exhausted — never a generic/silent message. Bounded exit, visible BLOCKED
-      // (the caller, RunOrchestratorService, turns this into phase='blocked' + operator notification).
-      const blockedReason = `ROUND-CAP-EXHAUSTED (R1.6/D7): no unanimous CLEAN verdict within ${roundCap} round(s) (~${effectiveTimeoutMs}ms budget); partner batch(es) [${partnerBatchIds.join(', ') || 'none configured'}] never confirmed agreement — bounded exit, never a silent pass.`;
-      return {
-        agreed: false,
-        coPlannerUsed: partner,
-        northStarPath: nsPath,
-        reqPath,
-        planJsonPath,
-        planMdPath,
-        plan,
-        createdTaskIds: [],
-        keyToId: {},
-        runId: 0,
-        blockedReason
-      };
     }
 
     // Gate passed: snapshot the one canonical set into runDir for implementation consumers, then
@@ -895,10 +914,17 @@ export class PlanningPhaseService {
   // comments elsewhere claiming otherwise (it is used unchanged by orchestrator-loop.ts, panel-service.ts,
   // waitForFirstCallback below, and run-orchestrator-service.ts's waitForNorthStarReady — broadening it
   // is a wider, separate fix outside this row's scope: "rewrite the partner matcher in waitForAgreement").
-  private parseAgreementCallbackLine(line: string): { role: string; batchId: string; state: string; note: string | null } | null {
-    const match = /^\[(?:helm|projcore) callback\]\s+(\S+)\s+(\S+)\s+STATUS:\s+([A-Z-]+)(?:\s+[—-]\s+(.+))?\s*$/.exec(line);
+  // B3 (AC8): separator class widened from [—-] (em dash/hyphen only) to also accept en dash
+  // and colon — agents use all four forms and a colon/en-dash line previously failed the whole
+  // match, so the seat read as silent instead of failing closed. B3 (AC6 foundation): optional
+  // planSha extracted from the note as additive data (plan-revision.ts's short12); B5 owns
+  // enforcing it against the current plan.md bytes — B3 only parses it out when present.
+  private parseAgreementCallbackLine(line: string): { role: string; batchId: string; state: string; note: string | null; planSha: string | null } | null {
+    const match = /^\[(?:helm|projcore) callback\]\s+(\S+)\s+(\S+)\s+STATUS:\s+([A-Z-]+)(?:\s+[\-—–:]\s+(.+))?\s*$/.exec(line);
     if (!match) return null;
-    return { role: match[1], batchId: match[2], state: match[3], note: match[4] ?? null };
+    const note = match[4] ?? null;
+    const planShaMatch = note ? /\bplan=([0-9a-f]{12})\b/.exec(note) : null;
+    return { role: match[1], batchId: match[2], state: match[3], note, planSha: planShaMatch ? planShaMatch[1] : null };
   }
 
   // A9 send-back (attempt=2): byte-accurate window read (Buffer.subarray, not a char-slice) — callbacks.md
@@ -1034,6 +1060,13 @@ export class PlanningPhaseService {
    * otherwise leave an OLD VERDICT-READY CLEAN for the same partner batch id (or an old PLAN-READY)
    * sitting in the file — same-batch stale, not the different-batch/foreign case R1.5 alone closes. A
    * prior attempt's agreement must never satisfy a later one just because the batch id was reused.
+   * B5 (AC7/AC23): a CLEAN verdict is no longer a bare enum — it must also carry a `plan=<sha12>`
+   * (B3 grammar) matching the CURRENT plan.md bytes (B1's readPlanRevision), re-derived fresh on
+   * EVERY poll pass via `currentPlanPath` (never cached at call-start), so a seat that reviewed an
+   * earlier revision and never re-emits stays excluded even after plancore rewrites plan.md mid-wait.
+   * A CLEAN with no `plan=`, a malformed SHA (B3 already nulls those), or a SHA for a superseded
+   * revision does not count. `currentPlanPath` is additive/optional — omitted (as B3/B4's existing
+   * direct unit tests do) falls back to the pre-B5 bare-enum CLEAN check, byte-identical behaviour.
    */
   private async waitForAgreement(
     cbPath: string,
@@ -1046,7 +1079,13 @@ export class PlanningPhaseService {
     /** Canonical plan.md. When given, a BROKEN verdict is not dispositive until this file exists
      *  and is non-empty — absence means plancore has not authored it yet, so no seat can have
      *  legitimately reviewed it. Omitted by existing callers/fixtures, which keep prior behaviour. */
-    planMdPathForRaceGuard?: string
+    planMdPathForRaceGuard?: string,
+    /** B5: canonical plan.md, read fresh every poll pass to bind each accepted CLEAN to the plan
+     *  revision actually in effect right now. Deliberately a SEPARATE parameter from the race-guard
+     *  path above (that one only ever proves existence for the BROKEN race guard; this one proves
+     *  byte-identity for the CLEAN agreement gate) — additive/optional, omitted by B3/B4's existing
+     *  direct unit tests, which keep their pre-B5 unbound-CLEAN behaviour. */
+    currentPlanPath?: string
   ): Promise<boolean> {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
@@ -1054,7 +1093,15 @@ export class PlanningPhaseService {
         const raw = await this.readCallbacksWindow(cbPath, sinceOffset);
         const lines = raw.split(/\r?\n/).reverse(); // newest first
         let sawPlanReady = false;
-        const verdicts = new Map<string, 'CLEAN' | 'BROKEN'>(); // partnerBatchId -> latest parsed verdict
+        // B5: per-seat evidence is now {verdict, planSha} rather than a bare enum — planSha is the
+        // plan=<sha12> parsed from that seat's own NEWEST VERDICT-READY note (null if absent/malformed).
+        const verdicts = new Map<string, { verdict: 'CLEAN' | 'BROKEN'; planSha: string | null }>(); // partnerBatchId -> latest parsed evidence
+        // B4 (AC8): tracks "have we already resolved this seat's NEWEST VERDICT-READY line", separate
+        // from whether that line parsed to a valid verdict. Set on first encounter (reversed = newest
+        // first) regardless of parse outcome, so a malformed newest line locks the seat out of `verdicts`
+        // for this poll pass instead of letting the scan fall through to an older, stale CLEAN/BROKEN for
+        // the same seat — that fallthrough was the stale-side fail-open this row fixes.
+        const seenNewestVerdict = new Set<string>();
         for (const line of lines) {
           const parsed = this.parseAgreementCallbackLine(line);
           if (!parsed) continue;
@@ -1062,22 +1109,28 @@ export class PlanningPhaseService {
             sawPlanReady = true;
           }
           if (
-            !verdicts.has(parsed.batchId) &&
+            !seenNewestVerdict.has(parsed.batchId) &&
             partnerBatchIds.includes(parsed.batchId) &&
             parsed.state === 'VERDICT-READY' &&
             roleMatches(partnerRole, parsed.role)
           ) {
+            seenNewestVerdict.add(parsed.batchId); // lock this seat to its NEWEST verdict line, parseable or not
             const verdictMatch = /^\s*(CLEAN|BROKEN)\b/i.exec(parsed.note || '');
-            if (verdictMatch) verdicts.set(parsed.batchId, verdictMatch[1].toUpperCase() as 'CLEAN' | 'BROKEN');
+            if (verdictMatch) {
+              verdicts.set(parsed.batchId, { verdict: verdictMatch[1].toUpperCase() as 'CLEAN' | 'BROKEN', planSha: parsed.planSha });
+            }
+            // else: newest line for this seat is malformed/unparseable — fail closed. Leaving `verdicts`
+            // unset for this batchId (rather than falling through to an older line) means the "every
+            // partnerBatchId is CLEAN" pass check below can never be satisfied by stale evidence.
           }
-          if (sawPlanReady && verdicts.size === partnerBatchIds.length) break; // every seat's latest already locked in (reversed scan)
+          if (sawPlanReady && seenNewestVerdict.size === partnerBatchIds.length) break; // every seat's newest line already locked in (reversed scan)
         }
         // R1.4/N11 (unanimous): a confirmed BROKEN from ANY partner fails the gate immediately —
         // dispositive on its own, whether or not PLAN-READY or the other seats' verdicts have arrived
         // yet. It has already arrived and is negative, so there is nothing left to wait for (never
         // byte-identical to a silent CLEAN pass, and never forced to burn the full 10min production
         // timeout to reach the same conclusion).
-        if ([...verdicts.values()].some((v) => v === 'BROKEN')) {
+        if ([...verdicts.values()].some((v) => v.verdict === 'BROKEN')) {
           // Race guard: a BROKEN cannot be a real plan defect if plan.md does not exist yet. Keep
           // waiting so the (brief-instructed) re-review can supersede it — the reversed scan already
           // takes each seat's LATEST verdict, so a later CLEAN legitimately replaces this one. The
@@ -1092,7 +1145,28 @@ export class PlanningPhaseService {
             }
           }
           if (planPresent) return false;
-        } else if (sawPlanReady && partnerBatchIds.every((id) => verdicts.get(id) === 'CLEAN')) return true;
+        } else if (sawPlanReady) {
+          // B5 (AC7/AC23): re-derive the CURRENT plan.md revision on THIS poll pass — never cached at
+          // call-start — so a plancore rewrite mid-wait (a partner CLEAN'd R1, plan.md is now R2) is
+          // reflected immediately. `currentPlanPath` omitted (B3/B4's direct unit tests) => currentShort12
+          // stays null and the sha check is skipped entirely (pre-B5 bare-enum behaviour, untouched).
+          const currentShort12 = currentPlanPath ? readPlanRevision(currentPlanPath)?.short12 ?? null : null;
+          const allAgreed = partnerBatchIds.every((id) => {
+            const v = verdicts.get(id);
+            if (!v || v.verdict !== 'CLEAN') return false;
+            if (!currentPlanPath) return true; // legacy: no plan revision to bind against
+            // If the current plan is absent/unreadable, this is not a non-convergence outcome: the seats
+            // have signaled agreement, but the canonical plan contract is invalid. Let the caller's
+            // canonical read fail on the thrown path so A6 cleanup/finalization still owns that terminal
+            // class. No stale plan can be handed off because the read below must succeed before ingest.
+            if (currentShort12 === null) return true;
+            // Fail closed: missing plan=, malformed SHA (already null from B3's parser), or a SHA
+            // for a superseded revision (present but !== the live short12) all fall through here —
+            // none of them count as agreement on the plan revision actually in effect right now.
+            return v.planSha !== null && v.planSha === currentShort12;
+          });
+          if (allAgreed) return true;
+        }
       } catch {}
       await new Promise((r) => setTimeout(r, 20));
     }

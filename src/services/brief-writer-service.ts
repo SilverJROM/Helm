@@ -2,6 +2,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { workerFaceRole } from './role-alias.js';
 import { BRAIN_BLOCKER_OWNERS, BRAIN_EDGE_CLASSES, BRAIN_ROUTE_TO, MACHINE_COMPLEXITIES } from './plan-schema.js';
+import { readPlanRevision } from './plan-revision.js';
 import {
   DISCOVERY_READY_ASK,
   DISCOVERY_ROLE,
@@ -438,13 +439,24 @@ Emit exactly:
     implementedDiff?: string;
     projectDir?: string;
     callbacksFile?: string;
+    /** Cycle-workspace override (AC6/AC14); falls back to callbacksFile's directory, then projectDir. */
+    canonicalArtifactRoot?: string;
   }): string {
     const r = params.role || 'panelist';
+    const root = path.resolve(
+      params.canonicalArtifactRoot
+        || (params.callbacksFile ? path.dirname(params.callbacksFile) : undefined)
+        || params.projectDir
+        || '.'
+    );
+    const planMdPath = path.join(root, 'plan.md');
+    const ogReqPath = path.join(root, 'og-requirements.md');
+    const revision = readPlanRevision(planMdPath);
     const base = this.generateBrief({
       batchId: params.batchId,
       role: r,
-      planPath: 'plan.json',
-      runDir: '.',
+      planPath: planMdPath,
+      runDir: root,
       branch: 'main',
       requirementsAssigned: 'PANEL-VERDICT',
       northStarAnchors: params.requirement || 'panel topic',
@@ -454,8 +466,17 @@ Emit exactly:
       callbacksFile: params.callbacksFile || '<abs-path-to-callbacks.md>',
       taskType: 'feature',
     });
+    const revisionLine = revision
+      ? `Expected plan revision: sha256=${revision.sha256} short12=${revision.short12} — your verdict is bound to this exact revision; if the plan.md you read hashes differently, stop and report a revision mismatch instead of reviewing.`
+      : `Expected plan revision: UNAVAILABLE — plan.md is missing or unreadable at spawn time. FAIL CLOSED: do NOT emit a verdict yet; re-read and retry; only emit VERDICT-READY once you can confirm the plan.md you read exists and state the sha256 you computed.`;
     const body = `
 You are ${r} seat ${params.seat} in a ${r === 'red-team' ? 'red-team' : 'deliberation'} panel (verifier ≠ fixer${r === 'red-team' ? ', using PROJECT role_bindings red-team agents' : ''}).
+
+## Canonical plan contract (AC6 / AC14 — do not guess the path)
+Canonical plan.md: ${planMdPath}
+Canonical og-requirements.md: ${ogReqPath}
+${revisionLine}
+
 Topic/Requirement: ${params.requirement || 'see plan'}
 Lens: ${params.lens}
 ${params.implementedDiff ? `Implemented diff under test:\n${params.implementedDiff}\n` : ''}
