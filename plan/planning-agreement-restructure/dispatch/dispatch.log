@@ -101,3 +101,53 @@
 [2026-07-30T00:58:38Z] wakeup-marker created path=/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/A4.wakeup-required wakeup_sec=3600
 [2026-07-30T00:58:38Z] manifest written role_path=/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/A4.implementer.json mirror_path=/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/A4.json
 [2026-07-30T00:59:41Z] ack-wakeup batch=A4 at=2026-07-30T00:59:41Z marker removed
+[2026-07-30T01:34:56Z] start batch=B2 role=implementer session=x-15_impl_sonnet5b2_helm brief=/home/agjrom/websites/Helm/plan/planning-agreement-restructure/prompts/B2.md bucket=SHORT estimate=22min marker=DISPATCH-B2-implementer-2317223-1785375296
+[2026-07-30T01:34:56Z] brief pre-baked path=/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/B2.implementer.brief.md
+[2026-07-30T01:34:56Z] scoped pending manifest written role_path=/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/B2.implementer.json
+[2026-07-30T01:34:56Z] dispatch boundary appended role=implementer batch=B2 marker=DISPATCH-B2-implementer-2317223-1785375296
+[2026-07-30T01:34:59Z] pane verified marker DISPATCH-B2-implementer-2317223-1785375296
+[2026-07-30T01:35:00Z] watcher PID file confirmed self_pid=2318180 launch_pid=2318180 role=implementer
+[2026-07-30T01:35:00Z] watcher launched pid=2318180 role=implementer log=/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/watcher-B2-implementer.log
+[2026-07-30T01:35:00Z] wakeup-marker created path=/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/B2.wakeup-required wakeup_sec=2640
+[2026-07-30T01:35:00Z] manifest written role_path=/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/B2.implementer.json mirror_path=/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/B2.json
+[2026-07-30T01:35:05Z] ack-wakeup batch=B2 at=2026-07-30T01:35:05Z marker removed
+[2026-07-30T01:44:55Z] start batch=B3 role=implementer session=x-15_impl_sonnet5b3_helm brief=/home/agjrom/websites/Helm/plan/planning-agreement-restructure/prompts/B3.md bucket=SHORT estimate=20min marker=DISPATCH-B3-implementer-2335116-1785375895
+[2026-07-30T01:44:55Z] brief pre-baked path=/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/B3.implementer.brief.md
+[2026-07-30T01:44:55Z] scoped pending manifest written role_path=/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/B3.implementer.json
+[2026-07-30T01:44:55Z] dispatch boundary appended role=implementer batch=B3 marker=DISPATCH-B3-implementer-2335116-1785375895
+[2026-07-30T01:44:58Z] pane verified marker DISPATCH-B3-implementer-2335116-1785375895
+[2026-07-30T01:44:58Z] watcher PID file confirmed self_pid=2335295 launch_pid=2335295 role=implementer
+[2026-07-30T01:44:58Z] watcher launched pid=2335295 role=implementer log=/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/watcher-B3-implementer.log
+[2026-07-30T01:44:58Z] wakeup-marker created path=/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/B3.wakeup-required wakeup_sec=2400
+[2026-07-30T01:44:58Z] manifest written role_path=/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/B3.implementer.json mirror_path=/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/B3.json
+[2026-07-30T01:45:03Z] ack-wakeup batch=B3 at=2026-07-30T01:45:03Z marker removed
+[2026-07-30T01:53:29Z] start batch=B4 role=implementer session=x-15_impl_sonnet5b4_helm brief=/home/agjrom/websites/Helm/plan/planning-agreement-restructure/prompts/B4.md bucket=SHORT estimate=26min marker=DISPATCH-B4-implementer-2379601-1785376409
+[2026-07-30T01:53:29Z] brief pre-baked path=/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/B4.implementer.brief.md
+[2026-07-30T01:53:29Z] scoped pending manifest written role_path=/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/B4.implementer.json
+[2026-07-30T01:53:29Z] dispatch boundary appended role=implementer batch=B4 marker=DISPATCH-B4-implementer-2379601-1785376409
+[2026-07-30T01:53:32Z] pane verified marker DISPATCH-B4-implementer-2379601-1785376409
+[2026-07-30T01:53:32Z] watcher PID file confirmed self_pid=2381583 launch_pid=2381583 role=implementer
+[2026-07-30T01:53:32Z] watcher launched pid=2381583 role=implementer log=/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/watcher-B4-implementer.log
+[2026-07-30T01:53:32Z] wakeup-marker created path=/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/B4.wakeup-required wakeup_sec=3120
+[2026-07-30T01:53:32Z] manifest written role_path=/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/B4.implementer.json mirror_path=/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/B4.json
+[2026-07-30T01:53:37Z] ack-wakeup batch=B4 at=2026-07-30T01:53:37Z marker removed
+[2026-07-30T02:03:57Z] start batch=B5 role=implementer session=x-15_impl_sonnet5b5_helm brief=/home/agjrom/websites/Helm/plan/planning-agreement-restructure/prompts/B5.md bucket=SHORT estimate=28min marker=DISPATCH-B5-implementer-2461734-1785377037
+[2026-07-30T02:03:57Z] brief pre-baked path=/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/B5.implementer.brief.md
+[2026-07-30T02:03:57Z] scoped pending manifest written role_path=/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/B5.implementer.json
+[2026-07-30T02:03:57Z] dispatch boundary appended role=implementer batch=B5 marker=DISPATCH-B5-implementer-2461734-1785377037
+[2026-07-30T02:04:00Z] pane verified marker DISPATCH-B5-implementer-2461734-1785377037
+[2026-07-30T02:04:00Z] watcher PID file confirmed self_pid=2463134 launch_pid=2463134 role=implementer
+[2026-07-30T02:04:00Z] watcher launched pid=2463134 role=implementer log=/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/watcher-B5-implementer.log
+[2026-07-30T02:04:00Z] wakeup-marker created path=/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/B5.wakeup-required wakeup_sec=3360
+[2026-07-30T02:04:00Z] manifest written role_path=/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/B5.implementer.json mirror_path=/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/B5.json
+[2026-07-30T02:04:04Z] ack-wakeup batch=B5 at=2026-07-30T02:04:04Z marker removed
+[2026-07-30T02:25:56Z] start batch=B6 role=implementer session=x-15_impl_sonnet5b6_helm brief=/home/agjrom/websites/Helm/plan/planning-agreement-restructure/prompts/B6.md bucket=SHORT estimate=25min marker=DISPATCH-B6-implementer-2515095-1785378356
+[2026-07-30T02:25:56Z] brief pre-baked path=/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/B6.implementer.brief.md
+[2026-07-30T02:25:56Z] scoped pending manifest written role_path=/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/B6.implementer.json
+[2026-07-30T02:25:56Z] dispatch boundary appended role=implementer batch=B6 marker=DISPATCH-B6-implementer-2515095-1785378356
+[2026-07-30T02:25:59Z] pane verified marker DISPATCH-B6-implementer-2515095-1785378356
+[2026-07-30T02:26:00Z] watcher PID file confirmed self_pid=2515493 launch_pid=2515493 role=implementer
+[2026-07-30T02:26:00Z] watcher launched pid=2515493 role=implementer log=/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/watcher-B6-implementer.log
+[2026-07-30T02:26:00Z] wakeup-marker created path=/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/B6.wakeup-required wakeup_sec=3000
+[2026-07-30T02:26:00Z] manifest written role_path=/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/B6.implementer.json mirror_path=/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/B6.json
+[2026-07-30T02:26:08Z] ack-wakeup batch=B6 at=2026-07-30T02:26:08Z marker removed

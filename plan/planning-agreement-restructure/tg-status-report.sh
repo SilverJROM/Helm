@@ -36,11 +36,19 @@ send_tg(){
   token=$(grep -oP '^BOT_TOKEN=\K.*' "$ENVF" 2>/dev/null | tr -d '"')
   chat=$(grep -oP '^AUTHORIZED_USER_ID=\K.*' "$ENVF" 2>/dev/null | tr -d '"')
   [ -z "$token" ] || [ -z "$chat" ] && { log "TG creds missing"; return 1; }
-  code=$(curl -s -m 25 -o /tmp/tg-par-resp.json -w '%{http_code}' \
-    "https://api.telegram.org/bot${token}/sendMessage" \
-    --data-urlencode "chat_id=${chat}" --data-urlencode "text=${text}" \
-    --data-urlencode "disable_notification=true")
-  log "TG -> HTTP $code"; [ "$code" = "200" ]
+  # BUG 8 (12:18 PHT): a transient network outage returned HTTP 000 and the update was silently LOST.
+  # JROM checks TG to know the run is progressing, so a dropped report reads as a dead run. Retry.
+  local try
+  for try in 1 2 3 4 5; do
+    code=$(curl -s -m 25 -o /tmp/tg-par-resp.json -w '%{http_code}' \
+      "https://api.telegram.org/bot${token}/sendMessage" \
+      --data-urlencode "chat_id=${chat}" --data-urlencode "text=${text}" \
+      --data-urlencode "disable_notification=true")
+    [ "$code" = "200" ] && { log "TG -> HTTP 200 (try $try)"; return 0; }
+    log "TG -> HTTP $code (try $try/5) — retrying in $((try*30))s"
+    sleep $((try * 30))
+  done
+  log "TG FAILED after 5 tries (last HTTP $code)"; return 1
 }
 
 collect(){

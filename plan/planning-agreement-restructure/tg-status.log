@@ -3,3 +3,15 @@
 [2026-07-30T08:19:39+08:00] TEST message sent
 [2026-07-30T08:19:51+08:00] cadence START pid=1972265 — every 90min PHT
 [2026-07-30T09:13:37+08:00] cadence START pid=2230251 — every 90min PHT
+[2026-07-30T10:43:37+08:00] facts: effort=planning-agreement-restructure (attempt 3+ at Helm planning) scope=24 slices (P0+P1+P2+D12); D1-D11 deferred by JROM verified=14/24 verified_ids= A0 A1 A2 A3 A4 A5 A6 B1 B2 B3 B4 B5 C1 D12 remaining=10 in_flight=B6 in_flight_running_min=0 next_up=C2 current_phase=P1 fail-closed gate worker_seats_live=1 blocked_count=0 raceguard_pin=3 (must be 3) janitor=0 (must be 0) latest_heartbeat=[hb] 2026-07-30T02:30:39Z B6 formal approval sent after self-reported handshake miss; proceed limited to early non-convergence return and one B6 test. time_now_pht=2026-07-30 10:43 PHT 
+[2026-07-30T10:46:07+08:00] TG -> HTTP 000
+[2026-07-30T10:46:07+08:00] TG send FAILED
+[2026-07-30T10:46:07+08:00] reported verified=14/24 inflight=B6
+[2026-07-30T12:16:07+08:00] facts: effort=planning-agreement-restructure (attempt 3+ at Helm planning) scope=24 slices (P0+P1+P2+D12); D1-D11 deferred by JROM verified=14/24 verified_ids= A0 A1 A2 A3 A4 A5 A6 B1 B2 B3 B4 B5 C1 D12 remaining=10 in_flight=B6 in_flight_running_min=0 next_up=C2 current_phase=P1 fail-closed gate worker_seats_live=1 blocked_count=0 raceguard_pin=3 (must be 3) janitor=0 (must be 0) latest_heartbeat=[hb] 2026-07-30T02:30:39Z B6 formal approval sent after self-reported handshake miss; proceed limited to early non-convergence return and one B6 test. time_now_pht=2026-07-30 12:16 PHT 
+[2026-07-30T12:18:37+08:00] TG -> HTTP 000
+[2026-07-30T12:18:37+08:00] TG send FAILED
+[2026-07-30T12:18:37+08:00] reported verified=14/24 inflight=B6
+[2026-07-30T13:31:42+08:00] facts: effort=planning-agreement-restructure (attempt 3+ at Helm planning) scope=24 slices (P0+P1+P2+D12); D1-D11 deferred by JROM verified=14/24 verified_ids= A0 A1 A2 A3 A4 A5 A6 B1 B2 B3 B4 B5 C1 D12 remaining=10 in_flight=B6 in_flight_running_min=0 next_up=C2 current_phase=P1 fail-closed gate worker_seats_live=0 blocked_count=0 raceguard_pin=3 (must be 3) janitor=0 (must be 0) latest_heartbeat=[hb] 2026-07-30T05:31:31Z B6 stranded by network/API outage; sweeping worker before local failure confirmation and fix-cycle dispatch. time_now_pht=2026-07-30 13:31 PHT 
+[2026-07-30T13:32:27+08:00] TG -> HTTP 200 (try 1)
+[2026-07-30T13:32:27+08:00] reported verified=14/24 inflight=B6
+[2026-07-30T13:32:27+08:00] cadence START pid=2670464 — every 90min PHT

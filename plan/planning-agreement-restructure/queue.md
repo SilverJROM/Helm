@@ -10,8 +10,8 @@
 - [VERIFIED] OVM-008: A4 — Keep failed planning cycles retryable.
 - [VERIFIED] OVM-009: A5 — Reap planning transports before DB finalize.
 - [VERIFIED] OVM-010: A6 — Route planning exits through one transport-first terminal owner.
-- [PENDING] OVM-011: B2 — Put canonical plan paths and expected SHA in panel briefs.
-- [PENDING] OVM-012: B3 — Parse verdict SHA fields fail-closed.
+- [VERIFIED] OVM-011: B2 — Put canonical plan paths and expected SHA in panel briefs.
+- [VERIFIED] OVM-012: B3 — Parse verdict SHA fields fail-closed.
 - [PENDING] OVM-013: B4 — Use newest verdict line only.
 - [PENDING] OVM-014: B5 — Require every CLEAN to match current plan bytes.
 - [PENDING] OVM-015: B6 — Return typed non-convergence instead of throwing.

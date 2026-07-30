@@ -108,3 +108,57 @@ A4 dispatched_at: 2026-07-30T00:58:35Z estimate_min: 32 bucket: SHORT — Keep f
 - 2026-07-30T01:08:58+00:00 [projcore TEARDOWN] killed x-15_impl_sonnet5a5_helm (sweep: idle worker, no keep row)
 - 2026-07-30T01:08:58+00:00 [projcore TEARDOWN] killed x-15_impl_sonnet5a6_helm (sweep: idle worker, no keep row)
 - 2026-07-30T01:08:58+00:00 [projcore TEARDOWN] killed x-15_impl_sparkd12_helm (sweep: idle worker, no keep row)
+B2 dispatched_at: 2026-07-30T01:34:56Z estimate_min: 22 bucket: SHORT — Put canonical plan paths and expected SHA in panel briefs
+[overmind] 2026-07-30T01:35:00+00:00 sync FAIL (best-effort, continuing): r":"Workflow not found","code":"workflow-not-found","message":"Workflow not found.","hint":"Use the workflow_id returned by /register, the canonical run_dir, or re-register before updating tasks."}404
+[overmind] 2026-07-30T01:35:00+00:00 sync FAIL (best-effort, continuing): r":"Workflow not found","code":"workflow-not-found","message":"Workflow not found.","hint":"Use the workflow_id returned by /register, the canonical run_dir, or re-register before updating tasks."}404
+[overmind] 2026-07-30T01:35:00+00:00 sync FAIL (best-effort, continuing): r":"Workflow not found","code":"workflow-not-found","message":"Workflow not found.","hint":"Use the workflow_id returned by /register, the canonical run_dir, or re-register before updating tasks."}404
+[hb] 2026-07-30T01:35:05Z I-P0 authorized/deployed by north; standing rule 6 recorded; B2 dispatched watcher_pid=2318180 session=x-15_impl_sonnet5b2_helm.
+[hb] 2026-07-30T01:36:48Z B2 REVISE-PLAN issued; placeholder PROPOSED remained after source analysis.
+[hb] 2026-07-30T01:39:05Z Approved B2 concrete plan: absolute plan.md/og-requirements.md plus B1 revision in generated panel brief; no importer or PPS edits.
+[hb] 2026-07-30T01:42:55Z ACKed B2 DONE; coordinator verification started.
+[hb] 2026-07-30T01:43:35Z VERIFIED B2; coordinator reran B2 2/2, brief-writer regression sweep 40/40, tsc exit 0, no forbidden-file diff. Auto-drain next: B3.
+- 2026-07-30T01:43:40+00:00 [projcore TEARDOWN] killed x-15_impl_sonnet5b2_helm (sweep: idle worker, no keep row)
+B3 dispatched_at: 2026-07-30T01:44:55Z estimate_min: 20 bucket: SHORT — Parse verdict SHA fields fail-closed foundation
+[overmind] 2026-07-30T01:44:58+00:00 sync FAIL (best-effort, continuing): r":"Workflow not found","code":"workflow-not-found","message":"Workflow not found.","hint":"Use the workflow_id returned by /register, the canonical run_dir, or re-register before updating tasks."}404
+[overmind] 2026-07-30T01:44:58+00:00 sync FAIL (best-effort, continuing): r":"Workflow not found","code":"workflow-not-found","message":"Workflow not found.","hint":"Use the workflow_id returned by /register, the canonical run_dir, or re-register before updating tasks."}404
+[overmind] 2026-07-30T01:44:58+00:00 sync FAIL (best-effort, continuing): r":"Workflow not found","code":"workflow-not-found","message":"Workflow not found.","hint":"Use the workflow_id returned by /register, the canonical run_dir, or re-register before updating tasks."}404
+[hb] 2026-07-30T01:45:03Z B3 dispatched watcher_pid=2335295 session=x-15_impl_sonnet5b3_helm; PPS serial chain started.
+[hb] 2026-07-30T01:47:21Z B3 concrete PROPOSED helper rejected note length; requested concise PROPOSED callback.
+[hb] 2026-07-30T01:48:04Z Approved B3 concrete plan: widen verdict separators and extract optional planSha; no gate acceptance semantics change.
+[hb] 2026-07-30T01:52:40Z ACKed B3 DONE; coordinator verification started.
+[hb] 2026-07-30T01:53:02Z VERIFIED B3; coordinator reran parser test 12/12, raceguard=3, tsc exit 0. Auto-drain next: B4.
+- 2026-07-30T01:53:02+00:00 [projcore TEARDOWN] killed x-15_impl_sonnet5b3_helm (sweep: idle worker, no keep row)
+B4 dispatched_at: 2026-07-30T01:53:29Z estimate_min: 26 bucket: SHORT — Use newest verdict line only
+[overmind] 2026-07-30T01:53:32+00:00 sync FAIL (best-effort, continuing): r":"Workflow not found","code":"workflow-not-found","message":"Workflow not found.","hint":"Use the workflow_id returned by /register, the canonical run_dir, or re-register before updating tasks."}404
+[overmind] 2026-07-30T01:53:32+00:00 sync FAIL (best-effort, continuing): r":"Workflow not found","code":"workflow-not-found","message":"Workflow not found.","hint":"Use the workflow_id returned by /register, the canonical run_dir, or re-register before updating tasks."}404
+[overmind] 2026-07-30T01:53:32+00:00 sync FAIL (best-effort, continuing): r":"Workflow not found","code":"workflow-not-found","message":"Workflow not found.","hint":"Use the workflow_id returned by /register, the canonical run_dir, or re-register before updating tasks."}404
+[hb] 2026-07-30T01:53:37Z B4 dispatched watcher_pid=2381583 session=x-15_impl_sonnet5b4_helm; PPS serial continues.
+[hb] 2026-07-30T01:55:54Z B4 REVISE-PLAN issued; placeholder PROPOSED remained after source analysis.
+[hb] 2026-07-30T01:56:54Z Approved B4 concrete plan: seenNewestVerdict blocks fallback to older CLEAN; no planSha enforcement change.
+[hb] 2026-07-30T02:01:55Z ACKed B4 DONE; coordinator verification started.
+[hb] 2026-07-30T02:03:34Z VERIFIED B4; coordinator reran B4 4/4, A0/A5/A6+B1/B2/B3/B4 37/37, planning-phase-service 31/31, raceguard=3, tsc exit 0. Auto-drain next: B5.
+- 2026-07-30T02:03:44+00:00 [projcore TEARDOWN] killed x-15_impl_sonnet5b4_helm (sweep: idle worker, no keep row)
+- 2026-07-30T02:03:48Z [projcore TEARDOWN] swept B4 worker: swept=1 kept=0 refused=0 already-gone=0.
+B5 dispatched_at: 2026-07-30T02:03:57Z estimate_min: 28 bucket: SHORT — Require every CLEAN to match current plan bytes
+[overmind] 2026-07-30T02:04:00+00:00 sync FAIL (best-effort, continuing): r":"Workflow not found","code":"workflow-not-found","message":"Workflow not found.","hint":"Use the workflow_id returned by /register, the canonical run_dir, or re-register before updating tasks."}404
+[overmind] 2026-07-30T02:04:01+00:00 sync FAIL (best-effort, continuing): r":"Workflow not found","code":"workflow-not-found","message":"Workflow not found.","hint":"Use the workflow_id returned by /register, the canonical run_dir, or re-register before updating tasks."}404
+[overmind] 2026-07-30T02:04:01+00:00 sync FAIL (best-effort, continuing): r":"Workflow not found","code":"workflow-not-found","message":"Workflow not found.","hint":"Use the workflow_id returned by /register, the canonical run_dir, or re-register before updating tasks."}404
+[hb] 2026-07-30T02:04:08Z B5 dispatched watcher_pid=2463134 session=x-15_impl_sonnet5b5_helm; current-plan SHA binding slice started.
+[hb] 2026-07-30T02:06:11Z B5 REVISE-PLAN issued; awaiting concrete SHA-binding plan or BLOCKED before code.
+[hb] 2026-07-30T02:08:14Z Approved B5 concrete plan: live readPlanRevision short12, per-seat {verdict,planSha}, CLEAN requires current short12, BROKEN unchanged, production call wired with canonical plan.md.
+[hb] 2026-07-30T02:12:21Z NORTH STOP received: halted coordinator action; no further dispatch, no B5 verification, B5 worker left running for north diagnosis.
+[hb] 2026-07-30T02:20:14Z B5 NEEDS-INFO answered: existing fixture edit refused as out-of-scope; requested restored source diff and terminal DONE/BLOCKED with B5 dedicated proof.
+[hb] 2026-07-30T02:24:58Z ACKed B5 DONE; settling worker before coordinator validation to avoid torn reads.
+- 2026-07-30T02:24:58+00:00 [projcore TEARDOWN] killed x-15_impl_sonnet5b5_helm (sweep: idle worker, no keep row)
+[hb] 2026-07-30T02:25:32Z VERIFIED B5; coordinator reran B5 4/4, A0/A5/A6+B1/B2/B3/B4/B5 41/41, tsc exit 0, settled diff scoped. Auto-drain next: B6.
+B6 dispatched_at: 2026-07-30T02:25:56Z estimate_min: 25 bucket: SHORT — Return typed blocked reason on non-convergence
+[overmind] 2026-07-30T02:26:00+00:00 sync FAIL (best-effort, continuing): r":"Workflow not found","code":"workflow-not-found","message":"Workflow not found.","hint":"Use the workflow_id returned by /register, the canonical run_dir, or re-register before updating tasks."}404
+[overmind] 2026-07-30T02:26:00+00:00 sync FAIL (best-effort, continuing): r":"Workflow not found","code":"workflow-not-found","message":"Workflow not found.","hint":"Use the workflow_id returned by /register, the canonical run_dir, or re-register before updating tasks."}404
+[overmind] 2026-07-30T02:26:00+00:00 sync FAIL (best-effort, continuing): r":"Workflow not found","code":"workflow-not-found","message":"Workflow not found.","hint":"Use the workflow_id returned by /register, the canonical run_dir, or re-register before updating tasks."}404
+[hb] 2026-07-30T02:26:08Z B6 dispatched watcher_pid=2515493 session=x-15_impl_sonnet5b6_helm; final P1 PPS slice started.
+[hb] 2026-07-30T02:29:21Z B6 protocol defect recorded: worker edited before approval; observed plan approved narrowly for early !agreed return before canonical read.
+[hb] 2026-07-30T02:30:39Z B6 formal approval sent after self-reported handshake miss; proceed limited to early non-convergence return and one B6 test.
+[hb] 2026-07-30T05:31:31Z B6 stranded by network/API outage; sweeping worker before local failure confirmation and fix-cycle dispatch.
+- 2026-07-30T05:31:31+00:00 [projcore TEARDOWN] killed x-15_impl_sonnet5b6_helm (sweep: idle worker, no keep row)
+[hb] 2026-07-30T05:37:14Z VERIFIED B6 fix cycle; B6 3/3, boundary 44/44, tsc exit 0, raceguard=3. HALT at I-P1 for north deploy authorization.
+[hb] 2026-07-30T05:38:12Z Resumed after outage; confirmed B6 VERIFIED record, artifacts, rule-6 gate 44/44, tsc 0, raceguard=3. Still halted at I-P1 for north.
