@@ -1,0 +1,22 @@
+{
+  "schema_version": 4,
+  "dispatch_status": "ready",
+  "batch_id": "A0",
+  "role": "implementer",
+  "run_dir": "/home/agjrom/websites/Helm/plan/planning-agreement-restructure",
+  "session": "x-15_impl_grok45a0_helm",
+  "brief": "/home/agjrom/websites/Helm/plan/planning-agreement-restructure/prompts/A0.md",
+  "prebaked_brief": "/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/A0.implementer.brief.md",
+  "callbacks_file": "/home/agjrom/websites/Helm/plan/planning-agreement-restructure/callbacks.md",
+  "dispatched_at": "2026-07-30T00:21:22Z",
+  "estimate_min": 20,
+  "bucket": "SHORT",
+  "wakeup_delay_sec": 2400,
+  "wakeup_marker_path": "/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/A0.wakeup-required",
+  "watcher_pid": 1976948,
+  "watcher_pid_file": "/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/A0.watcher-implementer.pid",
+  "watcher_log": "/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/watcher-A0-implementer.log",
+  "dispatch_marker": "DISPATCH-A0-implementer-1976118-1785370882",
+  "wakeup_acked_at": null,
+  "wakeup_acked_by": null
+}

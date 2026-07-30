@@ -1,0 +1,1 @@
+FAIL wakeup-required marker not present for A2 (already acked, or no active dispatch)

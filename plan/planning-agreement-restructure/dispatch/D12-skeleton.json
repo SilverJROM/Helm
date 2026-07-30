@@ -1,0 +1,22 @@
+{
+  "schema_version": 4,
+  "dispatch_status": "ready",
+  "batch_id": "D12-skeleton",
+  "role": "implementer",
+  "run_dir": "/home/agjrom/websites/Helm/plan/planning-agreement-restructure",
+  "session": "x-15_impl_sparkd12_helm",
+  "brief": "/home/agjrom/websites/Helm/plan/planning-agreement-restructure/prompts/D12-skeleton.md",
+  "prebaked_brief": "/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/D12-skeleton.implementer.brief.md",
+  "callbacks_file": "/home/agjrom/websites/Helm/plan/planning-agreement-restructure/callbacks.md",
+  "dispatched_at": "2026-07-30T00:21:22Z",
+  "estimate_min": 25,
+  "bucket": "SHORT",
+  "wakeup_delay_sec": 3000,
+  "wakeup_marker_path": "/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/D12-skeleton.wakeup-required",
+  "watcher_pid": 1977076,
+  "watcher_pid_file": "/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/D12-skeleton.watcher-implementer.pid",
+  "watcher_log": "/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/watcher-D12-skeleton-implementer.log",
+  "dispatch_marker": "DISPATCH-D12-skeleton-implementer-1976337-1785370882",
+  "wakeup_acked_at": "2026-07-30T00:21:38Z",
+  "wakeup_acked_by": "projcore"
+}

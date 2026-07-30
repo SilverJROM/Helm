@@ -1,0 +1,22 @@
+{
+  "schema_version": 4,
+  "dispatch_status": "ready",
+  "batch_id": "B1",
+  "role": "implementer",
+  "run_dir": "/home/agjrom/websites/Helm/plan/planning-agreement-restructure",
+  "session": "x-15_impl_grok45b1_helm",
+  "brief": "/home/agjrom/websites/Helm/plan/planning-agreement-restructure/prompts/B1.md",
+  "prebaked_brief": "/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/B1.implementer.brief.md",
+  "callbacks_file": "/home/agjrom/websites/Helm/plan/planning-agreement-restructure/callbacks.md",
+  "dispatched_at": "2026-07-30T00:21:22Z",
+  "estimate_min": 15,
+  "bucket": "SHORT",
+  "wakeup_delay_sec": 1800,
+  "wakeup_marker_path": "/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/B1.wakeup-required",
+  "watcher_pid": 1976950,
+  "watcher_pid_file": "/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/B1.watcher-implementer.pid",
+  "watcher_log": "/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/watcher-B1-implementer.log",
+  "dispatch_marker": "DISPATCH-B1-implementer-1976120-1785370882",
+  "wakeup_acked_at": "2026-07-30T00:21:38Z",
+  "wakeup_acked_by": "projcore"
+}

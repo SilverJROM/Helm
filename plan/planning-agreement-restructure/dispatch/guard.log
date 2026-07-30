@@ -1,0 +1,69 @@
+2026-07-30T00:12:27+00:00 REFUSE op=send target=__nonexistent__ reason=no session with this exact name is alive
+2026-07-30T00:21:00+00:00 SPAWNED x-15_impl_grok45a0_helm role=implementer batch=A0
+2026-07-30T00:21:00+00:00 SPAWNED x-15_impl_grok45b1_helm role=implementer batch=B1
+2026-07-30T00:21:00+00:00 SPAWNED x-15_impl_sparkd12_helm role=implementer batch=D12-skeleton
+2026-07-30T00:21:00+00:00 SPAWNED x-15_impl_grok45c1_helm role=implementer batch=C1
+2026-07-30T00:21:22+00:00 ALLOW  op=send target=x-15_impl_grok45a0_helm
+2026-07-30T00:21:22+00:00 ALLOW  op=send target=x-15_impl_grok45b1_helm
+2026-07-30T00:21:22+00:00 ALLOW  op=send target=x-15_impl_grok45c1_helm
+2026-07-30T00:21:22+00:00 ALLOW  op=send target=x-15_impl_sparkd12_helm
+2026-07-30T00:22:24+00:00 ALLOW  op=send target=x-15_impl_grok45a0_helm
+2026-07-30T00:22:24+00:00 ALLOW  op=send target=x-15_impl_grok45b1_helm
+2026-07-30T00:22:24+00:00 ALLOW  op=send target=x-15_impl_sparkd12_helm
+2026-07-30T00:22:52+00:00 ALLOW  op=send target=x-15_impl_grok45a0_helm
+2026-07-30T00:22:52+00:00 ALLOW  op=send target=x-15_impl_grok45b1_helm
+2026-07-30T00:22:52+00:00 ALLOW  op=send target=x-15_impl_sparkd12_helm
+2026-07-30T00:23:07+00:00 ALLOW  op=send target=x-15_impl_sparkd12_helm
+2026-07-30T00:23:19+00:00 ALLOW  op=send target=x-15_impl_grok45c1_helm
+2026-07-30T00:25:56+00:00 SPAWNED x-15_impl_sonnet5a1_helm role=implementer batch=A1
+2026-07-30T00:25:56+00:00 SPAWNED x-15_impl_sonnet5a5_helm role=implementer batch=A5
+2026-07-30T00:26:03+00:00 ALLOW  op=send target=x-15_impl_sonnet5a1_helm
+2026-07-30T00:26:03+00:00 ALLOW  op=send target=x-15_impl_sonnet5a5_helm
+2026-07-30T00:28:36+00:00 ALLOW  op=send target=x-15_impl_sonnet5a1_helm
+2026-07-30T00:28:36+00:00 ALLOW  op=send target=x-15_impl_sonnet5a5_helm
+2026-07-30T00:29:04+00:00 ALLOW  op=send target=x-15_impl_sonnet5a5_helm
+2026-07-30T00:29:04+00:00 ALLOW  op=send target=x-15_impl_sonnet5a1_helm
+2026-07-30T00:29:46+00:00 ALLOW  op=send target=x-15_impl_sonnet5a1_helm
+2026-07-30T00:29:46+00:00 ALLOW  op=send target=x-15_impl_sonnet5a5_helm
+2026-07-30T00:30:18+00:00 ALLOW  op=send target=x-15_impl_sonnet5a5_helm
+2026-07-30T00:30:18+00:00 ALLOW  op=send target=x-15_impl_sonnet5a1_helm
+2026-07-30T00:30:25+00:00 ALLOW  op=send target=x-15_impl_sonnet5a5_helm
+2026-07-30T00:30:48+00:00 ALLOW  op=send target=x-15_impl_sonnet5a5_helm
+2026-07-30T00:37:36+00:00 REFUSE op=send target=x-15_impl_sonnet5a6_helm reason=ownership: target is not in this run's dispatch/spawned_sessions.txt (only self-spawned sessions may be touched)
+2026-07-30T00:37:43+00:00 ALLOW  op=send target=x-15_impl_sonnet5a6_helm
+2026-07-30T00:40:21+00:00 ALLOW  op=send target=x-15_impl_sonnet5a6_helm
+2026-07-30T00:40:51+00:00 ALLOW  op=send target=x-15_impl_sonnet5a2_helm
+2026-07-30T00:41:09+00:00 ALLOW  op=send target=x-15_impl_sonnet5a6_helm
+2026-07-30T00:42:31+00:00 ALLOW  op=send target=x-15_impl_sonnet5a6_helm
+2026-07-30T00:43:15+00:00 ALLOW  op=send target=x-15_impl_sonnet5a6_helm
+2026-07-30T00:43:53+00:00 ALLOW  op=send target=x-15_impl_sonnet5a6_helm
+2026-07-30T00:43:53+00:00 ALLOW  op=send target=x-15_impl_sonnet5a2_helm
+2026-07-30T00:44:51+00:00 ALLOW  op=send target=x-15_impl_sonnet5a6_helm
+2026-07-30T00:44:51+00:00 ALLOW  op=send target=x-15_impl_sonnet5a2_helm
+2026-07-30T00:45:23+00:00 ALLOW  op=send target=x-15_impl_sonnet5a6_helm
+2026-07-30T00:46:10+00:00 ALLOW  op=send target=x-15_impl_sonnet5a2_helm
+2026-07-30T00:46:53+00:00 ALLOW  op=send target=x-15_impl_sonnet5a2_helm
+2026-07-30T00:51:12+00:00 ALLOW  op=send target=x-15_impl_sonnet5a2_helm
+2026-07-30T00:53:57+00:00 ALLOW  op=send target=x-15_impl_sonnet5a2_helm
+2026-07-30T00:54:48+00:00 ALLOW  op=send target=x-15_impl_sonnet5a2_helm
+2026-07-30T00:58:35+00:00 ALLOW  op=send target=x-15_impl_sonnet5a2_helm
+2026-07-30T01:00:56+00:00 ALLOW  op=send target=x-15_impl_sonnet5a2_helm
+2026-07-30T01:02:05+00:00 ALLOW  op=send target=x-15_impl_sonnet5a2_helm
+2026-07-30T01:03:19+00:00 ALLOW  op=send target=x-15_impl_sonnet5a2_helm
+2026-07-30T01:03:41+00:00 ALLOW  op=send target=x-15_impl_sonnet5a2_helm
+2026-07-30T01:08:58+00:00 ALLOW  op=kill target=x-15_impl_grok45a0_helm
+2026-07-30T01:08:58+00:00 KILLED x-15_impl_grok45a0_helm reason=sweep: idle worker, no keep row
+2026-07-30T01:08:58+00:00 ALLOW  op=kill target=x-15_impl_grok45b1_helm
+2026-07-30T01:08:58+00:00 KILLED x-15_impl_grok45b1_helm reason=sweep: idle worker, no keep row
+2026-07-30T01:08:58+00:00 ALLOW  op=kill target=x-15_impl_grok45c1_helm
+2026-07-30T01:08:58+00:00 KILLED x-15_impl_grok45c1_helm reason=sweep: idle worker, no keep row
+2026-07-30T01:08:58+00:00 ALLOW  op=kill target=x-15_impl_sonnet5a1_helm
+2026-07-30T01:08:58+00:00 KILLED x-15_impl_sonnet5a1_helm reason=sweep: idle worker, no keep row
+2026-07-30T01:08:58+00:00 ALLOW  op=kill target=x-15_impl_sonnet5a2_helm
+2026-07-30T01:08:58+00:00 KILLED x-15_impl_sonnet5a2_helm reason=sweep: idle worker, no keep row
+2026-07-30T01:08:58+00:00 ALLOW  op=kill target=x-15_impl_sonnet5a5_helm
+2026-07-30T01:08:58+00:00 KILLED x-15_impl_sonnet5a5_helm reason=sweep: idle worker, no keep row
+2026-07-30T01:08:58+00:00 ALLOW  op=kill target=x-15_impl_sonnet5a6_helm
+2026-07-30T01:08:58+00:00 KILLED x-15_impl_sonnet5a6_helm reason=sweep: idle worker, no keep row
+2026-07-30T01:08:58+00:00 ALLOW  op=kill target=x-15_impl_sparkd12_helm
+2026-07-30T01:08:58+00:00 KILLED x-15_impl_sparkd12_helm reason=sweep: idle worker, no keep row

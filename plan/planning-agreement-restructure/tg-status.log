@@ -1,0 +1,5 @@
+[2026-07-30T08:17:08+08:00] cadence START pid=1966693 — every 90min PHT
+[2026-07-30T08:19:39+08:00] TG -> HTTP 200
+[2026-07-30T08:19:39+08:00] TEST message sent
+[2026-07-30T08:19:51+08:00] cadence START pid=1972265 — every 90min PHT
+[2026-07-30T09:13:37+08:00] cadence START pid=2230251 — every 90min PHT
