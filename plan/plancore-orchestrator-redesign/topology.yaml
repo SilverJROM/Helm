@@ -14,11 +14,21 @@ revision: 1
 # reviewed and accepted this trade-off for the prior effort ("its fine i like my topology"). Not
 # re-litigated here.
 #
-# NOT TILLER on this run. wflow fixed both gaps from the 2026-07-30 handover (self-park on own
-# bookkeeping across all 6 sites; unbounded watcher lifetime, 3 exit conditions) — real progress — but
-# no clean attended HELM run has proven it yet, and this effort touches the planning-agreement subsystem
-# even more centrally than the last one (who authors/agrees the plan, not just the gate around it).
-# north -> projcore, the proven path, same as planning-agreement-restructure.
+# REVISED 2026-08-01, JROM: "if we can use tiller as well i prefer that". [north] verified BOTH gaps
+# from the 2026-07-30 handover are genuinely fixed IN CODE (not just claimed): Gap 1 —
+# projcore-driver.py's `_is_coordination_path`/`_product_tracked_dirt` now separates the conductor's own
+# bookkeeping from real product dirt, cited "GAP 1 (north/helm-97 2026-07-30)" at the fix site. Gap 2 —
+# tiller-escalation-watch.sh has three real, tested exit conditions (TILLER-EXIT.json present / no live
+# driver+no open RAISE / max-lifetime backstop), cited "GAP 2 (north/helm-97 2026-07-30)".
+# TILLER-USAGE.md §7 states MY OWN bar back verbatim, unmet until now: "the format contract satisfied,
+# plus one clean attended run on real slices." THIS RUN IS THAT PROOF RUN — attended (north gates every
+# phase boundary, same discipline as projcore got), independent validator tier UNCHANGED (codex55 L1/L2,
+# opus5 L3 — never the driver's own gate), on real work, not a throwaway. Tiller "holds no model and
+# makes no plan" — the effort_planning_team below still authors plan.md exactly as before; Tiller only
+# replaces the coordinator role that DRAINS the already-agreed plan.
+# Tiller's own spec, quoted in its usage doc: "THIS IS NOT FOOLPROOFING" — the safety net is the
+# independent validator + operator oversight, not drive_gate. That mitigation is preserved unchanged
+# below; nothing about the validator tier moved.
 #
 # IMPORTANT SCOPE NOTE: this topology governs HOW HELM ITSELF IS BUILT for this effort (the meta-level:
 # who plans/implements/validates the redesign). Do NOT confuse `co_planners` below (Helm's own in-run
@@ -39,8 +49,14 @@ co_planners:                                 # Helm's own in-run co-planning pai
   - { id: B, model: sol,     launch: "codex -m gpt-5.6-sol -c model_reasoning_effort=\"xhigh\" --dangerously-bypass-approvals-and-sandbox" }
 
 coordinator:
-  primary: { model: codex55, launch: "codex -m gpt-5.5 --dangerously-bypass-approvals-and-sandbox" }
-  backup:  { model: grok45,  launch: "grok --always-approve -m grok-4.5" }
+  primary: { engine: tiller, launch: "/home/agjrom/websites/wflow/tokenless_coord/shadow-harness/tiller --run-dir <run-dir>" }
+  # Tiller is a deterministic Python drain loop (no model, no planning) — see TILLER-USAGE.md. It
+  # dispatches implementer -> waits for commit -> dispatches independent validator -> fail-closed gate
+  # on the verdict -> advances the queue. It structurally cannot park (no LLM turn to end).
+  backup:  { model: codex55, launch: "codex -m gpt-5.5 --dangerously-bypass-approvals-and-sandbox" }
+  # Backup is the ORIGINAL primary (codex55/projcore) — if Tiller's driver crashes or the format
+  # contract proves unworkable mid-run, fall back to the proven path, not to grok45 (which is also
+  # implementer L2 and must not coordinate its own work).
 
 implementer:
   L1: { model: spark,   launch: "codex -m gpt-5.3-codex-spark --dangerously-bypass-approvals-and-sandbox" }
@@ -100,3 +116,20 @@ routing_notes:
     generatePanelBrief callers; treat it as standing practice for every citation in this document.
 
   base_commit: 93d7cd7                       # planning-agreement-restructure I-P2, deployed; not merged to main
+
+  tiller_operating_notes: >
+    ATTENDED MODE, per TILLER-USAGE.md §7 — [north] gates every phase boundary exactly as it did for
+    codex55/projcore, reading dispatch/escalations/ and dispatch/TILLER-EXIT.json rather than a chat
+    pane. Not left to run unsupervised for hours.
+    PLAN FORMAT IS THE CONTRACT: the synthesized plan.md must be Tiller's EXACT 11-column table
+    (id|scope|acs|tests|est_min|deps|impl_tier|val_tier|deliberation|redteam|budget) with the `tests`
+    column carrying a LITERAL runnable command per row (Tiller runs exactly that string; a narrative
+    description is not acceptable here, unlike the looser convention used for codex55/projcore runs).
+    Every vitest command in `tests` MUST include `--minWorkers=1 --maxWorkers=4` — uncapped vitest OOMs
+    the box and kills every tmux session, including live ones. [north] verifies each `tests` command
+    actually runs before handing plan.md to Tiller, not after.
+    queue.md is bullets, not a table (Tiller's format, distinct from plan.md).
+    THIS IS TILLER'S FIRST HELM RUN since the 2026-07-30 gap fixes and its first Helm run ever besides
+    2026-07-15's run 9715. Treat early slices as the proof, not a formality — if the format contract or
+    the drain loop misbehaves in a way the backup (codex55) would not have, escalate and consider
+    reverting to backup rather than pushing through.
