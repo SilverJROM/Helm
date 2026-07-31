@@ -1,0 +1,3 @@
+[2026-08-01T07:10:09+08:00] TG -> HTTP 200 (try 1)
+[2026-08-01T07:10:09+08:00] TEST message sent
+[2026-08-01T07:10:13+08:00] cadence START pid=1280200 — every 90min PHT
