@@ -288,7 +288,7 @@ End your reply with \`STATUS: <STATE> — <same short note>\`. The callbacks.md 
       requirementsAssigned: 'PLANNING-PHASE',
       northStarAnchors: params.northStar || '',
       // A12 / R1.7: scope must match post-A8–A11 engine (no "convene/iterate until agreement" open loop).
-      scope: `Planning phase (R-D1/D2/D4/H2 + D6/D7 LOCKED): author og-requirements.md then plan.md in helm-algo-digestible per-task schema; helm-algo spawns co-planners and runs one whole-plan agreement gate (planning_round_cap=${planningRoundCap}); emit PLAN-READY only after both artifacts written and whole-plan agreement holds. First tool call: callbacks.md append (Helm-native shell append to callbacks.md).`,
+      scope: `Planning phase (R-D1/D2/D4/H2 + D6/D7 LOCKED): author og-requirements.md then plan.md in helm-algo-digestible per-task schema; emit PLAN-READY once both artifacts are written and readable — this signals the artifacts are ready for engine review, not that agreement has been reached. helm-algo then spawns co-planners and runs the one whole-plan agreement gate itself (planning_round_cap=${planningRoundCap}); only the engine declares agreement and grants ingest permission. First tool call: callbacks.md append (Helm-native shell append to callbacks.md).`,
       requirementsSection: params.northStar || 'planning requirements from north-star.md',
       projectDir: params.projectDir || '/home/agjrom/TGBOTS/Helm',
       callbacksFile: params.callbacksFile || '<abs-path-to-callbacks.md>',
@@ -331,19 +331,19 @@ IMPORTANT: the north-star INTERVIEW IS COMPLETE. Do NOT ask the operator any que
 
 **5. Co-planner agreement (D6 + D7 LOCKED — engine-owned; do not invent a parallel loop)** —
   - **helm-algo spawns co-planner seats** (default 2; project panel size may be 1/2/3/N). You do **NOT** spawn, convene, or reap partners yourself.
-  - **Agreement scope is whole-plan (D6):** the pair debates and agrees **once** for the plan as a whole → **one PLAN-READY gate**. Do **NOT** run a per-task convene loop.
+  - **Agreement scope is whole-plan (D6):** using your PLAN-READY artifacts as the review input, the pair debates and agrees **once** for the plan as a whole → **one engine-run agreement gate**. Do **NOT** run a per-task convene loop.
   - **Per-task machine verdicts** \`ACCEPT | AMEND | ESCALATE\` are retained on the plan (free tags for the engine). Conflict-only reconvene (ESCALATE or conflicting AMEND) is **engine policy** — helm-algo may re-engage seats; you do not drive that loop.
   - **Round cap (D7):** agreement is bounded by **planning_round_cap=${planningRoundCap}** (from project config \`projects.planning_round_cap\`, default 3). Exhausting the cap without unanimous CLEAN agreement is a **visible BLOCKED** state escalated to the operator — **never a silent pass**. Do not run an unbounded agreement loop.
-  - Your job: author artifacts, respond to partner review when the engine presents it, then emit PLAN-READY when whole-plan agreement holds and both docs are on disk.
+  - **Your job ends at artifact readiness:** author og-requirements.md + plan.md, then emit PLAN-READY once both are written and readable. PLAN-READY means the artifacts are ready for engine review, not that agreement has been reached — you do NOT wait for or declare whole-plan agreement yourself. Only the engine judges agreement and grants ingest permission.
 
 **6. TASK RULE** — Every task MUST be a concrete code change with a specific deliverable. Do NOT create standalone "run the test suite" / "regression gate" / "final verification" / "confirm no regressions" tasks: Helm's validator ALREADY runs the FULL test suite (deterministic test-gate) after EVERY task and blocks advancement on any failure, so a dedicated test-run task is redundant, has no code deliverable, and will fail. If you want a final end-to-end capstone, make it a concrete task that ADDS an e2e test or feature wiring — never a bare "run tests" step.
 
-**7. Artifact verification + PLAN-READY** — Verify both og-requirements.md and plan.md are written; read back plan.md and confirm the fenced JSON parses. Emit PLAN-READY only after **whole-plan** co-planner agreement (engine gate) AND both artifact writes succeed. A BROKEN/negative partner verdict fails the gate — do not force PLAN-READY past it.
+**7. Artifact verification + PLAN-READY** — Verify both og-requirements.md and plan.md are written; read back plan.md and confirm the fenced JSON parses. Emit PLAN-READY as soon as both artifact writes succeed and the JSON parses — PLAN-READY means the artifacts are ready for engine review, not that agreement has been reached. Do NOT wait for, judge, or declare co-planner/whole-plan agreement yourself: the engine runs partner review and the whole-plan agreement gate, and only the engine grants ingest permission.
 
 **8. First tool call every reply:** the callbacks.md append (via the shell append below per streaming mandate).
 
 Emit exactly:
-[helm callback] helm_pm ${params.batchId} STATUS: PLAN-READY — plan agreed with ${params.mode || 'planner'}; see og-requirements.md + plan.md
+[helm callback] helm_pm ${params.batchId} STATUS: PLAN-READY — artifacts ready for engine review: og-requirements.md + plan.md written
 
 CRITICAL — AFTER emitting PLAN-READY, STOP COMPLETELY. Do NOT implement, do NOT explore the codebase, do NOT write or edit any code, do NOT spawn sub-agents, do NOT continue working. Helm's orchestration ALGORITHM (not you) drives ALL implementation from here — it dispatches the implementer and validator and advances the queue itself. You are the on-demand BRAIN: Helm re-invokes you (a fresh call) ONLY when it needs a decision. Your planning job ends the instant og-requirements.md + plan.md are written and PLAN-READY is emitted. Emit PLAN-READY and then idle/await — continuing past PLAN-READY is a contract violation that corrupts the run.
 `;

@@ -9,8 +9,17 @@ import { PlanningPhaseService } from './planning-phase-service.js';
 import { RunArtifactService } from './run-artifact-service.js';
 import { TaskQueueService } from './task-queue-service.js';
 import { DatabaseService } from '../db/database.js';
+import { planRevision } from './plan-revision.js';
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+async function waitFor(condition: () => boolean, timeoutMs = 1500): Promise<void> {
+  const start = Date.now();
+  while (!condition()) {
+    if (Date.now() - start > timeoutMs) throw new Error('timed out waiting for A6 fixture condition');
+    await sleep(10);
+  }
+}
 
 /**
  * A6 (AC5/AC23): every planning terminal exit — success, blocked, AND thrown — must reap the retained
@@ -21,9 +30,11 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
  * 'running' forever — the "single-brain-only cleanup asymmetry" this batch deletes.
  *
  * This forces exactly that thrown exit: USE_FAKE_TMUX is flipped off for the runPlanningPhase call
- * itself (real, non-fixture branch) while plan.md/og-requirements.md are deliberately never written, so
- * the canonical-plan read must fail and the method must throw PLANCORE-DID-NOT-PRODUCE-CANONICAL-PLAN —
- * AFTER the partner seat has already been spawned. Ordering is proven the same way A5 proved it:
+ * itself (real, non-fixture branch), valid canonical artifacts are published so C3 can spawn the
+ * reviewer, and the reviewer emits a B5-valid CLEAN bound to the current plan.md bytes. The
+ * requirements artifact is then removed before canonical ingest, so the method must throw
+ * PLANCORE-DID-NOT-PRODUCE-CANONICAL-PLAN AFTER the partner seat has already been spawned and agreed.
+ * Ordering is proven the same way A5 proved it:
  * transport.reap is spied, and at the instant it fires the spy reads worker_runtimes.state directly from
  * the DB — 'running' at that instant proves reap ran before finalize.
  */
@@ -87,9 +98,34 @@ describe('A6: planning-phase-service routes a thrown exit through the one termin
       return FakeTransport.prototype.reap.call(transport, handle, reason);
     });
 
-    // Flip to the real (non-fixture) branch for this call only — plan.md/og-requirements.md are
-    // deliberately never written below, so the canonical-plan read fails and the method throws.
+    // Flip to the real (non-fixture) branch for this call only; this keeps B5's SHA binding and the
+    // canonical artifact checks live.
     process.env.USE_FAKE_TMUX = '0';
+
+    const planMdPath = path.join(runDir, 'plan.md');
+    const reqPath = path.join(runDir, 'og-requirements.md');
+    const planMarkdown = `# Plan
+
+\`\`\`json
+[
+  {
+    "id": "A6-THROWN-1",
+    "batch": "A6",
+    "title": "Task whose canonical requirements disappear after agreement",
+    "req_refs": ["A6-R1"],
+    "assignee": "L1",
+    "validator_lane": "L1",
+    "effort": "low",
+    "type": "feature",
+    "deps": [],
+    "validation_criteria": "agreement should pass, then canonical ingest should throw"
+  }
+]
+\`\`\`
+`;
+    await fs.writeFile(planMdPath, planMarkdown, 'utf8');
+    await fs.writeFile(reqPath, '- **A6-R1** — requirements exist for reviewer spawn only.\n', 'utf8');
+    const currentPlanSha = planRevision(planMarkdown).short12;
 
     const p = phase.runPlanningPhase({
       runDir,
@@ -103,12 +139,13 @@ describe('A6: planning-phase-service routes a thrown exit through the one termin
     });
 
     const cbp = path.join(runDir, 'callbacks.md');
-    // Agreement is satisfied (both seats convene) — the throw comes from the canonical-plan read, not
-    // from a blocked gate, proving this is genuinely the thrown-exit path, not the blocked one.
+    // Agreement is satisfied (both seats convene, with B5's required plan=<sha12> binding) — the throw
+    // comes from the canonical artifact read after agreement, not from a blocked gate.
     await sleep(30);
     await fs.appendFile(cbp, `[helm callback] plancore batch-A6-thrown STATUS: PLAN-READY — plan.json written with all fields + deps\n`);
-    await sleep(60);
-    await fs.appendFile(cbp, `[helm callback] planner batch-A6-thrown-partner STATUS: VERDICT-READY — CLEAN: plan is atomic, deps clean\n`);
+    await waitFor(() => transport.spawnCalls.some((call) => call.role === 'planner' && call.batchId === 'batch-A6-thrown-partner'));
+    await fs.appendFile(cbp, `[helm callback] planner batch-A6-thrown-partner STATUS: VERDICT-READY — CLEAN plan=${currentPlanSha}: plan is atomic, deps clean\n`);
+    await fs.rm(reqPath, { force: true });
 
     await expect(p).rejects.toThrow(/PLANCORE-DID-NOT-PRODUCE-CANONICAL-PLAN/);
     process.env.USE_FAKE_TMUX = '1';

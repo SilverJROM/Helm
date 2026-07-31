@@ -13,6 +13,14 @@ import { planRevision } from './plan-revision.js';
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
+async function waitFor(condition: () => boolean, timeoutMs = 1500): Promise<void> {
+  const start = Date.now();
+  while (!condition()) {
+    if (Date.now() - start > timeoutMs) throw new Error('timed out waiting for B6 fixture condition');
+    await sleep(10);
+  }
+}
+
 function canonicalPlanMd(tasks: unknown[]): string {
   return `# Plan\n\n\`\`\`json\n${JSON.stringify(tasks, null, 2)}\n\`\`\`\n`;
 }
@@ -70,11 +78,19 @@ describe('B6: runPlanningPhase returns a typed blocked reason on non-convergence
     process.env.USE_FAKE_TMUX = '0';
     process.env.HELM_PLANNING_TIMEOUT_MS = '200'; // short, deterministic per-round window
 
-    // Deliberately never write plan.md or og-requirements.md, and never post PLAN-READY/VERDICT-READY —
-    // the old code's poll loop (bounded by the SAME env var) plus its read-or-throw block would add at
-    // least another ~1000ms (its first retry sleep alone) on top of the ~200ms agreement wait, then
-    // throw PLANCORE-DID-NOT-PRODUCE-CANONICAL-PLAN instead of returning. The fix returns right after
-    // the ~200ms agreement wait and never touches either.
+    // Publish canonical artifacts first so C3 allows the reviewer seat to spawn. Then deliberately never
+    // post PLAN-READY/VERDICT-READY — this isolates B6's non-agreement path from C3's artifact gate.
+    const planMarkdown = canonicalPlanMd([{
+      id: 'B6-NOAGREE-1', batch: 'B6', title: 'Task no reviewer ever agrees to',
+      req_refs: ['B6-R0'], assignee: 'L1', validator_lane: 'L1', effort: 'low', type: 'feature', deps: [],
+      validation_criteria: 'must never be ingested because agreement never arrives',
+    }]);
+    await fs.writeFile(path.join(runDir, 'og-requirements.md'), '- **B6-R0** — no agreement.\n', 'utf8');
+    await fs.writeFile(path.join(runDir, 'plan.md'), planMarkdown, 'utf8');
+
+    // The old code's poll loop (bounded by the SAME env var) plus its read-or-throw block would add at
+    // least another ~1000ms (its first retry sleep alone) on top of the ~200ms agreement wait. The fix
+    // returns right after the agreement wait and never ingests the otherwise-readable plan.
     const start = Date.now();
     const p = phase.runPlanningPhase({
       runDir,
@@ -88,6 +104,12 @@ describe('B6: runPlanningPhase returns a typed blocked reason on non-convergence
     await fs.appendFile(
       path.join(runDir, 'callbacks.md'),
       '[helm callback] plancore batch-B6-no-agreement STATUS: PLANNING\n',
+      'utf8'
+    );
+    await waitFor(() => transport.spawnCalls.some((call) => call.role === 'planner' && call.batchId === 'batch-B6-no-agreement-partner'));
+    await fs.appendFile(
+      path.join(runDir, 'callbacks.md'),
+      '[helm callback] planner batch-B6-no-agreement-partner STATUS: PLANNING\n',
       'utf8'
     );
     const res = await p;
@@ -105,8 +127,8 @@ describe('B6: runPlanningPhase returns a typed blocked reason on non-convergence
     // no canonical-plan poll loop ran (the pre-fix path adds another >=1000ms poll/read window).
     expect(elapsed).toBeLessThan(1800);
 
-    // Neither canonical artifact was ever touched on the blocked path.
-    await expect(fs.access(path.join(runDir, 'og-requirements.md'))).rejects.toThrow();
+    // The otherwise-readable plan was not ingested on the blocked path.
+    expect(res.plan).toEqual({ tasks: [] });
   });
 
   it('current-plan-SHA mismatch (B5 non-agreement): returns the same typed blocked result, not the plan it never agreed to', async () => {

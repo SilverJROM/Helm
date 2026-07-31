@@ -146,10 +146,9 @@ export class PlanParserService {
     queue: TaskQueueService,
     runDir?: string
   ): Promise<{ createdTaskIds: number[]; keyToId: Record<string, number> }> {
+    // C10: normalize + validate the ENTIRE accepted plan before any DB write.
     plan = validateMachinePlan(plan) as Plan;
     this.ingestValidator?.(runId, plan);
-    const keyToId: Record<string, number> = {};
-    const created: number[] = [];
 
     // Leg D (batch barrier): resolve + validate the durable batch for every task BEFORE persistence.
     // all-labeled → trimmed labels; all-unlabeled → synthetic 'default' (legacy single-queue); MIXED →
@@ -166,35 +165,60 @@ export class PlanParserService {
     const depErrs = validateBatchDependencies(plan.tasks, batchByKey);
     if (depErrs.length) throw new Error(`Invalid plan batch dependencies: ${depErrs.join('; ')}`);
 
-    // Create all tasks first (ids needed for dep resolution); persist the resolved batch.
-    plan.tasks.forEach((t, i) => {
-      const tid = this.artifacts.recordTask(runId, t.task_key, t.atomic_work, resolvedBatches[i]);
-      keyToId[t.task_key] = tid;
-      created.push(tid);
-    });
+    // C10: task rows + the plan artifact row + the queue admission all land as ONE unit — either
+    // every task/artifact row commits AND every task is enqueued, or none of it happens. `enqueue` is
+    // in-memory-only (no DB I/O), so it runs INSIDE the same synchronous better-sqlite3 transaction
+    // callback: a throw from any step (recordTask, recordArtifact, or enqueue) propagates out of the
+    // callback, which makes better-sqlite3 roll back every DB write made during this call before
+    // rethrowing. That undoes the DB side, but not JS-side mutations `enqueue` already made to the
+    // in-memory queue for earlier tasks in this same loop — so the outer catch compensates by wiping
+    // this run's queue state via `queue.clearRun(runId)` before rethrowing, leaving zero rows and zero
+    // queue entries on any failure.
+    const keyToId: Record<string, number> = {};
+    const created: number[] = [];
+    const runTx = this.artifacts['db'].raw.transaction(() => {
+      // Create all tasks first (ids needed for dep resolution); persist the resolved batch.
+      plan.tasks.forEach((t, i) => {
+        const tid = this.artifacts.recordTask(runId, t.task_key, t.atomic_work, resolvedBatches[i]);
+        keyToId[t.task_key] = tid;
+        created.push(tid);
+      });
 
-    // Record the canonical plan artifact (enables metadata lookup without extra columns)
+      // Record the canonical plan artifact row (enables metadata lookup without extra columns).
+      if (runDir) {
+        this.artifacts.recordArtifact(runId, 'plan', 'plan.json');
+      }
+
+      // Enqueue respecting deps (after all keys have ids); pass the resolved batch so the queue
+      // admission barrier can order by it (never plan-array, never task-key).
+      plan.tasks.forEach((t, i) => {
+        const tid = keyToId[t.task_key];
+        const depIds = (t.deps || [])
+          .map((d) => keyToId[d])
+          .filter((id): id is number => typeof id === 'number');
+        queue.enqueue(runId, tid, depIds, false, resolvedBatches[i]);
+      });
+    });
+    try {
+      runTx();
+    } catch (err) {
+      queue.clearRun(runId);
+      throw err;
+    }
+
+    // FS snapshot write is advisory (in production the planning phase already writes plan.json to
+    // runDir before ingest; this is a defensive write for callers/tests that ingest directly) —
+    // best-effort, AFTER the transaction has committed, so a write failure here cannot roll back
+    // already-committed DB rows or queue state.
     if (runDir) {
       try {
         const planPath = path.join(runDir, 'plan.json');
-        // ensure the file exists on disk (planning phase writes it; defensive write here for parser-only tests)
         await fs.mkdir(path.dirname(planPath), { recursive: true }).catch(() => {});
         await fs.writeFile(planPath, JSON.stringify(plan, null, 2), 'utf8');
-        this.artifacts.recordArtifact(runId, 'plan', 'plan.json');
       } catch {
         // non-fatal for tests that don't care about FS artifact
       }
     }
-
-    // Enqueue respecting deps (after all keys have ids); pass the resolved batch so the queue admission
-    // barrier can order by it (never plan-array, never task-key).
-    plan.tasks.forEach((t, i) => {
-      const tid = keyToId[t.task_key];
-      const depIds = (t.deps || [])
-        .map((d) => keyToId[d])
-        .filter((id): id is number => typeof id === 'number');
-      queue.enqueue(runId, tid, depIds, false, resolvedBatches[i]);
-    });
 
     return { createdTaskIds: created, keyToId };
   }
@@ -222,17 +246,8 @@ export class PlanParserService {
     // Consume the validator's normalized tasks verbatim (no re-map, no re-normalize, no extra check).
     const plan = { tasks: result.normalizedTasks as unknown as PlannedTask[] } as Plan;
 
-    if (runDir) {
-      try {
-        const planPath = path.join(runDir, 'plan.json');
-        await fs.mkdir(path.dirname(planPath), { recursive: true }).catch(() => {});
-        await fs.writeFile(planPath, JSON.stringify(plan, null, 2), 'utf8');
-        this.artifacts.recordArtifact(runId, 'plan', 'plan.json');
-      } catch {
-        // non-fatal (same as ingestPlan)
-      }
-    }
-
+    // C10: ingestPlan owns the transactional plan-snapshot write (FS) + artifact row (DB) — don't
+    // duplicate either here (the prior duplicate write produced two `artifacts` rows per ingest).
     return this.ingestPlan(runId, plan, queue, runDir);
   }
 }
