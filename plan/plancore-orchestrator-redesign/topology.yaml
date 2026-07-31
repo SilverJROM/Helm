@@ -1,0 +1,102 @@
+contract_version: 1
+run_id: plancore-orchestrator-redesign
+project: helm
+north_star_ref: /home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/north-star.md
+stamped_by: helm-97
+stamped_at: 2026-08-01T07:40:00+08:00   # PHT
+revision: 1
+
+# ROSTER — same roster JROM specified for planning-agreement-restructure, reused unchanged:
+#   "we have grok45, opus5, sol (all xhigh effort) to properly plan the work needed -> handover to
+#    codex55 (projcore) and implementers L1=spark,L2=grok45,L3=sonnet5, validator=L1/2=codex55,
+#    opus5 (l3) and defaults for delib and red teams"
+# Same objection log carries forward unchanged too: codex55 holds coordinator + validator L1/L2; JROM
+# reviewed and accepted this trade-off for the prior effort ("its fine i like my topology"). Not
+# re-litigated here.
+#
+# NOT TILLER on this run. wflow fixed both gaps from the 2026-07-30 handover (self-park on own
+# bookkeeping across all 6 sites; unbounded watcher lifetime, 3 exit conditions) — real progress — but
+# no clean attended HELM run has proven it yet, and this effort touches the planning-agreement subsystem
+# even more centrally than the last one (who authors/agrees the plan, not just the gate around it).
+# north -> projcore, the proven path, same as planning-agreement-restructure.
+#
+# IMPORTANT SCOPE NOTE: this topology governs HOW HELM ITSELF IS BUILT for this effort (the meta-level:
+# who plans/implements/validates the redesign). Do NOT confuse `co_planners` below (Helm's own in-run
+# co-planning pair for building this feature) with the SUBJECT of the effort — the memory_mcp-facing
+# co-planner debate/candidate/signature mechanism this effort is implementing. Same words, two layers.
+
+effort_planning_team:                        # JROM's three, xhigh. Authors THIS effort's plan.md.
+  - { id: A, model: grok45,  launch: "grok --always-approve -m grok-4.5" }
+  - { id: B, model: opus5,   launch: "claude --dangerously-skip-permissions --model claude-opus-5" }
+  - { id: C, model: sol,     launch: "codex -m gpt-5.6-sol -c model_reasoning_effort=\"xhigh\" --dangerously-bypass-approvals-and-sandbox" }
+  # grok45: CLI ceiling is `high`, not `xhigh` — runs at its max, recorded as a deviation, not written
+  #   as xhigh and left untrue.
+  # sol: PINNED xhigh — it silently defaults to `low` if unpinned.
+  # opus5: xhigh at session level.
+
+co_planners:                                 # Helm's own in-run co-planning pair (meta-level, see note above)
+  - { id: A, model: opus5,   launch: "claude --dangerously-skip-permissions --model claude-opus-5" }
+  - { id: B, model: sol,     launch: "codex -m gpt-5.6-sol -c model_reasoning_effort=\"xhigh\" --dangerously-bypass-approvals-and-sandbox" }
+
+coordinator:
+  primary: { model: codex55, launch: "codex -m gpt-5.5 --dangerously-bypass-approvals-and-sandbox" }
+  backup:  { model: grok45,  launch: "grok --always-approve -m grok-4.5" }
+
+implementer:
+  L1: { model: spark,   launch: "codex -m gpt-5.3-codex-spark --dangerously-bypass-approvals-and-sandbox" }
+  L2: { model: grok45,  launch: "grok --always-approve -m grok-4.5" }
+  L3: { model: sonnet5, launch: "claude --dangerously-skip-permissions --model claude-sonnet-5" }
+  # `sol` and `opus5` NEVER implement (standing project rule).
+
+validator:
+  L1: { model: codex55, launch: "codex -m gpt-5.5 --dangerously-bypass-approvals-and-sandbox" }
+  L2: { model: codex55, launch: "codex -m gpt-5.5 --dangerously-bypass-approvals-and-sandbox" }
+  L3: { model: opus5,   launch: "claude --dangerously-skip-permissions --model claude-opus-5" }
+  # verifier != fixer: implementers {spark, grok45, sonnet5} vs validators {codex55, opus5} — empty
+  # intersection, holds at every tier.
+
+deliberation_panel:                          # defaults
+  convergence: strict-unanimous
+  max_rounds: 3
+  settle: [opus5, sol]
+  panelists:
+    - { model: codex55, profile: agj-panelist }
+    - { model: sol,     profile: agj-panelist }
+    - { model: grok45,  profile: agj-panelist }
+    - { model: sonnet5, profile: agj-panelist }
+
+redteam_panel:                               # defaults
+  convergence: N-consecutive-clean
+  N: 2
+  tiers:
+    budget:   { count: 3, models: [codex55, grok45, sonnet5] }
+    standard: { count: 4, models: [codex55, sol, grok45, sonnet5] }
+    elite:    { count: 4, models: [codex55, sol, grok45, sonnet5] }
+
+routing_notes:
+  default_impl_tier: L2
+  default_validator_tier: L1
+
+  tier_guidance: >
+    This effort's whole subject matter is the agreement mechanism itself (R3: the asymmetric
+    proposer/signer protocol, alternation, fail-closed signature binding). Route those slices at
+    implementer L2/L3 with validator L2 minimum and elite red-team — mirroring how P0/P1's
+    safety-critical slices were tiered in planning-agreement-restructure. R1 (deleting
+    generatePlanningBrief), R5 (purpose-discriminated generatePanelBrief), and R6's regression-sweep
+    rewrite are similarly load-bearing and should not run at L1. Mechanical wiring (R4's gate re-scope,
+    R7's adaptive-planning scope note) may take L1.
+
+  safety_note: >
+    Do not touch A1-A6 (teardown/corruption fixes) or the E5-class session-registry path — R6.22 locks
+    this. HELM_SESSION_JANITOR stays 0. Commit 8024452's raceguard must still survive:
+    `grep -c planMdPathForRaceGuard src/services/planning-phase-service.ts` == 3, unchanged by this
+    effort (it touches a different mechanism in the same file family; verify it wasn't collaterally
+    edited). No merge to main (SD10) — main is at 680b6ca. Do not weaken B5's fail-closed SHA check —
+    R3 re-points it, never loosens it.
+    CITATION DISCIPLINE: og-requirements.md v1 shipped one wrong citation
+    (brief-writer-service.ts:523, actually the unrelated mid-implementation escalation replan) that an
+    independent review caught before code was written. Every implementer must RE-VERIFY file:line
+    citations against current source before editing — the requirements say this explicitly for R5's
+    generatePanelBrief callers; treat it as standing practice for every citation in this document.
+
+  base_commit: 93d7cd7                       # planning-agreement-restructure I-P2, deployed; not merged to main
