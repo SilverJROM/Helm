@@ -162,3 +162,103 @@ B6 dispatched_at: 2026-07-30T02:25:56Z estimate_min: 25 bucket: SHORT — Return
 - 2026-07-30T05:31:31+00:00 [projcore TEARDOWN] killed x-15_impl_sonnet5b6_helm (sweep: idle worker, no keep row)
 [hb] 2026-07-30T05:37:14Z VERIFIED B6 fix cycle; B6 3/3, boundary 44/44, tsc exit 0, raceguard=3. HALT at I-P1 for north deploy authorization.
 [hb] 2026-07-30T05:38:12Z Resumed after outage; confirmed B6 VERIFIED record, artifacts, rule-6 gate 44/44, tsc 0, raceguard=3. Still halted at I-P1 for north.
+C2 dispatched_at: 2026-07-30T06:54:37Z estimate_min: 28 bucket: SHORT — Extract behavior-preserving review round seam
+[overmind] 2026-07-30T06:54:40+00:00 sync FAIL (best-effort, continuing): r":"Workflow not found","code":"workflow-not-found","message":"Workflow not found.","hint":"Use the workflow_id returned by /register, the canonical run_dir, or re-register before updating tasks."}404
+[overmind] 2026-07-30T06:54:41+00:00 sync FAIL (best-effort, continuing): r":"Workflow not found","code":"workflow-not-found","message":"Workflow not found.","hint":"Use the workflow_id returned by /register, the canonical run_dir, or re-register before updating tasks."}404
+[hb] 2026-07-30T06:58:01Z C2 REVISE-PLAN issued; placeholder PROPOSED lacked concrete seam plan after source-analysis window. Worker remains alive; no C2 source diff yet.
+[hb] 2026-07-30T07:00:30Z C2 protocol defect: worker moved toward code after REVISE-PLAN; interrupted before source diff. Requiring concrete PROPOSED or BLOCKED.
+[hb] 2026-07-30T07:01:27Z Approved C2 concrete plan: new planning-review-round seam only, PPS keeps waitForAgreement/parser and canonical/terminal ownership, by-ref partner cleanup arrays, C2 test plus A0/A5/A6/B3-B6 regate.
+[hb] 2026-07-30T07:16:06Z ACKed C2 DONE; killed stray optional full-suite process group, swept worker x-15_impl_sonnet5c2_helm (swept=1 kept=0 refused=0), starting settled coordinator validation.
+[hb] 2026-07-30T07:17:31Z VERIFIED C2; coordinator reran C2 4/4, A0/A5/A6+B3/B4/B5/B6+C2 36/36, tsc exit 0, raceguard=3. Auto-drain next ready Wave 3 rows: C3 plus C9/C10 concurrent.
+[hb] 2026-07-30T07:22:48Z C3/C9/C10 placeholders rejected with REVISE-PLAN; no C3/C9/C10 source diffs yet. Awaiting concrete plans or BLOCKED.
+[hb] 2026-07-30T07:24:51Z Approved C9 concrete plan; scoped to brief-writer PLAN-READY wording, C9 test, B2 regate, tsc. C3/C10 still awaiting concrete plans.
+[hb] 2026-07-30T07:27:19Z Approved C3 concrete plan and re-sent C9 approval after clearing stale pane input. C10 protocol defect recorded for WORKING before approval; revised queue-after-commit plan as incomplete.
+[overmind] 2026-07-30T06:54:41+00:00 sync FAIL (best-effort, continuing): r":"Workflow not found","code":"workflow-not-found","message":"Workflow not found.","hint":"Use the workflow_id returned by /register, the canonical run_dir, or re-register before updating tasks."}404
+- 2026-07-30T07:16:19+00:00 [projcore TEARDOWN] killed x-15_impl_sonnet5c2_helm (sweep: idle worker, no keep row)
+C3 dispatched_at: 2026-07-30T07:19:08Z estimate_min: 24 bucket: SHORT — Gate reviewer spawn on published artifacts
+C9 dispatched_at: 2026-07-30T07:19:08Z estimate_min: 26 bucket: SHORT — Stop treating PLAN-READY as agreement
+C10 dispatched_at: 2026-07-30T07:19:08Z estimate_min: 28 bucket: SHORT — Persist accepted plans transactionally
+[overmind] 2026-07-30T07:19:11+00:00 sync FAIL (best-effort, continuing): r":"Workflow not found","code":"workflow-not-found","message":"Workflow not found.","hint":"Use the workflow_id returned by /register, the canonical run_dir, or re-register before updating tasks."}404
+[overmind] 2026-07-30T07:19:11+00:00 sync FAIL (best-effort, continuing): r":"Workflow not found","code":"workflow-not-found","message":"Workflow not found.","hint":"Use the workflow_id returned by /register, the canonical run_dir, or re-register before updating tasks."}404
+[overmind] 2026-07-30T07:19:11+00:00 sync FAIL (best-effort, continuing): r":"Workflow not found","code":"workflow-not-found","message":"Workflow not found.","hint":"Use the workflow_id returned by /register, the canonical run_dir, or re-register before updating tasks."}404
+[overmind] 2026-07-30T07:19:11+00:00 sync FAIL (best-effort, continuing): r":"Workflow not found","code":"workflow-not-found","message":"Workflow not found.","hint":"Use the workflow_id returned by /register, the canonical run_dir, or re-register before updating tasks."}404
+[overmind] 2026-07-30T07:19:11+00:00 sync FAIL (best-effort, continuing): r":"Workflow not found","code":"workflow-not-found","message":"Workflow not found.","hint":"Use the workflow_id returned by /register, the canonical run_dir, or re-register before updating tasks."}404
+[overmind] 2026-07-30T07:19:11+00:00 sync FAIL (best-effort, continuing): r":"Workflow not found","code":"workflow-not-found","message":"Workflow not found.","hint":"Use the workflow_id returned by /register, the canonical run_dir, or re-register before updating tasks."}404
+[overmind] 2026-07-30T07:19:11+00:00 sync FAIL (best-effort, continuing): r":"Workflow not found","code":"workflow-not-found","message":"Workflow not found.","hint":"Use the workflow_id returned by /register, the canonical run_dir, or re-register before updating tasks."}404
+[overmind] 2026-07-30T07:19:11+00:00 sync FAIL (best-effort, continuing): r":"Workflow not found","code":"workflow-not-found","message":"Workflow not found.","hint":"Use the workflow_id returned by /register, the canonical run_dir, or re-register before updating tasks."}404
+[overmind] 2026-07-30T07:19:11+00:00 sync FAIL (best-effort, continuing): r":"Workflow not found","code":"workflow-not-found","message":"Workflow not found.","hint":"Use the workflow_id returned by /register, the canonical run_dir, or re-register before updating tasks."}404
+- 2026-07-30T07:40:11+00:00 [projcore TEARDOWN] killed x-15_impl_sonnet5c10_helm (sweep: idle worker, no keep row)
+- 2026-07-30T07:40:11+00:00 [projcore TEARDOWN] killed x-15_impl_sonnet5c3_helm (sweep: idle worker, no keep row)
+- 2026-07-30T07:40:11+00:00 [projcore TEARDOWN] killed x-15_impl_sonnet5c9_helm (sweep: idle worker, no keep row)
+[hb] 2026-07-30T07:40:11Z ACKed C3/C9/C10 DONE; swept ledgered workers before coordinator validation. session-sweep: done — swept=3 kept=0 refused=0 already-gone=0
+[hb] 2026-07-30T07:41:05Z VERIFIED C3/C9/C10 after settled sweep: C3 6/6 + C2 4/4, C9 6/6 + B2 2/2, C10 4/4 + parser 13/13, tsc 0, PPS raceguard=3, no schema/index diff. Auto-drain next: C4.
+[hb] 2026-07-30T10:04:00Z North ruled C4 may make narrow PPS wiring exception: delete timeout*roundCap scalar, pass perRoundTimeoutMs+roundCap into runReviewRound; bounded loop in planning-review-round.ts. Preparing C4 dispatch.
+C4 dispatched_at: 2026-07-30T10:04:38Z estimate_min: 26 bucket: SHORT — Treat round cap as integer rounds
+[overmind] 2026-07-30T10:04:41+00:00 sync FAIL (best-effort, continuing): r":"Workflow not found","code":"workflow-not-found","message":"Workflow not found.","hint":"Use the workflow_id returned by /register, the canonical run_dir, or re-register before updating tasks."}404
+[overmind] 2026-07-30T10:04:42+00:00 sync FAIL (best-effort, continuing): r":"Workflow not found","code":"workflow-not-found","message":"Workflow not found.","hint":"Use the workflow_id returned by /register, the canonical run_dir, or re-register before updating tasks."}404
+[overmind] 2026-07-30T10:04:42+00:00 sync FAIL (best-effort, continuing): r":"Workflow not found","code":"workflow-not-found","message":"Workflow not found.","hint":"Use the workflow_id returned by /register, the canonical run_dir, or re-register before updating tasks."}404
+[hb] 2026-07-30T10:04:46Z C4 dispatched watcher_pid=3545839 session=x-15_impl_sonnet5c4_helm; waiting for concrete PROPOSED before code.
+[hb] 2026-07-30T10:06:34Z C4 REVISE-PLAN issued; placeholder PROPOSED remained after source analysis, no C4 source/test diff observed.
+[hb] 2026-07-30T10:10:11Z C4 concrete plan revised: effectiveTimeoutMs primary API rejected; requested perRoundTimeoutMs+roundCap primary with optional legacy alias for C2/C3 tests only.
+[hb] 2026-07-30T10:11:54Z Submitted visible C4 revise text with explicit Enter; waiting for corrected perRoundTimeoutMs proposal.
+[hb] 2026-07-30T10:12:46Z Approved C4 corrected plan: perRoundTimeoutMs+roundCap primary API, optional legacy alias only for C2/C3 tests, narrow PPS wiring/message edit, bounded loop in planning-review-round.ts.
+[hb] 2026-07-30T10:14:00Z Submitted visible C4 APPROVED-PLAN with explicit Enter; implementation may begin.
+- 2026-07-30T10:18:39+00:00 [projcore TEARDOWN] killed x-15_impl_sonnet5c4_helm (sweep: idle worker, no keep row)
+[hb] 2026-07-30T10:18:39Z ACKed C4 DONE; swept worker before coordinator validation. session-sweep: done — swept=1 kept=0 refused=0 already-gone=0
+[hb] 2026-07-30T10:19:21Z VERIFIED C4; coordinator reran C4 4/4, C2/C3 10/10, tsc 0, raceguard=3, worker swept, PPS exception limited to perRoundTimeoutMs/roundCap wiring and message wording. Auto-drain next: C5.
+C5 dispatched_at: 2026-07-30T10:19:51Z estimate_min: 28 bucket: SHORT — Spawn fresh reviewer seats per round
+[overmind] 2026-07-30T10:19:54+00:00 sync FAIL (best-effort, continuing): r":"Workflow not found","code":"workflow-not-found","message":"Workflow not found.","hint":"Use the workflow_id returned by /register, the canonical run_dir, or re-register before updating tasks."}404
+[overmind] 2026-07-30T10:19:54+00:00 sync FAIL (best-effort, continuing): r":"Workflow not found","code":"workflow-not-found","message":"Workflow not found.","hint":"Use the workflow_id returned by /register, the canonical run_dir, or re-register before updating tasks."}404
+[overmind] 2026-07-30T10:19:54+00:00 sync FAIL (best-effort, continuing): r":"Workflow not found","code":"workflow-not-found","message":"Workflow not found.","hint":"Use the workflow_id returned by /register, the canonical run_dir, or re-register before updating tasks."}404
+[hb] 2026-07-30T10:19:59Z C5 dispatched watcher_pid=3617702 session=x-15_impl_sonnet5c5_helm; waiting for concrete fresh-seat round plan.
+[hb] 2026-07-30T10:22:03Z C5 REVISE-PLAN issued; placeholder PROPOSED remained after source analysis, no C5 diff observed.
+[hb] 2026-07-30T10:24:06Z Submitted visible C5 revise prompt with explicit Enter; waiting for concrete fresh-seat proposal.
+[hb] 2026-07-30T10:25:11Z C5 concrete plan appeared in pane but no revised PROPOSED callback; requested concise canonical PROPOSED before approval.
+[hb] 2026-07-30T10:25:47Z Submitted visible C5 callback-correction prompt with explicit Enter.
+[hb] 2026-07-30T10:26:31Z Approved C5 concrete plan: fresh reviewer seats per round, prior-round reap before next spawn, no send/reuse, cleanup arrays accumulate, tests C5+C2-C4/raceguard/tsc.
+[hb] 2026-07-30T10:27:11Z Submitted visible C5 APPROVED-PLAN with explicit Enter; implementation may begin.
+- 2026-07-30T10:30:52+00:00 [projcore TEARDOWN] killed x-15_impl_sonnet5c5_helm (sweep: idle worker, no keep row)
+[hb] 2026-07-30T10:30:52Z ACKed C5 DONE; swept worker before coordinator validation. session-sweep: done — swept=1 kept=0 refused=0 already-gone=0
+[hb] 2026-07-30T10:31:29Z VERIFIED C5; coordinator reran C5 6/6, C2-C4 14/14, tsc 0, raceguard=3, worker swept, fresh-seat round loop verified. Auto-drain next: C6.
+C6 dispatched_at: 2026-07-30T10:48:02Z estimate_min: 18 bucket: SHORT — Fix C6 local newest-verdict fail-closed parser
+[overmind] 2026-07-30T10:32:37+00:00 sync FAIL (best-effort, continuing): r":"Workflow not found","code":"workflow-not-found","message":"Workflow not found.","hint":"Use the workflow_id returned by /register, the canonical run_dir, or re-register before updating tasks."}404
+[overmind] 2026-07-30T10:32:37+00:00 sync FAIL (best-effort, continuing): r":"Workflow not found","code":"workflow-not-found","message":"Workflow not found.","hint":"Use the workflow_id returned by /register, the canonical run_dir, or re-register before updating tasks."}404
+[overmind] 2026-07-30T10:32:37+00:00 sync FAIL (best-effort, continuing): r":"Workflow not found","code":"workflow-not-found","message":"Workflow not found.","hint":"Use the workflow_id returned by /register, the canonical run_dir, or re-register before updating tasks."}404
+[hb] 2026-07-30T10:32:44Z C6 dispatched watcher_pid=3635148 session=x-15_impl_sonnet5c6_helm; scope guard says planning-review-round only, local revise helper or BLOCKED.
+[hb] 2026-07-30T10:35:09Z C6 REVISE-PLAN issued; placeholder remained after source analysis, no C6 diff; reiterated no brief-writer/PPS edits.
+[hb] 2026-07-30T10:38:01Z Submitted visible C6 REVISE prompt with explicit Enter; waiting for concrete plan or BLOCKED.
+[hb] 2026-07-30T10:39:24Z Approved C6 narrow plan: local parser and local revise helper in planning-review-round only, unique plancore revise spawn, new-hash wait, cleanup-visible/reaped, no brief-writer/PPS edits.
+[hb] 2026-07-30T10:40:04Z Submitted visible C6 APPROVED-PLAN with explicit Enter; implementation may begin.
+- 2026-07-30T10:46:38+00:00 [projcore TEARDOWN] killed x-15_impl_sonnet5c6_helm (sweep: idle worker, no keep row)
+[hb] 2026-07-30T10:46:38Z ACKed C6 DONE; swept worker before coordinator validation. session-sweep: done — swept=1 kept=0 refused=0 already-gone=0
+[hb] 2026-07-30T10:47:30Z C6 validation reopened: duplicate local parser skipped malformed newest verdict and could use older BROKEN; dispatching C6 fix cycle, not VERIFIED.
+[overmind] 2026-07-30T10:48:06+00:00 sync FAIL (best-effort, continuing): r":"Workflow not found","code":"workflow-not-found","message":"Workflow not found.","hint":"Use the workflow_id returned by /register, the canonical run_dir, or re-register before updating tasks."}404
+[overmind] 2026-07-30T10:48:06+00:00 sync FAIL (best-effort, continuing): r":"Workflow not found","code":"workflow-not-found","message":"Workflow not found.","hint":"Use the workflow_id returned by /register, the canonical run_dir, or re-register before updating tasks."}404
+[overmind] 2026-07-30T10:48:06+00:00 sync FAIL (best-effort, continuing): r":"Workflow not found","code":"workflow-not-found","message":"Workflow not found.","hint":"Use the workflow_id returned by /register, the canonical run_dir, or re-register before updating tasks."}404
+[hb] 2026-07-30T10:48:14Z C6 fix-cycle dispatched watcher_pid=3651205 session=x-15_impl_sonnet5c6fix_helm for newest-verdict fail-closed bug.
+[hb] 2026-07-30T10:51:23Z C6 fix REVISE-PLAN issued; fix-cycle placeholder remained after source analysis, no new diff.
+- 2026-07-30T21:52:04+00:00 [projcore TEARDOWN] killed x-15_impl_sonnet5c6fix_helm (sweep: idle worker, no keep row)
+[hb] 2026-07-30T21:52:39Z C6 VERIFIED from settled coordinator gate after sweeping stuck fix worker; gate C6 5/5, C2-C5 20/20, tsc 0, raceguard=3; next dispatch C7.
+C7 dispatched_at: 2026-07-30T21:53:36Z estimate_min: 28 bucket: SHORT — Add reviewer first-callback and submit watchdog
+[overmind] 2026-07-30T21:53:39+00:00 sync FAIL (best-effort, continuing): r":"Workflow not found","code":"workflow-not-found","message":"Workflow not found.","hint":"Use the workflow_id returned by /register, the canonical run_dir, or re-register before updating tasks."}404
+[overmind] 2026-07-30T21:53:39+00:00 sync FAIL (best-effort, continuing): r":"Workflow not found","code":"workflow-not-found","message":"Workflow not found.","hint":"Use the workflow_id returned by /register, the canonical run_dir, or re-register before updating tasks."}404
+[overmind] 2026-07-30T21:53:39+00:00 sync FAIL (best-effort, continuing): r":"Workflow not found","code":"workflow-not-found","message":"Workflow not found.","hint":"Use the workflow_id returned by /register, the canonical run_dir, or re-register before updating tasks."}404
+[hb] 2026-07-30T21:55:04Z C7 dispatched via gateway; worker emitted initial PROPOSED and is still in source analysis; awaiting concrete plan before approval.
+[hb] 2026-07-30T21:55:48Z C7 initial PROPOSED was placeholder-only; sent REVISE-PLAN requiring concrete planning-review-round-only mechanism or BLOCKED.
+[hb] 2026-07-30T21:59:04Z C7 concrete PROPOSED accepted; APPROVED-PLAN sent for planning-review-round-only implementation and C7 real-mode watchdog tests.
+[hb] 2026-07-30T22:02:13Z C7 consumed approval but stayed silent/no edits; sent REDIRECT to emit WORKING/proceed or BLOCKED.
+[hb] 2026-07-30T22:04:48Z C7 live diff correction sent: watchdog cannot be opt-in without caller wiring; default to per-round real-mode gate, option override only.
+[hb] 2026-07-30T22:06:40Z C7 refined correction sent: production default-on via non-fake-tmux, C7 test can force env; preserve locked C3 fake harness.
+- 2026-07-30T22:14:18+00:00 [projcore TEARDOWN] killed x-15_impl_sonnet5c7_helm (sweep: idle worker, no keep row)
+[hb] 2026-07-30T22:14:58Z C7 VERIFIED from settled coordinator gate; C7 5/5, C2-C6 25/25, tsc 0, raceguard=3; next dispatch C8 LAST.
+C8 dispatched_at: 2026-07-30T22:15:59Z estimate_min: 24 bucket: SHORT — Replace BROKEN fail-fast with typed round results
+[overmind] 2026-07-30T22:16:02+00:00 sync FAIL (best-effort, continuing): r":"Workflow not found","code":"workflow-not-found","message":"Workflow not found.","hint":"Use the workflow_id returned by /register, the canonical run_dir, or re-register before updating tasks."}404
+[overmind] 2026-07-30T22:16:02+00:00 sync FAIL (best-effort, continuing): r":"Workflow not found","code":"workflow-not-found","message":"Workflow not found.","hint":"Use the workflow_id returned by /register, the canonical run_dir, or re-register before updating tasks."}404
+[overmind] 2026-07-30T22:16:02+00:00 sync FAIL (best-effort, continuing): r":"Workflow not found","code":"workflow-not-found","message":"Workflow not found.","hint":"Use the workflow_id returned by /register, the canonical run_dir, or re-register before updating tasks."}404
+[hb] 2026-07-30T22:16:20Z C8 dispatched as final round-spine slice; worker live in x-15_impl_sonnet5c8_helm, awaiting PROPOSED.
+[hb] 2026-07-30T22:17:47Z C8 had no callback after initial source-read window; sent REDIRECT for concrete PROPOSED or BLOCKED before code.
+[hb] 2026-07-30T22:20:57Z C8 concrete PROPOSED accepted; APPROVED-PLAN sent for typed blockedReasonKind and final-round same-plan-BROKEN classification.
+- 2026-07-30T22:27:38+00:00 [projcore TEARDOWN] killed x-15_impl_sonnet5c8_helm (sweep: idle worker, no keep row)
+[hb] 2026-07-30T22:28:39Z C8 VERIFIED from settled coordinator gate; C8 4/4, C2-C7 30/30, tsc 0, raceguard=3; typed same-current-plan BROKEN final-round path verified; Wave 3 round spine complete, entering I-P2 regate.
+[hb] 2026-07-30T22:30:16Z HALT at I-P2 validation failure: C8 own gate was green, but phase regate failed B6 no-agreement and A6 thrown-exit; isolated reruns reproduce both. Awaiting north; no further dispatch/edit.
+[hb] 2026-07-31T01:35:53Z I-P2 READY after fix cycle: B6 3/3, A6 1/1, full 24-slice regate 115 passed + 7 skipped, parser baseline 13/13, tsc 0, raceguard=3, index/schema untouched. Halting for north deploy/authorization.

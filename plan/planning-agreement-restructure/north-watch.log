@@ -3,3 +3,41 @@
 [11:55:59 PHT] NO VERIFIED PROGRESS ~90min (still 14/24)
 [13:32:49 PHT] verified 14/24
 [13:37:58 PHT] verified 15/24
+[15:10:09 PHT] ALERT: no verified progress ~90min (still 15/24) — checking provider reachability
+    api.anthropic.com -> 404
+    chatgpt.com -> 403
+    seat: x-15_impl_sonnet5c2_helm
+    seat: x-15_northwatch_helm
+    seat: x-15_projcore_codex55_helm
+    seat: x-15_tgcadence_helm
+[15:18:13 PHT] verified 16/24
+[15:41:18 PHT] verified 19/24
+[17:13:54 PHT] ALERT: no verified progress ~90min (still 19/24) — checking provider reachability
+    api.anthropic.com -> 404
+    chatgpt.com -> 403
+    seat: x-15_northwatch_helm
+    seat: x-15_projcore_codex55_helm
+    seat: x-15_tgcadence_helm
+[18:15:20 PHT] ALERT: no verified progress ~90min (still 19/24) — checking provider reachability
+    api.anthropic.com -> 404
+    chatgpt.com -> 403
+    seat: x-15_impl_sonnet5c4_helm
+    seat: x-15_northwatch_helm
+    seat: x-15_projcore_codex55_helm
+    seat: x-15_tgcadence_helm
+[18:19:22 PHT] verified 20/24
+[18:32:27 PHT] verified 21/24
+[20:02:38 PHT] ALERT: no verified progress ~90min (still 21/24) — checking provider reachability
+    api.anthropic.com -> 404
+    chatgpt.com -> 403
+    seat: x-15_impl_sonnet5c6fix_helm
+    seat: x-15_northwatch_helm
+    seat: x-15_projcore_codex55_helm
+    seat: x-15_tgcadence_helm
+[20:19:39 PHT] window ended at 21/24
+[05:49:18 PHT] verified 21/24
+[05:53:21 PHT] verified 23/24
+[06:28:30 PHT] verified 24/24
+[06:28:30 PHT] ALL 24 VERIFIED
+[09:25:25 PHT] verified 24/24
+[09:25:25 PHT] ALL 24 VERIFIED

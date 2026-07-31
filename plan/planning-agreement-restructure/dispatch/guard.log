@@ -103,3 +103,46 @@
 2026-07-30T02:30:39+00:00 ALLOW  op=send target=x-15_impl_sonnet5b6_helm
 2026-07-30T05:31:31+00:00 ALLOW  op=kill target=x-15_impl_sonnet5b6_helm
 2026-07-30T05:31:31+00:00 KILLED x-15_impl_sonnet5b6_helm reason=sweep: idle worker, no keep row
+2026-07-30T06:54:27+00:00 REFUSE op=send target=x-15_impl_sonnet5c2_helm reason=no session with this exact name is alive
+2026-07-30T06:54:33+00:00 SPAWNED x-15_impl_sonnet5c2_helm role=implementer batch=C2
+2026-07-30T06:54:37+00:00 ALLOW  op=send target=x-15_impl_sonnet5c2_helm
+2026-07-30T07:16:19+00:00 ALLOW  op=kill target=x-15_impl_sonnet5c2_helm
+2026-07-30T07:16:19+00:00 KILLED x-15_impl_sonnet5c2_helm reason=sweep: idle worker, no keep row
+2026-07-30T07:18:59+00:00 SPAWNED x-15_impl_sonnet5c3_helm role=implementer batch=C3
+2026-07-30T07:18:59+00:00 SPAWNED x-15_impl_sonnet5c9_helm role=implementer batch=C9
+2026-07-30T07:18:59+00:00 SPAWNED x-15_impl_sonnet5c10_helm role=implementer batch=C10
+2026-07-30T07:19:08+00:00 ALLOW  op=send target=x-15_impl_sonnet5c3_helm
+2026-07-30T07:19:08+00:00 ALLOW  op=send target=x-15_impl_sonnet5c9_helm
+2026-07-30T07:19:08+00:00 ALLOW  op=send target=x-15_impl_sonnet5c10_helm
+2026-07-30T07:40:11+00:00 ALLOW  op=kill target=x-15_impl_sonnet5c10_helm
+2026-07-30T07:40:11+00:00 KILLED x-15_impl_sonnet5c10_helm reason=sweep: idle worker, no keep row
+2026-07-30T07:40:11+00:00 ALLOW  op=kill target=x-15_impl_sonnet5c3_helm
+2026-07-30T07:40:11+00:00 KILLED x-15_impl_sonnet5c3_helm reason=sweep: idle worker, no keep row
+2026-07-30T07:40:11+00:00 ALLOW  op=kill target=x-15_impl_sonnet5c9_helm
+2026-07-30T07:40:11+00:00 KILLED x-15_impl_sonnet5c9_helm reason=sweep: idle worker, no keep row
+2026-07-30T10:04:25+00:00 REFUSE op=send target=x-15_impl_sonnet5c4_helm reason=no session with this exact name is alive
+2026-07-30T10:04:30+00:00 SPAWNED x-15_impl_sonnet5c4_helm role=implementer batch=C4
+2026-07-30T10:04:38+00:00 ALLOW  op=send target=x-15_impl_sonnet5c4_helm
+2026-07-30T10:18:39+00:00 ALLOW  op=kill target=x-15_impl_sonnet5c4_helm
+2026-07-30T10:18:39+00:00 KILLED x-15_impl_sonnet5c4_helm reason=sweep: idle worker, no keep row
+2026-07-30T10:19:51+00:00 SPAWNED x-15_impl_sonnet5c5_helm role=implementer batch=C5
+2026-07-30T10:19:51+00:00 ALLOW  op=send target=x-15_impl_sonnet5c5_helm
+2026-07-30T10:30:52+00:00 ALLOW  op=kill target=x-15_impl_sonnet5c5_helm
+2026-07-30T10:30:52+00:00 KILLED x-15_impl_sonnet5c5_helm reason=sweep: idle worker, no keep row
+2026-07-30T10:32:34+00:00 SPAWNED x-15_impl_sonnet5c6_helm role=implementer batch=C6
+2026-07-30T10:32:34+00:00 ALLOW  op=send target=x-15_impl_sonnet5c6_helm
+2026-07-30T10:46:38+00:00 ALLOW  op=kill target=x-15_impl_sonnet5c6_helm
+2026-07-30T10:46:38+00:00 KILLED x-15_impl_sonnet5c6_helm reason=sweep: idle worker, no keep row
+2026-07-30T10:48:02+00:00 SPAWNED x-15_impl_sonnet5c6fix_helm role=implementer batch=C6
+2026-07-30T10:48:02+00:00 ALLOW  op=send target=x-15_impl_sonnet5c6fix_helm
+2026-07-30T21:52:04+00:00 ALLOW  op=kill target=x-15_impl_sonnet5c6fix_helm
+2026-07-30T21:52:04+00:00 KILLED x-15_impl_sonnet5c6fix_helm reason=sweep: idle worker, no keep row
+2026-07-30T21:53:28+00:00 REFUSE op=send target=x-15_impl_sonnet5c7_helm reason=no session with this exact name is alive
+2026-07-30T21:53:32+00:00 SPAWNED x-15_impl_sonnet5c7_helm role=implementer batch=C7
+2026-07-30T21:53:36+00:00 ALLOW  op=send target=x-15_impl_sonnet5c7_helm
+2026-07-30T22:14:18+00:00 ALLOW  op=kill target=x-15_impl_sonnet5c7_helm
+2026-07-30T22:14:18+00:00 KILLED x-15_impl_sonnet5c7_helm reason=sweep: idle worker, no keep row
+2026-07-30T22:15:54+00:00 SPAWNED x-15_impl_sonnet5c8_helm role=implementer batch=C8
+2026-07-30T22:15:59+00:00 ALLOW  op=send target=x-15_impl_sonnet5c8_helm
+2026-07-30T22:27:38+00:00 ALLOW  op=kill target=x-15_impl_sonnet5c8_helm
+2026-07-30T22:27:38+00:00 KILLED x-15_impl_sonnet5c8_helm reason=sweep: idle worker, no keep row
