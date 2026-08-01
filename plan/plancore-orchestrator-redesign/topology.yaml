@@ -54,9 +54,26 @@ coordinator:
   # dispatches implementer -> waits for commit -> dispatches independent validator -> fail-closed gate
   # on the verdict -> advances the queue. It structurally cannot park (no LLM turn to end).
   backup:  { model: codex55, launch: "codex -m gpt-5.5 --dangerously-bypass-approvals-and-sandbox" }
-  # Backup is the ORIGINAL primary (codex55/projcore) — if Tiller's driver crashes or the format
-  # contract proves unworkable mid-run, fall back to the proven path, not to grok45 (which is also
-  # implementer L2 and must not coordinate its own work).
+  # Backup is the ORIGINAL primary (codex55/projcore) — if Tiller's driver crashes entirely or the
+  # format contract proves unworkable mid-run, fall back to the proven path.
+
+  brain: { model: grok45, session: x-17_brain_grok45_helm, brief: BRAIN-BRIEF.md }
+  # JROM 2026-08-01: "tiller should also still have a brain right and make it grok45, if tiller needs
+  # some decisions made". Distinct from `backup` above: brain is woken WHILE Tiller keeps running (a
+  # PARKED+RAISED slice, driver crash notice, terminal-drain review); backup REPLACES Tiller entirely.
+  # Wired via Tiller's own coord_session() mechanism (shadow-harness/tiller:33-41), which reads ONLY the
+  # "session" key from <run-dir>/.overmind-state.json and wakes that tmux session with a one-line ping
+  # naming dispatch/TILLER-EXIT.json + dispatch/escalations/. Helm runs skip full overmind adoption;
+  # this run's .overmind-state.json contains only that one field, nothing else pulled in.
+  #
+  # KNOWN CONFLICT, accepted by JROM's direct instruction, not silently absorbed: grok45 is ALSO
+  # implementer L2 (separate session). If grok45's own implemented slice gets PARKED, grok45-as-brain
+  # would be judging grok45-as-implementer's own stuck work. This is narrower than a verifier != fixer
+  # violation — the brain makes PROCESS decisions (re-plan/split/direction), never judges code
+  # correctness, which stays with the independent validator tier (codex55/opus5) untouched — but it is a
+  # real self-review surface on the "how do we get unstuck" layer. BRAIN-BRIEF.md requires the brain
+  # seat to flag this explicitly if it ever fires on its own implemented slice, and [north] independently
+  # reviews every escalation regardless of who the brain designates.
 
 implementer:
   L1: { model: spark,   launch: "codex -m gpt-5.3-codex-spark --dangerously-bypass-approvals-and-sandbox" }
