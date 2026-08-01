@@ -13,6 +13,8 @@ import {
 import {
   draftPlanPath as composeDraftPlanPath,
   draftReqPath as composeDraftReqPath,
+  candidatePlanPath as composeCandidatePlanPath,
+  candidateReqPath as composeCandidateReqPath,
 } from './seat-draft-store.js';
 
 /** Helm-owned deferral policy path (product tree). Never builder-side JROM style scaffolding. */
@@ -22,7 +24,7 @@ export const DEFERRAL_POLICY_RELPATH = 'policy/deferral-policy.md';
  * Exhaustive purpose discriminant for generatePanelBrief (R5.17 / R5.18).
  * No default — every caller must state why it is convening the panel.
  * plan-draft body: B2 (schema / seat-scoped / DRAFT-SUBMITTED).
- * plan-reconcile / plan-signature bodies: B3.
+ * plan-reconcile / plan-signature bodies: B3 (schema / candidate paths / CANDIDATE-SUBMITTED / SIGNED).
  */
 export const PANEL_BRIEF_PURPOSES = [
   'plan-draft',
@@ -519,6 +521,17 @@ Emit exactly:
     decisionsDir?: string;
     /** Run directory used when composing default seat draft paths. */
     runDir?: string;
+    /** plan-reconcile (B3, R3.10): both round-1 draft paths — read-only reconciliation inputs. */
+    roundDraftPlanPaths?: string[];
+    roundDraftReqPaths?: string[];
+    /** plan-reconcile (B3): prior signer's objection list, when reconciling after a refused signature. */
+    defectList?: string;
+    /**
+     * plan-reconcile write target (B3) / plan-signature read target (B3) — shared candidate paths,
+     * not seat-scoped. When omitted, composed via seat-draft-store from runDir/root.
+     */
+    candidatePlanPath?: string;
+    candidateReqPath?: string;
   }): string {
     assertPanelBriefPurpose(params.purpose);
     const r = params.role || 'panelist';
@@ -593,6 +606,119 @@ The \`plan=<sha12>\` claim is **NON-AUTHORITATIVE**. The engine recomputes the h
       return base.replace('<!-- PROJCORE-STATUS-CONTRACT v2 -->', `<!-- PROJCORE-STATUS-CONTRACT v2 -->${body}`).trim();
     }
 
+    // B3: purpose plan-reconcile — round-2+ proposer reconciles BOTH round-1 drafts (and any prior
+    // objection list) into exactly ONE candidate (R3.10). Same task-JSON schema as B2 (R2.8, shared
+    // via planAuthoringSchemaContract). Never a competing draft; never a panel-verdict grammar;
+    // publication is non-authoritative existence only, never agreement (R2.7/R3.14).
+    if (params.purpose === 'plan-reconcile') {
+      const candidatePlan = path.resolve(params.candidatePlanPath || composeCandidatePlanPath(root));
+      const candidateReq = path.resolve(params.candidateReqPath || composeCandidateReqPath(root));
+      const draftPlans = (params.roundDraftPlanPaths || []).map((p) => path.resolve(p));
+      const draftReqs = (params.roundDraftReqPaths || []).map((p) => path.resolve(p));
+      const base = this.generateBrief({
+        batchId: params.batchId,
+        role: r,
+        planPath: candidatePlan,
+        runDir: root,
+        branch: 'main',
+        requirementsAssigned: 'PLAN-RECONCILE',
+        northStarAnchors: params.requirement || 'reconcile round-1 drafts into one candidate',
+        scope:
+          'Round-2+ proposer reconciliation (purpose plan-reconcile). Read both round-1 drafts (and any prior objection list) then author ONE candidate at the candidate path. Emit CANDIDATE-SUBMITTED plan=<sha12> after atomic publish. Never write canonical plan.md / og-requirements.md; never author a second competing candidate.',
+        requirementsSection: params.requirement || 'reconcile the round-1 drafts below into one candidate',
+        projectDir: params.projectDir || '/home/agjrom/TGBOTS/Helm',
+        callbacksFile: params.callbacksFile || '<abs-path-to-callbacks.md>',
+        taskType: 'feature',
+      });
+      const draftsList = draftPlans.length
+        ? draftPlans
+            .map((p, i) => `- Round-1 draft plan ${i + 1}: ${p}${draftReqs[i] ? ` (requirements: ${draftReqs[i]})` : ''}`)
+            .join('\n')
+        : '- (no round-1 draft paths provided)';
+      const defectSection = params.defectList
+        ? `\n## Objection list from the prior signature round (revise the candidate to address these)\n${params.defectList}\n`
+        : '';
+      const body = `
+You are ${r} seat ${params.seat} reconciling round-1 co-planner drafts into **one** candidate proposal (proposer role this round; a separate fresh signer reviews your output blind next).
+Panel purpose: plan-reconcile
+
+## Round-1 drafts (READ ONLY — reconcile these; neither is final on its own)
+${draftsList}
+${defectSection}
+## Candidate write targets (ONLY paths you may write — never canonical, never a seat's draft path)
+- Candidate requirements: ${candidateReq}
+- Candidate plan: ${candidatePlan}
+
+CRITICAL (R3.10): author **one** merged candidate reconciling both drafts above (and the objection list, if present). **Never** write canonical \`plan.md\` / \`og-requirements.md\`, and **never** write back into either seat's round-1 draft path. Produce exactly one candidate — the signer receives only this single document, never a choice between two.
+
+${this.planAuthoringSchemaContract()}
+
+## Atomic publish + CANDIDATE-SUBMITTED (R2.7 — non-authoritative self-hash)
+1. Publish each candidate **atomically**: write a temp sibling in the same directory, then rename into place. Do not leave a partial final path.
+2. Self-hash the **committed candidate plan** bytes (sha256 hex; \`short12\` = first 12 hex chars).
+3. Emit exactly one terminal callback (claim is non-authoritative — engine recomputes from the committed file):
+[helm callback] ${r} ${params.batchId} STATUS: CANDIDATE-SUBMITTED plan=<sha12>
+
+The \`plan=<sha12>\` claim is **NON-AUTHORITATIVE**. The engine recomputes the hash from the committed candidate file and ignores a false claim. CANDIDATE-SUBMITTED asserts existence/publication only — never agreement and never "ready to use."
+
+## Forbidden on this purpose
+- Do **not** author two competing candidates or ask the signer to choose between documents — reconcile into exactly ONE.
+- Do **not** emit a panel-verdict grammar (no CLEAN/BROKEN/CONSENSUS/SETTLED/VERDICT-READY on plan-reconcile).
+- Do **not** emit PLAN-READY or any status meaning the plan is ready to use or agreed — only the engine, via the signer's matched signature, declares agreement (R3.14).
+- After CANDIDATE-SUBMITTED: **STOP**. The signer reviews next.
+`;
+      return base.replace('<!-- PROJCORE-STATUS-CONTRACT v2 -->', `<!-- PROJCORE-STATUS-CONTRACT v2 -->${body}`).trim();
+    }
+
+    // B3: purpose plan-signature — round-2+ signer reviews ONLY the reconciled candidate (R3.10/R3.11).
+    // Mirrors the existing revision-bind style used below for diff-review (Expected plan revision /
+    // mismatch -> stop instead of reviewing) so the signature is bound to exact candidate bytes read
+    // at decision time, never a stale copy. SIGNED or a bounded objection list only — never a
+    // competing draft, never PLAN-READY as agreement (R3.14).
+    if (params.purpose === 'plan-signature') {
+      const candidatePlan = path.resolve(params.candidatePlanPath || composeCandidatePlanPath(root));
+      const candidateRevision = readPlanRevision(candidatePlan);
+      const base = this.generateBrief({
+        batchId: params.batchId,
+        role: r,
+        planPath: candidatePlan,
+        runDir: root,
+        branch: 'main',
+        requirementsAssigned: 'PLAN-SIGNATURE',
+        northStarAnchors: params.requirement || 'sign or object to the reconciled candidate',
+        scope:
+          'Round-2+ signer review (purpose plan-signature). Read ONLY the candidate at the candidate path. Emit SIGNED plan=<sha12> bound to the exact committed bytes, or a numbered bounded objection list. Never author a competing draft; never emit PLAN-READY.',
+        requirementsSection: params.requirement || 'review the candidate below and sign or object',
+        projectDir: params.projectDir || '/home/agjrom/TGBOTS/Helm',
+        callbacksFile: params.callbacksFile || '<abs-path-to-callbacks.md>',
+        taskType: 'feature',
+      });
+      const revisionLine = candidateRevision
+        ? `Expected candidate revision: sha256=${candidateRevision.sha256} short12=${candidateRevision.short12} — your signature is bound to this exact candidate; if the candidate you read hashes differently, stop and report a revision mismatch instead of signing.`
+        : `Expected candidate revision: UNAVAILABLE — the candidate is missing or unreadable at spawn time. FAIL CLOSED: do NOT sign yet; re-read and retry; only emit SIGNED once you can confirm the candidate you read exists and state the sha256 you computed.`;
+      const body = `
+You are ${r} seat ${params.seat} reviewing a single reconciled candidate for signature (signer role this round; you never author a competing draft).
+Panel purpose: plan-signature
+
+## Candidate (READ ONLY — the only plan document you review this round)
+Candidate plan: ${candidatePlan}
+${revisionLine}
+
+## Your decision (exactly one of two outcomes — R3.11)
+1. **Sound candidate:** emit SIGNED bound to the sha12 YOU compute from re-reading the committed candidate bytes at decision time:
+[helm callback] ${r} ${params.batchId} STATUS: SIGNED plan=<sha12>
+2. **Defective candidate:** emit a numbered, bounded objection list instead of SIGNED (never both):
+[helm callback] ${r} ${params.batchId} STATUS: OBJECTIONS — n=<k>; 1. <defect> 2. <defect> ...
+
+## Forbidden on this purpose
+- Do **not** author a competing draft, rewrite the candidate, or propose your own version — objections only.
+- Do **not** emit PLAN-READY, VERDICT-READY, CONSENSUS, or any other status as if it means agreement — \`SIGNED plan=<sha12>\` bound to the correct hash is the **only** agreement grammar (R3.14).
+- The \`plan=<sha12>\` claim is **NON-AUTHORITATIVE** on its own — the engine recomputes the hash from the committed candidate file and rejects a stale or malformed claim (R3.11, fail-closed).
+- After emitting SIGNED or the objection list: **STOP**.
+`;
+      return base.replace('<!-- PROJCORE-STATUS-CONTRACT v2 -->', `<!-- PROJCORE-STATUS-CONTRACT v2 -->${body}`).trim();
+    }
+
     const planMdPath = path.join(root, 'plan.md');
     const ogReqPath = path.join(root, 'og-requirements.md');
     const revision = readPlanRevision(planMdPath);
@@ -613,9 +739,9 @@ The \`plan=<sha12>\` claim is **NON-AUTHORITATIVE**. The engine recomputes the h
     const revisionLine = revision
       ? `Expected plan revision: sha256=${revision.sha256} short12=${revision.short12} — your verdict is bound to this exact revision; if the plan.md you read hashes differently, stop and report a revision mismatch instead of reviewing.`
       : `Expected plan revision: UNAVAILABLE — plan.md is missing or unreadable at spawn time. FAIL CLOSED: do NOT emit a verdict yet; re-read and retry; only emit VERDICT-READY once you can confirm the plan.md you read exists and state the sha256 you computed.`;
-    // Default body (diff-review / task-conflict-reconvene / pre-B3 purposes): pre-purpose verdict
-    // render so ROUND can temporarily pass purpose:'diff-review' without changing verdict grammar.
-    // plan-reconcile / plan-signature instruction bodies land in B3 without contaminating this baseline (R5.19).
+    // Default body (diff-review / task-conflict-reconvene only, post-B3): verdict render, unchanged
+    // by B3's plan-reconcile / plan-signature bodies above, which return early with their own grammar
+    // and never fall through to this baseline (R5.19).
     const body = `
 You are ${r} seat ${params.seat} in a ${r === 'red-team' ? 'red-team' : 'deliberation'} panel (verifier ≠ fixer${r === 'red-team' ? ', using PROJECT role_bindings red-team agents' : ''}).
 Panel purpose: ${params.purpose}
