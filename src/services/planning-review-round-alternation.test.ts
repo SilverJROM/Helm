@@ -143,7 +143,8 @@ describe('runReviewRound — round 3+ alternates the proposer/signer pen (R4, R3
       }
       if (batchId === 'batch-R4A-r2-signer') {
         // Forced non-signature (round 2): the signer objects, never signs — the pen must move.
-        await post(`[helm callback] planner ${batchId} STATUS: OBJECTIONS — n=1; 1. round-2 candidate rejected for this test.`);
+        // R6 (R3.13): defect count must strictly shrink on the next objections round, so n=2 here.
+        await post(`[helm callback] planner ${batchId} STATUS: OBJECTIONS — n=2; 1. round-2 defect A. 2. round-2 defect B.`);
         return;
       }
       if (batchId === 'batch-R4A-r3-proposer') {
@@ -153,6 +154,7 @@ describe('runReviewRound — round 3+ alternates the proposer/signer pen (R4, R3
       }
       if (batchId === 'batch-R4A-r3-signer') {
         // Forced non-signature (round 3) too — round 4 must swap back to round 2's proposer.
+        // R6: n=1 < prior n=2 so monotonicity allows the loop to continue to round 4.
         await post(`[helm callback] planner ${batchId} STATUS: OBJECTIONS — n=1; 1. round-3 candidate rejected for this test.`);
         return;
       }

@@ -196,7 +196,11 @@ export interface RunReviewRoundOptions {
  * - 'signer-no-response': R3 (R3.11) — the round-2 signer never posted SIGNED or OBJECTIONS.
  * - 'signer-objections': R3 (R3.11/R3.13) — the signer returned a bounded numbered objection list
  *   against the candidate. Not agreement, and distinct from silence: there IS a defect set to act on
- *   (R6 owns monotonicity across rounds; this module only reports the round's own outcome).
+ *   (R6 owns monotonicity across rounds; this is the per-round outcome when the cap is hit with
+ *   objections still open, or when a single objections round ends the loop with no prior count).
+ * - 'objection-not-monotone': R6 (R3.13) — round N+1's parsed defect count against the revised
+ *   candidate was not strictly smaller than round N's. Typed BLOCK early without burning remaining
+ *   round-cap budget (no further proposer/signer spawns).
  * - 'signature-mismatch': R3 (R3.11) — the signer posted SIGNED but its claimed `plan=<sha12>` did
  *   not equal the candidate's engine-recomputed CURRENT on-disk short12 (missing/malformed/stale
  *   claim). Fail-closed: never agreement.
@@ -210,6 +214,7 @@ export type RoundBlockedReasonKind =
   | 'candidate-not-committed'
   | 'signer-no-response'
   | 'signer-objections'
+  | 'objection-not-monotone'
   | 'signature-mismatch';
 
 export interface ReviewRoundResult {
@@ -708,10 +713,87 @@ const SIGNED_CLAIM_RE = /^\s+plan=([0-9a-f]{12})\s*$/;
 /**
  * R3 (R3.11/R3.13): the plan-signature purpose's rejection grammar is
  * `STATUS: OBJECTIONS — n=<k>; 1. <defect> 2. <defect> ...`. The note (everything after the optional
- * separator) is captured verbatim for the caller to surface/parse further — this module does not
- * itself count or validate the numbered list (that is R6's objection-monotonicity scope).
+ * separator) is captured verbatim; R6's `parseBoundedObjectionList` counts/validates the numbered
+ * list for cross-round monotonicity.
  */
 const OBJECTIONS_RE = /^\[(?:helm|projcore) callback\]\s+(\S+)\s+(\S+)\s+STATUS:\s+OBJECTIONS\b(?:\s*[\-—–:]?\s*(.*))?$/;
+
+/** R6 (R3.13): hard upper bound on a single signer's numbered defect list. */
+export const MAX_BOUNDED_OBJECTIONS = 20;
+
+export type ParsedObjectionList =
+  | { ok: true; declaredN: number; count: number; defects: string[] }
+  | { ok: false; reason: string };
+
+/**
+ * R6 (R3.13): parse a signer's bounded numbered objection note
+ * (`n=<k>; 1. <defect> 2. <defect> ...`). Fail-closed:
+ * - missing/empty note, missing `n=<k>;` header, non-contiguous numbering, empty defect text,
+ *   declared `n` outside 1..MAX_BOUNDED_OBJECTIONS, or declared `n` ≠ parsed item count →
+ *   `{ ok: false }` — NEVER counted as zero objections (a zero would falsely look like progress).
+ */
+export function parseBoundedObjectionList(note: string | null | undefined): ParsedObjectionList {
+  if (note == null || typeof note !== 'string' || note.trim() === '') {
+    return { ok: false, reason: 'empty-objection-note' };
+  }
+  const trimmed = note.trim();
+  const headerMatch = /^n\s*=\s*(\d+)\s*;\s*(.*)$/s.exec(trimmed);
+  if (!headerMatch) {
+    return { ok: false, reason: 'missing-n-header' };
+  }
+  const declaredN = Number(headerMatch[1]);
+  if (!Number.isFinite(declaredN) || !Number.isInteger(declaredN) || declaredN < 1) {
+    return { ok: false, reason: 'invalid-declared-n' };
+  }
+  if (declaredN > MAX_BOUNDED_OBJECTIONS) {
+    return { ok: false, reason: `declared-n-exceeds-max-${MAX_BOUNDED_OBJECTIONS}` };
+  }
+  const body = headerMatch[2].trim();
+  if (!body) {
+    return { ok: false, reason: 'empty-defect-list' };
+  }
+
+  // Collect starts of "N. " items (number must be contiguous from 1).
+  const itemStartRe = /(?:^|\s)(\d+)\.\s+/g;
+  const starts: Array<{ n: number; textStart: number; matchStart: number }> = [];
+  let m: RegExpExecArray | null;
+  while ((m = itemStartRe.exec(body)) !== null) {
+    starts.push({
+      n: Number(m[1]),
+      textStart: m.index + m[0].length,
+      matchStart: m.index,
+    });
+  }
+  if (starts.length === 0) {
+    return { ok: false, reason: 'no-numbered-items' };
+  }
+
+  const defects: string[] = [];
+  for (let i = 0; i < starts.length; i++) {
+    const expected = i + 1;
+    if (starts[i].n !== expected) {
+      return {
+        ok: false,
+        reason: `non-contiguous-numbering-expected-${expected}-got-${starts[i].n}`,
+      };
+    }
+    const end = i + 1 < starts.length ? starts[i + 1].matchStart : body.length;
+    const defectText = body.slice(starts[i].textStart, end).trim();
+    if (!defectText) {
+      return { ok: false, reason: `empty-defect-${expected}` };
+    }
+    defects.push(defectText);
+  }
+
+  if (defects.length !== declaredN) {
+    return {
+      ok: false,
+      reason: `n-count-mismatch-declared-${declaredN}-parsed-${defects.length}`,
+    };
+  }
+
+  return { ok: true, declaredN, count: defects.length, defects };
+}
 
 /**
  * R3 (R3.10): the plan-reconcile purpose's terminal grammar is `STATUS: CANDIDATE-SUBMITTED
@@ -1494,6 +1576,9 @@ export async function runReviewRound(options: RunReviewRoundOptions): Promise<Re
   // R4 (R3.12): round 2's own D3 designation, captured once so round 3+ can alternate FROM it
   // (rolesForRound) instead of re-designating off the same unchanged round-1 drafts every round.
   let round2ProposerSeatId: string | undefined;
+  // R6 (R3.13): last proposer/signer round's parsed defect count (or 'unparseable'). Undefined until
+  // the first objections outcome; used to enforce strict shrink on the next objections round.
+  let previousObjectionCount: number | 'unparseable' | undefined;
   for (let round = 1; round <= resolvedRoundCap; round++) {
     roundsAttempted = round;
     if (round > 1) {
@@ -1514,6 +1599,9 @@ export async function runReviewRound(options: RunReviewRoundOptions): Promise<Re
     // continues into round 3 (and beyond) of the SAME exchange, alternating the pen via rolesForRound
     // instead of D3 re-designating the same seat off the same unchanged round-1 drafts every round.
     // Round 2 itself is unchanged: no rolesOverride, D3's natural designation.
+    // R6 (R3.13): when the signer objects, parse the bounded defect list and store its count; if this
+    // is not the first objections round and the new count is not STRICTLY smaller than the previous,
+    // typed-BLOCK early (`objection-not-monotone`) without spending remaining round-cap budget.
     if (roundOneDrafts) {
       const [draftA, draftB] = roundOneDrafts;
       const rolesOverride =
@@ -1529,7 +1617,50 @@ export async function runReviewRound(options: RunReviewRoundOptions): Promise<Re
         partnerHandles, partnerRuntimeIds,
       });
       if (round === 2) round2ProposerSeatId = psResult.designatedSeatId;
-      if (psResult.agreed || round >= resolvedRoundCap) {
+      if (psResult.agreed) {
+        return toReviewRoundResult(psResult, partnerBatchIds, roundOneDrafts, round);
+      }
+
+      if (psResult.signerDecision === 'objections') {
+        const parsed = parseBoundedObjectionList(psResult.objections);
+        // Fail-closed: unparseable list is NEVER counted as zero (that would look like progress).
+        const currentCount: number | 'unparseable' = parsed.ok ? parsed.count : 'unparseable';
+
+        if (previousObjectionCount !== undefined) {
+          const priorLabel =
+            previousObjectionCount === 'unparseable' ? 'unparseable' : String(previousObjectionCount);
+          const currentLabel =
+            currentCount === 'unparseable' ? 'unparseable' : String(currentCount);
+          const strictlySmaller =
+            typeof previousObjectionCount === 'number' &&
+            typeof currentCount === 'number' &&
+            currentCount < previousObjectionCount;
+          if (!strictlySmaller) {
+            const partnerBatchIdsWithPs = [
+              ...partnerBatchIds,
+              ...(psResult.proposerBatchId ? [psResult.proposerBatchId] : []),
+              ...(psResult.signerBatchId ? [psResult.signerBatchId] : []),
+            ];
+            const unspent = Math.max(0, resolvedRoundCap - round);
+            return {
+              agreed: false,
+              partnerBatchIds: partnerBatchIdsWithPs,
+              roundsAttempted: round,
+              roundOneDraftPublications: roundOneDrafts,
+              proposerSignerRound: psResult,
+              blockedReasonKind: 'objection-not-monotone',
+              blockedReason:
+                `OBJECTION-NOT-MONOTONE (R3.13/R6): round ${round} defect count (${currentLabel}) ` +
+                `is not strictly smaller than prior objections count (${priorLabel}) against the ` +
+                `revised candidate — typed BLOCK early; ${unspent} remaining round-cap slot(s) unspent ` +
+                `(cap ${resolvedRoundCap}), never burned chasing a non-shrinking objection set.`,
+            };
+          }
+        }
+        previousObjectionCount = currentCount;
+      }
+
+      if (round >= resolvedRoundCap) {
         return toReviewRoundResult(psResult, partnerBatchIds, roundOneDrafts, round);
       }
       // R4: budget remains — round (round + 1) alternates the pen over the SAME two round-1 drafts.

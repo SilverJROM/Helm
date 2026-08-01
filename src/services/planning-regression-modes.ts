@@ -181,3 +181,23 @@ registerRegressionMode({
   state: 'active',
   note: 'Round loop wires rolesForRound into every round 3+ of a proposer/signer exchange: round 2 = D3 designation, round 3 swaps to the other seat, round 4 swaps back — never one seat every round.',
 });
+
+/**
+ * R6 — objection monotonicity: a signer's rejection carries a bounded numbered defect list;
+ * round N+1's parsed count against the revised candidate must be strictly smaller than round N's,
+ * or the run typed-BLOCKs early (`objection-not-monotone`) without burning remaining round-cap budget.
+ */
+registerRegressionMode({
+  mode: 'objection-monotonicity',
+  slice: 'R6',
+  requirements: ['R3.13', 'R6.24'],
+  spec: 'src/services/planning-review-round-objection-mono.test.ts',
+  provingTests: [
+    'blocks early with objection-not-monotone when round N+1 defect count is not strictly smaller',
+    'does not spawn further proposer/signer rounds after a non-monotone objections outcome',
+    'allows a strictly shrinking defect count to continue (and eventually agree)',
+    'parseBoundedObjectionList: declared n must equal parsed item count (never counts mismatch as zero)',
+  ],
+  state: 'active',
+  note: 'Signer OBJECTIONS notes are parsed as bounded numbered lists; a non-shrinking count across rounds typed-BLOCKs objection-not-monotone early without burning remaining cap.',
+});
