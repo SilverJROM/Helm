@@ -1,4 +1,5 @@
 import fs from 'node:fs/promises';
+import fsSync from 'node:fs';
 import path from 'node:path';
 import type { ITransport } from './fake-transport.js';
 import type { BriefWriterService } from './brief-writer-service.js';
@@ -202,6 +203,11 @@ export interface RunReviewRoundOptions {
  * - 'signature-mismatch': R3 (R3.11) — the signer posted SIGNED but its claimed `plan=<sha12>` did
  *   not equal the candidate's engine-recomputed CURRENT on-disk short12 (missing/malformed/stale
  *   claim). Fail-closed: never agreement.
+ *
+ * R7 (R3.15) does NOT introduce a new kind: cap exhaustion and monotone fail keep their existing
+ * kinds (`signer-objections` / `round-cap-exhausted` / `objection-not-monotone` / …). The operator-
+ * legible **final-positions diff** rides on `blockedReason` (and the durable
+ * `nonConvergenceDiffPath` file), never as bare hash pairs alone.
  */
 export type RoundBlockedReasonKind =
   | 'artifact-not-published'
@@ -243,6 +249,10 @@ export interface ReviewRoundResult {
    *  the signer's decision. `agreed` above mirrors this result's `agreed` (signature on the candidate
    *  bytes is the only thing that agrees). Always undefined when the loop never reached round 2. */
   proposerSignerRound?: ProposerSignerRoundResult;
+  /** R7 (R3.15): absolute path of the durable final-positions report written on cap exhaustion /
+   *  monotone fail (and other terminal non-convergence of the proposer/signer exchange that has
+   *  positions to compare). Undefined when no report was written. */
+  nonConvergenceDiffPath?: string;
 }
 
 /**
@@ -729,6 +739,236 @@ export function parseBoundedObjectionList(note: string | null | undefined): Pars
   }
 
   return { ok: true, declaredN, count: defects.length, defects };
+}
+
+// ─── R7 (R3.15): non-convergence = visible final-positions diff (operator-legible, not bare hashes) ───
+
+/** Cap on how many unified-diff lines ride inside blockedReason (full report is always on disk). */
+export const NON_CONVERGENCE_DIFF_BLOCKED_REASON_MAX_LINES = 80;
+
+/**
+ * R7 (R3.15): durable final-positions report path under the run's planning-drafts dir.
+ * Written on cap exhaustion / monotone fail (and other terminal non-convergence with positions).
+ */
+export function nonConvergenceDiffPath(runDir: string): string {
+  return path.join(path.resolve(runDir), 'planning-drafts', 'non-convergence-diff.txt');
+}
+
+/**
+ * R7 (R3.15): line-oriented unified-style diff (no external dep). Operator-legible comparison of
+ * two text positions — never a bare hash pair. Identical inputs yield a short "identical" note.
+ */
+export function unifiedLineDiff(
+  aLabel: string,
+  aText: string,
+  bLabel: string,
+  bText: string,
+): string {
+  const aLines = aText.replace(/\r\n/g, '\n').split('\n');
+  const bLines = bText.replace(/\r\n/g, '\n').split('\n');
+  // Drop a single trailing empty element produced by a final newline so "a\n" vs "a\n" is identical.
+  if (aLines.length > 0 && aLines[aLines.length - 1] === '') aLines.pop();
+  if (bLines.length > 0 && bLines[bLines.length - 1] === '') bLines.pop();
+
+  const header = `--- ${aLabel}\n+++ ${bLabel}`;
+  if (aLines.length === bLines.length && aLines.every((l, i) => l === bLines[i])) {
+    return `${header}\n(identical — ${aLines.length} line(s))`;
+  }
+
+  // Classic LCS DP for small planning docs (plans are bounded; O(nm) is fine).
+  const n = aLines.length;
+  const m = bLines.length;
+  const dp: number[][] = Array.from({ length: n + 1 }, () => new Array<number>(m + 1).fill(0));
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      dp[i][j] =
+        aLines[i] === bLines[j]
+          ? dp[i + 1][j + 1] + 1
+          : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+
+  type Op = { kind: ' ' | '-' | '+'; line: string };
+  const ops: Op[] = [];
+  let i = 0;
+  let j = 0;
+  while (i < n && j < m) {
+    if (aLines[i] === bLines[j]) {
+      ops.push({ kind: ' ', line: aLines[i] });
+      i++;
+      j++;
+    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+      ops.push({ kind: '-', line: aLines[i] });
+      i++;
+    } else {
+      ops.push({ kind: '+', line: bLines[j] });
+      j++;
+    }
+  }
+  while (i < n) {
+    ops.push({ kind: '-', line: aLines[i++] });
+  }
+  while (j < m) {
+    ops.push({ kind: '+', line: bLines[j++] });
+  }
+
+  // Emit a single hunk spanning the whole file (plans are short; multi-hunk is not load-bearing).
+  const body = ops.map((op) => `${op.kind}${op.line}`).join('\n');
+  const removed = ops.filter((o) => o.kind === '-').length;
+  const added = ops.filter((o) => o.kind === '+').length;
+  return (
+    `${header}\n` +
+    `@@ final-positions -${n} +${m} (removed ${removed}, added ${added}) @@\n` +
+    body
+  );
+}
+
+export interface NonConvergenceDiffInput {
+  runDir: string;
+  cause: string;
+  candidatePath: string;
+  candidateShort12: string | null;
+  /** Signer's last authored plan position (round-1 draft path for that seat). */
+  otherLabel: string;
+  otherPath: string;
+  otherShort12: string | null;
+  /** Final signer objections note, if any. */
+  objectionsNote?: string | null;
+}
+
+export interface NonConvergenceDiffResult {
+  /** Full durable report body (written to disk). */
+  fullText: string;
+  /** Absolute path written (or attempted). */
+  path: string;
+  /** Truncated form safe to append inside blockedReason. */
+  summaryForBlockedReason: string;
+}
+
+function readTextOrNull(filePath: string): string | null {
+  try {
+    return fsSync.readFileSync(filePath, 'utf8');
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * R7 (R3.15): build + persist the final-positions report (candidate vs signer's last draft +
+ * remaining objections). Never reports bare hash pairs alone — hashes are metadata alongside
+ * the textual/hunk body. Failures to read a side are stated in prose, not silently omitted.
+ */
+export function buildAndPersistNonConvergenceDiff(
+  input: NonConvergenceDiffInput,
+): NonConvergenceDiffResult {
+  const outPath = nonConvergenceDiffPath(input.runDir);
+  const candidateText = readTextOrNull(input.candidatePath);
+  const otherText = readTextOrNull(input.otherPath);
+
+  const candidateLabel =
+    `final-candidate path=${input.candidatePath} sha12=${input.candidateShort12 ?? 'unreadable'}`;
+  const otherLabel =
+    `${input.otherLabel} path=${input.otherPath} sha12=${input.otherShort12 ?? 'unreadable'}`;
+
+  let positionsSection: string;
+  if (candidateText == null && otherText == null) {
+    positionsSection =
+      `--- ${candidateLabel}\n+++ ${otherLabel}\n` +
+      `(both sides unreadable on disk — cannot render a line diff; this is still a visible non-convergence ` +
+      `exit, not a silent pass. Hashes alone are never treated as an adequate operator report.)`;
+  } else if (candidateText == null) {
+    positionsSection =
+      `--- ${candidateLabel}\n+++ ${otherLabel}\n` +
+      `(final candidate unreadable on disk)\n` +
+      `--- other side (full text) ---\n${otherText}`;
+  } else if (otherText == null) {
+    positionsSection =
+      `--- ${candidateLabel}\n+++ ${otherLabel}\n` +
+      `(other side unreadable on disk)\n` +
+      `--- final candidate (full text) ---\n${candidateText}`;
+  } else {
+    positionsSection = unifiedLineDiff(candidateLabel, candidateText, otherLabel, otherText);
+  }
+
+  const objectionsSection =
+    input.objectionsNote != null && String(input.objectionsNote).trim() !== ''
+      ? `## Signer final objections\n${String(input.objectionsNote).trim()}`
+      : `## Signer final objections\n(none captured)`;
+
+  const fullText =
+    `# Non-convergence final-positions report (R3.15 / R7)\n` +
+    `cause: ${input.cause}\n` +
+    `\n` +
+    `## Textual diff — final candidate vs signer's last draft position\n` +
+    `${positionsSection}\n` +
+    `\n` +
+    `${objectionsSection}\n`;
+
+  try {
+    fsSync.mkdirSync(path.dirname(outPath), { recursive: true });
+    fsSync.writeFileSync(outPath, fullText, 'utf8');
+  } catch {
+    // Best-effort durable write — blockedReason still carries the summary even if disk fails.
+  }
+
+  const lines = fullText.split('\n');
+  let summaryBody: string;
+  if (lines.length <= NON_CONVERGENCE_DIFF_BLOCKED_REASON_MAX_LINES) {
+    summaryBody = fullText.trimEnd();
+  } else {
+    summaryBody =
+      lines.slice(0, NON_CONVERGENCE_DIFF_BLOCKED_REASON_MAX_LINES).join('\n') +
+      `\n… [truncated; full report at ${outPath}]`;
+  }
+
+  const summaryForBlockedReason =
+    `\n\nNON-CONVERGENCE-DIFF (R3.15): operator-legible final positions ` +
+    `(not bare hash pairs) — full report: ${outPath}\n` +
+    summaryBody;
+
+  return { fullText, path: outPath, summaryForBlockedReason };
+}
+
+/**
+ * R7 (R3.15): resolve the signer's last authored plan path from round-1 draft publications.
+ * The signer never authors a competing document after round 1 (R3.10) — their last draft IS
+ * their final position to compare against the reconciled candidate.
+ */
+function signerLastDraftFromRoundOne(
+  drafts: PublishedDraft[] | undefined,
+  signerSeatId: string,
+): PublishedDraft | null {
+  if (!drafts || drafts.length === 0) return null;
+  return drafts.find((d) => d.seatId === signerSeatId) ?? null;
+}
+
+/**
+ * R7 (R3.15): attach final-positions diff to a non-agreeing ReviewRoundResult that already has
+ * a proposer/signer outcome with positions worth comparing. Mutates nothing; returns the fields
+ * to spread onto the result.
+ */
+function nonConvergenceFieldsForPsResult(
+  runDir: string,
+  psResult: ProposerSignerRoundResult,
+  roundOneDrafts: PublishedDraft[] | undefined,
+  cause: string,
+): Pick<ReviewRoundResult, 'nonConvergenceDiffPath'> & { blockedReasonSuffix: string } {
+  const signerDraft = signerLastDraftFromRoundOne(roundOneDrafts, psResult.signerSeatId);
+  const otherPath = signerDraft?.planPath ?? path.join(runDir, `(missing-draft-${psResult.signerSeatId})`);
+  const built = buildAndPersistNonConvergenceDiff({
+    runDir,
+    cause,
+    candidatePath: psResult.candidatePlanPath,
+    candidateShort12: psResult.candidatePlan?.short12 ?? null,
+    otherLabel: `signer-last-draft seat=${psResult.signerSeatId}`,
+    otherPath,
+    otherShort12: signerDraft?.plan?.short12 ?? null,
+    objectionsNote: psResult.objections ?? null,
+  });
+  return {
+    nonConvergenceDiffPath: built.path,
+    blockedReasonSuffix: built.summaryForBlockedReason,
+  };
 }
 
 /**
@@ -1223,12 +1463,19 @@ export async function runProposerSignerRound(
  * committed, the signer never answered, the signer objected, or the signer's claimed sha did not match
  * the candidate's engine-recomputed current bytes. The full typed result rides along on
  * `proposerSignerRound` for consumers that need the candidate paths / designation log (P2's promotion).
+ *
+ * R7 (R3.15): on terminal non-convergence that has positions to compare (objections / signature-
+ * mismatch, and silence only when a candidate already sits on disk), `blockedReason` is extended
+ * with an operator-legible final-positions diff (candidate vs signer's last draft + remaining
+ * objections) — never bare hash pairs alone — and a durable report is written under
+ * `planning-drafts/non-convergence-diff.txt`.
  */
 function toReviewRoundResult(
   psResult: ProposerSignerRoundResult,
   roundOneBatchIds: string[],
   roundOneDraftPublications: PublishedDraft[],
-  roundsAttempted: number
+  roundsAttempted: number,
+  runDir: string,
 ): ReviewRoundResult {
   const partnerBatchIds = [
     ...roundOneBatchIds,
@@ -1244,40 +1491,54 @@ function toReviewRoundResult(
 
   if (psResult.agreed) return { agreed: true, ...base };
 
+  // R7 (R3.15): attach final-positions diff whenever a candidate exists on disk (or we still have
+  // draft positions to show against an unreadable candidate). candidate-not-committed has no
+  // candidate yet — still report drafts vs empty candidate side so the operator sees something
+  // other than two hex strings.
+  const attachDiff =
+    psResult.signerDecision === 'objections' ||
+    psResult.signerDecision === 'signed-mismatched' ||
+    psResult.blockedReasonKind === 'signer-no-response' ||
+    psResult.blockedReasonKind === 'candidate-not-committed' ||
+    !psResult.agreed;
+
+  const attach = (kind: RoundBlockedReasonKind, reason: string): ReviewRoundResult => {
+    if (!attachDiff) {
+      return { agreed: false, ...base, blockedReasonKind: kind, blockedReason: reason };
+    }
+    const nc = nonConvergenceFieldsForPsResult(runDir, psResult, roundOneDraftPublications, kind);
+    return {
+      agreed: false,
+      ...base,
+      blockedReasonKind: kind,
+      blockedReason: `${reason}${nc.blockedReasonSuffix}`,
+      nonConvergenceDiffPath: nc.nonConvergenceDiffPath,
+    };
+  };
+
   // Bounded, already-typed blocks from the exchange itself (proposer/signer silence) pass through with
   // their own message; the two decision-shaped refusals are classified here.
   if (psResult.blockedReasonKind) {
-    return {
-      agreed: false,
-      ...base,
-      blockedReasonKind: psResult.blockedReasonKind,
-      blockedReason: psResult.blockedReason,
-    };
+    return attach(psResult.blockedReasonKind, psResult.blockedReason ?? psResult.blockedReasonKind);
   }
 
   if (psResult.signerDecision === 'objections') {
-    return {
-      agreed: false,
-      ...base,
-      blockedReasonKind: 'signer-objections',
-      blockedReason:
-        `SIGNER-OBJECTIONS (R3/R3.11): signer seat ${psResult.signerSeatId} (${psResult.signerBatchId}) ` +
+    return attach(
+      'signer-objections',
+      `SIGNER-OBJECTIONS (R3/R3.11): signer seat ${psResult.signerSeatId} (${psResult.signerBatchId}) ` +
         `refused to sign candidate ${psResult.candidatePlan?.short12 ?? 'unreadable'} ` +
         `(${psResult.candidatePlanPath}) with a bounded objection list — never agreement: ` +
         `${psResult.objections ?? '(no note captured)'}`,
-    };
+    );
   }
 
-  return {
-    agreed: false,
-    ...base,
-    blockedReasonKind: 'signature-mismatch',
-    blockedReason:
-      `SIGNATURE-MISMATCH (R3/R3.11): signer seat ${psResult.signerSeatId} (${psResult.signerBatchId}) ` +
+  return attach(
+    'signature-mismatch',
+    `SIGNATURE-MISMATCH (R3/R3.11): signer seat ${psResult.signerSeatId} (${psResult.signerBatchId}) ` +
       `posted SIGNED, but its claimed plan sha did not equal the candidate's engine-recomputed current ` +
       `short12 ${psResult.candidatePlan?.short12 ?? '(candidate unreadable)'} (${psResult.candidatePlanPath}) — ` +
       `a missing, malformed, or stale claim is fail-closed, never a silent pass.`,
-  };
+  );
 }
 
 export async function runReviewRound(options: RunReviewRoundOptions): Promise<ReviewRoundResult> {
@@ -1553,7 +1814,7 @@ export async function runReviewRound(options: RunReviewRoundOptions): Promise<Re
       });
       if (round === 2) round2ProposerSeatId = psResult.designatedSeatId;
       if (psResult.agreed) {
-        return toReviewRoundResult(psResult, partnerBatchIds, roundOneDrafts, round);
+        return toReviewRoundResult(psResult, partnerBatchIds, roundOneDrafts, round, runDir);
       }
 
       if (psResult.signerDecision === 'objections') {
@@ -1577,6 +1838,10 @@ export async function runReviewRound(options: RunReviewRoundOptions): Promise<Re
               ...(psResult.signerBatchId ? [psResult.signerBatchId] : []),
             ];
             const unspent = Math.max(0, resolvedRoundCap - round);
+            // R7 (R3.15): monotone fail is a visible non-convergence with final-positions diff, not bare hashes.
+            const nc = nonConvergenceFieldsForPsResult(
+              runDir, psResult, roundOneDrafts, 'objection-not-monotone',
+            );
             return {
               agreed: false,
               partnerBatchIds: partnerBatchIdsWithPs,
@@ -1588,7 +1853,9 @@ export async function runReviewRound(options: RunReviewRoundOptions): Promise<Re
                 `OBJECTION-NOT-MONOTONE (R3.13/R6): round ${round} defect count (${currentLabel}) ` +
                 `is not strictly smaller than prior objections count (${priorLabel}) against the ` +
                 `revised candidate — typed BLOCK early; ${unspent} remaining round-cap slot(s) unspent ` +
-                `(cap ${resolvedRoundCap}), never burned chasing a non-shrinking objection set.`,
+                `(cap ${resolvedRoundCap}), never burned chasing a non-shrinking objection set.` +
+                nc.blockedReasonSuffix,
+              nonConvergenceDiffPath: nc.nonConvergenceDiffPath,
             };
           }
         }
@@ -1596,7 +1863,7 @@ export async function runReviewRound(options: RunReviewRoundOptions): Promise<Re
       }
 
       if (round >= resolvedRoundCap) {
-        return toReviewRoundResult(psResult, partnerBatchIds, roundOneDrafts, round);
+        return toReviewRoundResult(psResult, partnerBatchIds, roundOneDrafts, round, runDir);
       }
       // R4: budget remains — round (round + 1) alternates the pen over the SAME two round-1 drafts.
       continue;
