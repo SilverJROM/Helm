@@ -771,21 +771,29 @@ async function waitForCandidateCommit(
 }
 
 /**
- * R3 (R3.11): waits for the fresh-spawned signer seat to post its decision — SIGNED (with the sha12
- * it computed re-reading the candidate) or a bounded OBJECTIONS list. Unlike draft/candidate commits
- * there is no on-disk fallback: a signature decision is callback-grammar-only, so a seat that never
- * posts either line always resolves to a bounded timeout, never a silent pass.
+ * R5 (R3.11/R3.14/R6.21): waits for the fresh-spawned signer seat to post its decision — SIGNED or a
+ * bounded OBJECTIONS list — and, for a SIGNED line, resolves the agreement question in this SAME call.
+ * This is the one place `agreed:true` is ever decided (R3.14): the signer's claimed `plan=<sha12>` is
+ * checked against `readPlanRevision(candidatePlanFilePath)` recomputed HERE, at check time, never a
+ * cached/trusted claim (B5's exact mechanism, re-pointed). A missing, malformed, or stale-relative-to-
+ * current-candidate claim resolves `kind:'signed-mismatched'`, never agreement (R6.21, fail-closed).
+ * No line in this grammar means "ready to use" — brain `PLAN-READY` is not part of this path at all.
+ * Unlike draft/candidate commits there is no on-disk fallback: a signature decision is
+ * callback-grammar-only, so a seat that never posts either line always resolves to a bounded timeout,
+ * never a silent pass.
  */
-async function waitForSignerDecision(
+export async function waitForCandidateSignature(
   cbPath: string,
   partnerRole: string,
   seat: RoundOneDraftSeat,
+  candidatePlanFilePath: string,
   timeoutMs: number,
   sinceOffset: number,
   watchdogTransport: ReviewerWatchdogTransport
 ): Promise<
-  | { ok: true; kind: 'signed'; claimedShort12: string | null }
-  | { ok: true; kind: 'objections'; note: string | null }
+  | { ok: true; kind: 'signed-agreed'; candidatePlan: PlanRevision; claimedShort12: string }
+  | { ok: true; kind: 'signed-mismatched'; candidatePlan: PlanRevision | null; claimedShort12: string | null }
+  | { ok: true; kind: 'objections'; candidatePlan: PlanRevision | null; note: string | null }
   | { ok: false; reason: 'no-first-callback' | 'session-gone' }
 > {
   const start = Date.now();
@@ -798,9 +806,22 @@ async function waitForSignerDecision(
         const identity = RAW_CALLBACK_IDENTITY_RE.exec(line);
         if (!identity || identity[2] !== seat.batchId || !roleMatches(partnerRole, identity[1])) continue;
         const signedMatch = SIGNED_RE.exec(line);
-        if (signedMatch) return { ok: true, kind: 'signed', claimedShort12: signedMatch[3] ?? null };
+        if (signedMatch) {
+          const claimedShort12 = signedMatch[3] ?? null;
+          const candidatePlan = readPlanRevision(candidatePlanFilePath);
+          const agreed = !!candidatePlan && !!claimedShort12 && claimedShort12 === candidatePlan.short12;
+          return agreed
+            ? { ok: true, kind: 'signed-agreed', candidatePlan: candidatePlan!, claimedShort12: claimedShort12! }
+            : { ok: true, kind: 'signed-mismatched', candidatePlan, claimedShort12 };
+        }
         const objectionsMatch = OBJECTIONS_RE.exec(line);
-        if (objectionsMatch) return { ok: true, kind: 'objections', note: objectionsMatch[3] ?? null };
+        if (objectionsMatch) {
+          return {
+            ok: true, kind: 'objections',
+            candidatePlan: readPlanRevision(candidatePlanFilePath),
+            note: objectionsMatch[3] ?? null,
+          };
+        }
       }
     } catch {}
 
@@ -1112,9 +1133,13 @@ export async function runProposerSignerRound(
   );
   partnerHandles.push(signerSpawned.handle);
 
-  const decision = await waitForSignerDecision(
+  // R5 (R3.11/R3.14/R6.21): waitForCandidateSignature is the ONE place agreed:true is ever decided —
+  // it recomputes the candidate's current on-disk short12 itself and compares it to the signer's
+  // claim before returning, so this call site never re-derives (or re-trusts) that comparison.
+  const decision = await waitForCandidateSignature(
     cbPath, partner,
     { batchId: signerBatchId, brief: signerBrief, handle: signerSpawned.handle, seatId: signerSeatId },
+    candidatePlanPathResolved,
     perRoundTimeoutMs, agreementFenceOffset,
     transport as ReviewerWatchdogTransport
   );
@@ -1143,24 +1168,19 @@ export async function runProposerSignerRound(
       agreed: false, hashMatch, designatedSeatId, designationLog, roundProposerSeatId, reconcileSpawned,
       proposerBatchId, signerSeatId, signerBatchId,
       candidatePlanPath: candidatePlanPathResolved, candidateReqPath: candidateReqPathResolved,
-      candidatePlan: readPlanRevision(candidatePlanPathResolved),
+      candidatePlan: decision.candidatePlan,
       signerDecision: 'objections',
       objections: decision.note,
     };
   }
 
-  // decision.kind === 'signed' — R3.11: recompute the candidate's CURRENT bytes now; a missing,
-  // malformed, or stale-relative-to-current claim is never treated as agreement (fail-closed).
-  const currentCandidate = readPlanRevision(candidatePlanPathResolved);
-  const agreed =
-    !!currentCandidate && !!decision.claimedShort12 && decision.claimedShort12 === currentCandidate.short12;
-
+  const agreed = decision.kind === 'signed-agreed';
   return {
     agreed, hashMatch, designatedSeatId, designationLog, roundProposerSeatId, reconcileSpawned,
     proposerBatchId, signerSeatId, signerBatchId,
     candidatePlanPath: candidatePlanPathResolved, candidateReqPath: candidateReqPathResolved,
-    candidatePlan: currentCandidate,
-    signerDecision: agreed ? 'signed-agreed' : 'signed-mismatched',
+    candidatePlan: decision.candidatePlan,
+    signerDecision: decision.kind,
   };
 }
 
