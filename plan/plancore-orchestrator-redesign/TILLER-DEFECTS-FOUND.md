@@ -44,4 +44,58 @@ fix — this run stayed safe by luck of timing plus active supervision, not by t
 
 ---
 
+---
+
+## D2 — False park on the literal substring "BLOCKED" in free-text prose (found 03:56 PHT)
+
+**Severity:** real, causes rolled-back completed work — the exact class of damage this whole effort
+exists to prevent, now surfacing one layer down in the tool doing the preventing.
+
+**Mechanism, verified directly** (`projcore-driver.py:1318-1322`):
+
+```python
+iline, iwhy = poll_cb_active(cb, rf'\[projcore callback\] implementer {re.escape(s)} STATUS: (DONE|BLOCKED)', ...)
+...
+elif not iline or 'BLOCKED' in iline:
+    return {'slice': s, 'decision': 'ESCALATE', ...}
+```
+
+The regex correctly captures `DONE` vs `BLOCKED` as a group. The park check three lines later throws
+that away and re-checks `'BLOCKED' in iline` against the **entire captured line**, including whatever
+free-text note follows `STATUS: DONE`. Slice R7's own product feature (R3.15) is literally about
+labeling non-convergence "BLOCKED" in an operator-facing message — so its completion note read
+`STATUS: DONE — commit fc7c025 non-convergence BLOCKED + final-positions diff (R3.15)`, and the
+substring match false-triggered a park + `git reset --hard` rollback on work that had genuinely
+finished.
+
+**Found by:** the brain seat (grok45), diagnosed correctly from the driver source itself, not guessed.
+
+**Suggested fix:** check the regex's captured status group (`DONE`/`BLOCKED`), never substring-match
+the raw line. Any product whose vocabulary legitimately contains the word "blocked" will hit this.
+
+## D3 — The no-progress loop guard is process-scoped in a way that isn't documented
+
+**Severity:** minor / operator-facing friction, not data-damaging on its own — but easy to misuse.
+
+**Mechanism:** after a false-park unstick (D2) is retried, the driver's no-progress guard
+(`~projcore-driver.py:1615-1630`) can re-trigger within the **same live driver process**, because its
+"already driven once this drain" state is in-memory and process-scoped. A second `RETRY_WITH_DIRECTION`
+issued while that same process is still running just re-hits the guard and thrashes (re-RAISE, burn a
+seat pair, no advance). The only way to actually clear it is to let the process reach a terminal exit
+(or be stopped) and resume — a fresh process has empty guard state.
+
+**This is arguably correct behavior** (it prevents an actual infinite retry loop), but nothing in
+`TILLER-USAGE.md` explains it, so a brain/operator without this specific insight would very plausibly
+keep re-issuing directions into a live process and watch them silently thrash. Our brain seat figured
+this out correctly on its own (`DIRECTION-R7-a2`: *"another RETRY_WITH_DIRECTION while this monitor is
+live will unpark → re-hit `_no_progress` → re-RAISE thrash"*) and chose to hold the slice parked via
+`SKIP_TO_PROJCORE` until natural terminal drain, then retried fresh — but this should not have to be
+independently re-derived every time.
+
+**Suggested fix:** document this explicitly in `TILLER-USAGE.md` §4 (the escalation loop section), or
+better, have the RAISE payload itself say "this guard is process-scoped; a live-process retry will
+re-trigger it — hold and retry after resume" so the brain doesn't have to infer it from source.
+
+---
+
 *(Further defects, if any, appended below as the run progresses.)*
