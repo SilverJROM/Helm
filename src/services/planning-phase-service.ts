@@ -4,7 +4,7 @@ import { RunArtifactService } from './run-artifact-service.js';
 import { TaskQueueService } from './task-queue-service.js';
 import { PlanParserService, Plan, PlannedTask } from './plan-parser-service.js';
 import type { ITransport } from './fake-transport.js';
-import { bindDispatchNonce, BriefWriterService, createDispatchNonce } from './brief-writer-service.js';
+import { BriefWriterService } from './brief-writer-service.js';
 import { roleMatches } from './role-alias.js';
 import { parseCallbackLine } from './agent-event-ingest.js';
 import { classifySeatPane } from './seat-pane-state.js';
@@ -426,15 +426,10 @@ export class PlanningPhaseService {
     );
 
     // R1.1 / B4: plancore authoring brief deleted — not repurposed. Co-planners own drafts (plan-draft).
-    // P1 removes the residual plancore spawn / writeBrief authoring path. briefWriter still used for panel briefs.
+    // P1 (R1.2): the residual plancore spawn / writeBrief authoring path is retired below — no model
+    // call is made for plancore during initial whole-plan authoring. briefWriter still used for panel briefs.
     const briefWriter = new BriefWriterService();
     const effectiveProjectDir = inputs.projectDir || process.cwd();
-    // Residual authoring-seat path until P1; empty body — no model is briefed as whole-plan author here.
-    let planningBrief = '';
-    // A12: persist the (now empty) plancore brief path for path stability; P1 retires this write.
-    try {
-      await this.artifacts.writeBrief(runDir, 'plancore', planningBrief);
-    } catch { /* best-effort early write; post-spawn write remains below */ }
 
     // A15: hoist seat runtime ids so phase exit can finalize both (A1 only finalized plancore on retry).
     // A10: partner seats are now N (>= 0), one runtime id per spawned partner.
@@ -442,8 +437,10 @@ export class PlanningPhaseService {
     const partnerRuntimeIds: (number | null)[] = [];
     // A5 (AC5/AC23): retain each seat's transport handle too — the runtime id alone finalizes the DB
     // row, but never reaps the live transport session. A normal terminal exit (agreed or blocked) must
-    // reap before it finalizes, or the session leaks and can poison a retry. plancoreHandle tracks only
-    // the LAST successful spawn attempt; an earlier failed-attempt handle is already reaped in-loop below.
+    // reap before it finalizes, or the session leaks and can poison a retry. P1 (R1.2): plancore is no
+    // longer spawned, so plancoreHandle/plancoreRuntimeId stay null for the life of this call — both
+    // reapPlanningHandle and finalizeWorkerRuntime already no-op on null, so the terminal owner below
+    // is untouched (A5/A6).
     let plancoreHandle: string | null = null;
     const partnerHandles: string[] = [];
 
@@ -466,55 +463,10 @@ export class PlanningPhaseService {
     };
 
     try {
-    // POCFIX20: projcore spawn-retry. Helm's claude spawn is intermittently flaky (empty pane / brief never
-    // lands → no plan → dead run), while grok's is reliable; root cause is a hard-to-pin spawn timing/race.
-    // Cause-agnostic robustness: if projcore emits NO callback within a window, reap + respawn (up to 3x).
-    // Real path only (fake/test short-circuits to a single spawn so existing tests are unchanged).
-    {
-      const isFakeP = process.env.USE_FAKE_TMUX === '1' && process.env.NODE_ENV !== 'production';
-      const maxSpawnAttempts = isFakeP ? 1 : 3;
-      const firstCbWindowMs = isFakeP ? 0 : clampedPlanningMs('HELM_CB_FIRST_CALLBACK_MS', 120_000, 5_000, 5 * 60_000);
-      const cbPath = path.join(runDir, 'callbacks.md');
-      let lastDispatchBrief = planningBrief;
-      for (let attempt = 1; attempt <= maxSpawnAttempts; attempt++) {
-        let dispatchOffset = 0;
-        try { dispatchOffset = (await fs.stat(cbPath)).size; } catch {}
-        const dispatchNonce = createDispatchNonce();
-        const dispatchBrief = bindDispatchNonce(planningBrief, dispatchNonce);
-        lastDispatchBrief = dispatchBrief;
-        // The concrete seat is phase-owned (`plancore`). The brief/callback face intentionally
-        // remains the existing helm_pm/projcore compatibility seam so no raw role token reaches
-        // the model and callback ingest remains backward-compatible.
-        const spawned = await this.transport.spawn({ role: brainRole, brief: dispatchBrief, runDir, batchId, sessionName: inputs.sessionName, model: inputs.planningBrainModel, provider: inputs.planningBrainProvider, attemptId: 0, projectDir: effectiveProjectDir, projectId: inputs.projectId, runId: inputs.runId, ...(inputs.strictReadAllow ? { strictReadAllow: inputs.strictReadAllow } : {}) });  // B-ISO1 + A2: projectId/runId → helm_sessions via createSession
-        // A1 (R4.16): record this plancore seat so it is DB-observable with run+cycle linkage.
-        plancoreRuntimeId = this.registerWorkerRuntime(inputs.projectId, inputs.runId, brainRole, batchId, spawned.handle, inputs.planningBrainProvider, inputs.planningBrainModel);
-        // A5: latest surviving spawn's handle — overwritten every attempt (a failed attempt's own
-        // handle is reaped inline just below, before the loop moves on).
-        plancoreHandle = spawned.handle;
-        if (isFakeP) break;
-        // R8: pass the live handle+brief so the first-callback wait can watchdog a brief that is
-        // still sitting un-submitted in the composer (variable codex Enter-drop window) instead of
-        // burning the whole window and respawning.
-        const first = await this.waitForFirstCallback(cbPath, brainRole, batchId, firstCbWindowMs, dispatchOffset, {
-          handle: spawned.handle,
-          brief: dispatchBrief,
-          provider: inputs.planningBrainProvider ?? 'grok',
-          runId: inputs.runId,
-        });
-        if (first.ok) break;
-        try { await this.transport.reap(spawned.handle, `${brainRole}-${first.reason}-reaped`); } catch {}
-        this.finalizeWorkerRuntime(plancoreRuntimeId, 'reaped', `${first.reason}-reaped`);
-        if (attempt === maxSpawnAttempts) {
-          throw new Error(`planning ${first.reason}: ${brainRole} emitted no first callback after ${maxSpawnAttempts} spawn attempts`);
-        }
-        await new Promise((r) => setTimeout(r, 2500));
-      }
-      planningBrief = lastDispatchBrief;
-    }
-
-    // Always persist the plancore brief so prompts/plancore.brief.md exists on both planner and
-    // deliberation paths.
-    await this.artifacts.writeBrief(runDir, 'plancore', planningBrief);
+    // P1 (R1.2): plancore is no longer spawned for initial whole-plan authoring — no model call, no
+    // writeBrief authoring seat. The former POCFIX20 spawn-retry loop lived here; ROUND (runReviewRound
+    // below) now owns every seat that actually authors/reviews the plan. brainRole / the 'plancore'
+    // label are kept for logs, staffing (S05/S06), and topology — no renames (R1.3).
 
     // Fixture drive: simulate the exchange + agreement (tests append real [helm callback] lines + sleep).
     // The phase "blocks" here in real waits; in fixture the caller (test) drives the callbacks.md to PLAN-READY.
@@ -530,13 +482,16 @@ export class PlanningPhaseService {
 
     // C2 (AC11): the partner-spawn loop (A8/A10/S06/CONVENE-RACE-FIX) and the single waitForAgreement
     // call now live in runReviewRound (planning-review-round.ts) — pure seam extraction, no semantic
-    // change. runPlanningPhase remains the owner of plancore spawn (above), canonical plan
-    // polling/read/ingest and terminalization (below). waitForAgreement itself (and its parser helpers)
-    // stays put on this class, untouched — B3/B4/B5's direct unit tests call it here — and is handed to
-    // the seam already bound. partnerHandles/partnerRuntimeIds are the SAME arrays the terminal owner
-    // (runPlanningTerminal) already closes over, passed in and mutated in place so a spawn that throws
-    // mid-loop still leaves every already-spawned seat reapable/finalizable (A5/A6), even though the
-    // throw itself propagates out of runReviewRound before it can return a result.
+    // change. P1 (R1.2): runPlanningPhase no longer spawns plancore at all — ROUND is the sole spawner,
+    // and the engine hands it the context paths (north-star.md / conversation-log.md) it already
+    // resolved above (:394-411) via contextInputPaths, rather than relying on a plancore seat to have
+    // authored/read them first. runPlanningPhase remains the owner of canonical plan polling/read/ingest
+    // and terminalization (below). waitForAgreement itself (and its parser helpers) stays put on this
+    // class, untouched — B3/B4/B5's direct unit tests call it here — and is handed to the seam already
+    // bound. partnerHandles/partnerRuntimeIds are the SAME arrays the terminal owner (runPlanningTerminal)
+    // already closes over, passed in and mutated in place so a spawn that throws mid-loop still leaves
+    // every already-spawned seat reapable/finalizable (A5/A6), even though the throw itself propagates
+    // out of runReviewRound before it can return a result.
     const { agreed, partnerBatchIds, blockedReason, blockedReasonKind, roundsAttempted } = await runReviewRound({
       transport: this.transport,
       briefWriter,
@@ -551,6 +506,7 @@ export class PlanningPhaseService {
       effectiveProjectDir,
       cbPath,
       planMdPath,
+      contextInputPaths: [nsPath, convPath],
       perRoundTimeoutMs: PLANNING_TIMEOUT_MS,
       roundCap,
       agreementFenceOffset,
