@@ -81,7 +81,11 @@ export interface RunReviewRoundOptions {
     sinceOffset: number,
     partnerBatchIds: string[],
     planMdPathForRaceGuard?: string,
-    currentPlanPath?: string
+    currentPlanPath?: string,
+    /** P3 (R3.11/R3.14/R6.21): passed as `true` at this module's own call site below — production
+     *  non-adaptive planning no longer requires brain PLAN-READY for agreement (P1 already retired
+     *  plancore as a spawned/authoring seat, so nothing posts it). */
+    signatureOnly?: boolean
   ) => Promise<boolean>;
 
   runDir: string;
@@ -1673,9 +1677,14 @@ export async function runReviewRound(options: RunReviewRoundOptions): Promise<Re
       continue;
     }
 
+    // P3 (R3.11/R3.14/R6.21): signatureOnly:true unconditionally — P1 already retired plancore as a
+    // spawned/authoring seat, so no production run (real OR fixture-driven) ever posts brain
+    // PLAN-READY any more; requiring it here would deadlock every non-adaptive run. Unanimous CLEAN
+    // bound to the CURRENT plan.md revision (B5, untouched above) is the only thing that still gates
+    // agreement — a missing/malformed/stale plan= is still fail-closed, never agreement (R6.21).
     agreed = await waitForAgreement(
       cbPath, batchId, partner, brainRole, resolvedPerRoundTimeoutMs, agreementFenceOffset,
-      partnerBatchIds, planMdPath, isFake ? undefined : planMdPath
+      partnerBatchIds, planMdPath, isFake ? undefined : planMdPath, true
     );
     if (agreed) break;
 

@@ -998,7 +998,15 @@ export class PlanningPhaseService {
      *  path above (that one only ever proves existence for the BROKEN race guard; this one proves
      *  byte-identity for the CLEAN agreement gate) — additive/optional, omitted by B3/B4's existing
      *  direct unit tests, which keep their pre-B5 unbound-CLEAN behaviour. */
-    currentPlanPath?: string
+    currentPlanPath?: string,
+    /** P3 (R3.11/R3.14/R6.21): additive/optional, default false — every existing direct call (B3/B4/B5's
+     *  own unit tests) omits it and keeps the exact pre-P3 behaviour (brain `PLAN-READY` still required).
+     *  When true, the gate below drops the `sawPlanReady` precondition: unanimous CLEAN bound to the
+     *  CURRENT plan.md revision is sufficient on its own. P1 already retired plancore as an authoring/
+     *  spawned seat, so nothing posts PLAN-READY in production any more — requiring it here would just
+     *  deadlock every non-adaptive real run. This does NOT touch the BROKEN raceguard or the CLEAN
+     *  SHA-binding check above (B5) — a missing/malformed/stale `plan=<sha12>` is still never agreement. */
+    signatureOnly = false
   ): Promise<boolean> {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
@@ -1058,7 +1066,7 @@ export class PlanningPhaseService {
             }
           }
           if (planPresent) return false;
-        } else if (sawPlanReady) {
+        } else if (signatureOnly || sawPlanReady) {
           // B5 (AC7/AC23): re-derive the CURRENT plan.md revision on THIS poll pass — never cached at
           // call-start — so a plancore rewrite mid-wait (a partner CLEAN'd R1, plan.md is now R2) is
           // reflected immediately. `currentPlanPath` omitted (B3/B4's direct unit tests) => currentShort12
