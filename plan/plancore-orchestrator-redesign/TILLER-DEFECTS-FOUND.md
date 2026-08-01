@@ -98,4 +98,32 @@ re-trigger it — hold and retry after resume" so the brain doesn't have to infe
 
 ---
 
-*(Further defects, if any, appended below as the run progresses.)*
+---
+
+## Run outcome — COMPLETE, sending this compilation now
+
+**21/21 slices verified, `terminal_drain: true`, `parked: []`.** No defects beyond D1-D3 surfaced in
+the remainder of the run (R7 and P4 both landed clean on the brain's retry directions; X1's final
+regression sweep passed elite-clean). Deployed and independently re-verified by `[north]`: 30/30 slice
+test files pass, `tsc` exit 0, pre-existing baseline unchanged exactly (3/1/1), `worker-runtime-
+finalize.ts` diff-clean, raceguard 3/3, janitor 0, `main` untouched.
+
+**Net assessment: Tiller did real, correct work on a genuinely safety-critical effort**, including
+catching a real gate failure (P4's missing focused-test file, `FOCUSED_SPEC_MISSING`) that a less
+careful validator would have waved through. The three defects below are real and worth fixing, but none
+of them caused incorrect work to ship — D1 and D2 both self-healed (via oversight + the brain seat
+respectively) without needing the backup coordinator, and both are precisely diagnosed with a concrete
+fix, not vague reports.
+
+## Summary for the next run
+
+| # | Defect | Severity | Self-healed how |
+|---|---|---|---|
+| D1 | Escalation watcher startup race — exits if it checks for a live driver before the driver's PID file exists | Real — leaves the wake-brain mechanism silently dark | `[north]`'s oversight watcher detected and relaunched it |
+| D2 | Driver false-parks + rolls back genuinely DONE work if the callback's free-text note contains the substring "BLOCKED", even as legitimate product wording | Real — the exact class of damage a coordinator must never cause | Brain seat (grok45) diagnosed from source, issued a precise retry direction |
+| D3 | No-progress loop guard is process-scoped in a way `TILLER-USAGE.md` never documents; a live-process retry just re-thrashes it | Minor/operator-friction | Brain seat worked out the process-scoping itself and held-then-retried after natural terminal drain |
+
+**Recommended fix priority for wflow:** D2 first (data-damaging, clear one-line-ish fix — check the
+captured regex group, not substring-match the raw line), then D1 (add a grace/retry window before the
+watcher's "no live driver" conclusion), then D3 (documentation only — explain the process-scoping in
+`TILLER-USAGE.md` §4, or surface it in the RAISE payload itself).
