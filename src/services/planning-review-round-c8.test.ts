@@ -3,27 +3,27 @@ process.env.USE_FAKE_TMUX = '1';
 /**
  * C8 gate — typed round-loop results replace the anonymous boolean-false BROKEN short-circuit
  * (AC11/AC23). Scope: planning-review-round.ts only (the module C2 introduced, C3 hardened, C4
- * rounded, C5 made fresh-seat, C6 added the revise actuator, C7 added the reviewer watchdog, C8
- * makes the round loop's non-agreement classification typed and complete).
+ * rounded, C5 made fresh-seat, C6 added — and R8 retired — the revise actuator, C7 added the reviewer
+ * watchdog, C8 makes the round loop's non-agreement classification typed and complete).
  *
  * Before C8, C6's same-current-plan BROKEN scan (collectSameShaBrokenEvidence) only ran when
  * `round < resolvedRoundCap` — a round with budget left to spend on a revise turn. A same-current-plan
  * BROKEN on the FINAL round therefore left no trace: the function fell straight through to the
  * generic ROUND-CAP-EXHAUSTED return, indistinguishable from a round that simply timed out with no
- * BROKEN evidence at all. C8 hoists the classification itself (not the revise SPAWN, which stays
- * correctly gated on remaining round budget) to run every non-agreeing round, and adds an additive
- * `blockedReasonKind` field so the CAUSE is typed in code, not just prose.
+ * BROKEN evidence at all. C8 hoists the classification itself to run every non-agreeing round, and
+ * adds an additive `blockedReasonKind` field so the CAUSE is typed in code, not just prose. R8
+ * (R1.2/R3.10/R3.14/R6.20) later deleted the revise SPAWN this classification used to gate outright —
+ * the classification itself (proved here) is unchanged and untouched by that retirement.
  *
  * Proves:
- * - BROKEN on revision R1 drives a plancore revise turn that writes R2; fresh reviewer seats spawn
- *   for R2; a CLEAN on R2 converges — end to end through runReviewRound (the C6 flow, now also
- *   exercised through to a genuine agreement rather than stopping at "does it spawn a revise?");
- * - a same-current-plan BROKEN on the FINAL round (no budget left for a revise turn) returns a typed
- *   `blockedReasonKind: 'same-plan-broken'` and a message that does NOT read as ROUND-CAP-EXHAUSTED —
- *   the exact defect C8 fixes;
+ * - BROKEN on round 1 spawns no plancore revise turn; round 2 respawns fresh reviewer seats on the
+ *   SAME plan.md, and a CLEAN there converges normally — end to end through runReviewRound;
+ * - a same-current-plan BROKEN on the FINAL round returns a typed `blockedReasonKind: 'same-plan-
+ *   broken'` and a message that does NOT read as ROUND-CAP-EXHAUSTED — the exact defect C8 fixes,
+ *   preserved unchanged by R8's retirement of the (separate) revise actuator;
  * - a stale/superseded-SHA BROKEN on the final round still does not count for the current plan and
  *   falls back to the generic `round-cap-exhausted` classification (B5's SHA-binding discipline
- *   applies to the classification path too, not just the mid-loop revise path);
+ *   applies to the classification path too);
  * - an older same-SHA BROKEN followed by a newer malformed verdict line for the SAME seat remains
  *   fail-closed on the final round too (B4's newest-verdict-locks-the-seat invariant): the malformed
  *   newest line must never let the older, parseable BROKEN win.
@@ -95,27 +95,16 @@ describe('runReviewRound typed round-loop results (C8, AC11/AC23)', () => {
     };
   }
 
-  it('BROKEN on R1 revises to R2, fresh reviewer seats spawn, CLEAN on R2 converges end-to-end', async () => {
+  it('BROKEN on R1 spawns no plancore revise turn; round 2 respawns fresh reviewer seats on the same plan and a CLEAN there converges end-to-end', async () => {
     const shaR1 = await writePlan('# plan A\n');
     await seedBrokenVerdict('batch-C8-partner', shaR1, 'task T01 missing deps');
-
-    const originalSpawn = transport.spawn.bind(transport);
-    (transport as unknown as { spawn: typeof transport.spawn }).spawn = async (params) => {
-      const spawned = await originalSpawn(params);
-      if ((params.batchId || '').endsWith('-revise')) {
-        // Simulate plancore's revise turn: rewrite plan.md to a genuinely new revision before this
-        // spawn call returns, so the caller's subsequent waitForPlanRevisionChange poll sees it.
-        await fs.writeFile(planMdPath, '# plan B (revised)\n', 'utf8');
-      }
-      return spawned;
-    };
 
     let waitCalls = 0;
     const result = await runReviewRound(baseOptions({
       roundCap: 2,
       waitForAgreement: async () => {
         waitCalls += 1;
-        return waitCalls === 2; // round 1: BROKEN drives revise; round 2: CLEAN converges
+        return waitCalls === 2; // round 1: BROKEN, no revise; round 2: CLEAN converges
       },
     }));
 
@@ -125,16 +114,18 @@ describe('runReviewRound typed round-loop results (C8, AC11/AC23)', () => {
     expect(result.blockedReasonKind).toBeUndefined();
 
     const reviseCalls = transport.spawnCalls.filter((c) => (c.batchId || '').endsWith('-revise'));
-    expect(reviseCalls).toHaveLength(1);
-    expect(reviseCalls[0].batchId).toBe('batch-C8-r1-revise');
+    expect(reviseCalls).toHaveLength(0);
+    const plancoreSpawns = transport.spawnCalls.filter((c) => c.role === 'plancore');
+    expect(plancoreSpawns).toHaveLength(0);
 
     const reviewerCalls = transport.spawnCalls.filter((c) => (c.batchId || '').includes('-partner'));
     expect(reviewerCalls.map((c) => c.batchId)).toEqual(['batch-C8-partner', 'batch-C8-r2-partner']);
     expect(briefs.has('planner')).toBe(true);
     expect(briefs.has('planner-r2')).toBe(true);
 
+    // Nothing in this module rewrites plan.md anymore — round 2 converges on the SAME bytes round 1 saw.
     const finalContent = await fs.readFile(planMdPath, 'utf8');
-    expect(finalContent).toBe('# plan B (revised)\n');
+    expect(finalContent).toBe('# plan A\n');
   });
 
   it('same-current-plan BROKEN on the FINAL round returns typed same-plan-broken, not ROUND-CAP-EXHAUSTED', async () => {

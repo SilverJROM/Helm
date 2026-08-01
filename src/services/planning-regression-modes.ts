@@ -201,3 +201,23 @@ registerRegressionMode({
   state: 'active',
   note: 'Signer OBJECTIONS notes are parsed as bounded numbered lists; a non-shrinking count across rounds typed-BLOCKs objection-not-monotone early without burning remaining cap.',
 });
+
+/**
+ * R8 — proposer/signer role integrity: the engine retired its mid-round plancore whole-plan revise
+ * actuator (generatePlanRoundReviseBrief + its spawn block). Reconcile rounds — the proposer/signer
+ * exchange — are the ONLY revise path now; plancore never receives a model call from this module again,
+ * regardless of same-current-plan BROKEN evidence or remaining round-cap budget.
+ */
+registerRegressionMode({
+  mode: 'proposer-signer-role-integrity',
+  slice: 'R8',
+  requirements: ['R1.2', 'R3.10', 'R3.14', 'R6.20'],
+  spec: 'src/services/planning-review-round-no-plancore-revise.test.ts',
+  provingTests: [
+    'planning-review-round.ts source has no generatePlanRoundReviseBrief method definition',
+    'same-SHA BROKEN evidence with round budget remaining spawns no plancore/-revise seat',
+    'role-integrity: brainRole (plancore) is never the role of any seat spawned across a same-plan-broken run',
+  ],
+  state: 'active',
+  note: 'The mid-round plancore revise actuator is deleted outright: same-current-plan BROKEN evidence never spawns plancore/-revise anymore — only the proposer/signer co-planner exchange reconciles a divergent plan.',
+});

@@ -126,12 +126,6 @@ export interface RunReviewRoundOptions {
   coPlannerSeats?: ConfiguredCoPlannerSeat[];
   partnerModel?: string;
   partnerProvider?: string;
-  /** C6 (AC11): model/provider for the engine-spawned plancore REVISE turn (see
-   *  generatePlanRoundReviseBrief below). Additive/optional — omitted by every existing C2-C5
-   *  caller/fixture, which never trigger the revise actuator. Real callers may bind these to the
-   *  same brainRole model/provider used for the initial plancore spawn. */
-  planningBrainModel?: string;
-  planningBrainProvider?: string;
   projectId?: number;
   runId?: number;
   strictReadAllow?: string[];
@@ -363,12 +357,18 @@ const RAW_CALLBACK_IDENTITY_RE = /^\[(?:helm|projcore) callback\]\s+(\S+)\s+(\S+
 /**
  * C6 (AC11): after a round's waitForAgreement resolves false, this module has no verdict detail —
  * waitForAgreement (planning-phase-service.ts, untouched) returns only a boolean. To decide whether
- * the round failed on a genuine same-plan-revision BROKEN (revise-worthy) vs. a round-cap/timeout
- * with no BROKEN evidence at all (C5/C4's existing bounded behaviour, left alone), this re-scans the
- * SAME callbacks window waitForAgreement just read, restricted to THIS round's own round-scoped
- * partnerBatchIds (so an earlier round's stale evidence can never be mistaken for this round's).
- * Mirrors waitForAgreement's own reversed/newest-line-wins-per-seat scan and B5's SHA binding
- * (a BROKEN's plan= must equal the CURRENT plan.md short12, not a superseded revision).
+ * the round failed on a genuine same-plan-revision BROKEN vs. a round-cap/timeout with no BROKEN
+ * evidence at all (C5/C4's existing bounded behaviour, left alone), this re-scans the SAME callbacks
+ * window waitForAgreement just read, restricted to THIS round's own round-scoped partnerBatchIds (so
+ * an earlier round's stale evidence can never be mistaken for this round's). Mirrors waitForAgreement's
+ * own reversed/newest-line-wins-per-seat scan and B5's SHA binding (a BROKEN's plan= must equal the
+ * CURRENT plan.md short12, not a superseded revision).
+ *
+ * R8 (R1.2/R3.10/R3.14/R6.20): this evidence no longer drives a mid-round plancore revise spawn — that
+ * actuator is retired. It survives purely as C8's typed classification input: reconcile rounds (the
+ * proposer/signer exchange) are the only revise path now, so a legacy-reviewer same-plan BROKEN just
+ * distinguishes "there was concrete defect evidence against this exact plan revision" from a plain
+ * timeout in the result the caller reads — never a trigger to spawn anything.
  *
  * C6 fix-cycle: the initial cut locked a seat's "newest line" only once parseRoundCallbackLine had
  * ALREADY succeeded, so a newest line that failed that stricter parse (garbled/truncated mid-write)
@@ -419,74 +419,6 @@ async function collectSameShaBrokenEvidence(
     if (seenNewest.size === partnerBatchIds.length) break;
   }
   return sameShaBroken;
-}
-
-/**
- * C6 (AC11): the revise actuator's brief. Deliberately a LOCAL function, not a new
- * BriefWriterService method (ownership constraint: C6 may not add to brief-writer-service.ts) —
- * it composes text via the already-public briefWriter.generateBrief(...), the same base every other
- * brief in this file/service builds on (generatePlanReviseBrief follows the
- * identical base+body-splice pattern; plancore authoring brief deleted in B4).
- */
-function generatePlanRoundReviseBrief(
-  briefWriter: BriefWriterService,
-  params: {
-    reviseBatchId: string;
-    round: number;
-    planMdPath: string;
-    defects: Array<{ batchId: string; note: string | null }>;
-    runDir: string;
-    projectDir: string;
-    callbacksFile: string;
-  }
-): string {
-  const defectLines = params.defects.map((d, i) => `${i + 1}. [${d.batchId}] ${d.note || '(no note text)'}`);
-  const defectSection = defectLines.join('\n') || '(no defect text captured — re-inspect the plan for the reported class of issue)';
-  const base = briefWriter.generateBrief({
-    batchId: params.reviseBatchId,
-    role: 'plancore',
-    planPath: params.planMdPath,
-    runDir: params.runDir || '.',
-    branch: 'main',
-    requirementsAssigned: `PLAN-REVISE-ROUND:r${params.round}`,
-    northStarAnchors: 'round-review same-plan-revision BROKEN aggregate',
-    scope: `Revise the WHOLE plan.md at ${params.planMdPath} to resolve the reviewer-reported defects below for THIS SAME plan revision. Do NOT start a new plan from scratch; make the minimal correct fix. Re-write plan.md in place, then emit PLAN-READY.`,
-    requirementsSection: defectSection,
-    projectDir: params.projectDir,
-    callbacksFile: params.callbacksFile,
-    taskType: 'feature',
-  });
-  const body = `
-You are **helm_pm** (plancore / planning brain) — engine-spawned mid-round to REVISE the CURRENT plan.md after round ${params.round}'s reviewer(s) returned BROKEN against this SAME plan revision. You are NOT the implementation brain (ibrain). Bounded surgical revision ONLY.
-
-## Reviewer defects (same plan revision, round ${params.round})
-${defectSection}
-
-## Your job
-Rewrite plan.md at ${params.planMdPath} to fix the reported defects. Keep every task not implicated by a defect unchanged — do NOT rewrite unrelated tasks and do NOT touch og-requirements.md. Verify the rewritten plan.md is non-empty and its fenced JSON parses before emitting PLAN-READY.
-
-Emit EXACTLY:
-[helm callback] helm_pm ${params.reviseBatchId} STATUS: PLAN-READY — plan.md revised for round ${params.round}
-
-First tool call every reply: the callback STATUS line.
-`;
-  return base.replace('<!-- PROJCORE-STATUS-CONTRACT v2 -->', `<!-- PROJCORE-STATUS-CONTRACT v2 -->${body}`).trim();
-}
-
-/**
- * C6 (AC11): poll plan.md until its revision hash differs from the pre-revise short12, bounded by
- * timeoutMs. Returns true once a NEW revision is observed, false on timeout (still a bounded exit —
- * the caller reaps the revise seat and proceeds into the next round regardless, exactly like a
- * round-cap-exhausted non-agreement: never a silent/unbounded wait).
- */
-async function waitForPlanRevisionChange(planMdPath: string, previousShort12: string, timeoutMs: number): Promise<boolean> {
-  const start = Date.now();
-  for (;;) {
-    const current = readPlanRevision(planMdPath);
-    if (current && current.short12 !== previousShort12) return true;
-    if (Date.now() - start >= timeoutMs) return false;
-    await new Promise((r) => setTimeout(r, 200));
-  }
 }
 
 /**
@@ -1350,7 +1282,6 @@ export async function runReviewRound(options: RunReviewRoundOptions): Promise<Re
     runDir, batchId, brainRole, partner, effectiveProjectDir, cbPath, planMdPath,
     perRoundTimeoutMs, effectiveTimeoutMs, roundCap, reviewerFirstCallbackTimeoutMs, agreementFenceOffset, isFake,
     panelSize, coPlannerSeats, partnerModel, partnerProvider,
-    planningBrainModel, planningBrainProvider,
     projectId, runId, strictReadAllow,
     publicationArtifacts, contextInputPaths, blindDraftRound1,
     partnerHandles, partnerRuntimeIds,
@@ -1749,12 +1680,13 @@ export async function runReviewRound(options: RunReviewRoundOptions): Promise<Re
     if (agreed) break;
 
     // C8 (AC11/AC23): classify THIS round's non-agreement against the CURRENT plan.md bytes exactly
-    // once, EVERY non-agreeing round — not only when `round < resolvedRoundCap` (C6's original gate).
-    // C6 only ran this scan when a next round existed to spend on a revise turn, which meant a
-    // same-current-plan BROKEN on the FINAL round left no trace: it fell straight through to the
-    // generic ROUND-CAP-EXHAUSTED return below, indistinguishable from a round that timed out with no
-    // BROKEN evidence at all. Hoisting the scan itself (not the revise SPAWN, which stays correctly
-    // gated on remaining budget just below) lets the post-loop return classify the actual cause.
+    // once, EVERY non-agreeing round. R8 (R1.2/R3.10/R3.14/R6.20) retired the mid-round plancore
+    // revise actuator this scan used to gate: reconcile rounds (the proposer/signer exchange) are the
+    // only revise path now, and no agent — including the retired plancore label — is ever spawned from
+    // this classification. The scan survives purely as diagnostic input to the post-loop typed
+    // `blockedReasonKind` below, so a same-current-plan BROKEN is still reported distinctly from a
+    // plain round-cap/timeout with no BROKEN evidence at all (C5/C4's existing bounded behaviour,
+    // otherwise unchanged: fresh reviewer seats simply respawn on the SAME plan next round).
     lastSamePlanBrokenEvidence = [];
     const currentRevision = readPlanRevision(planMdPath);
     if (currentRevision) {
@@ -1762,58 +1694,13 @@ export async function runReviewRound(options: RunReviewRoundOptions): Promise<Re
         cbPath, agreementFenceOffset, partner, partnerBatchIds, currentRevision.short12
       );
     }
-
-    // C6 (AC11): the revise actuator. A round-cap-exhausted non-agreement with NO same-plan-revision
-    // BROKEN evidence just falls through to the next loop iteration unchanged — C5/C4's existing
-    // bounded behaviour (respawn fresh reviewers on the SAME plan) is preserved. Only when this
-    // round's non-agreement was actually caused by a confirmed BROKEN against the CURRENT plan.md
-    // bytes — and there is a next round left to spend — does this engine-spawn a fresh, uniquely
-    // named plancore revision turn and wait for a genuinely new plan.md revision before letting the
-    // loop's next iteration spawn C5's fresh reviewer seats.
-    if (lastSamePlanBrokenEvidence.length > 0 && round < resolvedRoundCap) {
-      const reviseBatchId = `${batchId}-r${round}-revise`;
-      const reviseBrief = generatePlanRoundReviseBrief(briefWriter, {
-        reviseBatchId,
-        round,
-        planMdPath,
-        defects: lastSamePlanBrokenEvidence,
-        runDir,
-        projectDir: effectiveProjectDir,
-        callbacksFile: cbPath,
-      });
-      await writeBrief(`${brainRole}-r${round}-revise`, reviseBrief);
-      const reviseSpawned = await transport.spawn({
-        role: brainRole,
-        brief: reviseBrief,
-        runDir,
-        batchId: reviseBatchId,
-        model: planningBrainModel,
-        provider: planningBrainProvider,
-        attemptId: 0,
-        projectDir: effectiveProjectDir,
-        projectId,
-        runId,
-        ...(strictReadAllow ? { strictReadAllow } : {}),
-      });
-      // C6: same caller-owned accumulators the reviewer seats use, so a throw mid-flow still
-      // leaves this revision seat visible to the caller's terminal owner (A5/A6 safety net) —
-      // it is ALSO explicitly reaped below once the hash wait resolves/times out, mirroring how
-      // this loop already reaps prior-round reviewer handles. Belt and suspenders; no leak.
-      partnerRuntimeIds.push(
-        registerWorkerRuntime(brainRole, reviseBatchId, reviseSpawned.handle, planningBrainProvider, planningBrainModel)
-      );
-      partnerHandles.push(reviseSpawned.handle);
-      // currentRevision is non-null here: lastSamePlanBrokenEvidence is only ever non-empty inside the
-      // `if (currentRevision)` branch above.
-      const revised = await waitForPlanRevisionChange(planMdPath, currentRevision!.short12, resolvedPerRoundTimeoutMs);
-      await transport.reap(reviseSpawned.handle, revised ? 'revise-turn-plan-updated-reaped' : 'revise-turn-timeout-reaped');
-    }
   }
 
   if (!agreed) {
     // C8 (AC11/AC23): a same-current-plan BROKEN on the round that actually ended the loop is a
-    // distinct, typed cause — never the anonymous boolean-false ROUND-CAP-EXHAUSTED below, even when
-    // (as on the final round) no budget remained to spend on a revise turn.
+    // distinct, typed cause — never the anonymous boolean-false ROUND-CAP-EXHAUSTED below. R8 retired
+    // the mid-round revise actuator this evidence used to gate; it is now purely diagnostic — the
+    // round-cap simply exhausted with no reconciliation attempted from this evidence.
     if (lastSamePlanBrokenEvidence.length > 0) {
       const defectBatchIds = lastSamePlanBrokenEvidence.map((d) => d.batchId).join(', ');
       return {
@@ -1823,9 +1710,9 @@ export async function runReviewRound(options: RunReviewRoundOptions): Promise<Re
         blockedReasonKind: 'same-plan-broken',
         blockedReason:
           `SAME-PLAN-BROKEN-NO-ROUNDS-LEFT (C8/AC11/AC23): round ${roundsAttempted} reviewer seat(s) ` +
-          `[${defectBatchIds}] returned BROKEN against the CURRENT plan.md revision, and no further round(s) ` +
-          `remained (cap ${resolvedRoundCap}) to spawn a revise turn — a same-current-plan BROKEN, not a ` +
-          `generic non-convergence timeout.`,
+          `[${defectBatchIds}] returned BROKEN against the CURRENT plan.md revision, and the round cap ` +
+          `(${resolvedRoundCap}) exhausted with no further rounds to reconcile it — a same-current-plan ` +
+          `BROKEN, not a generic non-convergence timeout.`,
       };
     }
     return {
