@@ -14,6 +14,7 @@ import { finalizeWorkerRuntimeRow } from './worker-runtime-finalize.js';
 import { readPlanRevision } from './plan-revision.js';
 import { runReviewRound } from './planning-review-round.js';
 import type { RoundBlockedReasonKind } from './planning-review-round.js';
+import { atomicWriteFile } from './seat-draft-store.js';
 
 /**
  * B9 PLN1: Planning-phase orchestration (projcore-brain + co-planner).
@@ -492,7 +493,7 @@ export class PlanningPhaseService {
     // already closes over, passed in and mutated in place so a spawn that throws mid-loop still leaves
     // every already-spawned seat reapable/finalizable (A5/A6), even though the throw itself propagates
     // out of runReviewRound before it can return a result.
-    const { agreed, partnerBatchIds, blockedReason, blockedReasonKind, roundsAttempted } = await runReviewRound({
+    const { agreed, partnerBatchIds, blockedReason, blockedReasonKind, roundsAttempted, proposerSignerRound } = await runReviewRound({
       transport: this.transport,
       briefWriter,
       writeBrief: (role, content) => this.artifacts.writeBrief(runDir, role, content),
@@ -529,7 +530,7 @@ export class PlanningPhaseService {
     // here can mean round-cap exhaustion, a confirmed BROKEN verdict, or (B5) a current-plan-SHA
     // mismatch — whatever the cause, it is a planning-agreement outcome, not a plan-read outcome, so
     // it must never fall through into the poll/read block below (which can itself throw a
-    // PLANCORE-DID-NOT-PRODUCE-CANONICAL-PLAN error and mask the real, mechanism-level reason).
+    // NO-AGREED-PLAN-CANDIDATE error and mask the real, mechanism-level reason).
     if (!agreed) {
       // Gate blocked — do not ingest or hand off.
       // A6: route through the one terminal owner — reason/state feed runPlanningTerminal(), which the
@@ -556,9 +557,6 @@ export class PlanningPhaseService {
       };
     }
 
-    // Short grace for plancore to flush canonical documents before the PLAN-READY callback is consumed.
-    await new Promise((r) => setTimeout(r, 120));
-
     const readCanonicalPlan = async (): Promise<{ markdown: string; plan: Plan }> => {
       const markdown = await fs.readFile(planMdPath, 'utf8');
       const parsed = validateExecutionPlan(markdown);
@@ -566,73 +564,103 @@ export class PlanningPhaseService {
       return { markdown, plan: { tasks: parsed.normalizedTasks as unknown as PlannedTask[] } };
     };
 
-    // Real planning requires both canonical authored documents. plan.json is deliberately not accepted as
-    // the authored contract here; it is derived only after plan.md validates and the agreement gate passes.
-    if (!isFake) {
-      const pollStart = Date.now();
-      while (Date.now() - pollStart < PLANNING_TIMEOUT_MS) {
-        try {
-          await fs.access(reqPath);
-          await readCanonicalPlan();
-          break;
-        } catch {
-          await new Promise((r) => setTimeout(r, 1000));
-        }
-      }
-    }
-
-    // Fake transport may synthesize a representative canonical document. A pre-seeded plan.json remains
-    // a read-only test/cache compatibility input, but it is immediately rendered into canonical plan.md.
     let plan: Plan;
     let planMarkdown: string;
-    try {
-      if (!isFake) await fs.access(reqPath);
+    if (proposerSignerRound?.candidatePlanPath && proposerSignerRound?.candidateReqPath) {
+      // P2 (R2.5/R3.14): ROUND already confirmed R3.11's signature condition — the signer signed these
+      // EXACT candidate bytes moments ago (waitForCandidateSignature re-derives short12 at check time,
+      // R6.21) — so there is nothing left to poll or wait for. The engine is the ONLY writer of
+      // canonical plan.md/og-requirements.md: it copies the signed candidate atomically (temp + rename,
+      // same primitive the candidate itself was published with) rather than trusting/re-deriving
+      // anything an agent claims. No status token from any seat is ever treated as "ready to use"
+      // (R3.14) — this copy, gated purely on ROUND's own agreed:true + candidate paths, is the one
+      // promotion path.
+      const [candidatePlanBytes, candidateReqBytes] = await Promise.all([
+        fs.readFile(proposerSignerRound.candidatePlanPath),
+        fs.readFile(proposerSignerRound.candidateReqPath),
+      ]);
+      atomicWriteFile(planMdPath, candidatePlanBytes);
+      atomicWriteFile(reqPath, candidateReqBytes);
       const canonical = await readCanonicalPlan();
       plan = canonical.plan;
       planMarkdown = canonical.markdown;
-    } catch (e) {
-      if (isFake) {
-        try {
-          plan = this.parser.parsePlanFromJson(await fs.readFile(planJsonPath, 'utf8'));
-        } catch {
-          plan = {
-            tasks: [
-              { task_key: 'P1', atomic_work: 'Bootstrap the planning parser + types from approved plan schema', complexity: 'med', model: 'claude-sonnet', recommended_model: 'claude-sonnet', effort: 'med', needs_more_info: false, task_type: 'feature', validation_criteria: 'parser roundtrips all fields + deps into run_tasks; queue orders correctly', deps: [] },
-              { task_key: 'P2', atomic_work: 'Implement planning-phase orchestration + co-planner gate + auto pick', complexity: 'high', recommended_model: 'codex-5.5', effort: 'high', needs_more_info: false, task_type: 'feature', validation_criteria: 'auto selects planner for simple north-star; deliberation for cross-cutting; gate blocks handoff until PLAN-READY + partner agree', deps: ['P1'] }
-            ],
-            meta: { source: 'planning-phase-fixture' }
-          };
+    } else {
+      // Legacy pre-signature path (still exercised directly by B3/B4/B5's waitForAgreement unit tests
+      // and by the fixture harness until P3 finishes the production cutover — R5's own note: "keep old
+      // waitForAgreement intact for tests until P3"). Untouched apart from R1.4's error rename below.
+
+      // Short grace for plancore to flush canonical documents before the PLAN-READY callback is consumed.
+      await new Promise((r) => setTimeout(r, 120));
+
+      // Real planning requires both canonical authored documents. plan.json is deliberately not accepted as
+      // the authored contract here; it is derived only after plan.md validates and the agreement gate passes.
+      if (!isFake) {
+        const pollStart = Date.now();
+        while (Date.now() - pollStart < PLANNING_TIMEOUT_MS) {
+          try {
+            await fs.access(reqPath);
+            await readCanonicalPlan();
+            break;
+          } catch {
+            await new Promise((r) => setTimeout(r, 1000));
+          }
         }
-        const canonicalTasks = plan.tasks.map((task, index) => ({
-          id: task.task_key,
-          batch: String((task as any).batch || 'default'),
-          title: task.atomic_work,
-          req_refs: Array.isArray((task as any).req_refs) ? (task as any).req_refs : [`P-${index + 1}`],
-          assignee: (task as any).recommended_rung != null
-            ? `L${Number((task as any).recommended_rung) + 1}`
-            : (task as any).recommended_model || (task as any).model || 'L1',
-          validator_lane: (task as any).validator_rung != null
-            ? `L${Number((task as any).validator_rung) + 1}`
-            : (task as any).validator_model || 'L1',
-          effort: task.effort || task.complexity,
-          type: task.task_type,
-          deps: task.deps || [],
-          validation_criteria: task.validation_criteria,
-          user_critical: Boolean((task as any).user_critical),
-          ...((task as any).redteam != null ? { redteam: (task as any).redteam } : {}),
-          ...((task as any).exception_handling != null ? { exception_handling: (task as any).exception_handling } : {}),
-        }));
-        planMarkdown = `# Plan\n\n\`\`\`json\n${JSON.stringify(canonicalTasks, null, 2)}\n\`\`\`\n`;
-        await this.writeFileSafe(planMdPath, planMarkdown);
-        try { await fs.access(reqPath); } catch {
-          await this.writeFileSafe(reqPath, `# Requirements\n\n${canonicalTasks.map((task) => `- **${task.req_refs[0]}** — ${task.title}`).join('\n')}\n`);
-        }
+      }
+
+      // Fake transport may synthesize a representative canonical document. A pre-seeded plan.json remains
+      // a read-only test/cache compatibility input, but it is immediately rendered into canonical plan.md.
+      try {
+        if (!isFake) await fs.access(reqPath);
         const canonical = await readCanonicalPlan();
         plan = canonical.plan;
         planMarkdown = canonical.markdown;
-      } else {
-        const errMsg = `[${batchId}] PLANCORE-DID-NOT-PRODUCE-CANONICAL-PLAN: plancore must write valid ${reqPath} then ${planMdPath} before PLAN-READY. plan.json is Helm-derived and is not an authored fallback. ${(e as Error).message || e}`;
-        throw new Error(errMsg);
+      } catch (e) {
+        if (isFake) {
+          try {
+            plan = this.parser.parsePlanFromJson(await fs.readFile(planJsonPath, 'utf8'));
+          } catch {
+            plan = {
+              tasks: [
+                { task_key: 'P1', atomic_work: 'Bootstrap the planning parser + types from approved plan schema', complexity: 'med', model: 'claude-sonnet', recommended_model: 'claude-sonnet', effort: 'med', needs_more_info: false, task_type: 'feature', validation_criteria: 'parser roundtrips all fields + deps into run_tasks; queue orders correctly', deps: [] },
+                { task_key: 'P2', atomic_work: 'Implement planning-phase orchestration + co-planner gate + auto pick', complexity: 'high', recommended_model: 'codex-5.5', effort: 'high', needs_more_info: false, task_type: 'feature', validation_criteria: 'auto selects planner for simple north-star; deliberation for cross-cutting; gate blocks handoff until PLAN-READY + partner agree', deps: ['P1'] }
+              ],
+              meta: { source: 'planning-phase-fixture' }
+            };
+          }
+          const canonicalTasks = plan.tasks.map((task, index) => ({
+            id: task.task_key,
+            batch: String((task as any).batch || 'default'),
+            title: task.atomic_work,
+            req_refs: Array.isArray((task as any).req_refs) ? (task as any).req_refs : [`P-${index + 1}`],
+            assignee: (task as any).recommended_rung != null
+              ? `L${Number((task as any).recommended_rung) + 1}`
+              : (task as any).recommended_model || (task as any).model || 'L1',
+            validator_lane: (task as any).validator_rung != null
+              ? `L${Number((task as any).validator_rung) + 1}`
+              : (task as any).validator_model || 'L1',
+            effort: task.effort || task.complexity,
+            type: task.task_type,
+            deps: task.deps || [],
+            validation_criteria: task.validation_criteria,
+            user_critical: Boolean((task as any).user_critical),
+            ...((task as any).redteam != null ? { redteam: (task as any).redteam } : {}),
+            ...((task as any).exception_handling != null ? { exception_handling: (task as any).exception_handling } : {}),
+          }));
+          planMarkdown = `# Plan\n\n\`\`\`json\n${JSON.stringify(canonicalTasks, null, 2)}\n\`\`\`\n`;
+          await this.writeFileSafe(planMdPath, planMarkdown);
+          try { await fs.access(reqPath); } catch {
+            await this.writeFileSafe(reqPath, `# Requirements\n\n${canonicalTasks.map((task) => `- **${task.req_refs[0]}** — ${task.title}`).join('\n')}\n`);
+          }
+          const canonical = await readCanonicalPlan();
+          plan = canonical.plan;
+          planMarkdown = canonical.markdown;
+        } else {
+          // R1.4: plancore no longer authors this file (P1) — the only legitimate source of a
+          // canonical plan is a signed candidate (R2.5/R3.14), so a missing/invalid one is a
+          // candidate/signature-shaped failure, not a specific-agent-named one.
+          const errMsg = `[${batchId}] NO-AGREED-PLAN-CANDIDATE: no signed candidate was promoted and no valid canonical ${reqPath} / ${planMdPath} exists. plan.json is Helm-derived and is not an authored fallback. ${(e as Error).message || e}`;
+          throw new Error(errMsg);
+        }
       }
     }
 

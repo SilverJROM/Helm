@@ -221,3 +221,27 @@ registerRegressionMode({
   state: 'active',
   note: 'The mid-round plancore revise actuator is deleted outright: same-current-plan BROKEN evidence never spawns plancore/-revise anymore — only the proposer/signer co-planner exchange reconciles a divergent plan.',
 });
+
+/**
+ * P2 — atomic candidate promotion: the engine, upon observing ROUND's agreed:true WITH a signed
+ * candidate (proposerSignerRound.candidatePlanPath/candidateReqPath — R3.11/R3.14's ONE agreement
+ * decision point), atomically copies those exact candidate bytes to canonical plan.md/
+ * og-requirements.md under canonicalArtifactRoot — the engine's only path to writing those files.
+ * B6 non-agreement discipline still holds for this path (agreed:false never promotes, even with a
+ * candidate on disk), and the retired PLANCORE-DID-NOT-PRODUCE-CANONICAL-PLAN failure is renamed to
+ * the candidate/signature-shaped NO-AGREED-PLAN-CANDIDATE (R1.4).
+ */
+registerRegressionMode({
+  mode: 'atomic-candidate-promotion',
+  slice: 'P2',
+  requirements: ['R1.4', 'R2.5', 'R3.14', 'R6.24'],
+  spec: 'src/services/planning-phase-candidate-promote.test.ts',
+  provingTests: [
+    'copies the exact signed candidate bytes to canonical plan.md/og-requirements.md under canonicalArtifactRoot and ingests them, without polling',
+    'overwrites a stale pre-existing canonical plan.md/og-requirements.md — the engine is the only writer of those paths (R2.5)',
+    'B6 discipline holds for the new promotion path too: agreed:false never writes canonicalArtifactRoot, even with a candidate ready',
+    'planning-phase-service.ts no longer contains PLANCORE-DID-NOT-PRODUCE-CANONICAL-PLAN and throws NO-AGREED-PLAN-CANDIDATE instead',
+  ],
+  state: 'active',
+  note: 'Promotion is a plain engine-side byte copy gated purely on ROUND returning agreed:true with a signed candidate — no agent status token is ever treated as "ready to use," and the renamed NO-AGREED-PLAN-CANDIDATE failure replaces the retired plancore-authorship-named one.',
+});

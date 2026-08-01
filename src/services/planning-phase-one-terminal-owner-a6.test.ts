@@ -33,7 +33,8 @@ async function waitFor(condition: () => boolean, timeoutMs = 1500): Promise<void
  * itself (real, non-fixture branch), valid canonical artifacts are published so C3 can spawn the
  * reviewer, and the reviewer emits a B5-valid CLEAN bound to the current plan.md bytes. The
  * requirements artifact is then removed before canonical ingest, so the method must throw
- * PLANCORE-DID-NOT-PRODUCE-CANONICAL-PLAN AFTER the partner seat has already been spawned and agreed.
+ * NO-AGREED-PLAN-CANDIDATE (R1.4 rename of PLANCORE-DID-NOT-PRODUCE-CANONICAL-PLAN — plancore no
+ * longer authors this file) AFTER the partner seat has already been spawned and agreed.
  * Ordering is proven the same way A5 proved it:
  * transport.reap is spied, and at the instant it fires the spy reads worker_runtimes.state directly from
  * the DB — 'running' at that instant proves reap ran before finalize.
@@ -147,7 +148,7 @@ describe('A6: planning-phase-service routes a thrown exit through the one termin
     await fs.appendFile(cbp, `[helm callback] planner batch-A6-thrown-partner STATUS: VERDICT-READY — CLEAN plan=${currentPlanSha}: plan is atomic, deps clean\n`);
     await fs.rm(reqPath, { force: true });
 
-    await expect(p).rejects.toThrow(/PLANCORE-DID-NOT-PRODUCE-CANONICAL-PLAN/);
+    await expect(p).rejects.toThrow(/NO-AGREED-PLAN-CANDIDATE/);
     process.env.USE_FAKE_TMUX = '1';
 
     // Both seats' handles were reaped while their rows were still 'running' — reap ran before finalize.
