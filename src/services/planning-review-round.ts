@@ -5,6 +5,7 @@ import type { BriefWriterService } from './brief-writer-service.js';
 import { validateExecutionPlan } from './execution-plan-parser.js';
 import { readPlanRevision } from './plan-revision.js';
 import { roleMatches } from './role-alias.js';
+import { composeSeatDraftReadAllow, publishDraft, type PublishedDraft } from './seat-draft-store.js';
 
 /**
  * C2 (AC11 foundation): behaviour-preserving seam extracted from planning-phase-service.ts's
@@ -142,6 +143,19 @@ export interface RunReviewRoundOptions {
    * round-1 pre-spawn mode when `publicationArtifacts` is empty/omitted.
    */
   contextInputPaths?: string[];
+  /**
+   * R2 (R2.5-R2.7, R6.20, R6.24): opt-in — when true, ROUND 1 spawns BOTH configured co-planner
+   * seats as independent blind drafters (`purpose:'plan-draft'`, seat-scoped write targets composed
+   * via seat-draft-store, D2 OS-enforced isolation allowlists) instead of the legacy diff-review
+   * reviewer path, and waits for each seat's committed draft (a DRAFT-SUBMITTED callback, or the C7
+   * first-callback watchdog plus an on-disk file commit) rather than the legacy verdict-grammar
+   * `waitForAgreement`. The engine always recomputes each draft's hash from disk (D1) and never
+   * trusts a callback's claimed sha. Additive/optional: every existing C2-C8 fixture/caller leaves
+   * this unset and is byte-identical. When set, this function returns immediately once round 1's
+   * drafts are collected (or timed out) — round 2+ asymmetric proposer/signer dynamics are R3's
+   * scope, not this flag's.
+   */
+  blindDraftRound1?: boolean;
 
   /** Caller-owned accumulators (the SAME arrays the caller's one terminal owner already closes over),
    *  mutated in place rather than returned — so a spawn that throws mid-loop still leaves every
@@ -167,12 +181,15 @@ export interface RunReviewRoundOptions {
  *   'round-cap-exhausted' below.
  * - 'round-cap-exhausted': no unanimous current-plan CLEAN and no same-plan BROKEN evidence at all —
  *   a genuine timeout/round-cap exit, C4/C5's pre-existing bounded behaviour.
+ * - 'draft-not-submitted': R2 (R2.5-R2.7) — a round-1 blind-draft seat never committed its draft
+ *   (neither a DRAFT-SUBMITTED callback nor an on-disk file commit) within the round's timeout.
  */
 export type RoundBlockedReasonKind =
   | 'artifact-not-published'
   | 'reviewer-no-first-callback'
   | 'same-plan-broken'
-  | 'round-cap-exhausted';
+  | 'round-cap-exhausted'
+  | 'draft-not-submitted';
 
 export interface ReviewRoundResult {
   agreed: boolean;
@@ -191,6 +208,11 @@ export interface ReviewRoundResult {
    *  artifact-publication gate blocked before any round ran; equal to the resolved roundCap on an
    *  exhausted non-agreement; less than roundCap when an earlier round agreed. */
   roundsAttempted?: number;
+  /** R2 (R2.5-R2.7, R6.24): set only when `blindDraftRound1` completed round 1 with every seat's draft
+   *  committed — one entry per seat, engine-recomputed from disk (D1's publishDraft; never a trusted
+   *  callback claim). `agreed` stays false alongside this (a published draft is not agreement); R3
+   *  consumes this to designate the round-2 proposer/signer. Always undefined otherwise. */
+  roundOneDraftPublications?: PublishedDraft[];
 }
 
 /**
@@ -498,6 +520,143 @@ async function waitForReviewerFirstCallback(
   }
 }
 
+/**
+ * R2 (R2.7): the plan-draft purpose's terminal grammar (brief-writer-service.ts's plan-draft body)
+ * is `STATUS: DRAFT-SUBMITTED plan=<sha12>` — NO `[-—–:]` separator before the `plan=` claim, unlike
+ * the legacy verdict grammar parseRoundCallbackLine expects. Reusing that stricter parser here would
+ * silently fail to match the real brief output (it requires a separator before any trailing text), so
+ * this is a dedicated, purpose-built match: state identity only. The `plan=<sha12>` claim itself is
+ * intentionally never extracted — it is non-authoritative (D1); the engine always re-reads the
+ * committed file instead.
+ */
+const DRAFT_SUBMITTED_RE = /^\[(?:helm|projcore) callback\]\s+(\S+)\s+(\S+)\s+STATUS:\s+DRAFT-SUBMITTED\b/;
+
+/**
+ * R2 (R2.5-R2.7): round-1 blind-draft seat identity — the same shape spawnRoundSeats' draft branch
+ * pushes into resolveRoundOneDraftPhase below. `seatId` is the exact seat-draft-store id (matches
+ * generatePanelBrief's `seat` param for purpose:'plan-draft'), reused to recompute the draft's
+ * on-disk path/hash via publishDraft.
+ */
+interface RoundOneDraftSeat {
+  batchId: string;
+  brief: string;
+  handle: string;
+  seatId: string;
+}
+
+/**
+ * R2 (R2.5-R2.7, R6.24): waits for ONE round-1 drafting seat to commit — extends C7's watchdog
+ * (session-alive probe + bounded composer-held resubmit, both optional per ReviewerWatchdogTransport)
+ * with the draft-specific acceptance grammar: "DRAFT-SUBMITTED (or first-callback + file commit)".
+ * A parsed DRAFT-SUBMITTED line is the fast path; a seat that has posted ANY callback plus a
+ * committed draft file also counts (the terminal line itself may be lost/malformed — the on-disk
+ * bytes are the actual publication). Either way the returned publication is ALWAYS the engine's own
+ * disk re-read via publishDraft (D1) — a callback's claimed sha is never trusted.
+ */
+async function waitForDraftCommit(
+  cbPath: string,
+  partnerRole: string,
+  seat: RoundOneDraftSeat,
+  runDir: string,
+  timeoutMs: number,
+  sinceOffset: number,
+  watchdogTransport: ReviewerWatchdogTransport
+): Promise<
+  | { ok: true; publication: PublishedDraft }
+  | { ok: false; reason: 'no-first-callback' | 'session-gone' | 'draft-not-committed' }
+> {
+  const start = Date.now();
+  let presses = 0;
+  let sawAnyCallback = false;
+  for (;;) {
+    try {
+      const buf = await fs.readFile(cbPath);
+      const window = (sinceOffset > 0 ? buf.subarray(sinceOffset) : buf).toString('utf8');
+      for (const line of window.split(/\r?\n/)) {
+        const identity = RAW_CALLBACK_IDENTITY_RE.exec(line);
+        if (!identity || identity[2] !== seat.batchId || !roleMatches(partnerRole, identity[1])) continue;
+        sawAnyCallback = true;
+        if (DRAFT_SUBMITTED_RE.test(line)) {
+          const publication = publishDraft(runDir, seat.seatId);
+          if (publication.plan) return { ok: true, publication };
+        }
+      }
+      if (sawAnyCallback) {
+        const publication = publishDraft(runDir, seat.seatId);
+        if (publication.plan) return { ok: true, publication };
+      }
+    } catch {}
+
+    if (watchdogTransport.inspectSeat) {
+      const inspection = await watchdogTransport.inspectSeat(seat.handle, seat.brief);
+      if (!inspection.sessionAlive) return { ok: false, reason: 'session-gone' };
+    }
+    if (watchdogTransport.resubmitIfComposerHeld && presses < REVIEWER_FIRST_CALLBACK_MAX_PRESSES) {
+      try {
+        const pressed = await watchdogTransport.resubmitIfComposerHeld(seat.handle, seat.brief);
+        if (pressed) presses += 1;
+      } catch {
+        // Best-effort nudge only — a probe error must never abort the bounded wait itself.
+      }
+    }
+
+    if (Date.now() - start >= timeoutMs) {
+      return { ok: false, reason: sawAnyCallback ? 'draft-not-committed' : 'no-first-callback' };
+    }
+    await new Promise((r) => setTimeout(r, REVIEWER_FIRST_CALLBACK_POLL_MS));
+  }
+}
+
+/**
+ * R2 (R2.5-R2.7, R6.24): resolves round 1 once every configured co-planner seat has been spawned as
+ * a blind drafter. Never calls the legacy `waitForAgreement` — a `plan-draft` seat never emits panel
+ * verdict grammar, so that wait would only ever time out. Returns a typed, bounded result either way:
+ * every seat committed (drafts published, `agreed` still false — a draft is not agreement; R3 owns
+ * what happens next) or at least one seat never committed (typed `draft-not-submitted` block).
+ */
+async function resolveRoundOneDraftPhase(
+  cbPath: string,
+  partnerRole: string,
+  roundSeats: RoundOneDraftSeat[],
+  runDir: string,
+  timeoutMs: number,
+  sinceOffset: number,
+  watchdogTransport: ReviewerWatchdogTransport,
+  roundsAttempted: number
+): Promise<ReviewRoundResult> {
+  const partnerBatchIds = roundSeats.map((seat) => seat.batchId);
+  const outcomes = await Promise.all(
+    roundSeats.map(async (seat) => ({
+      seat,
+      result: await waitForDraftCommit(cbPath, partnerRole, seat, runDir, timeoutMs, sinceOffset, watchdogTransport),
+    }))
+  );
+
+  const stuck = outcomes.filter((o) => !o.result.ok);
+  if (stuck.length > 0) {
+    const stuckDescription = stuck
+      .map((o) => `${o.seat.batchId} (${(o.result as { ok: false; reason: string }).reason})`)
+      .join(', ');
+    return {
+      agreed: false,
+      partnerBatchIds,
+      roundsAttempted,
+      blockedReasonKind: 'draft-not-submitted',
+      blockedReason:
+        `DRAFT-NOT-SUBMITTED (R2/R2.5-R2.7): round-1 blind-draft seat(s) [${stuckDescription}] never ` +
+        `committed a draft within ~${timeoutMs}ms — bounded exit, never a silent pass; the engine ` +
+        `recomputes hashes from disk (D1) and never trusts a callback's claimed sha.`,
+    };
+  }
+
+  return {
+    agreed: false,
+    partnerBatchIds,
+    roundsAttempted,
+    roundOneDraftPublications: outcomes.map((o) => (o.result as { ok: true; publication: PublishedDraft }).publication),
+  };
+}
+
 export async function runReviewRound(options: RunReviewRoundOptions): Promise<ReviewRoundResult> {
   const {
     transport, briefWriter, writeBrief, registerWorkerRuntime, waitForAgreement,
@@ -506,7 +665,7 @@ export async function runReviewRound(options: RunReviewRoundOptions): Promise<Re
     panelSize, coPlannerSeats, partnerModel, partnerProvider,
     planningBrainModel, planningBrainProvider,
     projectId, runId, strictReadAllow,
-    publicationArtifacts, contextInputPaths,
+    publicationArtifacts, contextInputPaths, blindDraftRound1,
     partnerHandles, partnerRuntimeIds,
   } = options;
 
@@ -569,9 +728,19 @@ export async function runReviewRound(options: RunReviewRoundOptions): Promise<Re
   // local closure return shape; partnerBatchIds (below) is still derived as a plain string[] so every
   // existing consumer of that field (waitForAgreement call, blockedReason messages, ReviewRoundResult)
   // is unchanged.
-  const spawnRoundSeats = async (round: number): Promise<Array<{ batchId: string; brief: string; handle: string }>> => {
-    const roundSeats: Array<{ batchId: string; brief: string; handle: string }> = [];
+  const spawnRoundSeats = async (round: number): Promise<RoundOneDraftSeat[]> => {
+    const roundSeats: RoundOneDraftSeat[] = [];
     const roundSuffix = round === 1 ? '' : `-r${round}`;
+    // R2 (R2.5-R2.8): round 1 = dual blind draft, not review, when the caller opts in. Every OTHER
+    // round (and round 1 itself when the flag is unset) keeps the legacy diff-review spawn below
+    // byte-identical.
+    const isBlindDraftRound = !!blindDraftRound1 && round === 1;
+    // R2 (R2.6): every round-1 drafting seat's own id, precomputed BEFORE any seat spawns so
+    // composeSeatDraftReadAllow can fence off every PEER seat's dir up front (D2) — not built
+    // incrementally as seats spawn one at a time below.
+    const blindDraftSeatIds = isBlindDraftRound
+      ? Array.from({ length: partnerCount }, (_, i) => (i === 0 ? 'partner' : `partner-${i + 1}`))
+      : [];
     for (let i = 0; i < partnerCount; i++) {
       const seatIndexSuffix = i === 0 ? '' : `-${i + 1}`;
       const partnerBatchId = `${batchId}${roundSuffix}-partner${seatIndexSuffix}`;
@@ -581,35 +750,70 @@ export async function runReviewRound(options: RunReviewRoundOptions): Promise<Re
       const seatModel = seatSpec?.model ?? partnerModel;
       const seatProvider = seatSpec?.provider ?? partnerProvider;
       const seatEffort = seatSpec?.effort;
-      // B1: ROUND temporarily uses diff-review (empty implementedDiff) so current verdict
-      // text survives until R2/B3 swaps this path to plan-draft / plan-signature.
-      const partnerBrief = briefWriter.generatePanelBrief({
-        purpose: 'diff-review',
-        role: partner,
-        batchId: partnerBatchId,
-        seat: seatLabel,
-        lens: 'plan atomicity, deps, fields, complexity/recommended_model, validation_criteria',
-        // CONVENE-RACE FIX (run 31, cycle 13, 2026-07-30 04:45 PHT): partners are spawned HERE, while
-        // plancore is still AUTHORING plan.md/og-requirements.md — they do not exist yet. Both seats
-        // dutifully reported "plan.md and og-requirements.md absent" as BROKEN within ~60s; plancore
-        // wrote the files a minute later and emitted PLAN-READY; waitForAgreement treats ANY BROKEN as
-        // dispositive fail-fast (R1.4/N11), so the run was blocked before the plan had ever been read.
-        // One partner literally wrote "Re-review after plan artifacts land" — it wanted to wait.
-        // Absence of the artifacts is NOT-YET, never a negative verdict. Engine-side suppression alone
-        // would deadlock (a seat that already emitted VERDICT-READY does not re-emit), so the wait must
-        // live in the brief, before the seat ever forms a verdict.
-        requirement:
-          'FIRST: confirm the canonical plan.md AND og-requirements.md exist and are non-empty. ' +
-          'plancore authors them AFTER you are spawned, so on your first look they are very likely ABSENT — ' +
-          'that is expected and is NOT a finding. If either is missing, empty, or truncated mid-write: do NOT ' +
-          'emit VERDICT-READY at all. Wait and re-check (re-read every ~15s, up to ~8 minutes). Emit a verdict ' +
-          'ONLY once you have actually read a complete plan.md. Never return BROKEN because an artifact was ' +
-          'absent — BROKEN is reserved for defects in a plan you have genuinely read. ' +
-          'THEN: review canonical plan.md and north-star.md. Pressure-test atomicity, deps, fields, ' +
-          'complexity/recommended_model, validation_criteria. Return agreement or concrete gaps.',
-        projectDir: effectiveProjectDir,
-        callbacksFile: cbPath,
-      });
+
+      let partnerBrief: string;
+      let seatStrictReadAllow: string[] | undefined = strictReadAllow;
+      if (isBlindDraftRound) {
+        // R2 (R2.5/R2.8): independent purpose:'plan-draft' seat — seat-scoped write targets are
+        // composed by generatePanelBrief itself (seat-draft-store, D1) since draftPlanPath/
+        // draftReqPath are omitted here; never canonical plan.md/og-requirements.md.
+        partnerBrief = briefWriter.generatePanelBrief({
+          purpose: 'plan-draft',
+          role: partner,
+          batchId: partnerBatchId,
+          seat: seatLabel,
+          lens: 'whole-plan blind draft',
+          runDir,
+          projectDir: effectiveProjectDir,
+          callbacksFile: cbPath,
+        });
+        // R2 (R2.6): OS-enforced blind isolation (D2) — this seat's allowlist covers ONLY its own
+        // draft dir plus the same context inputs generatePanelBrief just pointed it at (north-star.md
+        // / conversation-log.md / decisions/, matching that call's own root-relative defaults); every
+        // peer seat's dir is refused fail-closed (SeatDraftIsolationError) BEFORE this seat ever
+        // spawns — not merely "the brief omits it."
+        seatStrictReadAllow = composeSeatDraftReadAllow({
+          runDir,
+          seatId: seatLabel,
+          peerSeatIds: blindDraftSeatIds,
+          contextInputs: [
+            path.resolve(runDir, 'north-star.md'),
+            path.resolve(runDir, 'conversation-log.md'),
+            path.resolve(runDir, 'decisions'),
+          ],
+          deploymentAllow: strictReadAllow,
+        });
+      } else {
+        // B1: ROUND temporarily uses diff-review (empty implementedDiff) so current verdict
+        // text survives until R2/B3 swaps this path to plan-draft / plan-signature.
+        partnerBrief = briefWriter.generatePanelBrief({
+          purpose: 'diff-review',
+          role: partner,
+          batchId: partnerBatchId,
+          seat: seatLabel,
+          lens: 'plan atomicity, deps, fields, complexity/recommended_model, validation_criteria',
+          // CONVENE-RACE FIX (run 31, cycle 13, 2026-07-30 04:45 PHT): partners are spawned HERE, while
+          // plancore is still AUTHORING plan.md/og-requirements.md — they do not exist yet. Both seats
+          // dutifully reported "plan.md and og-requirements.md absent" as BROKEN within ~60s; plancore
+          // wrote the files a minute later and emitted PLAN-READY; waitForAgreement treats ANY BROKEN as
+          // dispositive fail-fast (R1.4/N11), so the run was blocked before the plan had ever been read.
+          // One partner literally wrote "Re-review after plan artifacts land" — it wanted to wait.
+          // Absence of the artifacts is NOT-YET, never a negative verdict. Engine-side suppression alone
+          // would deadlock (a seat that already emitted VERDICT-READY does not re-emit), so the wait must
+          // live in the brief, before the seat ever forms a verdict.
+          requirement:
+            'FIRST: confirm the canonical plan.md AND og-requirements.md exist and are non-empty. ' +
+            'plancore authors them AFTER you are spawned, so on your first look they are very likely ABSENT — ' +
+            'that is expected and is NOT a finding. If either is missing, empty, or truncated mid-write: do NOT ' +
+            'emit VERDICT-READY at all. Wait and re-check (re-read every ~15s, up to ~8 minutes). Emit a verdict ' +
+            'ONLY once you have actually read a complete plan.md. Never return BROKEN because an artifact was ' +
+            'absent — BROKEN is reserved for defects in a plan you have genuinely read. ' +
+            'THEN: review canonical plan.md and north-star.md. Pressure-test atomicity, deps, fields, ' +
+            'complexity/recommended_model, validation_criteria. Return agreement or concrete gaps.',
+          projectDir: effectiveProjectDir,
+          callbacksFile: cbPath,
+        });
+      }
       await writeBrief(writeBriefKey, partnerBrief);
       const partnerSpawned = await transport.spawn({
         role: partner,
@@ -623,7 +827,7 @@ export async function runReviewRound(options: RunReviewRoundOptions): Promise<Re
         projectDir: effectiveProjectDir,
         projectId,
         runId,
-        ...(strictReadAllow ? { strictReadAllow } : {}),
+        ...(seatStrictReadAllow ? { strictReadAllow: seatStrictReadAllow } : {}),
       }); // B-ISO1 + A2: projectId/runId → helm_sessions via createSession
       // A1 (R4.16) + S06 AC25: record each partner seat with its exact identity. C5: these are the
       // SAME caller-owned arrays across every round (never reset here), so the caller's terminal
@@ -634,7 +838,7 @@ export async function runReviewRound(options: RunReviewRoundOptions): Promise<Re
       );
       // A5: retain this partner's handle too — one entry per spawned partner, parallel to partnerRuntimeIds.
       partnerHandles.push(partnerSpawned.handle);
-      roundSeats.push({ batchId: partnerBatchId, brief: partnerBrief, handle: partnerSpawned.handle });
+      roundSeats.push({ batchId: partnerBatchId, brief: partnerBrief, handle: partnerSpawned.handle, seatId: seatLabel });
     }
     return roundSeats;
   };
@@ -733,6 +937,17 @@ export async function runReviewRound(options: RunReviewRoundOptions): Promise<Re
             `silent agreement; waitForAgreement was not called for this round.`,
         };
       }
+    }
+
+    // R2 (R2.5-R2.7, R6.24): round 1 = dual blind draft, not review, when the caller opts in. A
+    // 'plan-draft' seat never emits panel verdict grammar, so the legacy waitForAgreement below would
+    // only ever time out against it — resolve the draft-commit wait instead and return immediately.
+    // Round 2+ asymmetric proposer/signer dynamics (R3) are not this flag's concern.
+    if (blindDraftRound1 && round === 1) {
+      return resolveRoundOneDraftPhase(
+        cbPath, partner, roundSeats, runDir, resolvedPerRoundTimeoutMs, agreementFenceOffset,
+        transport as ReviewerWatchdogTransport, roundsAttempted
+      );
     }
 
     agreed = await waitForAgreement(
