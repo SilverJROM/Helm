@@ -358,6 +358,7 @@ export class PlanningPhaseService {
     // SEPARATE module (grok red-team FIX 7 — no if-soup here). OFF (default) → the existing single-author
     // flow below runs byte-identical. The delegate emits the SAME PlanningResult so ingest is unchanged.
     if (inputs.adaptivePlanning) {
+      // R7 explicit scope pin: keep adaptive path fully delegated and defer adaptive co-author contract reconciliation.
       const { runAdaptivePlanningPhase } = await import('./adaptive-planning-phase.js');
       return runAdaptivePlanningPhase(
         { transport: this.transport, artifacts: this.artifacts, taskQueue: this.queue },
