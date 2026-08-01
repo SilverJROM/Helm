@@ -508,7 +508,10 @@ export async function runReviewRound(options: RunReviewRoundOptions): Promise<Re
       const seatModel = seatSpec?.model ?? partnerModel;
       const seatProvider = seatSpec?.provider ?? partnerProvider;
       const seatEffort = seatSpec?.effort;
+      // B1: ROUND temporarily uses diff-review (empty implementedDiff) so current verdict
+      // text survives until R2/B3 swaps this path to plan-draft / plan-signature.
       const partnerBrief = briefWriter.generatePanelBrief({
+        purpose: 'diff-review',
         role: partner,
         batchId: partnerBatchId,
         seat: seatLabel,

@@ -71,6 +71,7 @@ describe('Q-11 brief-writer: deferral policy lives in Helm (not ~/.claude/JROM)'
         callbacksFile: baseParams.callbacksFile,
       }),
       writer.generatePanelBrief({
+        purpose: 'diff-review',
         batchId: 'Q11-panel',
         seat: 'A',
         lens: 'correctness',

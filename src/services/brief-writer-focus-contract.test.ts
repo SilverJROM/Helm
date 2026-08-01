@@ -70,6 +70,7 @@ describe('AGENT FOCUS CONTRACT — present in every worker seat brief', () => {
   it('panel seat brief contains the focus contract', () => {
     assertHasFocusContract(
       writer.generatePanelBrief({
+        purpose: 'diff-review',
         batchId: 'focus-panel',
         seat: 'A',
         lens: 'correctness',
@@ -83,6 +84,7 @@ describe('AGENT FOCUS CONTRACT — present in every worker seat brief', () => {
   it('red-team seat brief contains the focus contract', () => {
     assertHasFocusContract(
       writer.generatePanelBrief({
+        purpose: 'diff-review',
         role: 'red-team',
         batchId: 'focus-redteam',
         seat: 'R1',

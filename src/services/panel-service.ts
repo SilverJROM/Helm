@@ -61,6 +61,7 @@ export class PanelService {
       const lens = seats[i].lens;
       const briefWriter = new BriefWriterService();
       const brief = briefWriter.generatePanelBrief({
+        purpose: 'diff-review',
         role: 'panelist',
         batchId,
         seat,
@@ -121,6 +122,7 @@ export class PanelService {
       const agentInfo = agent ? ` (project role_bindings red-team agent: role=${agent.role}, model=${agent.model || 'default'}, id=${agent.agent_id || 'n/a'})` : ' (generic)';
       const briefWriter = new BriefWriterService();
       const brief = briefWriter.generatePanelBrief({
+        purpose: 'diff-review',
         role: spawnRole,
         batchId,
         seat,

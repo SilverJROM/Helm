@@ -14,6 +14,32 @@ import {
 /** Helm-owned deferral policy path (product tree). Never builder-side JROM style scaffolding. */
 export const DEFERRAL_POLICY_RELPATH = 'policy/deferral-policy.md';
 
+/**
+ * Exhaustive purpose discriminant for generatePanelBrief (R5.17 / R5.18).
+ * No default — every caller must state why it is convening the panel.
+ * plan-draft / plan-reconcile / plan-signature bodies land in B2/B3; B1 only
+ * plumbs the required param so typecheck fails on omission.
+ */
+export const PANEL_BRIEF_PURPOSES = [
+  'plan-draft',
+  'plan-reconcile',
+  'plan-signature',
+  'task-conflict-reconvene',
+  'diff-review',
+] as const;
+
+export type PanelBriefPurpose = (typeof PANEL_BRIEF_PURPOSES)[number];
+
+const PANEL_BRIEF_PURPOSE_SET: ReadonlySet<string> = new Set(PANEL_BRIEF_PURPOSES);
+
+export function assertPanelBriefPurpose(purpose: string): asserts purpose is PanelBriefPurpose {
+  if (!PANEL_BRIEF_PURPOSE_SET.has(purpose)) {
+    throw new Error(
+      `generatePanelBrief: purpose must be one of ${PANEL_BRIEF_PURPOSES.join(' | ')} (got ${JSON.stringify(purpose)})`,
+    );
+  }
+}
+
 export function createDispatchNonce(): string {
   return randomUUID();
 }
@@ -430,7 +456,10 @@ Emit exactly:
   }
 
   // Compliant panel/red-team/deliberation briefs (verifier ≠ fixer). Includes full contract + own enum.
+  // R5.18: purpose is required + exhaustive — no default; omit → typecheck fail.
   generatePanelBrief(params: {
+    /** Required exhaustive discriminant (R5.17/R5.18). No default. */
+    purpose: PanelBriefPurpose;
     role?: string;
     batchId: string;
     seat: string;
@@ -442,6 +471,7 @@ Emit exactly:
     /** Cycle-workspace override (AC6/AC14); falls back to callbacksFile's directory, then projectDir. */
     canonicalArtifactRoot?: string;
   }): string {
+    assertPanelBriefPurpose(params.purpose);
     const r = params.role || 'panelist';
     const root = path.resolve(
       params.canonicalArtifactRoot
@@ -469,8 +499,13 @@ Emit exactly:
     const revisionLine = revision
       ? `Expected plan revision: sha256=${revision.sha256} short12=${revision.short12} — your verdict is bound to this exact revision; if the plan.md you read hashes differently, stop and report a revision mismatch instead of reviewing.`
       : `Expected plan revision: UNAVAILABLE — plan.md is missing or unreadable at spawn time. FAIL CLOSED: do NOT emit a verdict yet; re-read and retry; only emit VERDICT-READY once you can confirm the plan.md you read exists and state the sha256 you computed.`;
+    // B1: body remains the pre-purpose verdict render for all purposes so ROUND can
+    // temporarily pass purpose:'diff-review' (empty implementedDiff) without changing
+    // verdict grammar until R2/B3. Purpose is echoed for audit; draft/reconcile/signature
+    // instruction bodies land in B2/B3 without contaminating this baseline (R5.19).
     const body = `
 You are ${r} seat ${params.seat} in a ${r === 'red-team' ? 'red-team' : 'deliberation'} panel (verifier ≠ fixer${r === 'red-team' ? ', using PROJECT role_bindings red-team agents' : ''}).
+Panel purpose: ${params.purpose}
 
 ## Canonical plan contract (AC6 / AC14 — do not guess the path)
 Canonical plan.md: ${planMdPath}

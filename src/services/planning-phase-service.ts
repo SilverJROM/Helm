@@ -950,6 +950,7 @@ export class PlanningPhaseService {
       const reconveneBatchId = `${batchId}-reconvene-${safeKey}`;
       try {
         const brief = briefWriter.generatePanelBrief({
+          purpose: 'task-conflict-reconvene',
           role: partner,
           batchId: reconveneBatchId,
           seat: `reconvene-${safeKey}`,

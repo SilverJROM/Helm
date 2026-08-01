@@ -17,6 +17,7 @@ describe('BriefWriterService.generatePanelBrief — canonical plan contract (B2)
 
     const writer = new BriefWriterService();
     const brief = writer.generatePanelBrief({
+      purpose: 'diff-review',
       batchId: 'batch-B2-readable',
       seat: 'A',
       lens: 'correctness',
@@ -40,6 +41,7 @@ describe('BriefWriterService.generatePanelBrief — canonical plan contract (B2)
 
     const writer = new BriefWriterService();
     const brief = writer.generatePanelBrief({
+      purpose: 'diff-review',
       batchId: 'batch-B2-missing',
       seat: 'A',
       lens: 'correctness',

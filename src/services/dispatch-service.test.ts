@@ -444,6 +444,7 @@ describe('DispatchService (B4 DSP1 + DSP3 envelope, USE_FAKE_TMUX)', () => {
 
       // Panel brief also aligned (verifier≠fixer + deliberation → park)
       const panel = writer.generatePanelBrief({
+        purpose: 'diff-review',
         batchId: 'batch-B12-T04-panel',
         seat: '1',
         lens: 'fsm',
