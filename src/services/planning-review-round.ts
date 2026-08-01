@@ -3,9 +3,17 @@ import path from 'node:path';
 import type { ITransport } from './fake-transport.js';
 import type { BriefWriterService } from './brief-writer-service.js';
 import { validateExecutionPlan } from './execution-plan-parser.js';
-import { readPlanRevision } from './plan-revision.js';
+import { readPlanRevision, type PlanRevision } from './plan-revision.js';
 import { roleMatches } from './role-alias.js';
-import { composeSeatDraftReadAllow, publishDraft, type PublishedDraft } from './seat-draft-store.js';
+import {
+  composeSeatDraftReadAllow,
+  publishDraft,
+  type PublishedDraft,
+  atomicWriteFile,
+  candidatePlanPath,
+  candidateReqPath,
+} from './seat-draft-store.js';
+import { designateRound2Proposer, formatProposerLog } from './proposer-role.js';
 
 /**
  * C2 (AC11 foundation): behaviour-preserving seam extracted from planning-phase-service.ts's
@@ -654,6 +662,460 @@ async function resolveRoundOneDraftPhase(
     partnerBatchIds,
     roundsAttempted,
     roundOneDraftPublications: outcomes.map((o) => (o.result as { ok: true; publication: PublishedDraft }).publication),
+  };
+}
+
+/**
+ * R3 (R3.11): the plan-signature purpose's terminal grammar is `STATUS: SIGNED plan=<sha12>` — NO
+ * `[-—–:]` separator before the `plan=` claim, the same reason DRAFT_SUBMITTED_RE above needed a
+ * dedicated match instead of reusing parseRoundCallbackLine. The sha12 capture is OPTIONAL: a
+ * malformed/missing claim still identifies the line as a signature decision, but yields no usable
+ * claim — R3.11 requires that case to be treated as non-agreement (fail-closed), never ignored.
+ */
+const SIGNED_RE = /^\[(?:helm|projcore) callback\]\s+(\S+)\s+(\S+)\s+STATUS:\s+SIGNED\b(?:\s+plan=([0-9a-f]{12}))?/;
+
+/**
+ * R3 (R3.11/R3.13): the plan-signature purpose's rejection grammar is
+ * `STATUS: OBJECTIONS — n=<k>; 1. <defect> 2. <defect> ...`. The note (everything after the optional
+ * separator) is captured verbatim for the caller to surface/parse further — this module does not
+ * itself count or validate the numbered list (that is R6's objection-monotonicity scope).
+ */
+const OBJECTIONS_RE = /^\[(?:helm|projcore) callback\]\s+(\S+)\s+(\S+)\s+STATUS:\s+OBJECTIONS\b(?:\s*[\-—–:]?\s*(.*))?$/;
+
+/**
+ * R3 (R3.10): the plan-reconcile purpose's terminal grammar is `STATUS: CANDIDATE-SUBMITTED
+ * plan=<sha12>` — mirrors DRAFT_SUBMITTED_RE's identity-only match (the `plan=` claim is
+ * non-authoritative; the engine always re-reads the committed candidate file instead, R2.7's
+ * discipline re-pointed at the shared candidate path).
+ */
+const CANDIDATE_SUBMITTED_RE = /^\[(?:helm|projcore) callback\]\s+(\S+)\s+(\S+)\s+STATUS:\s+CANDIDATE-SUBMITTED\b/;
+
+/**
+ * R3 (R3.10): waits for the fresh-spawned proposer seat to commit ONE reconciled candidate —
+ * extends the same C7 watchdog shape (session-alive probe + bounded composer-held resubmit) used by
+ * waitForDraftCommit above, with the candidate-specific acceptance grammar: "CANDIDATE-SUBMITTED (or
+ * first-callback + file commit)". The returned hash is ALWAYS the engine's own re-read of the shared
+ * candidate path (never a trusted callback claim) — the proposer never writes canonical plan.md.
+ */
+async function waitForCandidateCommit(
+  cbPath: string,
+  partnerRole: string,
+  seat: RoundOneDraftSeat,
+  candidatePlanFilePath: string,
+  timeoutMs: number,
+  sinceOffset: number,
+  watchdogTransport: ReviewerWatchdogTransport
+): Promise<
+  | { ok: true; candidatePlan: PlanRevision }
+  | { ok: false; reason: 'no-first-callback' | 'session-gone' | 'candidate-not-committed' }
+> {
+  const start = Date.now();
+  let presses = 0;
+  let sawAnyCallback = false;
+  for (;;) {
+    try {
+      const buf = await fs.readFile(cbPath);
+      const window = (sinceOffset > 0 ? buf.subarray(sinceOffset) : buf).toString('utf8');
+      for (const line of window.split(/\r?\n/)) {
+        const identity = RAW_CALLBACK_IDENTITY_RE.exec(line);
+        if (!identity || identity[2] !== seat.batchId || !roleMatches(partnerRole, identity[1])) continue;
+        sawAnyCallback = true;
+        if (CANDIDATE_SUBMITTED_RE.test(line)) {
+          const candidatePlan = readPlanRevision(candidatePlanFilePath);
+          if (candidatePlan) return { ok: true, candidatePlan };
+        }
+      }
+      if (sawAnyCallback) {
+        const candidatePlan = readPlanRevision(candidatePlanFilePath);
+        if (candidatePlan) return { ok: true, candidatePlan };
+      }
+    } catch {}
+
+    if (watchdogTransport.inspectSeat) {
+      const inspection = await watchdogTransport.inspectSeat(seat.handle, seat.brief);
+      if (!inspection.sessionAlive) return { ok: false, reason: 'session-gone' };
+    }
+    if (watchdogTransport.resubmitIfComposerHeld && presses < REVIEWER_FIRST_CALLBACK_MAX_PRESSES) {
+      try {
+        const pressed = await watchdogTransport.resubmitIfComposerHeld(seat.handle, seat.brief);
+        if (pressed) presses += 1;
+      } catch {
+        // Best-effort nudge only — a probe error must never abort the bounded wait itself.
+      }
+    }
+
+    if (Date.now() - start >= timeoutMs) {
+      return { ok: false, reason: sawAnyCallback ? 'candidate-not-committed' : 'no-first-callback' };
+    }
+    await new Promise((r) => setTimeout(r, REVIEWER_FIRST_CALLBACK_POLL_MS));
+  }
+}
+
+/**
+ * R3 (R3.11): waits for the fresh-spawned signer seat to post its decision — SIGNED (with the sha12
+ * it computed re-reading the candidate) or a bounded OBJECTIONS list. Unlike draft/candidate commits
+ * there is no on-disk fallback: a signature decision is callback-grammar-only, so a seat that never
+ * posts either line always resolves to a bounded timeout, never a silent pass.
+ */
+async function waitForSignerDecision(
+  cbPath: string,
+  partnerRole: string,
+  seat: RoundOneDraftSeat,
+  timeoutMs: number,
+  sinceOffset: number,
+  watchdogTransport: ReviewerWatchdogTransport
+): Promise<
+  | { ok: true; kind: 'signed'; claimedShort12: string | null }
+  | { ok: true; kind: 'objections'; note: string | null }
+  | { ok: false; reason: 'no-first-callback' | 'session-gone' }
+> {
+  const start = Date.now();
+  let presses = 0;
+  for (;;) {
+    try {
+      const buf = await fs.readFile(cbPath);
+      const window = (sinceOffset > 0 ? buf.subarray(sinceOffset) : buf).toString('utf8');
+      for (const line of window.split(/\r?\n/)) {
+        const identity = RAW_CALLBACK_IDENTITY_RE.exec(line);
+        if (!identity || identity[2] !== seat.batchId || !roleMatches(partnerRole, identity[1])) continue;
+        const signedMatch = SIGNED_RE.exec(line);
+        if (signedMatch) return { ok: true, kind: 'signed', claimedShort12: signedMatch[3] ?? null };
+        const objectionsMatch = OBJECTIONS_RE.exec(line);
+        if (objectionsMatch) return { ok: true, kind: 'objections', note: objectionsMatch[3] ?? null };
+      }
+    } catch {}
+
+    if (watchdogTransport.inspectSeat) {
+      const inspection = await watchdogTransport.inspectSeat(seat.handle, seat.brief);
+      if (!inspection.sessionAlive) return { ok: false, reason: 'session-gone' };
+    }
+    if (watchdogTransport.resubmitIfComposerHeld && presses < REVIEWER_FIRST_CALLBACK_MAX_PRESSES) {
+      try {
+        const pressed = await watchdogTransport.resubmitIfComposerHeld(seat.handle, seat.brief);
+        if (pressed) presses += 1;
+      } catch {
+        // Best-effort nudge only — a probe error must never abort the bounded wait itself.
+      }
+    }
+
+    if (Date.now() - start >= timeoutMs) return { ok: false, reason: 'no-first-callback' };
+    await new Promise((r) => setTimeout(r, REVIEWER_FIRST_CALLBACK_POLL_MS));
+  }
+}
+
+/**
+ * R3 (R3.9-R3.11): round-2 asymmetric proposer/signer divergence handling.
+ *
+ * Consumes the two round-1 draft publications R2's resolveRoundOneDraftPhase already collected
+ * (engine-recomputed hashes, D1) and resolves ONE round-2 outcome:
+ *
+ * - Hash mismatch: D3's designateRound2Proposer (full sha256, never short12) picks a proposer; the
+ *   rule + both full shas are logged via formatProposerLog (R3.9). The designated seat is
+ *   fresh-spawned (C5/R6.20) with purpose plan-reconcile and BOTH round-1 draft paths; the other
+ *   seat is fresh-spawned with purpose plan-signature and ONLY the resulting candidate (R3.10) —
+ *   never a second competing draft, never both seats asked to author a new full document.
+ * - Hash match: no model reconcile call — the engine copies the designated seat's already-identical
+ *   committed bytes straight to the candidate path. A real signature round still runs regardless
+ *   (R3.11's uniform promotion path is preferred over an unproven auto-agree shortcut).
+ *
+ * Agreement (R3.11) is B5's exact mechanism, re-pointed: the signer's claimed `plan=<sha12>` must
+ * equal the candidate's CURRENT on-disk short12, recomputed by the engine at check time. A missing,
+ * malformed, or stale claim is never agreement — fail-closed.
+ *
+ * Round-3+ alternation (rolesForRound, R4) and objection-driven re-reconciliation (R6) are not this
+ * function's scope — it resolves exactly one round-2 proposer/signer exchange.
+ */
+export interface RunProposerSignerRoundOptions {
+  transport: ITransport;
+  briefWriter: BriefWriterService;
+  writeBrief: (role: string, content: string) => Promise<void>;
+  registerWorkerRuntime: (
+    role: string,
+    correlationId: string,
+    handle: string,
+    provider?: string,
+    model?: string
+  ) => number | null;
+
+  runDir: string;
+  batchId: string;
+  /** Round number this call represents — R3's own scope is always round 2. */
+  round: number;
+  partner: 'planner' | 'deliberation';
+  effectiveProjectDir: string;
+  cbPath: string;
+
+  /** The two round-1 draft publications (R2's resolveRoundOneDraftPhase output) — both `plan` fields
+   *  must be non-null (both seats committed); this function is only ever called once that holds. */
+  draftA: PublishedDraft;
+  draftB: PublishedDraft;
+
+  perRoundTimeoutMs: number;
+  agreementFenceOffset: number;
+
+  coPlannerSeats?: ConfiguredCoPlannerSeat[];
+  partnerModel?: string;
+  partnerProvider?: string;
+
+  projectId?: number;
+  runId?: number;
+  strictReadAllow?: string[];
+
+  /** Overrides for the shared candidate paths; default to seat-draft-store's composed paths. */
+  candidatePlanPathOverride?: string;
+  candidateReqPathOverride?: string;
+
+  /** Caller-owned accumulators — same convention as RunReviewRoundOptions (A5/A6 safety net). */
+  partnerHandles: string[];
+  partnerRuntimeIds: (number | null)[];
+}
+
+export type SignerDecisionKind = 'signed-agreed' | 'signed-mismatched' | 'objections' | 'no-response';
+
+export interface ProposerSignerRoundResult {
+  agreed: boolean;
+  /** True when round-1 drafts' engine-recomputed hashes were already equal (no reconcile spawned). */
+  hashMatch: boolean;
+  /** D3's designateRound2Proposer output — always set, even on hashMatch (R3.9). */
+  designatedSeatId: string;
+  /** formatProposerLog's auditable line — always set (R3.9: call D3 designate + log the rule). */
+  designationLog: string;
+  /** True only when a proposer seat was actually fresh-spawned (hash mismatch). */
+  reconcileSpawned: boolean;
+  proposerBatchId: string | null;
+  signerSeatId: string;
+  signerBatchId: string | null;
+  candidatePlanPath: string;
+  candidateReqPath: string;
+  /** Engine-recomputed candidate hash at the last point it was read — never a trusted claim. */
+  candidatePlan: PlanRevision | null;
+  signerDecision: SignerDecisionKind;
+  objections?: string | null;
+  blockedReasonKind?: 'candidate-not-committed' | 'signer-no-response';
+  blockedReason?: string;
+}
+
+/** Inverse of R2's blindDraftSeatIds label scheme ('partner', 'partner-2', ...) → coPlannerSeats index. */
+function seatConfigIndex(seatId: string): number {
+  if (seatId === 'partner') return 0;
+  const m = /^partner-(\d+)$/.exec(seatId);
+  return m ? Number(m[1]) - 1 : -1;
+}
+
+export async function runProposerSignerRound(
+  options: RunProposerSignerRoundOptions
+): Promise<ProposerSignerRoundResult> {
+  const {
+    transport, briefWriter, writeBrief, registerWorkerRuntime,
+    runDir, batchId, round, partner, effectiveProjectDir, cbPath,
+    draftA, draftB, perRoundTimeoutMs, agreementFenceOffset,
+    coPlannerSeats, partnerModel, partnerProvider,
+    projectId, runId, strictReadAllow,
+    candidatePlanPathOverride, candidateReqPathOverride,
+    partnerHandles, partnerRuntimeIds,
+  } = options;
+
+  if (!draftA.plan || !draftB.plan) {
+    throw new Error(
+      'runProposerSignerRound: both round-1 drafts must have a committed plan revision ' +
+        '(R3.10 precondition — call only after resolveRoundOneDraftPhase reports every seat committed)'
+    );
+  }
+
+  const candidatePlanPathResolved = candidatePlanPathOverride || candidatePlanPath(runDir);
+  const candidateReqPathResolved = candidateReqPathOverride || candidateReqPath(runDir);
+
+  // R3.9: deterministic, artifact-reproducible designation — full sha256, never short12.
+  const designatedSeatId = designateRound2Proposer({
+    seatA: draftA.seatId, shaA: draftA.plan.sha256,
+    seatB: draftB.seatId, shaB: draftB.plan.sha256,
+  });
+  const designationLog = formatProposerLog({
+    seatA: draftA.seatId, shaA: draftA.plan.sha256,
+    seatB: draftB.seatId, shaB: draftB.plan.sha256,
+    proposer: designatedSeatId,
+  });
+
+  const designated = designatedSeatId === draftA.seatId ? draftA : draftB;
+  const other = designatedSeatId === draftA.seatId ? draftB : draftA;
+  const hashMatch = draftA.plan.sha256 === draftB.plan.sha256;
+
+  const roundSuffix = `-r${round}`;
+  const configuredSeats = Array.isArray(coPlannerSeats) ? coPlannerSeats : [];
+  const seatSpecFor = (seatId: string) => configuredSeats[seatConfigIndex(seatId)];
+
+  let reconcileSpawned = false;
+  let proposerBatchId: string | null = null;
+
+  if (hashMatch) {
+    // R3.11 preferred path: no model reconcile call — engine copies the already-identical bytes.
+    const planBytes = await fs.readFile(designated.planPath);
+    atomicWriteFile(candidatePlanPathResolved, planBytes);
+    if (designated.req) {
+      try {
+        const reqBytes = await fs.readFile(designated.reqPath);
+        atomicWriteFile(candidateReqPathResolved, reqBytes);
+      } catch {
+        // Best-effort — requirements-candidate copy is not load-bearing for the plan-hash agreement
+        // check this function resolves (R3.9-R3.11 concern plan.md agreement, not og-requirements.md).
+      }
+    }
+  } else {
+    reconcileSpawned = true;
+    proposerBatchId = `${batchId}${roundSuffix}-proposer`;
+    const proposerSpec = seatSpecFor(designatedSeatId);
+    const proposerBrief = briefWriter.generatePanelBrief({
+      purpose: 'plan-reconcile',
+      role: partner,
+      batchId: proposerBatchId,
+      seat: designatedSeatId,
+      lens: 'reconcile round-1 drafts into one candidate',
+      runDir,
+      projectDir: effectiveProjectDir,
+      callbacksFile: cbPath,
+      roundDraftPlanPaths: [draftA.planPath, draftB.planPath],
+      roundDraftReqPaths: [draftA.reqPath, draftB.reqPath],
+      candidatePlanPath: candidatePlanPathResolved,
+      candidateReqPath: candidateReqPathResolved,
+    });
+    await writeBrief(`${partner}${roundSuffix}-proposer`, proposerBrief);
+    const proposerSpawned = await transport.spawn({
+      role: partner,
+      brief: proposerBrief,
+      runDir,
+      batchId: proposerBatchId,
+      model: proposerSpec?.model ?? partnerModel,
+      provider: proposerSpec?.provider ?? partnerProvider,
+      ...(proposerSpec?.effort ? { effort: proposerSpec.effort } : {}),
+      attemptId: 0,
+      projectDir: effectiveProjectDir,
+      projectId,
+      runId,
+      ...(strictReadAllow ? { strictReadAllow } : {}),
+    });
+    partnerRuntimeIds.push(
+      registerWorkerRuntime(
+        partner, proposerBatchId, proposerSpawned.handle,
+        proposerSpec?.provider ?? partnerProvider, proposerSpec?.model ?? partnerModel
+      )
+    );
+    partnerHandles.push(proposerSpawned.handle);
+
+    const commitResult = await waitForCandidateCommit(
+      cbPath, partner,
+      { batchId: proposerBatchId, brief: proposerBrief, handle: proposerSpawned.handle, seatId: designatedSeatId },
+      candidatePlanPathResolved,
+      perRoundTimeoutMs, agreementFenceOffset,
+      transport as ReviewerWatchdogTransport
+    );
+    await transport.reap(
+      proposerSpawned.handle,
+      commitResult.ok ? 'proposer-candidate-committed-reaped' : 'proposer-candidate-not-committed-reaped'
+    );
+
+    if (!commitResult.ok) {
+      return {
+        agreed: false, hashMatch, designatedSeatId, designationLog, reconcileSpawned,
+        proposerBatchId, signerSeatId: other.seatId, signerBatchId: null,
+        candidatePlanPath: candidatePlanPathResolved, candidateReqPath: candidateReqPathResolved,
+        candidatePlan: null,
+        signerDecision: 'no-response',
+        blockedReasonKind: 'candidate-not-committed',
+        blockedReason:
+          `CANDIDATE-NOT-COMMITTED (R3/R3.10): proposer seat ${designatedSeatId} (${proposerBatchId}) ` +
+          `never published a candidate within ~${perRoundTimeoutMs}ms (${commitResult.reason}) — ` +
+          `bounded exit, never a silent pass; the signer was never spawned.`,
+      };
+    }
+  }
+
+  const signerSeatId = other.seatId;
+  const signerBatchId = `${batchId}${roundSuffix}-signer`;
+  const signerSpec = seatSpecFor(signerSeatId);
+  const signerBrief = briefWriter.generatePanelBrief({
+    purpose: 'plan-signature',
+    role: partner,
+    batchId: signerBatchId,
+    seat: signerSeatId,
+    lens: 'sign or object to the reconciled candidate',
+    runDir,
+    projectDir: effectiveProjectDir,
+    callbacksFile: cbPath,
+    candidatePlanPath: candidatePlanPathResolved,
+    candidateReqPath: candidateReqPathResolved,
+  });
+  await writeBrief(`${partner}${roundSuffix}-signer`, signerBrief);
+  const signerSpawned = await transport.spawn({
+    role: partner,
+    brief: signerBrief,
+    runDir,
+    batchId: signerBatchId,
+    model: signerSpec?.model ?? partnerModel,
+    provider: signerSpec?.provider ?? partnerProvider,
+    ...(signerSpec?.effort ? { effort: signerSpec.effort } : {}),
+    attemptId: 0,
+    projectDir: effectiveProjectDir,
+    projectId,
+    runId,
+    ...(strictReadAllow ? { strictReadAllow } : {}),
+  });
+  partnerRuntimeIds.push(
+    registerWorkerRuntime(
+      partner, signerBatchId, signerSpawned.handle,
+      signerSpec?.provider ?? partnerProvider, signerSpec?.model ?? partnerModel
+    )
+  );
+  partnerHandles.push(signerSpawned.handle);
+
+  const decision = await waitForSignerDecision(
+    cbPath, partner,
+    { batchId: signerBatchId, brief: signerBrief, handle: signerSpawned.handle, seatId: signerSeatId },
+    perRoundTimeoutMs, agreementFenceOffset,
+    transport as ReviewerWatchdogTransport
+  );
+  await transport.reap(
+    signerSpawned.handle,
+    decision.ok ? 'signer-decision-received-reaped' : 'signer-no-response-reaped'
+  );
+
+  if (!decision.ok) {
+    return {
+      agreed: false, hashMatch, designatedSeatId, designationLog, reconcileSpawned,
+      proposerBatchId, signerSeatId, signerBatchId,
+      candidatePlanPath: candidatePlanPathResolved, candidateReqPath: candidateReqPathResolved,
+      candidatePlan: readPlanRevision(candidatePlanPathResolved),
+      signerDecision: 'no-response',
+      blockedReasonKind: 'signer-no-response',
+      blockedReason:
+        `SIGNER-NO-RESPONSE (R3/R3.11): signer seat ${signerSeatId} (${signerBatchId}) never posted a ` +
+        `SIGNED/OBJECTIONS decision within ~${perRoundTimeoutMs}ms (${decision.reason}) — bounded exit, ` +
+        `never a silent pass.`,
+    };
+  }
+
+  if (decision.kind === 'objections') {
+    return {
+      agreed: false, hashMatch, designatedSeatId, designationLog, reconcileSpawned,
+      proposerBatchId, signerSeatId, signerBatchId,
+      candidatePlanPath: candidatePlanPathResolved, candidateReqPath: candidateReqPathResolved,
+      candidatePlan: readPlanRevision(candidatePlanPathResolved),
+      signerDecision: 'objections',
+      objections: decision.note,
+    };
+  }
+
+  // decision.kind === 'signed' — R3.11: recompute the candidate's CURRENT bytes now; a missing,
+  // malformed, or stale-relative-to-current claim is never treated as agreement (fail-closed).
+  const currentCandidate = readPlanRevision(candidatePlanPathResolved);
+  const agreed =
+    !!currentCandidate && !!decision.claimedShort12 && decision.claimedShort12 === currentCandidate.short12;
+
+  return {
+    agreed, hashMatch, designatedSeatId, designationLog, reconcileSpawned,
+    proposerBatchId, signerSeatId, signerBatchId,
+    candidatePlanPath: candidatePlanPathResolved, candidateReqPath: candidateReqPathResolved,
+    candidatePlan: currentCandidate,
+    signerDecision: agreed ? 'signed-agreed' : 'signed-mismatched',
   };
 }
 
