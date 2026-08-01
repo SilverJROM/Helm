@@ -13,7 +13,7 @@ import {
   candidatePlanPath,
   candidateReqPath,
 } from './seat-draft-store.js';
-import { designateRound2Proposer, formatProposerLog } from './proposer-role.js';
+import { designateRound2Proposer, formatProposerLog, rolesForRound, type RoundRoles } from './proposer-role.js';
 
 /**
  * C2 (AC11 foundation): behaviour-preserving seam extracted from planning-phase-service.ts's
@@ -841,8 +841,13 @@ async function waitForSignerDecision(
  * equal the candidate's CURRENT on-disk short12, recomputed by the engine at check time. A missing,
  * malformed, or stale claim is never agreement — fail-closed.
  *
- * Round-3+ alternation (rolesForRound, R4) and objection-driven re-reconciliation (R6) are not this
- * function's scope — it resolves exactly one round-2 proposer/signer exchange.
+ * R4 (R3.12): a caller resolving round 3+ of the SAME exchange passes `rolesOverride` (the round
+ * loop's own `rolesForRound` output) so the seat that actually proposes/signs alternates instead of
+ * this function re-designating the same seat every round off the unchanged round-1 drafts; the base
+ * D3 designation (`designatedSeatId`/`designationLog`) still always reflects round 2's rule, as R3
+ * shipped it — `roundProposerSeatId`/`signerSeatId` are the per-round roles the caller should act on.
+ * Objection-driven re-reconciliation (R6) is not this function's scope — every call still resolves
+ * exactly one round's proposer/signer exchange.
  */
 export interface RunProposerSignerRoundOptions {
   transport: ITransport;
@@ -868,6 +873,14 @@ export interface RunProposerSignerRoundOptions {
    *  must be non-null (both seats committed); this function is only ever called once that holds. */
   draftA: PublishedDraft;
   draftB: PublishedDraft;
+
+  /** R4 (R3.12): who actually proposes/signs THIS round. Omitted (round 2's natural call) → D3's
+   *  designateRound2Proposer decides, as R3 shipped it. Round 3+ callers pass the round loop's own
+   *  `rolesForRound` output so the pen alternates instead of D3 re-designating the same seat every
+   *  round off the same unchanged round-1 drafts. Never changes `hashMatch` / the base D3 designation
+   *  audit trail (`designatedSeatId`/`designationLog` stay the round-2 designation, always) — only
+   *  which seat is fresh-spawned as proposer vs signer for this specific round. */
+  rolesOverride?: RoundRoles;
 
   perRoundTimeoutMs: number;
   agreementFenceOffset: number;
@@ -895,13 +908,21 @@ export interface ProposerSignerRoundResult {
   agreed: boolean;
   /** True when round-1 drafts' engine-recomputed hashes were already equal (no reconcile spawned). */
   hashMatch: boolean;
-  /** D3's designateRound2Proposer output — always set, even on hashMatch (R3.9). */
+  /** D3's designateRound2Proposer output — always set, even on hashMatch (R3.9). This is the BASE
+   *  round-2 designation and never changes across rounds; it is the audit anchor `rolesForRound`
+   *  alternates from (R4/R3.12) — read `roundProposerSeatId` for who actually held the pen THIS
+   *  round. */
   designatedSeatId: string;
-  /** formatProposerLog's auditable line — always set (R3.9: call D3 designate + log the rule). */
+  /** formatProposerLog's auditable line — always set (R3.9: call D3 designate + log the rule). Always
+   *  describes the base round-2 designation above, even on a later, alternated round. */
   designationLog: string;
+  /** R4 (R3.12): the seat that actually proposed THIS round — equals `designatedSeatId` on round 2 (no
+   *  override) and alternates on round 3+ per the caller's `rolesOverride` (rolesForRound). */
+  roundProposerSeatId: string;
   /** True only when a proposer seat was actually fresh-spawned (hash mismatch). */
   reconcileSpawned: boolean;
   proposerBatchId: string | null;
+  /** R4 (R3.12): the seat that actually signed THIS round — alternates alongside roundProposerSeatId. */
   signerSeatId: string;
   signerBatchId: string | null;
   candidatePlanPath: string;
@@ -927,7 +948,7 @@ export async function runProposerSignerRound(
   const {
     transport, briefWriter, writeBrief, registerWorkerRuntime,
     runDir, batchId, round, partner, effectiveProjectDir, cbPath,
-    draftA, draftB, perRoundTimeoutMs, agreementFenceOffset,
+    draftA, draftB, rolesOverride, perRoundTimeoutMs, agreementFenceOffset,
     coPlannerSeats, partnerModel, partnerProvider,
     projectId, runId, strictReadAllow,
     candidatePlanPathOverride, candidateReqPathOverride,
@@ -955,8 +976,13 @@ export async function runProposerSignerRound(
     proposer: designatedSeatId,
   });
 
-  const designated = designatedSeatId === draftA.seatId ? draftA : draftB;
-  const other = designatedSeatId === draftA.seatId ? draftB : draftA;
+  // R4 (R3.12): rolesOverride (round 3+, from the round loop's rolesForRound) picks who ACTUALLY
+  // proposes/signs this round; round 2's natural call (no override) leaves it as D3's designation.
+  // Never re-derives from the drafts themselves — those are round-1's unchanged bytes, so re-running
+  // designateRound2Proposer every round would just re-pick the same seat forever (R3.12's failure mode).
+  const roundProposerSeatId = rolesOverride?.proposer ?? designatedSeatId;
+  const designated = roundProposerSeatId === draftA.seatId ? draftA : draftB;
+  const other = roundProposerSeatId === draftA.seatId ? draftB : draftA;
   const hashMatch = draftA.plan.sha256 === draftB.plan.sha256;
 
   const roundSuffix = `-r${round}`;
@@ -982,12 +1008,12 @@ export async function runProposerSignerRound(
   } else {
     reconcileSpawned = true;
     proposerBatchId = `${batchId}${roundSuffix}-proposer`;
-    const proposerSpec = seatSpecFor(designatedSeatId);
+    const proposerSpec = seatSpecFor(roundProposerSeatId);
     const proposerBrief = briefWriter.generatePanelBrief({
       purpose: 'plan-reconcile',
       role: partner,
       batchId: proposerBatchId,
-      seat: designatedSeatId,
+      seat: roundProposerSeatId,
       lens: 'reconcile round-1 drafts into one candidate',
       runDir,
       projectDir: effectiveProjectDir,
@@ -1022,7 +1048,7 @@ export async function runProposerSignerRound(
 
     const commitResult = await waitForCandidateCommit(
       cbPath, partner,
-      { batchId: proposerBatchId, brief: proposerBrief, handle: proposerSpawned.handle, seatId: designatedSeatId },
+      { batchId: proposerBatchId, brief: proposerBrief, handle: proposerSpawned.handle, seatId: roundProposerSeatId },
       candidatePlanPathResolved,
       perRoundTimeoutMs, agreementFenceOffset,
       transport as ReviewerWatchdogTransport
@@ -1034,14 +1060,14 @@ export async function runProposerSignerRound(
 
     if (!commitResult.ok) {
       return {
-        agreed: false, hashMatch, designatedSeatId, designationLog, reconcileSpawned,
+        agreed: false, hashMatch, designatedSeatId, designationLog, roundProposerSeatId, reconcileSpawned,
         proposerBatchId, signerSeatId: other.seatId, signerBatchId: null,
         candidatePlanPath: candidatePlanPathResolved, candidateReqPath: candidateReqPathResolved,
         candidatePlan: null,
         signerDecision: 'no-response',
         blockedReasonKind: 'candidate-not-committed',
         blockedReason:
-          `CANDIDATE-NOT-COMMITTED (R3/R3.10): proposer seat ${designatedSeatId} (${proposerBatchId}) ` +
+          `CANDIDATE-NOT-COMMITTED (R3/R3.10): proposer seat ${roundProposerSeatId} (${proposerBatchId}) ` +
           `never published a candidate within ~${perRoundTimeoutMs}ms (${commitResult.reason}) — ` +
           `bounded exit, never a silent pass; the signer was never spawned.`,
       };
@@ -1099,7 +1125,7 @@ export async function runProposerSignerRound(
 
   if (!decision.ok) {
     return {
-      agreed: false, hashMatch, designatedSeatId, designationLog, reconcileSpawned,
+      agreed: false, hashMatch, designatedSeatId, designationLog, roundProposerSeatId, reconcileSpawned,
       proposerBatchId, signerSeatId, signerBatchId,
       candidatePlanPath: candidatePlanPathResolved, candidateReqPath: candidateReqPathResolved,
       candidatePlan: readPlanRevision(candidatePlanPathResolved),
@@ -1114,7 +1140,7 @@ export async function runProposerSignerRound(
 
   if (decision.kind === 'objections') {
     return {
-      agreed: false, hashMatch, designatedSeatId, designationLog, reconcileSpawned,
+      agreed: false, hashMatch, designatedSeatId, designationLog, roundProposerSeatId, reconcileSpawned,
       proposerBatchId, signerSeatId, signerBatchId,
       candidatePlanPath: candidatePlanPathResolved, candidateReqPath: candidateReqPathResolved,
       candidatePlan: readPlanRevision(candidatePlanPathResolved),
@@ -1130,7 +1156,7 @@ export async function runProposerSignerRound(
     !!currentCandidate && !!decision.claimedShort12 && decision.claimedShort12 === currentCandidate.short12;
 
   return {
-    agreed, hashMatch, designatedSeatId, designationLog, reconcileSpawned,
+    agreed, hashMatch, designatedSeatId, designationLog, roundProposerSeatId, reconcileSpawned,
     proposerBatchId, signerSeatId, signerBatchId,
     candidatePlanPath: candidatePlanPathResolved, candidateReqPath: candidateReqPathResolved,
     candidatePlan: currentCandidate,
@@ -1433,6 +1459,9 @@ export async function runReviewRound(options: RunReviewRoundOptions): Promise<Re
   // asymmetric proposer/signer exchange below runs on the ENGINE'S OWN recomputed publications (D1) —
   // never a re-read of what a seat claimed. Undefined until round 1's draft phase resolves cleanly.
   let roundOneDrafts: PublishedDraft[] | undefined;
+  // R4 (R3.12): round 2's own D3 designation, captured once so round 3+ can alternate FROM it
+  // (rolesForRound) instead of re-designating off the same unchanged round-1 drafts every round.
+  let round2ProposerSeatId: string | undefined;
   for (let round = 1; round <= resolvedRoundCap; round++) {
     roundsAttempted = round;
     if (round > 1) {
@@ -1449,21 +1478,30 @@ export async function runReviewRound(options: RunReviewRoundOptions): Promise<Re
     // published both drafts above, this loop reaped those seats just now (C5: a round can never
     // observe a still-alive prior-round seat), and runProposerSignerRound fresh-spawns exactly one
     // proposer (plan-reconcile, BOTH drafts) and one signer (plan-signature, ONLY the candidate).
-    // Rounds 3+ alternate the pen (rolesForRound) — R4's scope — so this exchange resolves once and
-    // returns rather than looping; the remaining roundCap budget is R4's to spend.
+    // R4 (R3.12): a non-agreeing round 2 does not return here anymore — with budget left, the loop
+    // continues into round 3 (and beyond) of the SAME exchange, alternating the pen via rolesForRound
+    // instead of D3 re-designating the same seat off the same unchanged round-1 drafts every round.
+    // Round 2 itself is unchanged: no rolesOverride, D3's natural designation.
     if (roundOneDrafts) {
       const [draftA, draftB] = roundOneDrafts;
+      const rolesOverride =
+        round === 2 ? undefined : rolesForRound(round, round2ProposerSeatId!, draftA.seatId, draftB.seatId);
       const psResult = await runProposerSignerRound({
         transport, briefWriter, writeBrief, registerWorkerRuntime,
         runDir, batchId, round, partner, effectiveProjectDir, cbPath,
-        draftA, draftB,
+        draftA, draftB, rolesOverride,
         perRoundTimeoutMs: resolvedPerRoundTimeoutMs,
         agreementFenceOffset,
         coPlannerSeats, partnerModel, partnerProvider,
         projectId, runId, strictReadAllow,
         partnerHandles, partnerRuntimeIds,
       });
-      return toReviewRoundResult(psResult, partnerBatchIds, roundOneDrafts, round);
+      if (round === 2) round2ProposerSeatId = psResult.designatedSeatId;
+      if (psResult.agreed || round >= resolvedRoundCap) {
+        return toReviewRoundResult(psResult, partnerBatchIds, roundOneDrafts, round);
+      }
+      // R4: budget remains — round (round + 1) alternates the pen over the SAME two round-1 drafts.
+      continue;
     }
 
     const handleCountBeforeRound = partnerHandles.length;

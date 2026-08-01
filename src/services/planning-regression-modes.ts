@@ -162,3 +162,22 @@ registerRegressionMode({
   state: 'active',
   note: 'Round-1 co-planners draft blind: per-seat strictReadAllow excludes peer draft dirs, widening into the shared planning-drafts/ root refuses before spawn, no canonical write, engine rehashes from disk.',
 });
+
+/**
+ * R4 — round 3+ of a divergent proposer/signer exchange ALTERNATES the pen: the round loop's own
+ * `rolesForRound` (D3) picks who proposes/signs each round, anchored on round 2's D3 designation,
+ * instead of re-designating off the same unchanged round-1 drafts and letting one seat hold the pen
+ * every round.
+ */
+registerRegressionMode({
+  mode: 'proposer-signer-alternation',
+  slice: 'R4',
+  requirements: ['R3.12', 'R6.20', 'R6.24'],
+  spec: 'src/services/planning-review-round-alternation.test.ts',
+  provingTests: [
+    'round-2 proposer = designate(round1); round-3 proposer = the other seat; round-4 = round-2s proposer again',
+    'spawns the rolesOverride.proposer as proposer even though D3 would naturally designate the other seat',
+  ],
+  state: 'active',
+  note: 'Round loop wires rolesForRound into every round 3+ of a proposer/signer exchange: round 2 = D3 designation, round 3 swaps to the other seat, round 4 swaps back — never one seat every round.',
+});
