@@ -3,7 +3,6 @@ import path from 'node:path';
 import type { ITransport } from './fake-transport.js';
 import type { BriefWriterService } from './brief-writer-service.js';
 import { validateExecutionPlan } from './execution-plan-parser.js';
-import { CANONICAL_CYCLE_ARTIFACTS } from './cycle-artifact-paths.js';
 import { readPlanRevision } from './plan-revision.js';
 import { roleMatches } from './role-alias.js';
 
@@ -15,10 +14,13 @@ import { roleMatches } from './role-alias.js';
  *
  * runPlanningPhase remains the owner of plancore spawn, canonical plan polling/read/ingest,
  * terminalization (reap-then-finalize) and the PlanningResult return shape. This module never
- * reads plan.md/og-requirements.md and never reaps/finalizes anything itself — waitForAgreement
- * and its parser helpers stay put in planning-phase-service.ts (B3/B4/B5's direct unit tests call
- * them there as private methods via an `any`-typed accessor), so this seam takes that gate as an
- * injected, already-bound callback rather than re-implementing or relocating it.
+ * reaps/finalizes anything itself — waitForAgreement and its parser helpers stay put in
+ * planning-phase-service.ts (B3/B4/B5's direct unit tests call them there as private methods via an
+ * `any`-typed accessor), so this seam takes that gate as an injected, already-bound callback rather
+ * than re-implementing or relocating it.
+ *
+ * C3 re-scoped (R4.16): the pre-spawn publication gate checks seat-scoped drafts / candidates when
+ * supplied — never pre-promotion canonical plan.md / og-requirements.md (engine promotes those at P2).
  */
 
 export interface ConfiguredCoPlannerSeat {
@@ -27,6 +29,23 @@ export interface ConfiguredCoPlannerSeat {
   model: string;
   effort?: string;
   source?: string;
+}
+
+/**
+ * C3 re-scoped (R4.16): one artifact the publication gate must verify before spawn.
+ * Paths are seat-scoped drafts or shared candidates — never pre-promotion canonical
+ * `plan.md` / `og-requirements.md` (those stay absent until P2 engine promotion).
+ */
+export interface PublicationArtifactSpec {
+  /** Absolute path to the file that must exist. */
+  path: string;
+  /** Label for failure messages (e.g. "seat-a draft plan", "candidate plan"). */
+  label: string;
+  /**
+   * When true, non-empty content must pass `validateExecutionPlan` (plan documents only —
+   * requirements drafts stay existence + non-empty).
+   */
+  validateAsPlan?: boolean;
 }
 
 export interface RunReviewRoundOptions {
@@ -108,6 +127,22 @@ export interface RunReviewRoundOptions {
   runId?: number;
   strictReadAllow?: string[];
 
+  /**
+   * C3 re-scoped (R4.16): descriptors for the relevant seat-scoped draft or candidate the gate must
+   * see before spawn (round-2+ / post-draft gates).
+   * - omitted or empty: round-1 pre-spawn mode — only `runDir` must exist (plus optional
+   *   `contextInputPaths` when provided); **never** requires canonical plan.md / og-requirements.md.
+   * - non-empty: each artifact must exist and be non-empty; plan docs (`validateAsPlan`) must parse
+   *   via `validateExecutionPlan`.
+   * Real-mode only; `isFake` still exempts the entire gate (fixture harness).
+   */
+  publicationArtifacts?: PublicationArtifactSpec[];
+  /**
+   * Optional context inputs (north-star.md, conversation-log.md, decisions/) checked only in
+   * round-1 pre-spawn mode when `publicationArtifacts` is empty/omitted.
+   */
+  contextInputPaths?: string[];
+
   /** Caller-owned accumulators (the SAME arrays the caller's one terminal owner already closes over),
    *  mutated in place rather than returned — so a spawn that throws mid-loop still leaves every
    *  already-spawned seat's handle/runtime id visible to that terminal owner (A5/A6: no exit path,
@@ -122,8 +157,8 @@ export interface RunReviewRoundOptions {
  * Additive/optional alongside the pre-existing string `blockedReason` (kept for the human-readable
  * message every caller/log already reads); this field lets a consumer branch on the CAUSE without
  * parsing prose:
- * - 'artifact-not-published': C3's pre-spawn gate — the current attempt's plan.md/og-requirements.md
- *   were not yet published.
+ * - 'artifact-not-published': C3's pre-spawn gate (R4.16) — relevant seat-scoped draft/candidate (or
+ *   round-1 runDir/context inputs) not yet published; never "canonical plan.md missing" pre-P2.
  * - 'reviewer-no-first-callback': C7's watchdog — a spawned reviewer seat never posted anything to
  *   callbacks.md (or its session died) before the round's agreement wait would have started.
  * - 'same-plan-broken': C6/C8 — a reviewer returned BROKEN bound to the CURRENT plan.md revision.
@@ -142,8 +177,8 @@ export type RoundBlockedReasonKind =
 export interface ReviewRoundResult {
   agreed: boolean;
   partnerBatchIds: string[];
-  /** C3 (AC11/AC23): set when the artifact-publication gate below refused to spawn any reviewer
-   *  because the current attempt's plan.md/og-requirements.md were not yet published. C4 (AC10/AC3):
+  /** C3 (R4.16): set when the re-scoped artifact-publication gate refused to spawn (seat-scoped
+   *  draft/candidate missing/empty/unparseable, or round-1 runDir/context missing). C4 (AC10/AC3):
    *  also set when the round loop exhausts roundCap without agreement. Additive/optional so the
    *  existing `const { agreed, partnerBatchIds } = await runReviewRound(...)` destructure in
    *  planning-phase-service.ts is unaffected. */
@@ -159,59 +194,90 @@ export interface ReviewRoundResult {
 }
 
 /**
- * C3 (AC11/AC23): engine-owned artifact-publication gate. The partner brief above already carries a
- * CONVENE-RACE FIX instruction telling every seat to wait-and-recheck rather than emit BROKEN on an
- * absent artifact — that fix relies on every seat's model honoring free-text instructions. This gate
- * removes the race structurally: the current attempt's canonical plan.md must exist, be non-empty and
- * parse (the SAME validateExecutionPlan pipeline ingestion trusts), and og-requirements.md must exist
- * and be non-empty, BEFORE this function ever writes a brief or calls transport.spawn.
+ * C3 re-scoped (R4.16): engine-owned artifact-publication gate for **round-2+ / post-draft** paths.
+ * Checks the **relevant seat-scoped draft or candidate** exists, is non-empty, and — when
+ * `validateAsPlan` — parses via the SAME `validateExecutionPlan` pipeline ingestion trusts.
  *
- * Real-mode only (`!isFake`): under the FAKE fixture harness, plan.md/og-requirements.md are
- * synthesized by the CALLER (runPlanningPhase) only AFTER the agreement gate resolves — see the
- * `isFake ? undefined : planMdPath` comment on currentPlanPath below, the same pre-existing convention.
- * There is no genuine publication race under the fixture harness, so this gate does not run there and
- * the C2 fixture suite (isFake: true throughout, never writes plan.md into runDir) is unaffected.
+ * **Never** requires canonical `plan.md` / `og-requirements.md` before P2 promotion (those paths stay
+ * absent until the engine alone promotes a signed candidate). Callers pass seat-draft / candidate
+ * paths via `publicationArtifacts`; do not point this at pre-promotion canonical paths.
+ *
+ * Real-mode only (`!isFake`): under the FAKE fixture harness there is no genuine publication race,
+ * so this gate does not run and the C2 fixture suite (isFake: true throughout) is unaffected.
  */
 async function checkArtifactsPublished(
-  planMdPath: string,
-  reqMdPath: string
+  artifacts: PublicationArtifactSpec[]
 ): Promise<{ ready: true } | { ready: false; reason: string }> {
   const problems: string[] = [];
 
-  let planMarkdown: string | null = null;
-  try {
-    planMarkdown = await fs.readFile(planMdPath, 'utf8');
-  } catch {
-    problems.push(`plan.md not yet published (${planMdPath})`);
-  }
-  if (planMarkdown !== null) {
-    if (!planMarkdown.trim()) {
-      problems.push(`plan.md is empty (${planMdPath})`);
-    } else {
-      const parsed = validateExecutionPlan(planMarkdown);
+  for (const art of artifacts) {
+    let markdown: string | null = null;
+    try {
+      markdown = await fs.readFile(art.path, 'utf8');
+    } catch {
+      problems.push(`${art.label} not yet published (${art.path})`);
+      continue;
+    }
+    if (!markdown.trim()) {
+      problems.push(`${art.label} is empty (${art.path})`);
+      continue;
+    }
+    if (art.validateAsPlan) {
+      const parsed = validateExecutionPlan(markdown);
       if (!parsed.ok) {
-        problems.push(`plan.md does not yet parse as a complete plan (${planMdPath}): ${parsed.errors.join('; ')}`);
+        problems.push(
+          `${art.label} does not yet parse as a complete plan (${art.path}): ${parsed.errors.join('; ')}`
+        );
       }
     }
-  }
-
-  let reqMarkdown: string | null = null;
-  try {
-    reqMarkdown = await fs.readFile(reqMdPath, 'utf8');
-  } catch {
-    problems.push(`og-requirements.md not yet published (${reqMdPath})`);
-  }
-  if (reqMarkdown !== null && !reqMarkdown.trim()) {
-    problems.push(`og-requirements.md is empty (${reqMdPath})`);
   }
 
   if (problems.length === 0) return { ready: true };
   return {
     ready: false,
     reason:
-      `ARTIFACT-NOT-PUBLISHED (C3/AC11/AC23): ${problems.join('; ')} — plancore authors these artifacts ` +
-      `asynchronously; absence/truncation this early is NOT-YET, never a defect. No reviewer spawned for ` +
-      `this attempt yet.`,
+      `ARTIFACT-NOT-PUBLISHED (C3/R4.16): ${problems.join('; ')} — co-planner drafts/candidates ` +
+      `are authored asynchronously; absence/truncation this early is NOT-YET, never a defect. No seat ` +
+      `spawned for this gate check yet.`,
+  };
+}
+
+/**
+ * C3 re-scoped (R4.16): round-1 pre-spawn gate — only that `runDir` exists (and optional context
+ * inputs when provided). No seat-scoped draft, no candidate, and **never** canonical plan.md /
+ * og-requirements.md (those do not exist until P2).
+ */
+async function checkRound1PreSpawn(
+  runDir: string,
+  contextInputPaths?: string[]
+): Promise<{ ready: true } | { ready: false; reason: string }> {
+  const problems: string[] = [];
+
+  try {
+    const st = await fs.stat(runDir);
+    if (!st.isDirectory()) {
+      problems.push(`runDir is not a directory (${runDir})`);
+    }
+  } catch {
+    problems.push(`runDir does not exist (${runDir})`);
+  }
+
+  if (Array.isArray(contextInputPaths)) {
+    for (const p of contextInputPaths) {
+      try {
+        await fs.access(p);
+      } catch {
+        problems.push(`context input not yet available (${p})`);
+      }
+    }
+  }
+
+  if (problems.length === 0) return { ready: true };
+  return {
+    ready: false,
+    reason:
+      `ARTIFACT-NOT-PUBLISHED (C3/R4.16 round-1): ${problems.join('; ')} — round-1 pre-spawn requires ` +
+      `runDir (+ optional context inputs) only; canonical plan.md/og-requirements.md are not gated here.`,
   };
 }
 
@@ -440,6 +506,7 @@ export async function runReviewRound(options: RunReviewRoundOptions): Promise<Re
     panelSize, coPlannerSeats, partnerModel, partnerProvider,
     planningBrainModel, planningBrainProvider,
     projectId, runId, strictReadAllow,
+    publicationArtifacts, contextInputPaths,
     partnerHandles, partnerRuntimeIds,
   } = options;
 
@@ -448,17 +515,23 @@ export async function runReviewRound(options: RunReviewRoundOptions): Promise<Re
   const resolvedPerRoundTimeoutMs = (perRoundTimeoutMs ?? effectiveTimeoutMs)!;
   const resolvedRoundCap = Math.max(1, Math.trunc(roundCap ?? 1) || 1);
 
-  // C3 (AC11/AC23): structural artifact-publication gate — before ANY partner brief write or spawn.
-  // Real-mode only; see checkArtifactsPublished's doc comment for why the fixture harness is exempt.
+  // C3 re-scoped (R4.16): structural artifact-publication gate — before ANY partner brief write or
+  // spawn. Round-2+ / post-draft: relevant seat-scoped draft or candidate via publicationArtifacts.
+  // Round-1 (empty/omitted): runDir + optional context only — never canonical plan.md/og-requirements.md
+  // (those stay absent until P2 promotion). Real-mode only; fixture harness (isFake) is exempt.
   if (!isFake) {
-    const reqMdPath = path.join(path.dirname(planMdPath), CANONICAL_CYCLE_ARTIFACTS.requirements);
-    const publication = await checkArtifactsPublished(planMdPath, reqMdPath);
+    const artifacts = Array.isArray(publicationArtifacts) ? publicationArtifacts : [];
+    const publication =
+      artifacts.length > 0
+        ? await checkArtifactsPublished(artifacts)
+        : await checkRound1PreSpawn(runDir, contextInputPaths);
     if (!publication.ready) {
       return {
         agreed: false,
         partnerBatchIds: [],
         blockedReasonKind: 'artifact-not-published',
         blockedReason: publication.reason,
+        roundsAttempted: 0,
       };
     }
   }
