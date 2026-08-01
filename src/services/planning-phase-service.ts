@@ -425,24 +425,13 @@ export class PlanningPhaseService {
       `unanimous=${consensusPolicy.unanimous} maxRounds=${consensusPolicy.maxRounds} (source: teams.consensus_rule; settle-role clause not wired)`
     );
 
-    // Generate contract-compliant planning brief via BriefWriter (projcore role gets its own enum + full v2 sections + streaming/helper/paths etc).
-    // This fixes the live POST /runs 400 BRIEF-CONTRACT-MISSING for the planning (projcore) brief under real dispatch/RealTransport.
+    // R1.1 / B4: plancore authoring brief deleted — not repurposed. Co-planners own drafts (plan-draft).
+    // P1 removes the residual plancore spawn / writeBrief authoring path. briefWriter still used for panel briefs.
     const briefWriter = new BriefWriterService();
     const effectiveProjectDir = inputs.projectDir || process.cwd();
-    // A12 / R1.7: pass D7 config-sourced planning_round_cap into the brief (no open-ended "iterate").
-    let planningBrief = briefWriter.generatePlanningBrief({
-      batchId,
-      northStar: effectiveNorthStar,
-      conversationLog: effectiveConversationLog,
-      mode: partner,
-      projectDir: effectiveProjectDir,
-      callbacksFile: path.join(runDir, 'callbacks.md'),
-      runDir,
-      canonicalArtifactRoot,
-      planningRoundCap: roundCap,
-    });
-    // A12: persist the planning brief immediately so the contract is on disk before plancore cold-spawn
-    // (which can take minutes). Dispatch-nonce rebind rewrites the same path after spawn.
+    // Residual authoring-seat path until P1; empty body — no model is briefed as whole-plan author here.
+    let planningBrief = '';
+    // A12: persist the (now empty) plancore brief path for path stability; P1 retires this write.
     try {
       await this.artifacts.writeBrief(runDir, 'plancore', planningBrief);
     } catch { /* best-effort early write; post-spawn write remains below */ }

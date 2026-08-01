@@ -100,16 +100,9 @@ describe('AGENT FOCUS CONTRACT — present in every worker seat brief', () => {
 describe('AGENT FOCUS CONTRACT — absent from phase-brain briefs (enforcer, not enforced)', () => {
   const writer = new BriefWriterService();
 
+  // B4/R1.1: generatePlanningBrief deleted — coordinator sample is interview + brain + plancore label.
+  // plan-draft is a worker co-planner purpose (carries focus via generateBrief base when applicable).
   const coordinatorBriefs: Array<[string, string]> = [
-    [
-      'planning',
-      writer.generatePlanningBrief({
-        batchId: 'focus-plan',
-        northStar: 'ns',
-        projectDir: baseParams.projectDir,
-        callbacksFile: baseParams.callbacksFile,
-      }),
-    ],
     [
       'interview',
       writer.generateInterviewBrief({

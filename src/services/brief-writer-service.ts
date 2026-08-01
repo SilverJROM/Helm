@@ -295,94 +295,11 @@ End your reply with \`STATUS: <STATE> — <same short note>\`. The callbacks.md 
     return 'implementer states: PROPOSED | REVISE-PLAN | WORKING | DONE | BLOCKED | NEEDS-INFO';
   }
 
-  // Compliant planning brief for plancore (used by PlanningPhaseService for startRun / POST /runs path).
-  // Reuses generateBrief (for full v2 contract + sections + correct enum via getRoleStates) then injects planning instructions.
-  generatePlanningBrief(params: {
-    batchId: string;
-    northStar: string;
-    conversationLog?: string;
-    mode?: string;
-    projectDir?: string;
-    callbacksFile?: string;
-    runDir?: string;
-    canonicalArtifactRoot?: string;
-    /** A12 / D7: projects.planning_round_cap (default 3). Brief must state the config-sourced number. */
-    planningRoundCap?: number;
-  }): string {
-    const canonicalArtifactRoot = params.canonicalArtifactRoot || params.runDir || '.';
-    const planningRoundCap = Math.max(1, Math.trunc(params.planningRoundCap ?? 3) || 3);
-    const base = this.generateBrief({
-      batchId: params.batchId,
-      role: 'plancore',
-      planPath: path.join(canonicalArtifactRoot, 'plan.md'),
-      runDir: params.runDir || '.',
-      branch: 'main',
-      requirementsAssigned: 'PLANNING-PHASE',
-      northStarAnchors: params.northStar || '',
-      // A12 / R1.7: scope must match post-A8–A11 engine (no "convene/iterate until agreement" open loop).
-      scope: `Planning phase (R-D1/D2/D4/H2 + D6/D7 LOCKED): author og-requirements.md then plan.md in helm-algo-digestible per-task schema; emit PLAN-READY once both artifacts are written and readable — this signals the artifacts are ready for engine review, not that agreement has been reached. helm-algo then spawns co-planners and runs the one whole-plan agreement gate itself (planning_round_cap=${planningRoundCap}); only the engine declares agreement and grants ingest permission. First tool call: callbacks.md append (Helm-native shell append to callbacks.md).`,
-      requirementsSection: params.northStar || 'planning requirements from north-star.md',
-      projectDir: params.projectDir || '/home/agjrom/TGBOTS/Helm',
-      callbacksFile: params.callbacksFile || '<abs-path-to-callbacks.md>',
-      taskType: 'feature',
-    });
-    const instructions = `
-You are **helm_pm** — Helm's planning/decision brain for this run (a Helm-internal role; not any standalone CLI agent of a similar name).
-north-star: (see ${path.join(canonicalArtifactRoot, 'north-star.md')} + conversation-log.md)
-planning_partner.mode: ${params.mode || 'auto'}
-agree_before_proceed: true
-planning_round_cap: ${planningRoundCap}  (D7 LOCKED — projects.planning_round_cap; config-sourced, not invented)
+  // R1.1 / B4: generatePlanningBrief deleted (not repurposed). Plancore is not an authoring seat;
+  // co-planner purpose plan-draft / plan-reconcile own the schema + task-JSON contract (B2/B3).
+  // generateBrainBrief (mid-implementation escalation) is intentionally untouched (R1.3).
 
-IMPORTANT: the north-star INTERVIEW IS COMPLETE. Do NOT ask the operator any questions and do NOT re-interview — no operator is watching this phase and any question will hang the run. READ north-star.md + conversation-log.md + decisions/ in the canonical artifact root and author the plan DIRECTLY from them. If a detail is genuinely missing, make a reasonable assumption, note it in the task, and proceed. Never block on operator input.
-
-## CC-redesign Planning mandate (R-D1 / R-D2 / R-D4 / R-H2)
-
-**1. DERIVE ORDER (R-D1)** — From north-star.md + conversation-log.md + decisions/, author **og-requirements.md FIRST**, then **plan.md**. Do NOT skip og-requirements.md.
-
-**2. og-requirements.md** — Requirements contract in the canonical artifact root:
-  - Path: \`${path.join(canonicalArtifactRoot, 'og-requirements.md')}\`
-  - Structured sections with \`R-XX\` requirement IDs matching north-star.md/decisions. This is the validator's contract source.
-
-**3. plan.md** — Helm-algo machine contract (helm-algo-digestible; NOT an LLM coordinator plan) in the same canonical artifact root:
-  - Path: \`${path.join(canonicalArtifactRoot, 'plan.md')}\`
-  - Markdown wrapper + fenced \`\`\`json\`\`\` array of task objects. **Every field value is a JSON STRING unless noted** (\`req_refs\`/\`deps\` are string arrays). Each task MUST include:
-    - \`id\` (task key STRING, e.g. \`"B12-T02"\` or \`"T01"\`)
-    - \`batch\` — batch id, a **non-empty STRING** (e.g. \`"B1"\`, \`"B2"\`), **NOT a bare number** (\`1\` is rejected — write \`"B1"\`)
-    - \`title\` (atomic deliverable, STRING)
-    - \`req_refs\` (string array of R-XX IDs from og-requirements.md)
-    - \`assignee\` — implementer lane, **exactly one of \`L1\` | \`L2\` | \`L3\`** (or a launchable model slug only when deliberately overriding the project binding). Use \`L2\`/\`L3\` directly for complex work; do not force every task through \`L1\`.
-    - \`validator_lane\` — the independent validator counterpart, **exactly one of \`L1\` | \`L2\` | \`L3\`**; choose it independently from the implementer lane.
-    - \`effort\` — task complexity, **exactly one of \`low\` | \`med\` | \`high\` | \`xhigh\`**. Do NOT emit T-shirt sizes (\`S\`/\`M\`/\`L\`/\`XL\`) or any other token — a non-enum effort is REJECTED at ingest and blocks the run. (Lane-flavored aliases like \`L1-routine\`/\`L2\`/\`L3\` are tolerated, but prefer the plain enum.)
-    - \`type\` — **exactly one of \`feature\` | \`issue\`** (\`issue\` = repro-first bug task; everything else is \`feature\`).
-    - \`redteam\` (\`none\` | model slug — **decided per-task in planning**, R-D4)
-    - \`deps\` (string array of task ids)
-    - \`exception_handling\` (per-task edge-case note for helm-algo escalation)
-  - **COPY THIS EXACT EXAMPLE TASK** — every required field with the correct JSON type (note \`batch\` and \`id\` are STRINGS, \`req_refs\` is a string ARRAY, \`effort\`/\`type\` are enum strings): \`{"id":"T01","batch":"B1","title":"Project scaffold: TS + ws server + test runner","req_refs":["OPS-1"],"assignee":"L1","validator_lane":"L1","effort":"med","type":"feature","deps":[]}\`
-
-**4. plan.json — DO NOT author** — The brief header may reference plan.json (legacy artifact-path contract). You write **og-requirements.md + plan.md ONLY**. Helm/helm-algo **derives** the compat plan.json automatically at ingest via ingestExecutionPlan (B10-T01). Do NOT also hand-author plan.json — that would duplicate schema and risk drift.
-
-**5. Co-planner agreement (D6 + D7 LOCKED — engine-owned; do not invent a parallel loop)** —
-  - **helm-algo spawns co-planner seats** (default 2; project panel size may be 1/2/3/N). You do **NOT** spawn, convene, or reap partners yourself.
-  - **Agreement scope is whole-plan (D6):** using your PLAN-READY artifacts as the review input, the pair debates and agrees **once** for the plan as a whole → **one engine-run agreement gate**. Do **NOT** run a per-task convene loop.
-  - **Per-task machine verdicts** \`ACCEPT | AMEND | ESCALATE\` are retained on the plan (free tags for the engine). Conflict-only reconvene (ESCALATE or conflicting AMEND) is **engine policy** — helm-algo may re-engage seats; you do not drive that loop.
-  - **Round cap (D7):** agreement is bounded by **planning_round_cap=${planningRoundCap}** (from project config \`projects.planning_round_cap\`, default 3). Exhausting the cap without unanimous CLEAN agreement is a **visible BLOCKED** state escalated to the operator — **never a silent pass**. Do not run an unbounded agreement loop.
-  - **Your job ends at artifact readiness:** author og-requirements.md + plan.md, then emit PLAN-READY once both are written and readable. PLAN-READY means the artifacts are ready for engine review, not that agreement has been reached — you do NOT wait for or declare whole-plan agreement yourself. Only the engine judges agreement and grants ingest permission.
-
-**6. TASK RULE** — Every task MUST be a concrete code change with a specific deliverable. Do NOT create standalone "run the test suite" / "regression gate" / "final verification" / "confirm no regressions" tasks: Helm's validator ALREADY runs the FULL test suite (deterministic test-gate) after EVERY task and blocks advancement on any failure, so a dedicated test-run task is redundant, has no code deliverable, and will fail. If you want a final end-to-end capstone, make it a concrete task that ADDS an e2e test or feature wiring — never a bare "run tests" step.
-
-**7. Artifact verification + PLAN-READY** — Verify both og-requirements.md and plan.md are written; read back plan.md and confirm the fenced JSON parses. Emit PLAN-READY as soon as both artifact writes succeed and the JSON parses — PLAN-READY means the artifacts are ready for engine review, not that agreement has been reached. Do NOT wait for, judge, or declare co-planner/whole-plan agreement yourself: the engine runs partner review and the whole-plan agreement gate, and only the engine grants ingest permission.
-
-**8. First tool call every reply:** the callbacks.md append (via the shell append below per streaming mandate).
-
-Emit exactly:
-[helm callback] helm_pm ${params.batchId} STATUS: PLAN-READY — artifacts ready for engine review: og-requirements.md + plan.md written
-
-CRITICAL — AFTER emitting PLAN-READY, STOP COMPLETELY. Do NOT implement, do NOT explore the codebase, do NOT write or edit any code, do NOT spawn sub-agents, do NOT continue working. Helm's orchestration ALGORITHM (not you) drives ALL implementation from here — it dispatches the implementer and validator and advances the queue itself. You are the on-demand BRAIN: Helm re-invokes you (a fresh call) ONLY when it needs a decision. Your planning job ends the instant og-requirements.md + plan.md are written and PLAN-READY is emitted. Emit PLAN-READY and then idle/await — continuing past PLAN-READY is a contract violation that corrupts the run.
-`;
-    return base.replace('<!-- PROJCORE-STATUS-CONTRACT v2 -->', `<!-- PROJCORE-STATUS-CONTRACT v2 -->${instructions}`).trim();
-  }
-
-  // Contract-compliant north-star INTERVIEW brief (discovery role). Mirrors generatePlanningBrief so the
+  // Contract-compliant north-star INTERVIEW brief (discovery role). Shares generateBrief base so the
   // dispatch brief-contract check (callback_format / helper / paths / streaming etc.) passes under RealTransport.
   // S01: consumes shared Discovery contract — no Plan: header; canonical enum; exact ready ASK.
   generateInterviewBrief(params: {

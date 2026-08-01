@@ -50,6 +50,7 @@ describe('Q-11 brief-writer: deferral policy lives in Helm (not ~/.claude/JROM)'
   });
 
   it('all brief generators omit ~/.claude/JROM (prefer zero scaffold path)', () => {
+    // B4/R1.1: generatePlanningBrief deleted — sample plan-draft purpose instead.
     const samples = [
       writer.generateBrief({ ...baseParams, role: 'implementer' }),
       writer.generateBrief({ ...baseParams, role: 'validator' }),
@@ -58,10 +59,13 @@ describe('Q-11 brief-writer: deferral policy lives in Helm (not ~/.claude/JROM)'
         role: 'implementer',
         previousNote: 'gap',
       }),
-      writer.generatePlanningBrief({
-        batchId: 'Q11-plan',
-        northStar: 'ns',
+      writer.generatePanelBrief({
+        purpose: 'plan-draft',
+        batchId: 'Q11-plan-draft',
+        seat: 'q11-a',
+        lens: 'whole-plan',
         projectDir: baseParams.projectDir,
+        runDir: baseParams.runDir,
         callbacksFile: baseParams.callbacksFile,
       }),
       writer.generateInterviewBrief({

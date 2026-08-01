@@ -305,8 +305,8 @@ async function collectSameShaBrokenEvidence(
  * C6 (AC11): the revise actuator's brief. Deliberately a LOCAL function, not a new
  * BriefWriterService method (ownership constraint: C6 may not add to brief-writer-service.ts) —
  * it composes text via the already-public briefWriter.generateBrief(...), the same base every other
- * brief in this file/service builds on (generatePlanReviseBrief/generatePlanningBrief follow the
- * identical base+body-splice pattern).
+ * brief in this file/service builds on (generatePlanReviseBrief follows the
+ * identical base+body-splice pattern; plancore authoring brief deleted in B4).
  */
 function generatePlanRoundReviseBrief(
   briefWriter: BriefWriterService,

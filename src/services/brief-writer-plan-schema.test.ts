@@ -1,23 +1,28 @@
 /**
- * PLAN.MD SCHEMA CONTRACT (cards2 ingest fault, 2026-07-16): the planning brief's plan.md task schema must
- * state the EXACT accepted enum for every field the plan parser validates — otherwise the planner emits
- * out-of-enum values (e.g. T-shirt effort sizes S/M/L) that throw at ingest ("invalid effort S") and BLOCK
- * the run. This test pins the enum specs into the generated planning brief so the schema stays ingestible.
+ * PLAN.MD SCHEMA CONTRACT (cards2 ingest fault, 2026-07-16): the co-planner plan-draft brief
+ * (purpose plan-draft — formerly generatePlanningBrief, deleted B4/R1.1) must state the EXACT
+ * accepted enum for every field the plan parser validates — otherwise the planner emits
+ * out-of-enum values (e.g. T-shirt effort sizes S/M/L) that throw at ingest ("invalid effort S")
+ * and BLOCK the run. This test pins the enum specs into the draft brief so the schema stays ingestible.
  *
  * Source of truth (must match): plan-schema.ts MACHINE_COMPLEXITIES=[low,med,high,xhigh] +
  * MACHINE_TASK_TYPES=[feature,issue]; plan-parser-service _normEffort / _laneRung lane tokens L1|L2|L3.
  */
+import path from 'node:path';
 import { describe, it, expect } from 'vitest';
 import { BriefWriterService } from './brief-writer-service.js';
 
-describe('PLAN.MD SCHEMA CONTRACT — planning brief specifies the parser-accepted enums', () => {
+describe('PLAN.MD SCHEMA CONTRACT — plan-draft purpose specifies the parser-accepted enums', () => {
   const writer = new BriefWriterService();
 
-  const planningBrief = writer.generatePlanningBrief({
+  const planningBrief = writer.generatePanelBrief({
+    purpose: 'plan-draft',
     batchId: 'schema-plan',
-    northStar: 'ns',
+    seat: 'schema-a',
+    lens: 'whole-plan',
     projectDir: '/tmp/schema-project',
-    callbacksFile: '/tmp/run/callbacks.md',
+    runDir: '/tmp/schema-run',
+    callbacksFile: path.join('/tmp/schema-run', 'callbacks.md'),
   });
 
   it('states the effort enum (low | med | high | xhigh)', () => {
