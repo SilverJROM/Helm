@@ -6,8 +6,9 @@ process.env.USE_FAKE_TMUX = '1';
  * reviewer-round loop; R2 adds an additive, opt-in `blindDraftRound1` path that replaces round 1's
  * spawn+wait for callers that set it, leaving every existing C2-C8 fixture byte-identical).
  *
- * Registers regression mode `blind-draft-isolation` (R6.24) — this file is the active behavioral
- * proof; X1 later wires it into the enforced planning-regression-index.
+ * Registers regression mode `blind-draft-isolation` (R6.24) in the planning regression-mode registry
+ * (`planning-regression-modes.ts`), pointing at this file as the active behavioral proof; X1 later
+ * enforces the registry from the planning-regression-index sweep.
  *
  * Proves:
  * - round 1 spawns BOTH configured co-planner seats with purpose:'plan-draft' to seat-scoped draft
@@ -40,6 +41,13 @@ import {
   atomicWriteFile,
   SeatDraftIsolationError,
 } from './seat-draft-store.js';
+import {
+  getRegressionMode,
+  listRegressionModes,
+  registerRegressionMode,
+  resolveRegressionMode,
+  RegressionModeRegistrationError,
+} from './planning-regression-modes.js';
 
 describe('runReviewRound blind draft round 1 (R2, R2.5-R2.7/R6.20/R6.24)', () => {
   let runDir: string;
@@ -241,5 +249,121 @@ describe('runReviewRound blind draft round 1 (R2, R2.5-R2.7/R6.20/R6.24)', () =>
     const briefA = briefs.get('planner')!;
     expect(briefA).toMatch(/Panel purpose: diff-review/);
     expect(briefA).not.toMatch(/plan-draft/);
+  });
+});
+
+/**
+ * R6.24 — the slice must REGISTER its sweep mode, not merely prove the behavior. These drive the
+ * real registry module and the real on-disk resolution X1 will enforce with; nothing is stubbed.
+ */
+describe('R6.24 sweep-mode registration — blind-draft-isolation (R2)', () => {
+  const REPO_ROOT = process.cwd();
+  let probeRoot: string | undefined;
+
+  afterEach(async () => {
+    if (probeRoot) {
+      await fs.rm(probeRoot, { recursive: true, force: true }).catch(() => {});
+      probeRoot = undefined;
+    }
+  });
+
+  it('registers blind-draft-isolation as an active mode owned by R2, covering the R2 requirement set', () => {
+    const entry = getRegressionMode('blind-draft-isolation');
+    expect(entry).toBeDefined();
+    expect(entry!.slice).toBe('R2');
+    expect(entry!.state).toBe('active');
+    expect(entry!.requirements).toEqual(
+      expect.arrayContaining(['R2.5', 'R2.6', 'R2.7', 'R6.20', 'R6.24']),
+    );
+    expect(entry!.note.trim().length).toBeGreaterThan(0);
+    // Discoverable by the sweep, which iterates the registry rather than a hand-kept list.
+    expect(listRegressionModes().map((e) => e.mode)).toContain('blind-draft-isolation');
+  });
+
+  it('resolves to THIS spec on disk, with every proving test present and no disarming marker', () => {
+    const entry = getRegressionMode('blind-draft-isolation')!;
+    expect(entry.spec).toBe('src/services/planning-review-round-blind-draft.test.ts');
+
+    const resolution = resolveRegressionMode('blind-draft-isolation', REPO_ROOT);
+    expect(resolution.exists).toBe(true);
+    expect(resolution.specPath).toBe(path.resolve(REPO_ROOT, entry.spec));
+    // No it.skip/todo/only anywhere in the registered proof — a disarmed sweep is the R6.24 defect.
+    expect(resolution.markers).toEqual([]);
+    expect(resolution.missingProvingTests).toEqual([]);
+    // The named proofs are the isolation behaviors this file actually asserts against runReviewRound.
+    expect(entry.provingTests.length).toBeGreaterThanOrEqual(4);
+  });
+
+  it('reports a gutted proof as unresolved — the resolver reads the file, it does not rubber-stamp', async () => {
+    probeRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'helm-r2-mode-probe-'));
+    // Built by concatenation so this spec does not contain a literal disarming marker of its own.
+    const skipMarker = ['it', '.skip('].join('');
+    await fs.mkdir(path.join(probeRoot, 'src'), { recursive: true });
+    await fs.writeFile(
+      path.join(probeRoot, 'src', 'probe.test.ts'),
+      `${skipMarker}'sleeping proof', () => {});\n`,
+      'utf8',
+    );
+
+    registerRegressionMode({
+      mode: 'r2-probe-mode',
+      slice: 'R2',
+      requirements: ['R6.24'],
+      spec: 'src/probe.test.ts',
+      provingTests: ['a proof that no longer exists'],
+      state: 'active',
+      note: 'probe: resolver must surface skipped + missing proofs',
+    });
+
+    const resolution = resolveRegressionMode('r2-probe-mode', probeRoot);
+    expect(resolution.exists).toBe(true);
+    expect(resolution.markers).toContain('it.skip');
+    expect(resolution.missingProvingTests).toEqual(['a proof that no longer exists']);
+
+    // A spec that was deleted outright resolves as missing, not as silently passing.
+    await fs.rm(path.join(probeRoot, 'src', 'probe.test.ts'));
+    expect(resolveRegressionMode('r2-probe-mode', probeRoot).exists).toBe(false);
+  });
+
+  it('refuses a skeleton, duplicate, or malformed registration instead of degrading into an unenforced entry', () => {
+    expect(() =>
+      registerRegressionMode({
+        mode: 'blind-draft-isolation',
+        slice: 'R2',
+        requirements: ['R6.24'],
+        spec: 'src/services/planning-review-round-blind-draft.test.ts',
+        provingTests: ['x'],
+        state: 'active',
+        note: 'duplicate',
+      }),
+    ).toThrow(RegressionModeRegistrationError);
+
+    expect(() =>
+      registerRegressionMode({
+        mode: 'r2-skeleton-mode',
+        slice: 'R2',
+        requirements: ['R6.24'],
+        spec: 'src/services/planning-review-round-blind-draft.test.ts',
+        provingTests: ['x'],
+        // A pending/skipped skeleton is exactly what R6.24 forbids.
+        state: 'skipped' as unknown as 'active',
+        note: 'skeleton',
+      }),
+    ).toThrow(RegressionModeRegistrationError);
+
+    expect(() =>
+      registerRegressionMode({
+        mode: 'r2-no-proof-mode',
+        slice: 'R2',
+        requirements: ['R6.24'],
+        spec: 'src/services/planning-review-round-blind-draft.test.ts',
+        provingTests: [],
+        state: 'active',
+        note: 'no proving test named',
+      }),
+    ).toThrow(RegressionModeRegistrationError);
+
+    expect(getRegressionMode('r2-skeleton-mode')).toBeUndefined();
+    expect(getRegressionMode('r2-no-proof-mode')).toBeUndefined();
   });
 });

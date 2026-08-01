@@ -1,6 +1,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
+import {
+  listRegressionModes,
+  resolveRegressionMode,
+} from './services/planning-regression-modes.js';
 
 const BRIEF_PATH = path.join(
   process.cwd(),
@@ -90,6 +94,40 @@ describe('AC23 planning-regression index', () => {
     it.skip(`skeleton mode is tracked for "${mode}" (${entry.state})`, () => {
       expect(mode).toContain(mode);
       expect(entry.state === 'pending' || entry.state === 'skipped').toBe(true);
+    });
+  }
+});
+
+/**
+ * R6.24 registered modes. Registration is spread across the producing slices
+ * (R2/R4/R6/R8/P2) in `services/planning-regression-modes.ts`; the index reads that
+ * registry so a newly guarded failure mode lands here without a hand edit. X1 later
+ * upgrades enforcement to execute each registered proof; this block already fails on
+ * a mode whose spec is missing, disarmed, or whose named proofs have been gutted.
+ */
+describe('R6.24 registered regression modes', () => {
+  const registered = listRegressionModes();
+
+  it('includes blind-draft-isolation, registered by slice R2', () => {
+    const modes = registered.map((entry) => entry.mode);
+    expect(modes).toContain('blind-draft-isolation');
+    expect(registered.find((entry) => entry.mode === 'blind-draft-isolation')!.slice).toBe('R2');
+  });
+
+  it('carries no skeleton entries — every registered mode is active', () => {
+    expect(registered.length).toBeGreaterThan(0);
+    for (const entry of registered) {
+      expect(entry.state).toBe('active');
+      expect(entry.requirements.length).toBeGreaterThan(0);
+    }
+  });
+
+  for (const entry of registered) {
+    it(`"${entry.mode}" (${entry.slice}) resolves to an active, non-disarmed behavioral spec`, () => {
+      const resolution = resolveRegressionMode(entry.mode);
+      expect(resolution.exists).toBe(true);
+      expect(resolution.markers).toEqual([]);
+      expect(resolution.missingProvingTests).toEqual([]);
     });
   }
 });
