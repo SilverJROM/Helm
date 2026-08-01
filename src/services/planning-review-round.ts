@@ -191,13 +191,26 @@ export interface RunReviewRoundOptions {
  *   a genuine timeout/round-cap exit, C4/C5's pre-existing bounded behaviour.
  * - 'draft-not-submitted': R2 (R2.5-R2.7) — a round-1 blind-draft seat never committed its draft
  *   (neither a DRAFT-SUBMITTED callback nor an on-disk file commit) within the round's timeout.
+ * - 'candidate-not-committed': R3 (R3.10) — the round-2 proposer never published a reconciled
+ *   candidate within the round's timeout; the signer was never spawned.
+ * - 'signer-no-response': R3 (R3.11) — the round-2 signer never posted SIGNED or OBJECTIONS.
+ * - 'signer-objections': R3 (R3.11/R3.13) — the signer returned a bounded numbered objection list
+ *   against the candidate. Not agreement, and distinct from silence: there IS a defect set to act on
+ *   (R6 owns monotonicity across rounds; this module only reports the round's own outcome).
+ * - 'signature-mismatch': R3 (R3.11) — the signer posted SIGNED but its claimed `plan=<sha12>` did
+ *   not equal the candidate's engine-recomputed CURRENT on-disk short12 (missing/malformed/stale
+ *   claim). Fail-closed: never agreement.
  */
 export type RoundBlockedReasonKind =
   | 'artifact-not-published'
   | 'reviewer-no-first-callback'
   | 'same-plan-broken'
   | 'round-cap-exhausted'
-  | 'draft-not-submitted';
+  | 'draft-not-submitted'
+  | 'candidate-not-committed'
+  | 'signer-no-response'
+  | 'signer-objections'
+  | 'signature-mismatch';
 
 export interface ReviewRoundResult {
   agreed: boolean;
@@ -221,6 +234,12 @@ export interface ReviewRoundResult {
    *  callback claim). `agreed` stays false alongside this (a published draft is not agreement); R3
    *  consumes this to designate the round-2 proposer/signer. Always undefined otherwise. */
   roundOneDraftPublications?: PublishedDraft[];
+  /** R3 (R3.9-R3.11): set when this round loop actually ran the round-2 asymmetric proposer/signer
+   *  exchange (see runProposerSignerRound) — the full typed outcome: D3 designation + rule log, which
+   *  seat proposed vs signed, the shared candidate paths, the engine-recomputed candidate revision and
+   *  the signer's decision. `agreed` above mirrors this result's `agreed` (signature on the candidate
+   *  bytes is the only thing that agrees). Always undefined when the loop never reached round 2. */
+  proposerSignerRound?: ProposerSignerRoundResult;
 }
 
 /**
@@ -1119,6 +1138,72 @@ export async function runProposerSignerRound(
   };
 }
 
+/**
+ * R3 (R3.9-R3.11): projects one round-2 proposer/signer outcome onto the round loop's own
+ * ReviewRoundResult contract, so a caller that never knew about drafts/candidates still reads the
+ * same `{ agreed, partnerBatchIds, blockedReason, blockedReasonKind, roundsAttempted }` shape.
+ *
+ * Every non-agreeing outcome gets a TYPED cause (never a bare boolean false): the proposer never
+ * committed, the signer never answered, the signer objected, or the signer's claimed sha did not match
+ * the candidate's engine-recomputed current bytes. The full typed result rides along on
+ * `proposerSignerRound` for consumers that need the candidate paths / designation log (P2's promotion).
+ */
+function toReviewRoundResult(
+  psResult: ProposerSignerRoundResult,
+  roundOneBatchIds: string[],
+  roundOneDraftPublications: PublishedDraft[],
+  roundsAttempted: number
+): ReviewRoundResult {
+  const partnerBatchIds = [
+    ...roundOneBatchIds,
+    ...(psResult.proposerBatchId ? [psResult.proposerBatchId] : []),
+    ...(psResult.signerBatchId ? [psResult.signerBatchId] : []),
+  ];
+  const base = {
+    partnerBatchIds,
+    roundsAttempted,
+    roundOneDraftPublications,
+    proposerSignerRound: psResult,
+  };
+
+  if (psResult.agreed) return { agreed: true, ...base };
+
+  // Bounded, already-typed blocks from the exchange itself (proposer/signer silence) pass through with
+  // their own message; the two decision-shaped refusals are classified here.
+  if (psResult.blockedReasonKind) {
+    return {
+      agreed: false,
+      ...base,
+      blockedReasonKind: psResult.blockedReasonKind,
+      blockedReason: psResult.blockedReason,
+    };
+  }
+
+  if (psResult.signerDecision === 'objections') {
+    return {
+      agreed: false,
+      ...base,
+      blockedReasonKind: 'signer-objections',
+      blockedReason:
+        `SIGNER-OBJECTIONS (R3/R3.11): signer seat ${psResult.signerSeatId} (${psResult.signerBatchId}) ` +
+        `refused to sign candidate ${psResult.candidatePlan?.short12 ?? 'unreadable'} ` +
+        `(${psResult.candidatePlanPath}) with a bounded objection list — never agreement: ` +
+        `${psResult.objections ?? '(no note captured)'}`,
+    };
+  }
+
+  return {
+    agreed: false,
+    ...base,
+    blockedReasonKind: 'signature-mismatch',
+    blockedReason:
+      `SIGNATURE-MISMATCH (R3/R3.11): signer seat ${psResult.signerSeatId} (${psResult.signerBatchId}) ` +
+      `posted SIGNED, but its claimed plan sha did not equal the candidate's engine-recomputed current ` +
+      `short12 ${psResult.candidatePlan?.short12 ?? '(candidate unreadable)'} (${psResult.candidatePlanPath}) — ` +
+      `a missing, malformed, or stale claim is fail-closed, never a silent pass.`,
+  };
+}
+
 export async function runReviewRound(options: RunReviewRoundOptions): Promise<ReviewRoundResult> {
   const {
     transport, briefWriter, writeBrief, registerWorkerRuntime, waitForAgreement,
@@ -1344,6 +1429,10 @@ export async function runReviewRound(options: RunReviewRoundOptions): Promise<Re
   // what lets the final blockedReason distinguish a genuine same-plan BROKEN from a plain timeout
   // instead of both collapsing into the same anonymous ROUND-CAP-EXHAUSTED exit.
   let lastSamePlanBrokenEvidence: Array<{ batchId: string; note: string | null }> = [];
+  // R3 (R3.9-R3.11): the round-1 blind drafts this loop already collected, carried into round 2 so the
+  // asymmetric proposer/signer exchange below runs on the ENGINE'S OWN recomputed publications (D1) —
+  // never a re-read of what a seat claimed. Undefined until round 1's draft phase resolves cleanly.
+  let roundOneDrafts: PublishedDraft[] | undefined;
   for (let round = 1; round <= resolvedRoundCap; round++) {
     roundsAttempted = round;
     if (round > 1) {
@@ -1352,6 +1441,31 @@ export async function runReviewRound(options: RunReviewRoundOptions): Promise<Re
       }
       priorRoundHandles = [];
     }
+
+    // R3 (R3.9-R3.11): round 2 of a blind-draft run is the ASYMMETRIC proposer/signer exchange — NOT
+    // another reviewer round and NOT a second dual-authoring round. This is the R2→R3 handoff inside
+    // the engine's own round loop (the only path a real planning run takes through this module), so
+    // the resolver is reached by production control flow rather than by a standalone caller: round 1
+    // published both drafts above, this loop reaped those seats just now (C5: a round can never
+    // observe a still-alive prior-round seat), and runProposerSignerRound fresh-spawns exactly one
+    // proposer (plan-reconcile, BOTH drafts) and one signer (plan-signature, ONLY the candidate).
+    // Rounds 3+ alternate the pen (rolesForRound) — R4's scope — so this exchange resolves once and
+    // returns rather than looping; the remaining roundCap budget is R4's to spend.
+    if (roundOneDrafts) {
+      const [draftA, draftB] = roundOneDrafts;
+      const psResult = await runProposerSignerRound({
+        transport, briefWriter, writeBrief, registerWorkerRuntime,
+        runDir, batchId, round, partner, effectiveProjectDir, cbPath,
+        draftA, draftB,
+        perRoundTimeoutMs: resolvedPerRoundTimeoutMs,
+        agreementFenceOffset,
+        coPlannerSeats, partnerModel, partnerProvider,
+        projectId, runId, strictReadAllow,
+        partnerHandles, partnerRuntimeIds,
+      });
+      return toReviewRoundResult(psResult, partnerBatchIds, roundOneDrafts, round);
+    }
+
     const handleCountBeforeRound = partnerHandles.length;
     const roundSeats = await spawnRoundSeats(round);
     partnerBatchIds = roundSeats.map((seat) => seat.batchId);
@@ -1403,13 +1517,28 @@ export async function runReviewRound(options: RunReviewRoundOptions): Promise<Re
 
     // R2 (R2.5-R2.7, R6.24): round 1 = dual blind draft, not review, when the caller opts in. A
     // 'plan-draft' seat never emits panel verdict grammar, so the legacy waitForAgreement below would
-    // only ever time out against it — resolve the draft-commit wait instead and return immediately.
-    // Round 2+ asymmetric proposer/signer dynamics (R3) are not this flag's concern.
+    // only ever time out against it — resolve the draft-commit wait instead.
     if (blindDraftRound1 && round === 1) {
-      return resolveRoundOneDraftPhase(
+      const draftPhase = await resolveRoundOneDraftPhase(
         cbPath, partner, roundSeats, runDir, resolvedPerRoundTimeoutMs, agreementFenceOffset,
         transport as ReviewerWatchdogTransport, roundsAttempted
       );
+      // R3 (R3.9-R3.11): hand the drafts to the NEXT loop iteration's asymmetric proposer/signer
+      // exchange (top of the loop). Two conditions keep round 1 a terminal round exactly as R2 shipped
+      // it, so no existing caller changes shape:
+      // - a typed draft-phase block (draft-not-submitted) is final: there is nothing to reconcile;
+      // - a caller with only ONE round of budget (the default roundCap) never starts a round-2
+      //   exchange it cannot finish — it returns the publications, as R2's own callers/fixtures do.
+      // The exchange itself is the two-seat asymmetric one (D3 designates between exactly two round-1
+      // drafts); a panel configured with any other seat count still ends at the draft phase here
+      // rather than silently picking two of N.
+      if (!draftPhase.roundOneDraftPublications || draftPhase.roundOneDraftPublications.length !== 2) {
+        return draftPhase;
+      }
+      if (round >= resolvedRoundCap) return draftPhase;
+      roundOneDrafts = draftPhase.roundOneDraftPublications;
+      partnerBatchIds = draftPhase.partnerBatchIds;
+      continue;
     }
 
     agreed = await waitForAgreement(

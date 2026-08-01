@@ -32,7 +32,9 @@ import { FakeTransport } from './fake-transport.js';
 import { BriefWriterService } from './brief-writer-service.js';
 import {
   runProposerSignerRound,
+  runReviewRound,
   RunProposerSignerRoundOptions,
+  RunReviewRoundOptions,
 } from './planning-review-round.js';
 import {
   draftPlanPath,
@@ -333,5 +335,309 @@ describe('runProposerSignerRound — asymmetric proposer/signer divergence (R3, 
 
     await expect(runProposerSignerRound(baseOptions({ draftA, draftB }))).rejects.toThrow(/committed plan revision/);
     expect(transport.spawnCalls).toHaveLength(0);
+  });
+});
+
+/**
+ * R3 REACHABILITY — the engine's OWN round loop resolves divergence this way.
+ *
+ * The suite above drives `runProposerSignerRound` directly. That proves the mechanism but not that a
+ * planning run ever performs it: a resolver only a spec calls is not a behaviour the product has. This
+ * suite therefore drives `runReviewRound` — the single production entry every planning run takes
+ * through this module — end to end, with NOTHING about the resolver mocked, stubbed, or short-circuited:
+ * the real round loop spawns the real round-1 blind-draft seats, resolves the real draft phase, reaps
+ * those seats, and continues into the real `runProposerSignerRound` (real D3 designation, real
+ * brief-writer purposes, real disk re-reads, real signature check).
+ *
+ * Seats are driven by a transport that reacts ONLY to spawns the engine actually performs — a seat
+ * writes its draft/candidate and posts its callback at the moment the engine spawns it, never before.
+ * So a round that never happened produces no artifact, and an out-of-order engine would deadlock
+ * rather than pass.
+ *
+ * Boundary (deliberate, not an omission): flipping the production `planning-phase-service.ts` call
+ * onto `blindDraftRound1` belongs to P1/P2 — plancore is still the authoring seat there (P1 removes
+ * it) and nothing promotes a signed candidate to canonical plan.md yet (P2 adds it), so enabling it
+ * from this slice would leave the run unable to reach ingestion. R3 owns the round-engine handoff.
+ */
+describe('runReviewRound — round 2 of a blind-draft run IS the proposer/signer exchange (R3 reachability)', () => {
+  let runDir: string;
+  let cbPath: string;
+  let briefWriter: BriefWriterService;
+  let briefs: Map<string, string>;
+  let partnerHandles: string[];
+  let partnerRuntimeIds: (number | null)[];
+  let waitForAgreementCalls: number;
+
+  /** Records engine actions in order, and lets each seat respond only once it is genuinely spawned. */
+  class ScriptedSeatTransport extends FakeTransport {
+    public readonly events: string[] = [];
+    constructor(private readonly onSpawn: (batchId: string) => Promise<void>) {
+      super();
+    }
+    async spawn(params: Parameters<FakeTransport['spawn']>[0]): Promise<{ handle: string; role: string }> {
+      const spawned = await super.spawn(params);
+      this.events.push(`spawn:${params.batchId}`);
+      await this.onSpawn(params.batchId ?? '');
+      return spawned;
+    }
+    async reap(handle: string, reason = 'complete'): Promise<void> {
+      this.events.push(`reap:${reason}`);
+      return super.reap(handle, reason);
+    }
+  }
+
+  const DRAFT_A = '# Draft A — plan one\n```json\n[]\n```\n';
+  const DRAFT_B = '# Draft B — a materially different plan\n```json\n[]\n```\n';
+  const CANDIDATE = '# Reconciled candidate\n```json\n[]\n```\n';
+
+  beforeEach(async () => {
+    runDir = await fs.mkdtemp(path.join(os.tmpdir(), 'helm-r3-round-loop-'));
+    cbPath = path.join(runDir, 'callbacks.md');
+    await fs.writeFile(cbPath, '', 'utf8');
+    briefWriter = new BriefWriterService();
+    briefs = new Map();
+    partnerHandles = [];
+    partnerRuntimeIds = [];
+    waitForAgreementCalls = 0;
+  });
+
+  afterEach(async () => {
+    if (runDir) await fs.rm(runDir, { recursive: true, force: true }).catch(() => {});
+  });
+
+  async function post(line: string): Promise<void> {
+    await fs.appendFile(cbPath, `${line}\n`, 'utf8');
+  }
+
+  function baseOptions(
+    transport: FakeTransport,
+    overrides: Partial<RunReviewRoundOptions> = {}
+  ): RunReviewRoundOptions {
+    return {
+      transport,
+      briefWriter,
+      writeBrief: async (role, content) => { briefs.set(role, content); },
+      registerWorkerRuntime: () => partnerRuntimeIds.length + 1,
+      waitForAgreement: async () => { waitForAgreementCalls += 1; return true; },
+      runDir,
+      batchId: 'batch-R3L',
+      brainRole: 'plancore',
+      partner: 'planner',
+      effectiveProjectDir: '/home/agjrom/websites/Helm',
+      cbPath,
+      planMdPath: path.join(runDir, 'plan.md'),
+      perRoundTimeoutMs: 1500,
+      roundCap: 2,
+      agreementFenceOffset: 0,
+      isFake: true,
+      blindDraftRound1: true,
+      coPlannerSeats: [
+        { slot: 0, provider: 'anthropic', model: 'claude-sonnet' },
+        { slot: 1, provider: 'grok', model: 'grok-4.5' },
+      ],
+      partnerHandles,
+      partnerRuntimeIds,
+      ...overrides,
+    };
+  }
+
+  /**
+   * The default seat script: both round-1 seats draft divergent plans; the round-2 proposer writes the
+   * reconciled candidate; the round-2 signer re-reads the candidate off disk and signs the sha it
+   * actually found (exactly what a real signer's brief instructs).
+   */
+  function seatScript(opts: {
+    draftA?: string;
+    draftB?: string;
+    candidate?: string | null;
+    signerLine?: (candidateShort12: string) => string | null;
+  } = {}) {
+    return async (batchId: string): Promise<void> => {
+      if (batchId === 'batch-R3L-partner') {
+        atomicWriteFile(draftPlanPath(runDir, 'partner'), opts.draftA ?? DRAFT_A);
+        await post(`[helm callback] planner ${batchId} STATUS: DRAFT-SUBMITTED plan=ffffffffffff`);
+        return;
+      }
+      if (batchId === 'batch-R3L-partner-2') {
+        atomicWriteFile(draftPlanPath(runDir, 'partner-2'), opts.draftB ?? DRAFT_B);
+        await post(`[helm callback] planner ${batchId} STATUS: DRAFT-SUBMITTED plan=ffffffffffff`);
+        return;
+      }
+      if (batchId === 'batch-R3L-r2-proposer') {
+        if (opts.candidate === null) return; // proposer stays silent — bounded block expected
+        atomicWriteFile(candidatePlanPath(runDir), opts.candidate ?? CANDIDATE);
+        await post(`[helm callback] planner ${batchId} STATUS: CANDIDATE-SUBMITTED plan=ffffffffffff`);
+        return;
+      }
+      if (batchId === 'batch-R3L-r2-signer') {
+        const onDisk = await fs.readFile(candidatePlanPath(runDir), 'utf8');
+        const line = opts.signerLine
+          ? opts.signerLine(planRevision(onDisk).short12)
+          : `[helm callback] planner ${batchId} STATUS: SIGNED plan=${planRevision(onDisk).short12}`;
+        if (line) await post(line);
+      }
+    };
+  }
+
+  it('carries round-1 divergence into a real round-2 proposer/signer exchange and agrees on the signature (R3.9-R3.11)', async () => {
+    const transport = new ScriptedSeatTransport(seatScript());
+
+    const result = await runReviewRound(baseOptions(transport));
+
+    // The engine ran BOTH rounds: two blind drafters, then exactly one proposer and one signer.
+    expect(transport.spawnCalls.map((c) => c.batchId)).toEqual([
+      'batch-R3L-partner',
+      'batch-R3L-partner-2',
+      'batch-R3L-r2-proposer',
+      'batch-R3L-r2-signer',
+    ]);
+    expect(result.roundsAttempted).toBe(2);
+    // C5/R6.20: round-1 seats are reaped BEFORE round 2 spawns — no seat survives its round.
+    expect(transport.events.indexOf('spawn:batch-R3L-r2-proposer')).toBeGreaterThan(
+      transport.events.lastIndexOf('reap:round-non-agreement-reaped')
+    );
+    expect(transport.reapCalls.filter((r) => r.reason === 'round-non-agreement-reaped')).toHaveLength(2);
+
+    // R3.9: the round-2 designation came from D3 over the engine's own recomputed round-1 shas.
+    const draftARev = planRevision(DRAFT_A);
+    const draftBRev = planRevision(DRAFT_B);
+    const expectedProposer = designateRound2Proposer({
+      seatA: 'partner', shaA: draftARev.sha256, seatB: 'partner-2', shaB: draftBRev.sha256,
+    });
+    expect(result.proposerSignerRound!.designatedSeatId).toBe(expectedProposer);
+    expect(result.proposerSignerRound!.designationLog).toContain(`rule=${PROPOSER_DESIGNATE_RULE}`);
+    expect(result.proposerSignerRound!.designationLog).toContain(draftARev.sha256);
+    expect(result.proposerSignerRound!.hashMatch).toBe(false);
+    expect(result.proposerSignerRound!.reconcileSpawned).toBe(true);
+    // The publications handed to R3 are the engine's disk re-reads, not the seats' (false) claims.
+    expect(result.roundOneDraftPublications!.map((p) => p.plan!.short12).sort()).toEqual(
+      [draftARev.short12, draftBRev.short12].sort()
+    );
+
+    // R3.10: proposer got BOTH drafts; signer got ONLY the candidate — no dual-authoring path.
+    const proposerBrief = briefs.get('planner-r2-proposer')!;
+    const signerBrief = briefs.get('planner-r2-signer')!;
+    expect(proposerBrief).toMatch(/Panel purpose: plan-reconcile/);
+    expect(proposerBrief).toContain(draftPlanPath(runDir, 'partner'));
+    expect(proposerBrief).toContain(draftPlanPath(runDir, 'partner-2'));
+    expect(signerBrief).toMatch(/Panel purpose: plan-signature/);
+    expect(signerBrief).toContain(candidatePlanPath(runDir));
+    expect(signerBrief).not.toContain(draftPlanPath(runDir, 'partner-2'));
+    // Round 2 is never another blind-draft or diff-review round.
+    expect(proposerBrief).not.toMatch(/Panel purpose: plan-draft/);
+    expect(signerBrief).not.toMatch(/Panel purpose: (plan-draft|diff-review)/);
+
+    // R3.11: agreement is the signature over the candidate's current bytes — and nothing else.
+    expect(result.agreed).toBe(true);
+    expect(result.blockedReasonKind).toBeUndefined();
+    expect(result.proposerSignerRound!.signerDecision).toBe('signed-agreed');
+    expect(result.proposerSignerRound!.candidatePlan!.short12).toBe(planRevision(CANDIDATE).short12);
+    expect(await fs.readFile(candidatePlanPath(runDir), 'utf8')).toBe(CANDIDATE);
+    // The legacy verdict-grammar agreement gate is never consulted on this path.
+    expect(waitForAgreementCalls).toBe(0);
+    // R2.5/R3.14: still no canonical plan written by this module — promotion is P2's, engine-side.
+    await expect(fs.access(path.join(runDir, 'plan.md'))).rejects.toThrow();
+    await expect(fs.access(path.join(runDir, 'og-requirements.md'))).rejects.toThrow();
+  });
+
+  it('spawns NO proposer when the two round-1 drafts already hash-match, but still runs a real signature round', async () => {
+    const identical = '# Identical plan\n```json\n[]\n```\n';
+    const transport = new ScriptedSeatTransport(seatScript({ draftA: identical, draftB: identical }));
+
+    const result = await runReviewRound(baseOptions(transport));
+
+    expect(transport.spawnCalls.map((c) => c.batchId)).toEqual([
+      'batch-R3L-partner',
+      'batch-R3L-partner-2',
+      'batch-R3L-r2-signer',
+    ]);
+    expect(result.proposerSignerRound!.hashMatch).toBe(true);
+    expect(result.proposerSignerRound!.reconcileSpawned).toBe(false);
+    expect(result.proposerSignerRound!.proposerBatchId).toBeNull();
+    // Engine copied the already-identical bytes; the signature round still decided agreement.
+    expect(await fs.readFile(candidatePlanPath(runDir), 'utf8')).toBe(identical);
+    expect(result.agreed).toBe(true);
+    expect(result.proposerSignerRound!.signerDecision).toBe('signed-agreed');
+  });
+
+  it('fails closed through the round loop when the signer signs a stale sha (R3.11)', async () => {
+    const transport = new ScriptedSeatTransport(seatScript({
+      signerLine: () => '[helm callback] planner batch-R3L-r2-signer STATUS: SIGNED plan=000000000000',
+    }));
+
+    const result = await runReviewRound(baseOptions(transport));
+
+    expect(result.agreed).toBe(false);
+    expect(result.blockedReasonKind).toBe('signature-mismatch');
+    expect(result.blockedReason).toMatch(/SIGNATURE-MISMATCH/);
+    expect(result.blockedReason).toContain(planRevision(CANDIDATE).short12);
+    expect(result.proposerSignerRound!.signerDecision).toBe('signed-mismatched');
+  });
+
+  it('surfaces a signer objection list as a typed non-agreement, never as agreement', async () => {
+    const transport = new ScriptedSeatTransport(seatScript({
+      signerLine: () =>
+        '[helm callback] planner batch-R3L-r2-signer STATUS: OBJECTIONS — n=2; 1. Task T02 has no req_refs. 2. Effort "L" is invalid.',
+    }));
+
+    const result = await runReviewRound(baseOptions(transport));
+
+    expect(result.agreed).toBe(false);
+    expect(result.blockedReasonKind).toBe('signer-objections');
+    expect(result.blockedReason).toMatch(/SIGNER-OBJECTIONS/);
+    expect(result.blockedReason).toContain('req_refs');
+    expect(result.proposerSignerRound!.signerDecision).toBe('objections');
+  });
+
+  it('bounds a proposer that never commits a candidate, and never spawns the signer', async () => {
+    const transport = new ScriptedSeatTransport(seatScript({ candidate: null }));
+
+    const result = await runReviewRound(baseOptions(transport, { perRoundTimeoutMs: 400 }));
+
+    expect(result.agreed).toBe(false);
+    expect(result.blockedReasonKind).toBe('candidate-not-committed');
+    expect(result.blockedReason).toMatch(/CANDIDATE-NOT-COMMITTED/);
+    expect(transport.spawnCalls.map((c) => c.batchId)).toEqual([
+      'batch-R3L-partner',
+      'batch-R3L-partner-2',
+      'batch-R3L-r2-proposer',
+    ]);
+  });
+
+  it('never starts an exchange it cannot finish: one round of budget still ends at the draft phase (R2 shape preserved)', async () => {
+    const transport = new ScriptedSeatTransport(seatScript());
+
+    const result = await runReviewRound(baseOptions(transport, { roundCap: 1 }));
+
+    expect(transport.spawnCalls.map((c) => c.batchId)).toEqual([
+      'batch-R3L-partner',
+      'batch-R3L-partner-2',
+    ]);
+    expect(result.agreed).toBe(false);
+    expect(result.roundsAttempted).toBe(1);
+    expect(result.roundOneDraftPublications).toHaveLength(2);
+    expect(result.proposerSignerRound).toBeUndefined();
+    expect(result.blockedReasonKind).toBeUndefined();
+  });
+
+  it('never reaches the exchange when a round-1 seat never drafts — the typed draft block is final', async () => {
+    const transport = new ScriptedSeatTransport(async (batchId: string) => {
+      if (batchId === 'batch-R3L-partner') {
+        atomicWriteFile(draftPlanPath(runDir, 'partner'), DRAFT_A);
+        await post(`[helm callback] planner ${batchId} STATUS: DRAFT-SUBMITTED plan=ffffffffffff`);
+      }
+      // seat B never posts and never commits.
+    });
+
+    const result = await runReviewRound(baseOptions(transport, { perRoundTimeoutMs: 400 }));
+
+    expect(result.agreed).toBe(false);
+    expect(result.blockedReasonKind).toBe('draft-not-submitted');
+    expect(result.proposerSignerRound).toBeUndefined();
+    expect(transport.spawnCalls.map((c) => c.batchId)).toEqual([
+      'batch-R3L-partner',
+      'batch-R3L-partner-2',
+    ]);
+    expect(waitForAgreementCalls).toBe(0);
   });
 });
