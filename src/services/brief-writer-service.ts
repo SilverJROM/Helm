@@ -10,6 +10,10 @@ import {
   discoveryTerminalEnumLine,
   PLANNING_FORBIDDEN_FOR_DISCOVERY,
 } from './discovery-contract.js';
+import {
+  draftPlanPath as composeDraftPlanPath,
+  draftReqPath as composeDraftReqPath,
+} from './seat-draft-store.js';
 
 /** Helm-owned deferral policy path (product tree). Never builder-side JROM style scaffolding. */
 export const DEFERRAL_POLICY_RELPATH = 'policy/deferral-policy.md';
@@ -17,8 +21,8 @@ export const DEFERRAL_POLICY_RELPATH = 'policy/deferral-policy.md';
 /**
  * Exhaustive purpose discriminant for generatePanelBrief (R5.17 / R5.18).
  * No default — every caller must state why it is convening the panel.
- * plan-draft / plan-reconcile / plan-signature bodies land in B2/B3; B1 only
- * plumbs the required param so typecheck fails on omission.
+ * plan-draft body: B2 (schema / seat-scoped / DRAFT-SUBMITTED).
+ * plan-reconcile / plan-signature bodies: B3.
  */
 export const PANEL_BRIEF_PURPOSES = [
   'plan-draft',
@@ -455,6 +459,39 @@ Emit exactly:
     return base.replace('<!-- PROJCORE-STATUS-CONTRACT v2 -->', `<!-- PROJCORE-STATUS-CONTRACT v2 -->${instructions}`).trim();
   }
 
+  /**
+   * Task-JSON + R-XX schema contract (R2.8). Moved out of generatePlanningBrief so
+   * co-planner draft/reconcile briefs own the format wherever a full document is authored.
+   * Shared with plan-reconcile (B3); do not re-embed a divergent copy.
+   */
+  private planAuthoringSchemaContract(): string {
+    return `## Schema / R-XX / task-JSON contract (R2.8 — ingest-safe enums)
+
+**1. DERIVE ORDER** — From the context inputs (north-star.md + conversation-log.md + decisions/), author the **requirements draft FIRST**, then the **plan draft**. Do NOT skip the requirements draft.
+
+**2. Requirements draft** — Requirements contract at the seat-scoped requirements path only:
+  - Structured sections with \`R-XX\` requirement IDs matching north-star.md/decisions. This is the validator's contract source.
+
+**3. Plan draft** — Helm-algo machine contract (helm-algo-digestible; NOT an LLM coordinator plan) at the seat-scoped plan path only:
+  - Markdown wrapper + fenced \`\`\`json\`\`\` array of task objects. **Every field value is a JSON STRING unless noted** (\`req_refs\`/\`deps\` are string arrays). Each task MUST include:
+    - \`id\` (task key STRING, e.g. \`"B12-T02"\` or \`"T01"\`)
+    - \`batch\` — batch id, a **non-empty STRING** (e.g. \`"B1"\`, \`"B2"\`), **NOT a bare number** (\`1\` is rejected — write \`"B1"\`)
+    - \`title\` (atomic deliverable, STRING)
+    - \`req_refs\` (string array of R-XX IDs from the requirements draft)
+    - \`assignee\` — implementer lane, **exactly one of \`L1\` | \`L2\` | \`L3\`** (or a launchable model slug only when deliberately overriding the project binding). Use \`L2\`/\`L3\` directly for complex work; do not force every task through \`L1\`.
+    - \`validator_lane\` — the independent validator counterpart, **exactly one of \`L1\` | \`L2\` | \`L3\`**; choose it independently from the implementer lane.
+    - \`effort\` — task complexity, **exactly one of \`low\` | \`med\` | \`high\` | \`xhigh\`**. Do NOT emit T-shirt sizes (\`S\`/\`M\`/\`L\`/\`XL\`) or any other token — a non-enum effort is REJECTED at ingest and blocks the run. (Lane-flavored aliases like \`L1-routine\`/\`L2\`/\`L3\` are tolerated, but prefer the plain enum.)
+    - \`type\` — **exactly one of \`feature\` | \`issue\`** (\`issue\` = repro-first bug task; everything else is \`feature\`).
+    - \`redteam\` (\`none\` | model slug — **decided per-task in planning**)
+    - \`deps\` (string array of task ids)
+    - \`exception_handling\` (per-task edge-case note for helm-algo escalation)
+  - **COPY THIS EXACT EXAMPLE TASK** — every required field with the correct JSON type (note \`batch\` and \`id\` are STRINGS, \`req_refs\` is a string ARRAY, \`effort\`/\`type\` are enum strings): \`{"id":"T01","batch":"B1","title":"Project scaffold: TS + ws server + test runner","req_refs":["OPS-1"],"assignee":"L1","validator_lane":"L1","effort":"med","type":"feature","deps":[]}\`
+
+**4. plan.json — DO NOT author** — You write **requirements draft + plan draft ONLY**. Helm/helm-algo **derives** the compat plan.json automatically at ingest. Do NOT also hand-author plan.json — that would duplicate schema and risk drift.
+
+**5. TASK RULE** — Every task MUST be a concrete code change with a specific deliverable. Do NOT create standalone "run the test suite" / "regression gate" / "final verification" / "confirm no regressions" tasks: Helm's validator ALREADY runs the FULL test suite after EVERY task and blocks advancement on any failure.`;
+  }
+
   // Compliant panel/red-team/deliberation briefs (verifier ≠ fixer). Includes full contract + own enum.
   // R5.18: purpose is required + exhaustive — no default; omit → typecheck fail.
   generatePanelBrief(params: {
@@ -470,15 +507,92 @@ Emit exactly:
     callbacksFile?: string;
     /** Cycle-workspace override (AC6/AC14); falls back to callbacksFile's directory, then projectDir. */
     canonicalArtifactRoot?: string;
+    /**
+     * Seat-scoped write targets for purpose plan-draft (R2.5). Absolute paths preferred.
+     * When omitted, composed via seat-draft-store from runDir/root + seat.
+     */
+    draftPlanPath?: string;
+    draftReqPath?: string;
+    /** Context inputs only (plan-draft): absolute paths to north-star / conversation-log / decisions. */
+    northStarPath?: string;
+    conversationLogPath?: string;
+    decisionsDir?: string;
+    /** Run directory used when composing default seat draft paths. */
+    runDir?: string;
   }): string {
     assertPanelBriefPurpose(params.purpose);
     const r = params.role || 'panelist';
     const root = path.resolve(
       params.canonicalArtifactRoot
+        || params.runDir
         || (params.callbacksFile ? path.dirname(params.callbacksFile) : undefined)
         || params.projectDir
         || '.'
     );
+
+    // B2: purpose plan-draft — independent blind authoring body (schema + seat paths + DRAFT-SUBMITTED).
+    // Does not use canonical plan.md / og-requirements.md write targets or verdict grammar.
+    if (params.purpose === 'plan-draft') {
+      const seatId = params.seat;
+      const draftPlan = path.resolve(params.draftPlanPath || composeDraftPlanPath(root, seatId));
+      const draftReq = path.resolve(params.draftReqPath || composeDraftReqPath(root, seatId));
+      const northStarAbs = path.resolve(params.northStarPath || path.join(root, 'north-star.md'));
+      const conversationLogAbs = path.resolve(
+        params.conversationLogPath || path.join(root, 'conversation-log.md'),
+      );
+      const decisionsAbs = path.resolve(params.decisionsDir || path.join(root, 'decisions'));
+      const base = this.generateBrief({
+        batchId: params.batchId,
+        role: r,
+        planPath: draftPlan,
+        runDir: root,
+        branch: 'main',
+        requirementsAssigned: 'PLAN-DRAFT',
+        northStarAnchors: params.requirement || 'blind whole-plan draft from context inputs',
+        scope:
+          'Round-1 blind co-planner draft (purpose plan-draft). Author seat-scoped requirements draft then plan draft only. Emit DRAFT-SUBMITTED plan=<sha12> after atomic publish. Never write canonical plan.md / og-requirements.md. No partner agreement; no panel verdict.',
+        requirementsSection: params.requirement || 'author from north-star.md + conversation-log.md + decisions/',
+        projectDir: params.projectDir || '/home/agjrom/TGBOTS/Helm',
+        callbacksFile: params.callbacksFile || '<abs-path-to-callbacks.md>',
+        taskType: 'feature',
+      });
+      const body = `
+You are ${r} seat ${params.seat} drafting an **independent whole-plan proposal** (blind co-planner; no partner visibility).
+Panel purpose: plan-draft
+
+## Context inputs (READ ONLY — absolute paths; these are the only context sources)
+- north-star.md: ${northStarAbs}
+- conversation-log.md: ${conversationLogAbs}
+- decisions/: ${decisionsAbs}
+
+READ these three only. Do NOT invent other context paths. Do NOT treat partner drafts as inputs (you cannot see them).
+
+## Seat-scoped write targets (ONLY paths you may write — never canonical)
+- Requirements draft: ${draftReq}
+- Plan draft: ${draftPlan}
+
+CRITICAL (R2.5): write **only** the seat-scoped paths above (from params / seat-draft composition). **NEVER** write canonical \`plan.md\` or \`og-requirements.md\` — the engine alone promotes a signed candidate later.
+
+${this.planAuthoringSchemaContract()}
+
+## Atomic publish + DRAFT-SUBMITTED (R2.7 — non-authoritative self-hash)
+1. Publish each draft **atomically**: write a temp sibling in the same directory, then rename into place. Do not leave a partial final path.
+2. Self-hash the **committed plan draft** bytes (sha256 hex; \`short12\` = first 12 hex chars).
+3. Emit exactly one terminal callback (claim is non-authoritative — engine recomputes from the committed file):
+[helm callback] ${r} ${params.batchId} STATUS: DRAFT-SUBMITTED plan=<sha12>
+
+The \`plan=<sha12>\` claim is **NON-AUTHORITATIVE**. The engine recomputes the hash from the committed plan-draft file and ignores a false claim. DRAFT-SUBMITTED asserts existence/publication only — never agreement and never "ready to use."
+
+## Forbidden on this purpose
+- Do **not** seek partner agreement, convene co-planners, wait for peer review, or declare whole-plan agreement (you draft alone and blind).
+- Do **not** emit a panel verdict (no CLEAN/BROKEN/CONSENSUS/SETTLED completion path on plan-draft).
+- Do **not** emit PLAN-READY or any status meaning the plan is ready to use.
+- Do **not** author plan.json.
+- After DRAFT-SUBMITTED: **STOP**. Helm-algo owns the rest.
+`;
+      return base.replace('<!-- PROJCORE-STATUS-CONTRACT v2 -->', `<!-- PROJCORE-STATUS-CONTRACT v2 -->${body}`).trim();
+    }
+
     const planMdPath = path.join(root, 'plan.md');
     const ogReqPath = path.join(root, 'og-requirements.md');
     const revision = readPlanRevision(planMdPath);
@@ -499,10 +613,9 @@ Emit exactly:
     const revisionLine = revision
       ? `Expected plan revision: sha256=${revision.sha256} short12=${revision.short12} — your verdict is bound to this exact revision; if the plan.md you read hashes differently, stop and report a revision mismatch instead of reviewing.`
       : `Expected plan revision: UNAVAILABLE — plan.md is missing or unreadable at spawn time. FAIL CLOSED: do NOT emit a verdict yet; re-read and retry; only emit VERDICT-READY once you can confirm the plan.md you read exists and state the sha256 you computed.`;
-    // B1: body remains the pre-purpose verdict render for all purposes so ROUND can
-    // temporarily pass purpose:'diff-review' (empty implementedDiff) without changing
-    // verdict grammar until R2/B3. Purpose is echoed for audit; draft/reconcile/signature
-    // instruction bodies land in B2/B3 without contaminating this baseline (R5.19).
+    // Default body (diff-review / task-conflict-reconvene / pre-B3 purposes): pre-purpose verdict
+    // render so ROUND can temporarily pass purpose:'diff-review' without changing verdict grammar.
+    // plan-reconcile / plan-signature instruction bodies land in B3 without contaminating this baseline (R5.19).
     const body = `
 You are ${r} seat ${params.seat} in a ${r === 'red-team' ? 'red-team' : 'deliberation'} panel (verifier ≠ fixer${r === 'red-team' ? ', using PROJECT role_bindings red-team agents' : ''}).
 Panel purpose: ${params.purpose}
