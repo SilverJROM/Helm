@@ -1,5 +1,6 @@
 /**
  * D1 — seat-draft-store path helpers, atomic publish, engine rehash (R2.5, R2.7).
+ * Paths nest under planning-drafts/<seatId>/ (R2.6 isolation unit; D2).
  */
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
@@ -14,6 +15,7 @@ import {
   draftPlanPath,
   draftReqPath,
   hashDraft,
+  seatDraftDir,
 } from './seat-draft-store.js';
 
 const tempDirs: string[] = [];
@@ -38,31 +40,34 @@ function expectedSha256(bytes: Buffer | string): string {
   return createHash('sha256').update(bytes).digest('hex');
 }
 
-describe('path helpers — seat-scoped drafts + shared candidate (R2.5)', () => {
-  it('draftPlanPath / draftReqPath use R2.5 naming under runDir', () => {
+describe('path helpers — seat-scoped drafts + shared candidate (R2.5 / R2.6 nest)', () => {
+  it('draftPlanPath / draftReqPath use R2.5 names under planning-drafts/<seatId>/', () => {
     const runDir = '/tmp/helm-run-example';
     const seatId = 'co-planner-a';
+    const seatDir = path.join(path.resolve(runDir), 'planning-drafts', seatId);
 
-    expect(draftPlanPath(runDir, seatId)).toBe(path.join(runDir, 'draft-co-planner-a.md'));
-    expect(draftReqPath(runDir, seatId)).toBe(path.join(runDir, 'draft-co-planner-a-req.md'));
+    expect(seatDraftDir(runDir, seatId)).toBe(seatDir);
+    expect(draftPlanPath(runDir, seatId)).toBe(path.join(seatDir, 'draft-co-planner-a.md'));
+    expect(draftReqPath(runDir, seatId)).toBe(path.join(seatDir, 'draft-co-planner-a-req.md'));
   });
 
-  it('different seats get distinct draft paths', () => {
+  it('different seats get distinct draft paths and isolation dirs', () => {
     const runDir = '/runs/r1';
     expect(draftPlanPath(runDir, 'seat-a')).not.toBe(draftPlanPath(runDir, 'seat-b'));
     expect(draftReqPath(runDir, 'seat-a')).not.toBe(draftReqPath(runDir, 'seat-b'));
+    expect(seatDraftDir(runDir, 'seat-a')).not.toBe(seatDraftDir(runDir, 'seat-b'));
   });
 
   it('candidate paths are shared (not seat-scoped) under runDir', () => {
     const runDir = '/runs/r1';
-    expect(candidatePlanPath(runDir)).toBe(path.join(runDir, 'candidate-plan.md'));
-    expect(candidateReqPath(runDir)).toBe(path.join(runDir, 'candidate-req.md'));
+    expect(candidatePlanPath(runDir)).toBe(path.join(path.resolve(runDir), 'candidate-plan.md'));
+    expect(candidateReqPath(runDir)).toBe(path.join(path.resolve(runDir), 'candidate-req.md'));
   });
 
   it('draft and candidate paths never collide with canonical plan.md / og-requirements.md', () => {
     const runDir = '/runs/r1';
-    const canonicalPlan = path.join(runDir, 'plan.md');
-    const canonicalReq = path.join(runDir, 'og-requirements.md');
+    const canonicalPlan = path.join(path.resolve(runDir), 'plan.md');
+    const canonicalReq = path.join(path.resolve(runDir), 'og-requirements.md');
     const seats = ['a', 'b', 'plancore'];
 
     for (const seat of seats) {
@@ -77,17 +82,23 @@ describe('path helpers — seat-scoped drafts + shared candidate (R2.5)', () => 
     expect(candidateReqPath(runDir)).not.toBe(canonicalPlan);
   });
 
-  it('module exports no helpers that write canonical plan.md / og-requirements.md', async () => {
+  it('module exports path helpers + isolation + publish (no canonical writers)', async () => {
     const mod = await import('./seat-draft-store.js');
     const names = Object.keys(mod).sort();
-    // Path helpers + atomic write + rehash only — promotion is P2/engine-side.
     expect(names).toEqual([
+      'SEAT_DRAFT_ISOLATION',
+      'SeatDraftIsolationError',
+      'assertNoPeerDraftAccess',
       'atomicWriteFile',
       'candidatePlanPath',
       'candidateReqPath',
+      'composeSeatDraftReadAllow',
       'draftPlanPath',
       'draftReqPath',
       'hashDraft',
+      'publishDraft',
+      'sanitizeSeatId',
+      'seatDraftDir',
     ]);
     expect(names.some((n) => /canonical|promote|planMd|ogReq/i.test(n))).toBe(false);
   });
@@ -100,7 +111,7 @@ describe('atomicWriteFile — temp sibling + rename (R2.7)', () => {
     const target = draftPlanPath(runDir, seat);
     const body = Buffer.from('# draft plan\n\nseat A content\n', 'utf8');
 
-    // Parent is runDir itself; write into nested subpath to exercise mkdir.
+    // Parent is seat draft dir; write into nested subpath to exercise mkdir.
     const nested = path.join(runDir, 'nested', 'deep', 'file.md');
     atomicWriteFile(nested, body);
 
@@ -132,7 +143,7 @@ describe('atomicWriteFile — temp sibling + rename (R2.7)', () => {
     expect(fs.readFileSync(p1)).toEqual(fs.readFileSync(p2));
   });
 
-  it('publishes seat plan + req drafts at R2.5 paths', () => {
+  it('publishes seat plan + req drafts at R2.5 paths under seat dir', () => {
     const runDir = makeTempDir();
     const seat = 'partner-1';
     const planBody = Buffer.from('# plan draft partner-1\n');
@@ -141,8 +152,8 @@ describe('atomicWriteFile — temp sibling + rename (R2.7)', () => {
     atomicWriteFile(draftPlanPath(runDir, seat), planBody);
     atomicWriteFile(draftReqPath(runDir, seat), reqBody);
 
-    expect(fs.readFileSync(path.join(runDir, `draft-${seat}.md`))).toEqual(planBody);
-    expect(fs.readFileSync(path.join(runDir, `draft-${seat}-req.md`))).toEqual(reqBody);
+    expect(fs.readFileSync(path.join(seatDraftDir(runDir, seat), `draft-${seat}.md`))).toEqual(planBody);
+    expect(fs.readFileSync(path.join(seatDraftDir(runDir, seat), `draft-${seat}-req.md`))).toEqual(reqBody);
     // Canonicals remain absent (engine-only in P2).
     expect(fs.existsSync(path.join(runDir, 'plan.md'))).toBe(false);
     expect(fs.existsSync(path.join(runDir, 'og-requirements.md'))).toBe(false);
