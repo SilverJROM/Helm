@@ -687,11 +687,23 @@ async function resolveRoundOneDraftPhase(
 /**
  * R3 (R3.11): the plan-signature purpose's terminal grammar is `STATUS: SIGNED plan=<sha12>` — NO
  * `[-—–:]` separator before the `plan=` claim, the same reason DRAFT_SUBMITTED_RE above needed a
- * dedicated match instead of reusing parseRoundCallbackLine. The sha12 capture is OPTIONAL: a
- * malformed/missing claim still identifies the line as a signature decision, but yields no usable
- * claim — R3.11 requires that case to be treated as non-agreement (fail-closed), never ignored.
+ * dedicated match instead of reusing parseRoundCallbackLine. This match is IDENTITY-ONLY: it says
+ * "this line is a signature decision" and hands the rest of the line (group 3) to SIGNED_CLAIM_RE.
+ * A malformed/missing claim still identifies the line, but yields no usable claim — R3.11 requires
+ * that case to be treated as non-agreement (fail-closed), never ignored.
  */
-const SIGNED_RE = /^\[(?:helm|projcore) callback\]\s+(\S+)\s+(\S+)\s+STATUS:\s+SIGNED\b(?:\s+plan=([0-9a-f]{12}))?/;
+const SIGNED_RE = /^\[(?:helm|projcore) callback\]\s+(\S+)\s+(\S+)\s+STATUS:\s+SIGNED\b(.*)$/;
+
+/**
+ * R5 (R6.21): the claim is usable ONLY when everything after `SIGNED` is EXACTLY the grammar's one
+ * claim token — `plan=` + exactly 12 lowercase hex, anchored at BOTH ends. The end anchor is the
+ * whole point: a bare `plan=([0-9a-f]{12})` with no trailing boundary captures the first 12 hex of
+ * `plan=<current12>XYZ` (or of a longer hex run), so a malformed line whose claim merely STARTS with
+ * the current short12 would agree — fail-OPEN, exactly what R6.21 forbids. Anything that is not the
+ * bare token (fused prefix/suffix, a longer hex run, a second smuggled `plan=`, uppercase hex,
+ * trailing prose) yields NO claim, which the caller resolves as non-agreement.
+ */
+const SIGNED_CLAIM_RE = /^\s+plan=([0-9a-f]{12})\s*$/;
 
 /**
  * R3 (R3.11/R3.13): the plan-signature purpose's rejection grammar is
@@ -807,7 +819,7 @@ export async function waitForCandidateSignature(
         if (!identity || identity[2] !== seat.batchId || !roleMatches(partnerRole, identity[1])) continue;
         const signedMatch = SIGNED_RE.exec(line);
         if (signedMatch) {
-          const claimedShort12 = signedMatch[3] ?? null;
+          const claimedShort12 = SIGNED_CLAIM_RE.exec(signedMatch[3] ?? '')?.[1] ?? null;
           const candidatePlan = readPlanRevision(candidatePlanFilePath);
           const agreed = !!candidatePlan && !!claimedShort12 && claimedShort12 === candidatePlan.short12;
           return agreed

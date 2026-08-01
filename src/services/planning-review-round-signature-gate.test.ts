@@ -71,8 +71,8 @@ describe('waitForCandidateSignature — signature-on-candidate-bytes gate (R3.11
   it('R6.21: SIGNED with a malformed (wrong-length) sha is fail-closed, never agreement', async () => {
     const bytes = '# Candidate\n```json\n[]\n```\n';
     atomicWriteFile(candidatePath, bytes);
-    // "abc123" is not a 12-hex-char short12 — SIGNED_RE's optional capture will not match it, so the
-    // line is still identified as a signature decision but yields no usable claim (per R5's scope).
+    // "abc123" is not a 12-hex-char short12 — the claim token does not match, so the line is still
+    // identified as a signature decision but yields no usable claim (per R5's scope).
     await post(`[helm callback] planner ${seat.batchId} STATUS: SIGNED plan=abc123`);
 
     const result = await waitForCandidateSignature(cbPath, 'planner', seat, candidatePath, 500, 0, {});
@@ -81,6 +81,119 @@ describe('waitForCandidateSignature — signature-on-candidate-bytes gate (R3.11
     if (result.ok && result.kind !== 'objections') {
       expect(result.kind).toBe('signed-mismatched');
       expect(result.claimedShort12).toBeNull();
+    }
+  });
+
+  it('R6.21: SIGNED whose claim is the current sha with a FUSED suffix is fail-closed, never agreement', async () => {
+    // The exact red-team probe that failed attempt 1: an unanchored `plan=([0-9a-f]{12})` capture
+    // matches the first 12 hex of `plan=<current12>XYZ` and agrees on a malformed line — fail-OPEN.
+    const bytes = '# Candidate\n```json\n[]\n```\n';
+    const revision = planRevision(bytes);
+    atomicWriteFile(candidatePath, bytes);
+    await post(`[helm callback] planner ${seat.batchId} STATUS: SIGNED plan=${revision.short12}XYZ`);
+
+    const result = await waitForCandidateSignature(cbPath, 'planner', seat, candidatePath, 500, 0, {});
+
+    expect(result.ok).toBe(true);
+    if (result.ok && result.kind !== 'objections') {
+      expect(result.kind).toBe('signed-mismatched');
+      expect(result.claimedShort12).toBeNull();
+    }
+  });
+
+  it('R6.21: SIGNED whose claim is a LONGER hex run starting with the current sha is fail-closed', async () => {
+    // Sneakier than XYZ: every character is hex, so only an end anchor rejects it.
+    const bytes = '# Candidate\n```json\n[]\n```\n';
+    const revision = planRevision(bytes);
+    atomicWriteFile(candidatePath, bytes);
+    await post(`[helm callback] planner ${seat.batchId} STATUS: SIGNED plan=${revision.short12}ab`);
+
+    const result = await waitForCandidateSignature(cbPath, 'planner', seat, candidatePath, 500, 0, {});
+
+    expect(result.ok).toBe(true);
+    if (result.ok && result.kind !== 'objections') {
+      expect(result.kind).toBe('signed-mismatched');
+      expect(result.claimedShort12).toBeNull();
+    }
+  });
+
+  it('R6.21: SIGNED whose claim carries a fused PREFIX before the current sha is fail-closed', async () => {
+    const bytes = '# Candidate\n```json\n[]\n```\n';
+    const revision = planRevision(bytes);
+    atomicWriteFile(candidatePath, bytes);
+    await post(`[helm callback] planner ${seat.batchId} STATUS: SIGNED plan=ff${revision.short12}`);
+
+    const result = await waitForCandidateSignature(cbPath, 'planner', seat, candidatePath, 500, 0, {});
+
+    expect(result.ok).toBe(true);
+    if (result.ok && result.kind !== 'objections') {
+      expect(result.kind).toBe('signed-mismatched');
+      expect(result.claimedShort12).toBeNull();
+    }
+  });
+
+  it('R6.21: a malformed claim followed by a SECOND well-formed plan= token is fail-closed', async () => {
+    // Token-smuggling: the line must be the ONE claim token, so a scan that "finds a good plan="
+    // anywhere on the line must not rescue a malformed first claim.
+    const bytes = '# Candidate\n```json\n[]\n```\n';
+    const revision = planRevision(bytes);
+    atomicWriteFile(candidatePath, bytes);
+    await post(
+      `[helm callback] planner ${seat.batchId} STATUS: SIGNED plan=${revision.short12}XYZ plan=${revision.short12}`
+    );
+
+    const result = await waitForCandidateSignature(cbPath, 'planner', seat, candidatePath, 500, 0, {});
+
+    expect(result.ok).toBe(true);
+    if (result.ok && result.kind !== 'objections') {
+      expect(result.kind).toBe('signed-mismatched');
+      expect(result.claimedShort12).toBeNull();
+    }
+  });
+
+  it('R6.21: an UPPERCASE-hex claim of the same sha is fail-closed (grammar is lowercase sha12)', async () => {
+    const bytes = '# Candidate\n```json\n[]\n```\n';
+    const revision = planRevision(bytes);
+    atomicWriteFile(candidatePath, bytes);
+    await post(`[helm callback] planner ${seat.batchId} STATUS: SIGNED plan=${revision.short12.toUpperCase()}`);
+
+    const result = await waitForCandidateSignature(cbPath, 'planner', seat, candidatePath, 500, 0, {});
+
+    expect(result.ok).toBe(true);
+    if (result.ok && result.kind !== 'objections') {
+      expect(result.kind).toBe('signed-mismatched');
+      expect(result.claimedShort12).toBeNull();
+    }
+  });
+
+  it('R6.21: a correct claim with TRAILING PROSE after it is fail-closed (the line is the token, not a prefix)', async () => {
+    const bytes = '# Candidate\n```json\n[]\n```\n';
+    const revision = planRevision(bytes);
+    atomicWriteFile(candidatePath, bytes);
+    await post(`[helm callback] planner ${seat.batchId} STATUS: SIGNED plan=${revision.short12} — looks good to me`);
+
+    const result = await waitForCandidateSignature(cbPath, 'planner', seat, candidatePath, 500, 0, {});
+
+    expect(result.ok).toBe(true);
+    if (result.ok && result.kind !== 'objections') {
+      expect(result.kind).toBe('signed-mismatched');
+      expect(result.claimedShort12).toBeNull();
+    }
+  });
+
+  it('the exact grammar still agrees when only surrounding whitespace varies', async () => {
+    // The boundary tightening must not break the one line the signer brief actually instructs.
+    const bytes = '# Candidate\n```json\n[]\n```\n';
+    const revision = planRevision(bytes);
+    atomicWriteFile(candidatePath, bytes);
+    await post(`[helm callback] planner ${seat.batchId} STATUS: SIGNED  plan=${revision.short12}  `);
+
+    const result = await waitForCandidateSignature(cbPath, 'planner', seat, candidatePath, 500, 0, {});
+
+    expect(result.ok).toBe(true);
+    if (result.ok && result.kind !== 'objections') {
+      expect(result.kind).toBe('signed-agreed');
+      expect(result.claimedShort12).toBe(revision.short12);
     }
   });
 
