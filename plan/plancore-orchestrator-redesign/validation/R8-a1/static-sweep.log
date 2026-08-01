@@ -1,0 +1,8 @@
+$ rg -n "\\bgeneratePlanRoundReviseBrief\\s*[(:=]" src --glob "!*.test.ts"
+
+$ rg -n "planningBrainModel|role:\\s*brainRole|role:\\s*'plancore'|batchId:.*revise|writeBrief\\([^\\n]*revise" src/services/planning-review-round.ts
+
+$ rg -n "mode: 'proposer-signer-role-integrity'|slice: 'R8'|spec: 'src/services/planning-review-round-no-plancore-revise.test.ts'" src/services/planning-regression-modes.ts
+212:  mode: 'proposer-signer-role-integrity',
+213:  slice: 'R8',
+215:  spec: 'src/services/planning-review-round-no-plancore-revise.test.ts',

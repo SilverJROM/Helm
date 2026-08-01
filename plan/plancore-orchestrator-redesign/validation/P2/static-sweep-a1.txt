@@ -1,0 +1,17 @@
+P2 static sweep
+HEAD a624cce6e8b7459fabf0a1b6ab8d2459a98b536b
+
+planMdPathForRaceGuard count in planning-phase-service.ts: 3
+
+Failure token references in planning-phase-service.ts:
+533:    // NO-AGREED-PLAN-CANDIDATE error and mask the real, mechanism-level reason).
+661:          const errMsg = `[${batchId}] NO-AGREED-PLAN-CANDIDATE: no signed candidate was promoted and no valid canonical ${reqPath} / ${planMdPath} exists. plan.json is Helm-derived and is not an authored fallback. ${(e as Error).message || e}`;
+
+Promotion path references in planning-phase-service.ts:
+534:    if (!agreed) {
+569:    if (proposerSignerRound?.candidatePlanPath && proposerSignerRound?.candidateReqPath) {
+582:      atomicWriteFile(planMdPath, candidatePlanBytes);
+583:      atomicWriteFile(reqPath, candidateReqBytes);
+
+Focused evidence file exists:
+focused-vitest-a1.txt OK

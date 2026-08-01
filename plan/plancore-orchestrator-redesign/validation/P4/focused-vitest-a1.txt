@@ -1,0 +1,14 @@
+
+ RUN  v2.1.9 /home/agjrom/websites/Helm
+
+stdout | src/services/adaptive-planning-foundation.test.ts > adaptive planner — Stage 1 foundation > OFF (default) does NOT enter the adaptive module — the existing path runs
+[planning-phase] consensus policy for batch batch-B9 (mode=planner): unanimous=false maxRounds=3 (source: teams.consensus_rule; settle-role clause not wired)
+
+ ✓ src/services/adaptive-planning-foundation.test.ts (7 tests) 296ms
+ ✓ src/services/planning-phase-adaptive-scope-pin.test.ts (2 tests) 4ms
+
+ Test Files  2 passed (2)
+      Tests  9 passed (9)
+   Start at  07:47:43
+   Duration  929ms (transform 315ms, setup 15ms, collect 421ms, tests 299ms, environment 0ms, prepare 59ms)
+

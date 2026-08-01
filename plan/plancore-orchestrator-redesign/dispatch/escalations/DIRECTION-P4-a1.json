@@ -1,0 +1,13 @@
+{
+  "slice": "P4",
+  "attempt": 1,
+  "action": "RETRY_WITH_DIRECTION",
+  "note": "P4 parked: validator FAIL defect_class=FOCUSED_SPEC_MISSING, then claude-escalation budget exhausted (no a2 correction seat). Product rolled back to 5236c4af7f; orphan a67f8de + parked-patches/P4.patch remain.\n\nProcess direction (not a code taste call \u2014 gate named a missing plan-row deliverable):\n1. Re-apply P4 scope pin (R7.25): runPlanningPhase early-returns when adaptivePlanning truthy BEFORE any new draft/signature code; short comment at that branch citing R7/deferred backlog; no behavioral change to adaptive-planning-phase.*; backlog note under plan/plancore-orchestrator-redesign/decisions/ (backburner already drafted in prior attempt \u2014 restore if needed).\n2. REQUIRED: create and land the plan-row focused spec src/services/planning-phase-adaptive-scope-pin.test.ts \u2014 a1 only ran adaptive-planning-foundation.test.ts because the pin file was absent from tree/index. Assert adaptive truthy early-return ordering / pin comment presence as appropriate without widening into adaptive co-author rewrite.\n3. Focused acceptance command must execute BOTH paths: npx vitest run src/services/planning-phase-adaptive-scope-pin.test.ts src/services/adaptive-planning-foundation.test.ts --minWorkers=1 --maxWorkers=4\n4. Prefer re-apply product hunk from a67f8de / P4.patch then add the missing test. Do not restore queue.md from the parked patch.\n5. Do not widen scope. Safety: HELM_SESSION_JANITOR=0, no merge main, hands off A1-A6 / worker-runtime-finalize.ts / E5 session path.\n\nNote: X1 deps include P4 \u2014 unblocking P4 unblocks the final regression-index slice once R7/P4 DRIVE.",
+  "raised_from": "RAISE-P4-c1.json",
+  "brain": "grok45",
+  "self_conflict": false,
+  "rationale": "Concrete FOCUSED_SPEC_MISSING + esc budget 0 is a re-dispatchable incompleteness, not a true block or re-plan of P4 scope. RETRY with explicit missing-file instruction. Not STOP (recoverable; X1 still waiting). Not SKIP (ready to land on fresh process).",
+  "applied": true,
+  "outcome": "unparked",
+  "applied_at": "2026-08-01T07:42:34Z"
+}

@@ -1,0 +1,31 @@
+
+ RUN  v2.1.9 /home/agjrom/websites/Helm
+
+stdout | src/services/planning-phase-candidate-promote.test.ts > P2 (R2.5/R3.14): engine promotes the signed candidate to canonical plan.md/og-requirements.md > copies the exact signed candidate bytes to canonical plan.md/og-requirements.md under canonicalArtifactRoot and ingests them, without polling
+[planning-phase] consensus policy for batch batch-p2-promote (mode=planner): unanimous=true maxRounds=3 (source: teams.consensus_rule; settle-role clause not wired)
+
+stdout | src/services/planning-phase-candidate-promote.test.ts > P2 (R2.5/R3.14): engine promotes the signed candidate to canonical plan.md/og-requirements.md > overwrites a stale pre-existing canonical plan.md/og-requirements.md — the engine is the only writer of those paths (R2.5)
+[planning-phase] consensus policy for batch batch-p2-overwrite (mode=planner): unanimous=true maxRounds=3 (source: teams.consensus_rule; settle-role clause not wired)
+
+stdout | src/services/planning-phase-candidate-promote.test.ts > P2 (R2.5/R3.14): engine promotes the signed candidate to canonical plan.md/og-requirements.md > B6 discipline holds for the new promotion path too: agreed:false never writes canonicalArtifactRoot, even with a candidate ready
+[planning-phase] consensus policy for batch batch-p2-blocked (mode=planner): unanimous=true maxRounds=3 (source: teams.consensus_rule; settle-role clause not wired)
+
+ ✓ src/services/planning-phase-candidate-promote.test.ts (4 tests) 146ms
+stdout | src/services/planning-phase-nonconvergence-b6.test.ts > B6: runPlanningPhase returns a typed blocked reason on non-convergence, never a plan-read failure > no partner agreement ever arrives: resolves (never throws) with the typed blocked reason, no canonical-plan polling
+[planning-phase] consensus policy for batch batch-B6-no-agreement (mode=planner): unanimous=true maxRounds=3 (source: teams.consensus_rule; settle-role clause not wired)
+
+stdout | src/services/planning-phase-nonconvergence-b6.test.ts > B6: runPlanningPhase returns a typed blocked reason on non-convergence, never a plan-read failure > current-plan-SHA mismatch (B5 non-agreement): returns the same typed blocked result, not the plan it never agreed to
+[planning-phase] consensus policy for batch batch-B6-sha-mismatch (mode=planner): unanimous=true maxRounds=3 (source: teams.consensus_rule; settle-role clause not wired)
+
+stdout | src/services/planning-phase-nonconvergence-b6.test.ts > B6: runPlanningPhase returns a typed blocked reason on non-convergence, never a plan-read failure > agreed path is not regressed: still reads/ingests the canonical plan.md exactly as before
+[planning-phase] consensus policy for batch batch-B6-agreed-path (mode=planner): unanimous=true maxRounds=3 (source: teams.consensus_rule; settle-role clause not wired)
+
+ ✓ src/services/planning-phase-nonconvergence-b6.test.ts (3 tests) 1100ms
+   ✓ B6: runPlanningPhase returns a typed blocked reason on non-convergence, never a plan-read failure > no partner agreement ever arrives: resolves (never throws) with the typed blocked reason, no canonical-plan polling 467ms
+   ✓ B6: runPlanningPhase returns a typed blocked reason on non-convergence, never a plan-read failure > current-plan-SHA mismatch (B5 non-agreement): returns the same typed blocked result, not the plan it never agreed to 464ms
+
+ Test Files  2 passed (2)
+      Tests  7 passed (7)
+   Start at  03:37:49
+   Duration  1.87s (transform 291ms, setup 16ms, collect 404ms, tests 1.25s, environment 0ms, prepare 64ms)
+

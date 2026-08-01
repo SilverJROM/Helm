@@ -1,0 +1,12 @@
+
+ RUN  v2.1.9 /home/agjrom/websites/Helm
+
+ ✓ src/services/planning-review-round-blind-draft.test.ts (12 tests) 1434ms
+   ✓ runReviewRound blind draft round 1 (R2, R2.5-R2.7/R6.20/R6.24) > times out into a typed draft-not-submitted block when a seat never posts and never commits, never calling waitForAgreement 605ms
+   ✓ runReviewRound blind draft round 1 (R2, R2.5-R2.7/R6.20/R6.24) > extends the C7 first-callback watchdog to draft seats when force-enabled under the fixture harness 405ms
+
+ Test Files  1 passed (1)
+      Tests  12 passed (12)
+   Start at  01:30:37
+   Duration  1.66s (transform 95ms, setup 11ms, collect 107ms, tests 1.43s, environment 0ms, prepare 31ms)
+

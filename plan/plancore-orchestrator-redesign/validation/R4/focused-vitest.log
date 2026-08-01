@@ -1,0 +1,10 @@
+
+ RUN  v2.1.9 /home/agjrom/websites/Helm
+
+ ✓ src/services/planning-review-round-alternation.test.ts (3 tests) 25ms
+
+ Test Files  1 passed (1)
+      Tests  3 passed (3)
+   Start at  02:16:48
+   Duration  252ms (transform 100ms, setup 12ms, collect 111ms, tests 25ms, environment 0ms, prepare 29ms)
+

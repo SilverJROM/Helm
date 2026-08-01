@@ -1,0 +1,14 @@
+{
+  "slice": "R7",
+  "attempt": 3,
+  "action": "RETRY_WITH_DIRECTION",
+  "note": "FRESH PROCESS unpark \u2014 terminal_drain=True; prior SKIP (a2) held R7 to avoid same-process no-progress thrash. _no_progress is now empty on resume.\n\nHistory (do not re-park on product wording):\n- c1 false park: STATUS: DONE commit fc7c025 but note contained substring BLOCKED (R3.15 product wording). Driver parks if 'BLOCKED' appears anywhere in the callback line.\n- c2 no-progress after a1 unpark in same process. Queue PENDING + no advance-R7.marker is correct; product never advanced.\n\nImplement R7 (R3.15) on CURRENT HEAD (5236c4a post-P3; R8/P1/P2/P3 already landed without R7):\n1. Re-apply non-convergence final-positions diff: blockedReason carries operator-legible textual/hunk summary (final candidate vs signer last draft/objections), not bare hash pairs; durable report under planning-drafts (or plan-row path). Extend RoundBlockedReasonKind if needed.\n2. Prefer adapt orphan fc7c025 / product hunks from parked-patches/R7.patch onto current tree \u2014 expect merge with R8+P3 edits in planning-review-round.ts. Do not restore queue.md from that patch.\n3. Focused test must exist and pass: npx vitest run src/services/planning-review-round-block-diff.test.ts --minWorkers=1 --maxWorkers=4\n4. CRITICAL callback hygiene: DONE note must NOT contain the literal substring BLOCKED. Safe: 'commit <sha> non-conv final-positions diff (R3.15)'.\n5. Do not widen scope. Safety: HELM_SESSION_JANITOR=0, no merge main, hands off A1-A6 / worker-runtime-finalize.ts / E5 session path.",
+  "raised_from": "TILLER-EXIT terminal_drain parked=[P4,R7]; prior RAISE-R7-c1/c2 + DIRECTION-R7-a2 SKIP",
+  "brain": "grok45",
+  "self_conflict": true,
+  "self_conflict_detail": "R7 a1 implementer was grok45 L2; brain is also grok45. Process-only unstick after false park + no-progress hold \u2014 not a code-correctness judgment. Validator owns the retry verdict.",
+  "rationale": "Driver process exited; safe to RETRY. R7 product still missing on HEAD; R3.15 still required. Scope unchanged. Not STOP (recoverable). Not SKIP (hold already done; now execute).",
+  "applied": true,
+  "outcome": "unparked",
+  "applied_at": "2026-08-01T07:42:34Z"
+}

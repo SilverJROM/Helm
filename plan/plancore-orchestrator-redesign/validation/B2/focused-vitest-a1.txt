@@ -1,0 +1,10 @@
+
+ RUN  v2.1.9 /home/agjrom/websites/Helm
+
+ ✓ src/services/brief-writer-plan-draft-purpose.test.ts (6 tests) 5ms
+
+ Test Files  1 passed (1)
+      Tests  6 passed (6)
+   Start at  00:49:06
+   Duration  197ms (transform 75ms, setup 12ms, collect 78ms, tests 5ms, environment 0ms, prepare 28ms)
+

@@ -1,0 +1,112 @@
+
+ RUN  v2.1.9 /home/agjrom/websites/Helm
+
+stdout | src/services/planning-phase-service.test.ts > planning-phase-service (B9 PLN1) + gate + auto pick > gate BLOCKS handoff until agreement; planner mode always convenes + waits for the partner (A8/R1.2)
+[planning-phase] consensus policy for batch batch-B9-gate (mode=planner): unanimous=true maxRounds=3 (source: teams.consensus_rule; settle-role clause not wired)
+
+stdout | src/services/planning-phase-service.test.ts > planning-phase-service (B9 PLN1) + gate + auto pick > A8/P1: default-config planning spawns exactly 1 partner seat (plancore is never spawned)
+[planning-phase] consensus policy for batch batch-A8-two-seats (mode=planner): unanimous=true maxRounds=3 (source: teams.consensus_rule; settle-role clause not wired)
+
+stdout | src/services/planning-phase-service.test.ts > planning-phase-service (B9 PLN1) + gate + auto pick > A10/P1: panelSize=3 spawns exactly 2 partner seats (plancore is never spawned), unanimous CLEAN from BOTH required
+[planning-phase] consensus policy for batch batch-A10-three-seats (mode=planner): unanimous=true maxRounds=3 (source: teams.consensus_rule; settle-role clause not wired)
+
+stdout | src/services/planning-phase-service.test.ts > planning-phase-service (B9 PLN1) + gate + auto pick > A10: panelSize=3 — a BROKEN from either partner fails the gate (unanimous, not majority)
+[planning-phase] consensus policy for batch batch-A10-broken-one-of-two (mode=planner): unanimous=true maxRounds=3 (source: teams.consensus_rule; settle-role clause not wired)
+
+stdout | src/services/planning-phase-service.test.ts > planning-phase-service (B9 PLN1) + gate + auto pick > hands Discovery cycle artifacts through Planning into implementation as one canonical set
+[planning-phase] consensus policy for batch batch-S6-canonical (mode=planner): unanimous=true maxRounds=3 (source: teams.consensus_rule; settle-role clause not wired)
+
+stdout | src/services/planning-phase-service.test.ts > planning-phase-service (B9 PLN1) + gate + auto pick > gate still works for explicit deliberation mode + ambiguous signals
+[planning-phase] consensus policy for batch batch-B9-delib (mode=deliberation): unanimous=true maxRounds=3 (source: teams.consensus_rule; settle-role clause not wired)
+
+stdout | src/services/planning-phase-service.test.ts > planning-phase-service (B9 PLN1) + gate + auto pick > parses plancore-authored canonical plan.md and derives plan.json instead of using the fixture
+[planning-phase] consensus policy for batch batch-POCFIX3-realpath (mode=planner): unanimous=true maxRounds=3 (source: teams.consensus_rule; settle-role clause not wired)
+
+stdout | src/services/planning-phase-service.test.ts > planning-phase-service (B9 PLN1) + gate + auto pick > POCFIX8 (a): real !fake path uses long waitForAgreement timeout + ingests on PLAN-READY+plan.json (fake keeps fast; no fixture on real)
+[planning-phase] consensus policy for batch batch-POCFIX8-timeout (mode=planner): unanimous=true maxRounds=3 (source: teams.consensus_rule; settle-role clause not wired)
+
+stdout | src/services/planning-phase-service.test.ts > planning-phase-service (B9 PLN1) + gate + auto pick > A8: planner mode always convenes a partner and requires its agreement signal (PLAN-READY alone does not pass)
+[planning-phase] consensus policy for batch batch-A8-planner-partner (mode=planner): unanimous=true maxRounds=3 (source: teams.consensus_rule; settle-role clause not wired)
+
+stdout | src/services/planning-phase-service.test.ts > planning-phase-service (B9 PLN1) + gate + auto pick > A8: a stall with no partner signal returns agreed:false (bounded), never a silent pass
+[planning-phase] consensus policy for batch batch-A8-stall (mode=planner): unanimous=true maxRounds=3 (source: teams.consensus_rule; settle-role clause not wired)
+
+stdout | src/services/planning-phase-service.test.ts > planning-phase-service (B9 PLN1) + gate + auto pick > A11: round cap scales the bounded-exit wait — roundCap=3 (default) waits ~3x longer than roundCap=1 before BLOCKED
+[planning-phase] consensus policy for batch batch-A11-cap1 (mode=planner): unanimous=true maxRounds=3 (source: teams.consensus_rule; settle-role clause not wired)
+
+stdout | src/services/planning-phase-service.test.ts > planning-phase-service (B9 PLN1) + gate + auto pick > A11: round cap scales the bounded-exit wait — roundCap=3 (default) waits ~3x longer than roundCap=1 before BLOCKED
+[planning-phase] consensus policy for batch batch-A11-cap3 (mode=planner): unanimous=true maxRounds=3 (source: teams.consensus_rule; settle-role clause not wired)
+
+stdout | src/services/planning-phase-service.test.ts > planning-phase-service (B9 PLN1) + gate + auto pick > A13: per-task ACCEPT/AMEND/ESCALATE conflict-only reconvene > a plan whose tasks all ACCEPT (or carry no verdict at all) produces exactly one agreement gate and zero per-task convenes
+[planning-phase] consensus policy for batch batch-A13-all-accept (mode=planner): unanimous=true maxRounds=3 (source: teams.consensus_rule; settle-role clause not wired)
+
+stdout | src/services/planning-phase-service.test.ts > planning-phase-service (B9 PLN1) + gate + auto pick > A13: per-task ACCEPT/AMEND/ESCALATE conflict-only reconvene > a seeded ESCALATE on one task convenes the pair exactly once (T1 unaffected)
+[planning-phase] consensus policy for batch batch-A13-escalate (mode=planner): unanimous=true maxRounds=3 (source: teams.consensus_rule; settle-role clause not wired)
+
+stdout | src/services/planning-phase-service.test.ts > planning-phase-service (B9 PLN1) + gate + auto pick > A13: per-task ACCEPT/AMEND/ESCALATE conflict-only reconvene > a conflicting AMEND pair convenes the pair exactly once; a BYTE-IDENTICAL AMEND from both seats does not conflict
+[planning-phase] consensus policy for batch batch-A13-amend-conflict (mode=planner): unanimous=true maxRounds=3 (source: teams.consensus_rule; settle-role clause not wired)
+
+stdout | src/services/planning-phase-service.test.ts > planning-phase-service (B9 PLN1) + gate + auto pick > A13: per-task ACCEPT/AMEND/ESCALATE conflict-only reconvene > a unilateral AMEND (plancore AMEND, partner silent -> default ACCEPT) is not a conflict — zero convenes
+[planning-phase] consensus policy for batch batch-A13-unilateral-amend-plancore (mode=planner): unanimous=true maxRounds=3 (source: teams.consensus_rule; settle-role clause not wired)
+
+stdout | src/services/planning-phase-service.test.ts > planning-phase-service (B9 PLN1) + gate + auto pick > A13: per-task ACCEPT/AMEND/ESCALATE conflict-only reconvene > a unilateral AMEND (plancore explicit ACCEPT, partner AMEND) is not a conflict — zero convenes
+[planning-phase] consensus policy for batch batch-A13-unilateral-amend-partner (mode=planner): unanimous=true maxRounds=3 (source: teams.consensus_rule; settle-role clause not wired)
+
+stdout | src/services/planning-phase-service.test.ts > planning-phase-service (B9 PLN1) + gate + auto pick > A13: per-task ACCEPT/AMEND/ESCALATE conflict-only reconvene > DB: a convene event is recorded against the run + cycle (auditable trigger)
+[planning-phase] consensus policy for batch batch-A13-db-convene (mode=planner): unanimous=true maxRounds=3 (source: teams.consensus_rule; settle-role clause not wired)
+
+stdout | src/services/planning-phase-service.test.ts > planning-phase-service (B9 PLN1) + gate + auto pick > A1/P1: cycle-linked planning run inserts a worker_runtimes row for the partner (not plancore) resolving via runs.cycle_id
+[planning-phase] consensus policy for batch batch-A1-worker-runtimes (mode=deliberation): unanimous=true maxRounds=3 (source: teams.consensus_rule; settle-role clause not wired)
+
+stdout | src/services/planning-phase-service.test.ts > planning-phase-service (B9 PLN1) + gate + auto pick > A2/P1: planning spawns pass projectId+runId into transport.spawn for the partner seat
+[planning-phase] consensus policy for batch batch-A2-helm-sessions (mode=deliberation): unanimous=true maxRounds=3 (source: teams.consensus_rule; settle-role clause not wired)
+
+stdout | src/services/planning-phase-service.test.ts > planning-phase-service (B9 PLN1) + gate + auto pick > A9: waitForAgreement rewrite (payload verdict, batch-scoped partner, dual-prefix) > (a) a BROKEN verdict fails the gate — no ingest, no hand-off
+[planning-phase] consensus policy for batch batch-A9-broken (mode=planner): unanimous=true maxRounds=3 (source: teams.consensus_rule; settle-role clause not wired)
+
+stdout | src/services/planning-phase-service.test.ts > planning-phase-service (B9 PLN1) + gate + auto pick > A9: waitForAgreement rewrite (payload verdict, batch-scoped partner, dual-prefix) > (b) a stale VERDICT-READY from a different run/batch does not satisfy — the deadlock/foreign-acceptance fix
+[planning-phase] consensus policy for batch batch-A9-stale (mode=planner): unanimous=true maxRounds=3 (source: teams.consensus_rule; settle-role clause not wired)
+
+stdout | src/services/planning-phase-service.test.ts > planning-phase-service (B9 PLN1) + gate + auto pick > A9: waitForAgreement rewrite (payload verdict, batch-scoped partner, dual-prefix) > (c) a genuine current-batch CLEAN verdict passes (anti-deadlock guard) — exactly one whole-plan gate, no per-task loop
+[planning-phase] consensus policy for batch batch-A9-clean (mode=planner): unanimous=true maxRounds=3 (source: teams.consensus_rule; settle-role clause not wired)
+
+stdout | src/services/planning-phase-service.test.ts > planning-phase-service (B9 PLN1) + gate + auto pick > A9: waitForAgreement rewrite (payload verdict, batch-scoped partner, dual-prefix) > N4: accepts a [projcore callback]-prefixed partner verdict, not just [helm callback]
+[planning-phase] consensus policy for batch batch-A9-projcore-prefix (mode=planner): unanimous=true maxRounds=3 (source: teams.consensus_rule; settle-role clause not wired)
+
+stdout | src/services/planning-phase-service.test.ts > planning-phase-service (B9 PLN1) + gate + auto pick > A9: waitForAgreement rewrite (payload verdict, batch-scoped partner, dual-prefix) > send-back: a same-batch CLEAN verdict from a PRIOR attempt does not satisfy a later attempt, even across a fresh service instance (process restart)
+[planning-phase] consensus policy for batch batch-A9-restart-reuse (mode=planner): unanimous=true maxRounds=3 (source: teams.consensus_rule; settle-role clause not wired)
+
+stdout | src/services/planning-phase-service.test.ts > planning-phase-service (B9 PLN1) + gate + auto pick > A9: waitForAgreement rewrite (payload verdict, batch-scoped partner, dual-prefix) > send-back: a same-batch CLEAN verdict from a PRIOR attempt does not satisfy a later attempt, even across a fresh service instance (process restart)
+[planning-phase] consensus policy for batch batch-A9-restart-reuse (mode=planner): unanimous=true maxRounds=3 (source: teams.consensus_rule; settle-role clause not wired)
+
+ ✓ src/services/planning-phase-service.test.ts (31 tests) 19952ms
+   ✓ planning-phase-service (B9 PLN1) + gate + auto pick > gate BLOCKS handoff until agreement; planner mode always convenes + waits for the partner (A8/R1.2) 301ms
+   ✓ planning-phase-service (B9 PLN1) + gate + auto pick > A10: panelSize=3 — a BROKEN from either partner fails the gate (unanimous, not majority) 995ms
+   ✓ planning-phase-service (B9 PLN1) + gate + auto pick > POCFIX8 (a): real !fake path uses long waitForAgreement timeout + ingests on PLAN-READY+plan.json (fake keeps fast; no fixture on real) 368ms
+   ✓ planning-phase-service (B9 PLN1) + gate + auto pick > A8: a stall with no partner signal returns agreed:false (bounded), never a silent pass 556ms
+   ✓ planning-phase-service (B9 PLN1) + gate + auto pick > A11: round cap scales the bounded-exit wait — roundCap=3 (default) waits ~3x longer than roundCap=1 before BLOCKED 550ms
+   ✓ planning-phase-service (B9 PLN1) + gate + auto pick > A9: waitForAgreement rewrite (payload verdict, batch-scoped partner, dual-prefix) > (a) a BROKEN verdict fails the gate — no ingest, no hand-off 12072ms
+   ✓ planning-phase-service (B9 PLN1) + gate + auto pick > A9: waitForAgreement rewrite (payload verdict, batch-scoped partner, dual-prefix) > (b) a stale VERDICT-READY from a different run/batch does not satisfy — the deadlock/foreign-acceptance fix 681ms
+   ✓ planning-phase-service (B9 PLN1) + gate + auto pick > A9: waitForAgreement rewrite (payload verdict, batch-scoped partner, dual-prefix) > send-back: a same-batch CLEAN verdict from a PRIOR attempt does not satisfy a later attempt, even across a fresh service instance (process restart) 806ms
+stdout | src/services/planning-phase-no-plancore-author.test.ts > P1 (R1.2/R1.3): plancore is never spawned during initial whole-plan authoring > spawns only the partner seat — no transport.spawn call is ever made for the plancore/brainRole seat
+[planning-phase] consensus policy for batch batch-P1-no-spawn (mode=planner): unanimous=true maxRounds=3 (source: teams.consensus_rule; settle-role clause not wired)
+
+stdout | src/services/planning-phase-no-plancore-author.test.ts > P1 (R1.2/R1.3): plancore is never spawned during initial whole-plan authoring > never writes prompts/plancore.brief.md — the authoring-seat writeBrief call is retired
+[planning-phase] consensus policy for batch batch-P1-no-brief (mode=planner): unanimous=true maxRounds=3 (source: teams.consensus_rule; settle-role clause not wired)
+
+stdout | src/services/planning-phase-no-plancore-author.test.ts > P1 (R1.2/R1.3): plancore is never spawned during initial whole-plan authoring > never registers a plancore worker_runtimes row, even with projectId/runId wired end to end
+[planning-phase] consensus policy for batch batch-P1-worker-runtimes (mode=planner): unanimous=true maxRounds=3 (source: teams.consensus_rule; settle-role clause not wired)
+
+stdout | src/services/planning-phase-no-plancore-author.test.ts > P1 (R1.2/R1.3): plancore is never spawned during initial whole-plan authoring > hands ROUND the engine-resolved context paths (north-star.md, conversation-log.md) via contextInputPaths
+[planning-phase] consensus policy for batch batch-P1-context-paths (mode=planner): unanimous=true maxRounds=3 (source: teams.consensus_rule; settle-role clause not wired)
+
+stdout | src/services/planning-phase-no-plancore-author.test.ts > P1 (R1.2/R1.3): plancore is never spawned during initial whole-plan authoring > real mode: engine-written context paths satisfy ROUND without any plancore seat authoring them
+[planning-phase] consensus policy for batch batch-P1-real-context (mode=planner): unanimous=true maxRounds=3 (source: teams.consensus_rule; settle-role clause not wired)
+
+ ✓ src/services/planning-phase-no-plancore-author.test.ts (5 tests) 966ms
+
+ Test Files  2 passed (2)
+      Tests  36 passed (36)
+   Start at  03:21:58
+   Duration  21.56s (transform 312ms, setup 14ms, collect 434ms, tests 20.92s, environment 0ms, prepare 59ms)
+

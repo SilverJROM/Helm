@@ -1,0 +1,10 @@
+
+ RUN  v2.1.9 /home/agjrom/websites/Helm
+
+ ✓ src/services/planning-review-round-objection-mono.test.ts (8 tests) 24ms
+
+ Test Files  1 passed (1)
+      Tests  8 passed (8)
+   Start at  02:35:57
+   Duration  260ms (transform 103ms, setup 12ms, collect 117ms, tests 24ms, environment 0ms, prepare 29ms)
+
