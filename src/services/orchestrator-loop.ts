@@ -14,6 +14,7 @@ import { classifySeatPane } from './seat-pane-state.js';
 import { CANONICAL_CYCLE_ARTIFACTS } from './cycle-artifact-paths.js';
 import type { RoutingConfigService } from './routing-config-service.js';
 import { getRunAbort } from './run-abort-registry.js';
+import type { CycleGitAllowCycle } from '../security/landlock-sandbox.js';
 import {
   httpNotificationTransport,
   notifyBlockedRun,
@@ -228,6 +229,10 @@ export class OrchestratorLoop {
   // (implementer/validator dispatch, brain-decision, final-tests validator) so retries/escalations do
   // not silently launch read-all. undefined (default) => read-all, byte-identical to before.
   private readonly strictReadAllow?: string[];
+  // B9 (R4.1/R4.3): persisted, revalidated cycle identity for THIS run — threaded to the
+  // implementer/validator dispatch and the final-validation seat only (CYCLE SEATS ONLY).
+  // Absent (every non-cycle run) => those spawns carry no git env, byte-identical to before.
+  private readonly cycleGitIdentity?: CycleGitAllowCycle;
   private readonly brainRole: string;
   private readonly brainModel?: string;
   private readonly brainProvider?: string;
@@ -235,7 +240,7 @@ export class OrchestratorLoop {
 
   constructor(
     private readonly transport: ITransport,
-    opts: { runDir: string; batchId?: string; writer?: ThinRunArtifactWriter; artifactService?: RunArtifactService; escalationService?: EscalationService | null; panelService?: PanelService; redTeamAgents?: Array<{ role: string; agent_id?: number; model?: string; provider?: string }>; deliberationRoster?: any[]; projectDir?: string; projectId?: number; runId?: number; routingConfig?: RoutingConfigService | null; verifySeatBinary?: (provider: string, model: string) => Promise<{ ok: boolean; bin?: string | null; reason?: string }>; strictReadAllow?: string[]; brainRole?: string; brainModel?: string; brainProvider?: string; notificationTransport?: NotificationTransport }
+    opts: { runDir: string; batchId?: string; writer?: ThinRunArtifactWriter; artifactService?: RunArtifactService; escalationService?: EscalationService | null; panelService?: PanelService; redTeamAgents?: Array<{ role: string; agent_id?: number; model?: string; provider?: string }>; deliberationRoster?: any[]; projectDir?: string; projectId?: number; runId?: number; routingConfig?: RoutingConfigService | null; verifySeatBinary?: (provider: string, model: string) => Promise<{ ok: boolean; bin?: string | null; reason?: string }>; strictReadAllow?: string[]; brainRole?: string; brainModel?: string; brainProvider?: string; notificationTransport?: NotificationTransport; cycleGitIdentity?: CycleGitAllowCycle }
   ) {
     this.runDir = opts.runDir;
     this.batchId = opts.batchId || 'batch-B0';
@@ -252,6 +257,7 @@ export class OrchestratorLoop {
     this.projectId = opts.projectId;
     this.verifySeatBinary = opts.verifySeatBinary;
     this.strictReadAllow = opts.strictReadAllow;  // B-ISO1: run-scoped strict read policy for every seat this loop spawns
+    this.cycleGitIdentity = opts.cycleGitIdentity;  // B9: persisted cycle identity, threaded to cycle seats only
     this.brainRole = opts.brainRole || 'ibrain';
     this.brainModel = opts.brainModel;
     this.brainProvider = opts.brainProvider;
@@ -1053,6 +1059,11 @@ export class OrchestratorLoop {
       attemptId: this.currentAttemptId,  // POCFIX7: thread real attemptId for per-task dispatches (FK); planning omits/uses 0 and skips insert
       projectDir: this.projectDir,  // POCFIX14: fence implementer/validator to the registered project dir so they can WRITE the code/tests there
       ...(this.strictReadAllow ? { strictReadAllow: this.strictReadAllow } : {}),  // B-ISO1: run-scoped strict read fence (undefined => read-all, unchanged)
+      // B9 (R4.1/R4.3): CYCLE SEATS ONLY — implementer/validator get the persisted cycle git
+      // identity; every other role dispatched through performRolePhase (e.g. 'reviewer') does not,
+      // matching the plan's exact three seat classes (the third, final-validation, is threaded at
+      // its own spawn site below).
+      ...(this.cycleGitIdentity && (role === 'implementer' || role === 'validator') ? { cycleGitIdentity: this.cycleGitIdentity } : {}),
     });
     const handle = spawned.handle;
 
@@ -2810,7 +2821,18 @@ For each requirement confirm VERIFIED status with evidence from artifacts/state/
     }
     let dispatchOffset = 0;
     try { dispatchOffset = (await fs.stat(path.join(this.runDir, 'callbacks.md'))).size; } catch {}
-    const spawned = await this.transport.spawn({ role: 'validator', brief: dispatchBrief, runDir: this.runDir, batchId: this.batchId, effort: this.currentEffort, ...(this.strictReadAllow ? { strictReadAllow: this.strictReadAllow } : {}) });  // B-ISO1: run-scoped strict read fence on the final-tests validator seat
+    const spawned = await this.transport.spawn({
+      role: 'validator',
+      brief: dispatchBrief,
+      runDir: this.runDir,
+      batchId: this.batchId,
+      effort: this.currentEffort,
+      projectDir: this.projectDir,  // B9: this seam previously omitted projectDir, silently reproducing the fenced-write bug at final tests
+      ...(this.strictReadAllow ? { strictReadAllow: this.strictReadAllow } : {}),  // B-ISO1: run-scoped strict read fence on the final-tests validator seat
+      // B9 (R4.1/R4.3): final-validation is the third CYCLE SEAT class — carries the same persisted
+      // cycle git identity as implementer/validator dispatch.
+      ...(this.cycleGitIdentity ? { cycleGitIdentity: this.cycleGitIdentity } : {}),
+    });
     const handle = spawned.handle;
     // R8: composer submit watchdog on the final-validation wait too.
     let seen: { state: string; note: string | null };

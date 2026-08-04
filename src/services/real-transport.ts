@@ -5,7 +5,7 @@ import type { ITransport } from './fake-transport.js';
 import { TmuxService } from '../tmux/tmux-service.js';
 import { DispatchService, type DispatchStartParams } from './dispatch-service.js';
 import { ProviderResolverService } from './provider-resolver-service.js';
-import { resolveHelmSandboxBin, makeStrictReadProfileEnv, makeRunRootWriteAllowEnv } from '../security/landlock-sandbox.js';
+import { resolveHelmSandboxBin, makeStrictReadProfileEnv, makeRunRootWriteAllowEnv, makeCycleGitAllowEnv, resolveCycleGitReadPaths, type CycleGitAllowCycle } from '../security/landlock-sandbox.js';
 import { startGovernedDocGuard, type GovernedDocGuardHandle } from './doc-path-guard.js';
 import { PROVIDERS, seatReadySignal } from '../config/providers.js';
 import { matchInterstitial, InterstitialBlockedError } from './cli-interstitials.js';
@@ -192,6 +192,11 @@ export class RealTransport implements ITransport {
     seatId?: string;
     round?: number;
     briefFileName?: string;
+    // B9 (R4.1/R4.3): persisted, revalidated cycle identity — CYCLE SEATS ONLY (implementation,
+    // validator, final-validation seats bound to this cycle). Absent (master-runtime spawns, chat
+    // sessions, non-cycle workers) => no git env composed at all. A stale/mismatched identity
+    // fails this spawn closed (makeCycleGitAllowEnv throws before any session is created).
+    cycleGitIdentity?: CycleGitAllowCycle;
   }): Promise<{ handle: string; role: string }> {
     const role = params.role;
     const runDir = params.runDir;
@@ -228,14 +233,27 @@ export class RealTransport implements ITransport {
     // (verified: --bare breaks the Max keychain login; these flags do not). Defense-in-depth on top of the
     // helm_pm role alias. See waitFor*ComposerReady — the TUI/prompt is unchanged by these flags.
     const { envPrefix, launchCmd } = applyEnvelopeIsolation(provider, launchSpec.launch_cmd);
+    // B9 (R4.1/R4.3): compose (+ fail-closed validate) the cycle git capability BEFORE the
+    // createSession side effect below, so a stale/mismatched identity refuses this spawn cleanly —
+    // no session is ever created for a spawn that would launch half-fenced. Absent cycleGitIdentity
+    // (master-runtime spawns, chat sessions, non-cycle workers) → '' (byte-identical, no git env).
+    const cycleGitEnv = params.cycleGitIdentity ? makeCycleGitAllowEnv(params.cycleGitIdentity) : '';
+    // B9: under the strict read profile, the git capability's write classes (ADMIN/REF_RW/OBJ) are
+    // useless without a matching READ grant on the git common dir (config/HEAD/packed-refs/index) —
+    // write bits without reads leave git broken. Fold that one path into the strict allowlist before
+    // composing strictEnv; read-all (strictReadAllow undefined) already covers it, so this only
+    // engages when the caller opted this seat into strict mode.
+    const strictAllow = params.strictReadAllow !== undefined && params.cycleGitIdentity
+      ? Array.from(new Set([...params.strictReadAllow, ...resolveCycleGitReadPaths(params.cycleGitIdentity)]))
+      : params.strictReadAllow;
     // B-ISO1: compose (+ fail-closed validate) the OPT-IN strict read env BEFORE the createSession
     // side effect below, so a bad allowlist refuses the spawn cleanly. Absent → '' (byte-identical).
-    const strictEnv = params.strictReadAllow !== undefined ? makeStrictReadProfileEnv(params.strictReadAllow) : '';
+    const strictEnv = strictAllow !== undefined ? makeStrictReadProfileEnv(strictAllow) : '';
     // B1 (R2.12/F6, send-back CRITICAL fix): opt-in extra write-fence grant scoped to THIS seat's own
     // runDir only — never the shared HELM_RUN_ROOT (that would let this seat write sibling runs'
     // callbacks.md). '' when HELM_RUN_ROOT is unset or runDir isn't under it (byte-identical default).
     const runRootWriteEnv = makeRunRootWriteAllowEnv(runDir);
-    const fencedLaunch = `${strictEnv}${runRootWriteEnv}${envPrefix}${sandboxBin} ${fenceDir} ${launchCmd}`;
+    const fencedLaunch = `${strictEnv}${runRootWriteEnv}${cycleGitEnv}${envPrefix}${sandboxBin} ${fenceDir} ${launchCmd}`;
 
     // POCFIX7: for claude, pre-ensure trust in launch dir (fenceDir / project cwd) so no interactive dialog blocks boot.
     // Best-effort (never abort launch). Only claude (grok/codex have no such).

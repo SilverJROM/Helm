@@ -450,7 +450,23 @@ function resolveCommonAndAdminFromWorktree(
   return { common, admin };
 }
 
-export function makeCycleGitAllowEnv(cycle: CycleGitAllowCycle): string {
+/** Resolved absolute paths for the four git capability classes, pre-formatting. */
+type ResolvedCycleGitAllowPaths = {
+  ro: string;
+  adminPath: string;
+  refPath: string;
+  logPath: string;
+  objPath: string;
+};
+
+/**
+ * B9 (R4.1/R4.3): shared resolution/validation core, factored out of `makeCycleGitAllowEnv` so
+ * `resolveCycleGitReadPaths` (below) can fold the same RO anchor into a strict-profile
+ * HELM_SANDBOX_RO_ALLOW list without a second, independently-drifting implementation of these
+ * checks. Returns null for a no-worktree (legacy) cycle — byte-identical no-op — and throws on
+ * every fail-closed condition `makeCycleGitAllowEnv` always has.
+ */
+function resolveCycleGitAllowPaths(cycle: CycleGitAllowCycle): ResolvedCycleGitAllowPaths | null {
   if (!cycle || typeof cycle !== "object") {
     throw new Error("cycle git allow: cycle is required");
   }
@@ -460,7 +476,7 @@ export function makeCycleGitAllowEnv(cycle: CycleGitAllowCycle): string {
 
   // No worktree → byte-identical no-op (legacy null-identity cycles).
   if ((wtPath == null || wtPath === "") && (wtId == null || wtId === "")) {
-    return "";
+    return null;
   }
   // Partial identity is a caller/persist bug — fail closed, never half-grant.
   if (wtPath == null || wtPath === "" || wtId == null || wtId === "") {
@@ -613,6 +629,13 @@ export function makeCycleGitAllowEnv(cycle: CycleGitAllowCycle): string {
     throw new Error(`cycle git allow: GIT_OBJ must be the objects dir (got '${objPath}')`);
   }
 
+  return { ro, adminPath, refPath, logPath, objPath };
+}
+
+export function makeCycleGitAllowEnv(cycle: CycleGitAllowCycle): string {
+  const resolved = resolveCycleGitAllowPaths(cycle);
+  if (!resolved) return "";
+  const { ro, adminPath, refPath, logPath, objPath } = resolved;
   // REF_RW is a colon-separated list; each entry was already validated free of ':'.
   const refRw = `${refPath}:${logPath}`;
   return (
@@ -621,6 +644,19 @@ export function makeCycleGitAllowEnv(cycle: CycleGitAllowCycle): string {
     `HELM_SANDBOX_GIT_REF_RW='${shellSingleQuote(refRw)}' ` +
     `HELM_SANDBOX_GIT_OBJ='${shellSingleQuote(objPath)}' `
   );
+}
+
+/**
+ * B9 (R4.1/R4.3): the git-common READ anchor alone (the same path `makeCycleGitAllowEnv` emits as
+ * HELM_SANDBOX_GIT_RO), for callers that must fold it into HELM_SANDBOX_RO_ALLOW under the strict
+ * read profile. Write bits (ADMIN/REF_RW/OBJ) without a matching READ grant leave git unable to
+ * open its own config/HEAD/packed-refs/index — the capability would be write-only and broken.
+ * Returns [] for a no-worktree (legacy) cycle — byte-identical no-op; throws on the same
+ * fail-closed terms as `makeCycleGitAllowEnv` for a stale/malformed identity.
+ */
+export function resolveCycleGitReadPaths(cycle: CycleGitAllowCycle): string[] {
+  const resolved = resolveCycleGitAllowPaths(cycle);
+  return resolved ? [resolved.ro] : [];
 }
 
 /**
