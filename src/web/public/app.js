@@ -878,6 +878,10 @@ function App() {
   // phase=complete but still status=active). cycleId -> busy flag / inline outcome note.
   const [ccCompleting, setCcCompleting] = useState({});
   const [ccCompleteNote, setCcCompleteNote] = useState({});
+  // B23 / R1 UI: archive (completed→archived) and un-archive (archived→completed). Status-only;
+  // same busy/note shape as completeCycleAction. cycleId -> busy flag / inline outcome note.
+  const [ccArchiving, setCcArchiving] = useState({});
+  const [ccArchiveNote, setCcArchiveNote] = useState({});
   // IS-R2 (impl-start): Start Implementation button. cycleId -> busy flag / inline notice for the
   // POST /start-implementation outcome. The button is enabled purely on (valid plan.md
   // exists AND no active run) — never gated behind Approve-Planning. Clicking it starts the run.
@@ -5228,7 +5232,8 @@ function App() {
   const ccProjectCycles = (projectId) => [
     ...((ccOvData && ccOvData.active) || []),
     ...((ccOvData && ccOvData.pending) || []),
-    ...((ccOvData && ccOvData.completed) || [])
+    ...((ccOvData && ccOvData.completed) || []),
+    ...((ccOvData && ccOvData.archived) || [])
   ].filter(c => c.project_id === projectId);
   const ccOpenWorkspace = (projectId, cycleId, phase) => {
     setCcWsProjectId(projectId);
@@ -5763,6 +5768,77 @@ function App() {
       setCcCompleteNote(p => ({ ...p, [cycleId]: 'Complete request failed to send — retry.' }));
     } finally {
       setCcCompleting(p => ({ ...p, [cycleId]: false }));
+    }
+  };
+  // B23 / R1.2–R1.3: Archive is offered only on completed cycles (server 409s otherwise). Status-only
+  // — no second folder move; cycle leaves Completed list and appears under Archived.
+  const ccFindOverviewCycle = (cycleId) => {
+    const buckets = ['active', 'pending', 'completed', 'archived'];
+    for (const b of buckets) {
+      const row = ((ccOvData && ccOvData[b]) || []).find(x => x.id === cycleId);
+      if (row) return row;
+    }
+    return null;
+  };
+  const archiveCycleAction = async (cycleId) => {
+    if (ccArchiving[cycleId]) return;
+    const c = ccFindOverviewCycle(cycleId);
+    const label = c ? c.name : `cycle ${cycleId}`;
+    if (!confirm(`Archive "${label}"?\n\nIt leaves the Completed list and appears under Archived. Nothing is deleted — files and history stay put.`)) return;
+    setCcArchiving(p => ({ ...p, [cycleId]: true }));
+    setCcArchiveNote(p => ({ ...p, [cycleId]: '' }));
+    try {
+      const r = await authedFetch(`/api/cycles/${cycleId}/archive`, { method: 'POST', allowStatuses: [400, 403, 404, 409] });
+      if (r.ok) {
+        setCcArchiveNote(p => ({ ...p, [cycleId]: 'Cycle archived — moved to Archived.' }));
+        loadCcOverview();
+        // If we archived from the workspace, drop back to overview on the Archived tab so the
+        // bucket move is visible without hunting for a now-missing completed row.
+        if (ccWsCycleId === cycleId) {
+          setCcWsProjectId(null);
+          setCcWsCycleId(null);
+          setCcOvBucket('archived');
+        }
+      } else {
+        let msg = 'Archive failed.';
+        try { const d = await r.json(); if (d && d.error) msg = d.error; } catch {}
+        if (r.status === 409) msg = 'Only Completed cycles can be archived.';
+        setCcArchiveNote(p => ({ ...p, [cycleId]: msg }));
+      }
+    } catch (e) {
+      setCcArchiveNote(p => ({ ...p, [cycleId]: 'Archive request failed to send — retry.' }));
+    } finally {
+      setCcArchiving(p => ({ ...p, [cycleId]: false }));
+    }
+  };
+  // B23 / R1.3: Un-archive restores Archived → Completed (status-only).
+  const unarchiveCycleAction = async (cycleId) => {
+    if (ccArchiving[cycleId]) return;
+    const c = ccFindOverviewCycle(cycleId);
+    const label = c ? c.name : `cycle ${cycleId}`;
+    if (!confirm(`Un-archive "${label}"?\n\nIt returns to the Completed list. Nothing is deleted.`)) return;
+    setCcArchiving(p => ({ ...p, [cycleId]: true }));
+    setCcArchiveNote(p => ({ ...p, [cycleId]: '' }));
+    try {
+      const r = await authedFetch(`/api/cycles/${cycleId}/unarchive`, { method: 'POST', allowStatuses: [400, 403, 404, 409] });
+      if (r.ok) {
+        setCcArchiveNote(p => ({ ...p, [cycleId]: 'Cycle un-archived — back in Completed.' }));
+        loadCcOverview();
+        if (ccWsCycleId === cycleId) {
+          setCcWsProjectId(null);
+          setCcWsCycleId(null);
+          setCcOvBucket('completed');
+        }
+      } else {
+        let msg = 'Un-archive failed.';
+        try { const d = await r.json(); if (d && d.error) msg = d.error; } catch {}
+        if (r.status === 409) msg = 'Only Archived cycles can be un-archived.';
+        setCcArchiveNote(p => ({ ...p, [cycleId]: msg }));
+      }
+    } catch (e) {
+      setCcArchiveNote(p => ({ ...p, [cycleId]: 'Un-archive request failed to send — retry.' }));
+    } finally {
+      setCcArchiving(p => ({ ...p, [cycleId]: false }));
     }
   };
   // IS-R2 (impl-start): manual Start Implementation. POST /api/cycles/:id/start-implementation with
@@ -7321,10 +7397,18 @@ function App() {
           </div>
           ${ccWsTab === 'implementation' ? html`<button type="button" class="btn btn-sm btn-danger" data-testid="ws-graceful-stop"
             onclick=${() => requestGracefulStop(cycle.id)}>Graceful Stop</button>` : null}
-          ${cycle.status !== 'completed' ? html`<button type="button" class="btn btn-sm" data-testid="ws-complete-cycle"
+          ${cycle.status !== 'completed' && cycle.status !== 'archived' ? html`<button type="button" class="btn btn-sm" data-testid="ws-complete-cycle"
             disabled=${!!ccCompleting[cycle.id]}
             title="Retire this cycle: its folder moves to cycle/completed/ and it leaves the active cycle list"
             onclick=${() => completeCycleAction(cycle.id)}>${ccCompleting[cycle.id] ? 'Completing…' : 'Complete cycle'}</button>` : null}
+          ${cycle.status === 'completed' ? html`<button type="button" class="btn btn-sm" data-testid="ws-archive-cycle"
+            disabled=${!!ccArchiving[cycle.id]}
+            title="Hide this completed cycle under Archived — files and history stay put"
+            onclick=${() => archiveCycleAction(cycle.id)}>${ccArchiving[cycle.id] ? 'Archiving…' : 'Archive'}</button>` : null}
+          ${cycle.status === 'archived' ? html`<button type="button" class="btn btn-sm" data-testid="ws-unarchive-cycle"
+            disabled=${!!ccArchiving[cycle.id]}
+            title="Return this cycle to the Completed list"
+            onclick=${() => unarchiveCycleAction(cycle.id)}>${ccArchiving[cycle.id] ? 'Un-archiving…' : 'Un-archive'}</button>` : null}
           <div class="cc-ws-switcher-wrap">
             <button class="btn btn-sm" data-testid="ws-cycle-switcher-btn" onclick=${() => setCcWsSwitcherOpen(!ccWsSwitcherOpen)}>Cycle switcher</button>
             ${ccWsSwitcherOpen ? html`<div class="cc-ws-switcher-menu" data-testid="ws-cycle-switcher-menu">
@@ -7343,6 +7427,7 @@ function App() {
         ${ccWsTab === 'implementation' ? html`<div class="cc-ws-impl-subtitle text-sec" data-testid="ws-impl-subtitle">${implementationSubtitle()}</div>` : null}
         ${ccWsTab === 'implementation' && ccGracefulStopNote[cycle.id] ? html`<div class="cc-ws-impl-subtitle text-sec" data-testid="ws-graceful-stop-note">${ccGracefulStopNote[cycle.id]}</div>` : null}
         ${ccCompleteNote[cycle.id] ? html`<div class="cc-ws-impl-subtitle text-sec" data-testid="ws-complete-cycle-note">${ccCompleteNote[cycle.id]}</div>` : null}
+        ${ccArchiveNote[cycle.id] ? html`<div class="cc-ws-impl-subtitle text-sec" data-testid="ws-archive-cycle-note">${ccArchiveNote[cycle.id]}</div>` : null}
       </div>
 
       <div class="tab-strip" data-testid="ws-phase-tabs">
@@ -7361,11 +7446,13 @@ function App() {
   };
 
   const renderCommandCenterOverview = () => {
-    const counts = (ccOvData && ccOvData.counts) || { pending: 0, active: 0, completed: 0 };
+    const counts = (ccOvData && ccOvData.counts) || { pending: 0, active: 0, completed: 0, archived: 0 };
+    // B23 / R1.1: fourth segmented bucket tab Archived (same badge language as the other three).
     const buckets = [
       { key: 'active', label: 'Active' },
       { key: 'pending', label: 'Pending (not started)' },
-      { key: 'completed', label: 'Completed' }
+      { key: 'completed', label: 'Completed' },
+      { key: 'archived', label: 'Archived' }
     ];
     // B5-T04: R-E3 gate-mode cycle sitting in planning phase = genuinely waiting on JROM's approval to
     // advance to implementation — the only real "waiting on you" signal available today. Parked-task
@@ -7458,7 +7545,7 @@ function App() {
         ${!ccOvLoading && !ccOvError ? (
           bucketCount === 0
             ? html`<div class="text-sec" data-testid="ov-empty" style="font-size:12px;padding:16px 0">No ${ccOvBucket} cycles yet.</div>`
-            : ccOvBucket === 'completed'
+            : (ccOvBucket === 'completed' || ccOvBucket === 'archived')
               ? html`<div class="cc-hist-list" data-testid="ov-hist-list">
                   ${bucketRows.map(row => html`<div class="cc-hist-row" key=${row.id} data-testid=${`ov-hist-row-${row.id}`}
                     onclick=${() => ccOpenWorkspace(row.project_id, row.id, row.phase)}>
@@ -7466,6 +7553,14 @@ function App() {
                     <span class="cc-hist-name">${row.name}</span>
                     <span class="chip chip-gray">${(CC_PHASE_META[row.phase] || { label: row.phase }).label}</span>
                     <span class="text-sec cc-hist-date">${row.created_at}</span>
+                    ${ccOvBucket === 'completed' ? html`<button type="button" class="btn btn-sm" data-testid=${`ov-archive-${row.id}`}
+                      disabled=${!!ccArchiving[row.id]}
+                      title="Hide under Archived — nothing deleted"
+                      onclick=${(e) => { e.stopPropagation(); archiveCycleAction(row.id); }}>${ccArchiving[row.id] ? 'Archiving…' : 'Archive'}</button>` : null}
+                    ${ccOvBucket === 'archived' ? html`<button type="button" class="btn btn-sm" data-testid=${`ov-unarchive-${row.id}`}
+                      disabled=${!!ccArchiving[row.id]}
+                      title="Return to Completed"
+                      onclick=${(e) => { e.stopPropagation(); unarchiveCycleAction(row.id); }}>${ccArchiving[row.id] ? 'Un-archiving…' : 'Un-archive'}</button>` : null}
                   </div>`)}
                 </div>`
               : html`<div class="cc-cards-grid" data-testid="ov-cards-grid">
