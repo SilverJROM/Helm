@@ -1,0 +1,10 @@
+
+ RUN  v2.1.9 /home/agjrom/websites/Helm
+
+ ✓ src/services/planning-review-round-block-diff.test.ts (6 tests) 22ms
+
+ Test Files  1 passed (1)
+      Tests  6 passed (6)
+   Start at  07:45:54
+   Duration  267ms (transform 111ms, setup 13ms, collect 124ms, tests 22ms, environment 0ms, prepare 30ms)
+

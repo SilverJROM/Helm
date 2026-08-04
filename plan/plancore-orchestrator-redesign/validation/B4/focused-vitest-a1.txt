@@ -1,0 +1,11 @@
+
+ RUN  v2.1.9 /home/agjrom/websites/Helm
+
+ ✓ src/services/brief-writer-planning-brief-deleted.test.ts (4 tests) 15ms
+ ✓ src/services/brief-writer-q11.test.ts (3 tests) 3ms
+
+ Test Files  2 passed (2)
+      Tests  7 passed (7)
+   Start at  01:01:12
+   Duration  314ms (transform 80ms, setup 14ms, collect 90ms, tests 17ms, environment 0ms, prepare 57ms)
+

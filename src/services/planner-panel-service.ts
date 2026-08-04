@@ -262,11 +262,15 @@ export class PlannerPanelService {
       this.requireModel(Number(b.model_id));
     }
 
+    // S05 / AC20: planning_panel_size = N co-planners (member count), excluding plancore.
+    // Mirror member count in the same transaction as the panel rows — never drift silently.
+    const panelSize = members.length;
+
     this.db.raw.transaction(() => {
       this.db.prepare('DELETE FROM project_planner_panel WHERE project_id = ?').run(projectId);
       this.db.prepare(
-        `UPDATE projects SET planner_default_effort = ?, updated_at = datetime('now') WHERE id = ?`
-      ).run(default_effort, projectId);
+        `UPDATE projects SET planner_default_effort = ?, planning_panel_size = ?, updated_at = datetime('now') WHERE id = ?`
+      ).run(default_effort, panelSize, projectId);
 
       const ins = this.db.prepare(`
         INSERT INTO project_planner_panel (project_id, slot_index, role, model_id, is_lead, effort)

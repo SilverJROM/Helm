@@ -1,0 +1,10 @@
+
+ RUN  v2.1.9 /home/agjrom/websites/Helm
+
+ ✓ src/planning-regression-index.test.ts (21 tests) 13ms
+
+ Test Files  1 passed (1)
+      Tests  21 passed (21)
+   Start at  07:53:47
+   Duration  270ms (transform 64ms, setup 23ms, collect 48ms, tests 13ms, environment 0ms, prepare 54ms)
+

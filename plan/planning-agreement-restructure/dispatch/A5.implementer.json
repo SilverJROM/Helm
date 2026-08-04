@@ -1,0 +1,22 @@
+{
+  "schema_version": 4,
+  "dispatch_status": "ready",
+  "batch_id": "A5",
+  "role": "implementer",
+  "run_dir": "/home/agjrom/websites/Helm/plan/planning-agreement-restructure",
+  "session": "x-15_impl_sonnet5a5_helm",
+  "brief": "/home/agjrom/websites/Helm/plan/planning-agreement-restructure/prompts/A5.md",
+  "prebaked_brief": "/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/A5.implementer.brief.md",
+  "callbacks_file": "/home/agjrom/websites/Helm/plan/planning-agreement-restructure/callbacks.md",
+  "dispatched_at": "2026-07-30T00:26:03Z",
+  "estimate_min": 28,
+  "bucket": "SHORT",
+  "wakeup_delay_sec": 3360,
+  "wakeup_marker_path": "/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/A5.wakeup-required",
+  "watcher_pid": 2015699,
+  "watcher_pid_file": "/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/A5.watcher-implementer.pid",
+  "watcher_log": "/home/agjrom/websites/Helm/plan/planning-agreement-restructure/dispatch/watcher-A5-implementer.log",
+  "dispatch_marker": "DISPATCH-A5-implementer-2015432-1785371163",
+  "wakeup_acked_at": null,
+  "wakeup_acked_by": null
+}

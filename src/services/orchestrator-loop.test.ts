@@ -5,15 +5,23 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { FakeTransport } from './fake-transport.js';
-import { OrchestratorLoop } from './orchestrator-loop.js';
+import {
+  CallbackWaitError,
+  OrchestratorLoop,
+  RunAbortedError,
+  SeatAuthTerminalError,
+  inferKlooRoute,
+} from './orchestrator-loop.js';
+import { requestRunAbort } from './run-abort-registry.js';
 import { RunArtifactService } from './run-artifact-service.js';
+import { ProjectService } from './project-service.js';
 import { TaskQueueService } from './task-queue-service.js';
 import { DatabaseService } from '../db/database.js';
 import { SCHEMA_VERSION } from '../db/schema.js';
 import { EscalationService } from './escalation-service.js';
 import { PanelService } from './panel-service.js';
 import { resolveAgentLaunchSpec, ProviderResolverService } from './provider-resolver-service.js';
-import { inferKlooRoute } from './orchestrator-loop.js';
+import * as WorkerRuntimeFinalize from './worker-runtime-finalize.js';
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -406,9 +414,10 @@ describe('orchestrator-loop B6 queue (DSP8) + TaskQueueService (USE_FAKE_TMUX)',
     q.enqueue(rid, tDep, [t2]);
 
     // 1. exactly one active
-    expect(q.getNextReady(rid)).toBe(t1);
+    const c1 = q.claimNextReady(rid);
+    expect(c1!.taskId).toBe(t1);
     expect(q.isInFlight(rid)).toBe(true);
-    expect(q.getNextReady(rid)).toBeNull(); // strictly one
+    expect(q.claimNextReady(rid)).toBeNull(); // strictly one
 
     // inject while t1 "in flight"
     q.enqueue(rid, tU, [], true); // URGENT after in-flight
@@ -416,23 +425,26 @@ describe('orchestrator-loop B6 queue (DSP8) + TaskQueueService (USE_FAKE_TMUX)',
     q.enqueue(rid, tDepF, [tF]);
 
     // complete t1 -> next should be urgent (after in-flight at time of inject)
-    q.markComplete(t1, rid);
-    expect(q.getNextReady(rid)).toBe(tU); // urgent jumped after the (now done) in-flight
-    q.markComplete(tU, rid);
+    q.markComplete(c1!);
+    const cU = q.claimNextReady(rid);
+    expect(cU!.taskId).toBe(tU); // urgent jumped after the (now done) in-flight
+    q.markComplete(cU!);
 
     // now normal t2
-    expect(q.getNextReady(rid)).toBe(t2);
-    q.markComplete(t2, rid);
+    const c2 = q.claimNextReady(rid);
+    expect(c2!.taskId).toBe(t2);
+    q.markComplete(c2!);
 
     // dep now ready
-    expect(q.getNextReady(rid)).toBe(tDep);
-    q.markComplete(tDep, rid);
+    const cDep = q.claimNextReady(rid);
+    expect(cDep!.taskId).toBe(tDep);
+    q.markComplete(cDep!);
 
     // 2+3. failed blocks its dependents (tDepF depends on tF)
     // enqueue tF already done above, now fail it
-    q.markFailed(tF, rid);
+    q.markFailed(q.freezeTerminalToken(rid, tF)!);
     expect(q.isBlockedByFailure(tDepF)).toBe(true);
-    expect(q.getNextReady(rid)).toBeNull(); // blocked by failure dep
+    expect(q.claimNextReady(rid)).toBeNull(); // blocked by failure dep
 
     // cleanup
     dbs.close();
@@ -448,28 +460,29 @@ describe('orchestrator-loop B6 queue (DSP8) + TaskQueueService (USE_FAKE_TMUX)',
     q.enqueue(rid, 3, [1, 2]);
     q.enqueue(rid, 4, []);      // parallel indep
 
-    expect(q.getNextReady(rid)).toBe(1); q.markComplete(1, rid);
+    const cStart = q.claimNextReady(rid);
+    expect(cStart!.taskId).toBe(1); q.markComplete(cStart!);
     // after 1: 2 and 4 ready. Prove one-at-a-time + 3 waits for 2.
-    let n: number | null = q.getNextReady(rid)!;
-    expect([2, 4]).toContain(n);
-    const first = n;
-    q.markComplete(n, rid);
+    let n = q.claimNextReady(rid)!;
+    expect([2, 4]).toContain(n.taskId);
+    const first = n.taskId;
+    q.markComplete(n);
 
-    n = q.getNextReady(rid)!;
+    n = q.claimNextReady(rid)!;
     if (first === 2) {
-      expect(n).toBe(3); // 3 now unblocked
+      expect(n.taskId).toBe(3); // 3 now unblocked
     } else {
-      expect(n).toBe(2);
-      q.markComplete(2, rid);
-      n = q.getNextReady(rid)!;
-      expect(n).toBe(3);
+      expect(n.taskId).toBe(2);
+      q.markComplete(n);
+      n = q.claimNextReady(rid)!;
+      expect(n.taskId).toBe(3);
     }
-    q.markComplete(3, rid);
+    q.markComplete(n);
 
     // remaining (4 if not taken)
-    n = q.getNextReady(rid);
-    if (n !== null) q.markComplete(n, rid);
-    expect(q.getNextReady(rid)).toBeNull();
+    const rest = q.claimNextReady(rid);
+    if (rest !== null) q.markComplete(rest);
+    expect(q.claimNextReady(rid)).toBeNull();
   });
 
   // B10-T02: cycle detection (real cycle must surface as deadlock reason, not silent null==done)
@@ -483,11 +496,11 @@ describe('orchestrator-loop B6 queue (DSP8) + TaskQueueService (USE_FAKE_TMUX)',
     expect(q.getDeadlockReason(rid)).toBeNull();
 
     // simulate progress until blocked legitimately by failure
-    q.markComplete(10, rid);
-    q.markComplete(11, rid);
-    q.markFailed(12, rid);  // 12 failed, any dependents would be blocked by failed (legit)
+    q.markComplete(q.freezeTerminalToken(rid, 10)!);
+    q.markComplete(q.freezeTerminalToken(rid, 11)!);
+    q.markFailed(q.freezeTerminalToken(rid, 12)!);  // 12 failed, any dependents would be blocked by failed (legit)
     // no more ready, pending none in this case
-    expect(q.getNextReady(rid)).toBeNull();
+    expect(q.claimNextReady(rid)).toBeNull();
     expect(q.getDeadlockReason(rid)).toBeNull();  // not a cycle
 
     // Now a real cycle case
@@ -495,7 +508,7 @@ describe('orchestrator-loop B6 queue (DSP8) + TaskQueueService (USE_FAKE_TMUX)',
     q.enqueue(rid2, 20, [21]);
     q.enqueue(rid2, 21, [20]);
     // no one can ever start
-    expect(q.getNextReady(rid2)).toBeNull();
+    expect(q.claimNextReady(rid2)).toBeNull();
     const reason = q.getDeadlockReason(rid2);
     expect(reason).toMatch(/deadlock.*cycle/);
     expect(reason).toMatch(/20,21|21,20/);
@@ -1587,16 +1600,17 @@ describe('orchestrator-loop B8 escalation ladder (USE_FAKE_TMUX)', () => {
     q.enqueue(99, 2, [1]);
     q.enqueue(99, 3, [2]);
     q.enqueue(99, 4, [1]);
-    expect(q.getNextReady(99)).toBe(1);
-    q.markComplete(1, 99);
-    expect(q.getNextReady(99)).toBe(2);
+    const c99a = q.claimNextReady(99);
+    expect(c99a!.taskId).toBe(1);
+    q.markComplete(c99a!);
+    expect(q.claimNextReady(99)!.taskId).toBe(2);
     // fail variant
     const q2 = new TaskQueueService();
     q2.enqueue(99, 1, []);
     q2.enqueue(99, 2, [1]);
     q2.enqueue(99, 4, [1]);
-    q2.markFailed(1, 99);
-    expect(q2.getNextReady(99)).toBeNull(); // 2 and 4 blocked
+    q2.markFailed(q2.freezeTerminalToken(99, 1)!);
+    expect(q2.claimNextReady(99)).toBeNull(); // 2 and 4 blocked
   });
 
   it('projcore-emit-status.sh accepts red-team VERDICT-READY and validator PASS (d)', async () => {
@@ -2235,6 +2249,257 @@ describe('POCFIX22 regression: byte-offset sinceOffset must use Buffer (not char
     const goodWindow: string = await (loop as any).readCallbacksWindow(sinceOffset);
     expect(goodWindow.includes(unique)).toBe(true);
   }, 15000);
+});
+
+describe('S01 finalizeWorkerRuntime chokepoint: all terminal paths use finalizeWorkerRuntimeRow', () => {
+  let runDir: string;
+  let transport: FakeTransport;
+  let loop: OrchestratorLoop;
+  let dbs: DatabaseService;
+  let svc: RunArtifactService;
+  let tmpDbPath: string;
+  let projectId: number;
+  let runId: number;
+  let attemptId: number;
+
+  const setupActiveAttempt = async (batchId: string) => {
+    runDir = await fs.mkdtemp(path.join(os.tmpdir(), 'helm-s01-finalize-'));
+    await fs.writeFile(path.join(runDir, 'callbacks.md'), '# S01 callbacks\n', 'utf8');
+
+    tmpDbPath = path.join(os.tmpdir(), `helm-s01-finalize-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+    dbs = new DatabaseService(tmpDbPath);
+    svc = new RunArtifactService(dbs);
+
+    const projects = new ProjectService(dbs);
+    const project = projects.createProject({
+      name: `s01-finalize-${Date.now()}`,
+      directory: path.join(os.tmpdir(), 'helm-s01-finalize-project'),
+    });
+    projectId = project.id;
+    runId = svc.createRun(projectId, batchId);
+
+    const taskId = svc.recordTask(runId, 'S01-001', 'S01 terminal finalize writer');
+    attemptId = svc.recordAttempt(taskId, 1);
+
+    transport = new FakeTransport();
+    loop = new OrchestratorLoop(transport, {
+      runDir,
+      batchId,
+      artifactService: svc,
+    });
+
+    (loop as any).projectId = projectId;
+    (loop as any).runId = runId;
+    (loop as any).taskId = taskId;
+    (loop as any).currentAttemptId = attemptId;
+  };
+
+  const workerRuntimeRow = () =>
+    dbs.raw
+      .prepare('SELECT id, state, exit_reason, ended_at FROM worker_runtimes WHERE run_id=? ORDER BY id DESC LIMIT 1')
+      .get(runId) as any;
+
+  const cleanup = async () => {
+    if (runDir) {
+      await fs.rm(runDir, { recursive: true, force: true }).catch(() => {});
+    }
+    if (dbs) dbs.close();
+    if (tmpDbPath) {
+      await fs.rm(tmpDbPath).catch(() => {});
+    }
+  };
+
+  beforeEach(async () => {
+    await setupActiveAttempt('batch-S01');
+  });
+
+  afterEach(async () => {
+    await cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it('DONE terminal path writes via finalizeWorkerRuntimeRow', async () => {
+    const finalizeSpy = vi.spyOn(WorkerRuntimeFinalize, 'finalizeWorkerRuntimeRow');
+    const callbacks = path.join(runDir, 'callbacks.md');
+
+    const p = (loop as any).performRolePhase('implementer', 'S01 done terminal path', ['DONE']);
+    await sleep(20);
+    await fs.appendFile(callbacks, '[helm callback] implementer batch-S01 STATUS: DONE — all clear\n');
+    const result = await p;
+
+    expect(result.state).toBe('DONE');
+    const row = workerRuntimeRow();
+    expect(row.state).toBe('done');
+    expect(row.exit_reason).toBe('reaped-DONE');
+    expect(row.ended_at).toBeTruthy();
+    expect(finalizeSpy).toHaveBeenCalledWith(expect.anything(), row.id, 'done', 'reaped-DONE');
+  });
+
+  it('auth fault path writes via finalizeWorkerRuntimeRow', async () => {
+    const finalizeSpy = vi.spyOn(WorkerRuntimeFinalize, 'finalizeWorkerRuntimeRow');
+    const brief = 'S01 auth fault terminal path';
+    transport.queueSeatScript([
+      {
+        sessionAlive: true,
+        pane: `${brief}\nAuthentication required — your session has expired`,
+        composerHoldsBrief: false,
+      },
+    ]);
+
+    const p = (loop as any).performRolePhase('implementer', brief, ['DONE']);
+    await expect(p).rejects.toBeInstanceOf(SeatAuthTerminalError);
+
+    const row = workerRuntimeRow();
+    expect(row.state).toBe('reaped');
+    expect(row.exit_reason).toBe('implementer-seat-auth-paused');
+    expect(finalizeSpy).toHaveBeenCalledWith(expect.anything(), row.id, 'reaped', 'implementer-seat-auth-paused');
+  });
+
+  it('failed terminal path writes via finalizeWorkerRuntimeRow', async () => {
+    const finalizeSpy = vi.spyOn(WorkerRuntimeFinalize, 'finalizeWorkerRuntimeRow');
+    const previousWall = process.env.HELM_CB_WALL_MS;
+    const previousFirst = process.env.HELM_CB_FIRST_CALLBACK_MS;
+    process.env.HELM_CB_WALL_MS = '120';
+    process.env.HELM_CB_FIRST_CALLBACK_MS = '120';
+
+    try {
+      const p = (loop as any).performRolePhase('implementer', 'S01 failed terminal path', ['DONE']);
+      await expect(p).rejects.toBeInstanceOf(CallbackWaitError);
+
+      const row = workerRuntimeRow();
+      expect(row.state).toBe('failed');
+      expect(row.exit_reason.startsWith('implementer-')).toBe(true);
+      expect(row.exit_reason).toBe('implementer-wall-timeout');
+      expect(finalizeSpy).toHaveBeenCalledWith(expect.anything(), row.id, 'failed', 'implementer-wall-timeout');
+    } finally {
+      if (previousWall === undefined) delete process.env.HELM_CB_WALL_MS;
+      else process.env.HELM_CB_WALL_MS = previousWall;
+      if (previousFirst === undefined) delete process.env.HELM_CB_FIRST_CALLBACK_MS;
+      else process.env.HELM_CB_FIRST_CALLBACK_MS = previousFirst;
+    }
+  });
+
+  it('run-abort path writes via finalizeWorkerRuntimeRow', async () => {
+    const finalizeSpy = vi.spyOn(WorkerRuntimeFinalize, 'finalizeWorkerRuntimeRow');
+
+    const p = (loop as any).performRolePhase('implementer', 'S01 abort terminal path', ['DONE']);
+    await sleep(10);
+    requestRunAbort(runId, 'operator stop');
+
+    await expect(p).rejects.toBeInstanceOf(RunAbortedError);
+
+    const row = workerRuntimeRow();
+    expect(row.state).toBe('reaped');
+    expect(row.exit_reason).toBe('run-aborted');
+    expect(finalizeSpy).toHaveBeenCalledWith(expect.anything(), row.id, 'reaped', 'run-aborted');
+  });
+});
+
+/**
+ * S02 (5) — reapLiveRunWorkers residual: boundary-sweep must use finalizeWorkerRuntimeRow
+ * and leave helm_sessions consistent (idle when still active; reaped stays reaped).
+ */
+describe('S02 reapLiveRunWorkers routes through finalizeWorkerRuntimeRow + registry', () => {
+  let runDir: string;
+  let transport: FakeTransport;
+  let loop: OrchestratorLoop;
+  let dbs: DatabaseService;
+  let svc: RunArtifactService;
+  let tmpDbPath: string;
+  let projectId: number;
+  let runId: number;
+  let reg: import('./session-registry-service.js').SessionRegistryService;
+
+  beforeEach(async () => {
+    runDir = await fs.mkdtemp(path.join(os.tmpdir(), 'helm-s02-reap-'));
+    await fs.writeFile(path.join(runDir, 'callbacks.md'), '# S02 reapLiveRunWorkers\n', 'utf8');
+
+    tmpDbPath = path.join(os.tmpdir(), `helm-s02-reap-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+    dbs = new DatabaseService(tmpDbPath);
+    svc = new RunArtifactService(dbs);
+
+    const projects = new ProjectService(dbs);
+    const project = projects.createProject({
+      name: `s02-reap-${Date.now()}`,
+      directory: path.join(os.tmpdir(), 'helm-s02-reap-project'),
+    });
+    projectId = project.id;
+    runId = svc.createRun(projectId, 'batch-S02-reap');
+
+    const { SessionRegistryService } = await import('./session-registry-service.js');
+    reg = new SessionRegistryService(dbs);
+    WorkerRuntimeFinalize.configureWorkerRuntimeFinalize({
+      markIdle: (token, reason) => reg.markIdle(token, reason),
+    });
+
+    transport = new FakeTransport();
+    loop = new OrchestratorLoop(transport, {
+      runDir,
+      batchId: 'batch-S02-reap',
+      artifactService: svc,
+    });
+    (loop as any).projectId = projectId;
+    (loop as any).runId = runId;
+  });
+
+  afterEach(async () => {
+    WorkerRuntimeFinalize.configureWorkerRuntimeFinalize({ markIdle: null });
+    vi.restoreAllMocks();
+    if (runDir) await fs.rm(runDir, { recursive: true, force: true }).catch(() => {});
+    if (dbs) dbs.close();
+    if (tmpDbPath) await fs.rm(tmpDbPath).catch(() => {});
+  });
+
+  it('(5) reapLiveRunWorkers finalizes via chokepoint and marks active registry idle', async () => {
+    const session = 'helm-w-s02-boundary-sweep';
+    reg.register(session, { owner: 'helm',  projectId, runId, kind: 'worker' });
+    expect(reg.get(session)!.status).toBe('active');
+
+    const info = dbs.raw
+      .prepare(
+        `INSERT INTO worker_runtimes (project_id, role, provider, model, session, correlation_id, state, spawned_by, run_id, started_at)
+         VALUES (?,?,?,?,?,?,'running','s02-test',?, datetime('now'))`
+      )
+      .run(projectId, 'implementer', 'grok', 'grok-4.5', session, 's02-reap-corr', runId);
+    const workerId = Number(info.lastInsertRowid);
+
+    const finalizeSpy = vi.spyOn(WorkerRuntimeFinalize, 'finalizeWorkerRuntimeRow');
+    await (loop as any).reapLiveRunWorkers('run-aborted');
+
+    expect(finalizeSpy).toHaveBeenCalledWith(expect.anything(), workerId, 'reaped', 'run-aborted');
+
+    const wr = dbs.raw
+      .prepare('SELECT state, exit_reason, ended_at FROM worker_runtimes WHERE id=?')
+      .get(workerId) as any;
+    expect(wr.state).toBe('reaped');
+    expect(wr.exit_reason).toBe('run-aborted');
+    expect(wr.ended_at).toBeTruthy();
+
+    // FakeTransport.reap does not markReaped — markIdle must leave registry idle for janitor.
+    const sess = reg.get(session)!;
+    expect(sess.status).toBe('idle');
+    expect(sess.reason).toBe('run-aborted');
+  });
+
+  it('(5b) reapLiveRunWorkers leaves already-reaped registry reaped', async () => {
+    const session = 'helm-w-s02-boundary-reaped';
+    reg.register(session, { owner: 'helm',  projectId, runId, kind: 'worker' });
+    const { sessionStatusTokenFromRow } = await import('./session-registry-service.js');
+    reg.markReaped(sessionStatusTokenFromRow(reg.get(session)!), 'prior-terminate');
+
+    dbs.raw
+      .prepare(
+        `INSERT INTO worker_runtimes (project_id, role, provider, model, session, correlation_id, state, spawned_by, run_id, started_at)
+         VALUES (?,?,?,?,?,?,'running','s02-test',?, datetime('now'))`
+      )
+      .run(projectId, 'implementer', 'grok', 'grok-4.5', session, 's02-reap-corr-2', runId);
+
+    await (loop as any).reapLiveRunWorkers('run-aborted');
+
+    const sess = reg.get(session)!;
+    expect(sess.status).toBe('reaped');
+    expect(sess.reason).toBe('prior-terminate');
+  });
 });
 
 // C0: thread the kloo `route` (models.route, B1) from a bound model through to spawn, so

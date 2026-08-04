@@ -25,6 +25,7 @@ import { PhaseStaffingService } from './phase-staffing.js';
 import { matchSeatAuthError, authRemedyFor } from './seat-auth.js';
 import { parsePlanContradiction } from './plan-contradiction.js';
 import { classifyGateFault, authFault } from './fault-class.js';
+import { finalizeWorkerRuntimeRow } from './worker-runtime-finalize.js';
 
 export type Transition = string;
 
@@ -410,6 +411,7 @@ export class OrchestratorLoop {
 
   // R5a: best-effort cleanup of any still-live run workers (sessions reaped via transport,
   // worker_runtimes rows transitioned) so an aborted run leaves nothing spawning/streaming.
+  // S02: route terminal writes through finalizeWorkerRuntimeRow so markIdle propagates.
   private async reapLiveRunWorkers(reason: string): Promise<void> {
     try {
       const db = (this.artifactService as any)?.['db']?.raw;
@@ -420,9 +422,7 @@ export class OrchestratorLoop {
       for (const r of rows) {
         if (r.session) { try { await this.transport.reap(`${r.session}:0.0`, reason); } catch {} }
         try {
-          db.prepare(
-            `UPDATE worker_runtimes SET state='reaped', exit_reason=?, ended_at=datetime('now') WHERE id = ?`
-          ).run(reason, r.id);
+          finalizeWorkerRuntimeRow(db, Number(r.id), 'reaped', reason);
         } catch {}
       }
     } catch { /* best-effort */ }
@@ -1217,9 +1217,7 @@ export class OrchestratorLoop {
     try {
       const db = (this.artifactService as any)['db']?.raw;
       if (!db) return;
-      db.prepare(
-        `UPDATE worker_runtimes SET state=?, exit_reason=?, ended_at=datetime('now') WHERE id=? AND state NOT IN ('done','failed','reaped')`
-      ).run(state, reason, id);
+      finalizeWorkerRuntimeRow(db, id, state, reason);
     } catch {
       /* best-effort bookkeeping */
     }
@@ -2694,8 +2692,10 @@ export class OrchestratorLoop {
     this.runId = params.runId;
 
     while (true) {
-      const taskId = params.queue.getNextReady(params.runId);
-      if (taskId == null) break;
+      // B03 C1: claim freezes TaskTerminalToken; carry through await — never mark*(taskId, runId) after settle.
+      const terminalToken = params.queue.claimNextReady(params.runId);
+      if (terminalToken == null) break;
+      const taskId = terminalToken.taskId;
 
       const key = idToKey[taskId];
       const pTask = (meta[key] || {}) as PlannedTask;
@@ -2746,18 +2746,18 @@ export class OrchestratorLoop {
         });
         finalStatuses.push(res.finalStatus);
         if (res.finalStatus === 'PASS') {
-          params.queue.markComplete(taskId, params.runId);
+          params.queue.markComplete(terminalToken);
         } else if (res.finalStatus === 'DEFERRED') {
-          params.queue.markDeferred(taskId, params.runId);
+          params.queue.markDeferred(terminalToken);
         } else if (res.finalStatus === 'BLOCKED') {
           // pause already enacted inside runTask (phase+artifact); do not mark task, stop further dispatch
         } else {
-          params.queue.markFailed(taskId, params.runId);
+          params.queue.markFailed(terminalToken);
         }
         if (res.finalStatus === 'BLOCKED') break;
       } catch (e) {
         // FIX-C hole #6: wrap to mirror the catch in run-orchestrator drain; prevent abort of whole queue on timeout.
-        params.queue.markFailed(taskId, params.runId);
+        params.queue.markFailed(terminalToken);
         finalStatuses.push('FAIL');
         // R5a: run-abort must stop the DRAIN too, not just the task — rethrow after bookkeeping.
         if (e instanceof RunAbortedError) throw e;

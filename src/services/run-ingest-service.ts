@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { DatabaseService } from '../db/database.js';
+import { advanceLifecycleSeqAtLeast, allocateLifecycleGeneration } from './lifecycle-cas.js';
 
 export const RUN_REGISTER_ENVELOPE = 'helm.run-ingest/v1';
 
@@ -262,23 +263,42 @@ export class RunIngestService {
         throw new RunIngestConflictError('run identity already registered under a different event');
       }
 
+      // B04 fix cycle 1 (redteam C1) / B01 residual: `runs.generation` is shared by two namespaces —
+      // the native lifecycle allocator (B01/B03) and this caller-supplied ingest identity component.
+      // Writing the caller's value directly let a caller (deliberately or by chance) supply a
+      // generation already issued to a now-deleted native run on the same recycled numeric id, so
+      // AC8's `id + generation` CAS would match the wrong (ingest) occupant. Allocate FIRST — the
+      // allocator is strictly increasing and never reused, so a fresh value is provably greater than
+      // every generation issued before this call, native or ingest — then take the caller's value only
+      // if it is larger still (never smaller than the fresh floor). The identity triple
+      // `(project_id, external_run_id, generation)` and its UNIQUE index are preserved; the response
+      // and REGISTERED event echo the AUTHORITATIVE written value, not the raw supplied one, so a
+      // caller must track the returned generation for a later `complete()` call.
+      const allocated = allocateLifecycleGeneration(this.db.raw);
+      const generation = Math.max(allocated, envelope.generation);
+
       let runId: number;
       try {
         const info = this.db.prepare(
           `INSERT INTO runs (project_id, external_run_id, generation, source, status, phase, register_seal_hash, state_revision)
            VALUES (?, ?, ?, 'ingest', 'active', 'executing', ?, 0)`
-        ).run(projectId, envelope.external_run_id, envelope.generation, canonicalHash);
+        ).run(projectId, envelope.external_run_id, generation, canonicalHash);
         runId = Number(info.lastInsertRowid);
       } catch {
         throw new RunIngestConflictError('run identity already registered');
       }
+
+      // Push the counter past whatever was actually WRITTEN (not just the raw supplied hint) — closes
+      // the case where the caller's value exceeds this call's fresh allocation and would otherwise be
+      // re-issued to a future native run.
+      advanceLifecycleSeqAtLeast(this.db.raw, generation + 1);
 
       this.db.prepare(
         `INSERT INTO run_events (run_id, event_type, payload_json) VALUES (?, 'REGISTERED', ?)`
       ).run(String(runId), JSON.stringify({
         event_id: envelope.event_id,
         external_run_id: envelope.external_run_id,
-        generation: envelope.generation,
+        generation,
         hashes: envelope.hashes,
         project_id: projectId,
       }));
@@ -288,7 +308,7 @@ export class RunIngestService {
         run_id: runId,
         project_id: projectId,
         external_run_id: envelope.external_run_id,
-        generation: envelope.generation,
+        generation,
         event_id: envelope.event_id,
         state_revision: 0,
       };

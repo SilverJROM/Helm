@@ -1,0 +1,296 @@
+[08:24:03 PHT] verified 0/21 | driver=1 watcher=1 escalations=0
+[08:25:03 PHT] verified 1/21 | driver=1 watcher=1 escalations=0
+[08:27:04 PHT] verified 2/21 | driver=1 watcher=1 escalations=0
+[08:39:05 PHT] verified 3/21 | driver=1 watcher=1 escalations=0
+[08:41:06 PHT] verified 4/21 | driver=1 watcher=1 escalations=0
+[08:45:06 PHT] verified 5/21 | driver=1 watcher=1 escalations=0
+[08:50:07 PHT] verified 6/21 | driver=1 watcher=1 escalations=0
+[08:58:08 PHT] verified 7/21 | driver=1 watcher=1 escalations=0
+[09:03:09 PHT] verified 8/21 | driver=1 watcher=1 escalations=0
+[09:08:10 PHT] verified 9/21 | driver=1 watcher=1 escalations=0
+[09:22:12 PHT] verified 0/21 | driver=1 watcher=1 escalations=0
+[09:23:12 PHT] verified 9/21 | driver=1 watcher=1 escalations=0
+[09:32:13 PHT] verified 10/21 | driver=1 watcher=1 escalations=0
+[09:54:16 PHT] verified 11/21 | driver=1 watcher=1 escalations=0
+[10:18:20 PHT] verified 12/21 | driver=1 watcher=1 escalations=0
+[10:31:22 PHT] verified 13/21 | driver=1 watcher=1 escalations=0
+[10:37:22 PHT] verified 14/21 | driver=1 watcher=1 escalations=0
+[10:46:24 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+[10:47:24 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+[10:48:24 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+[10:49:24 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+[10:50:24 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+[10:51:24 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+[10:52:25 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+[10:53:25 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+[10:54:25 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+[10:55:25 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+[10:56:25 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+[10:57:25 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+[10:58:25 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+[10:59:26 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+[11:00:26 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+[11:01:26 PHT] verified 15/21 | driver=1 watcher=1 escalations=2
+[11:01:26 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:02:26 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:03:26 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:04:26 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:05:26 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:06:27 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:07:27 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:08:27 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:09:27 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:10:27 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:11:27 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:12:27 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:13:28 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:14:28 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:15:28 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:16:28 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:17:28 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:18:28 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:19:28 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:20:29 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:21:29 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:22:29 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:23:29 PHT] verified 16/21 | driver=1 watcher=1 escalations=2
+[11:23:29 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:24:29 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:25:29 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:26:29 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:27:30 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:28:30 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:29:30 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:30:30 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:31:30 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:32:30 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:33:30 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:34:31 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:35:31 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:36:31 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:37:31 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:38:31 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:39:31 PHT] verified 17/21 | driver=1 watcher=1 escalations=2
+[11:39:31 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:40:31 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:41:32 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:42:32 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:43:32 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:44:32 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:45:32 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:46:32 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:47:32 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:48:33 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:49:33 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:50:33 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:51:33 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:52:33 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:53:33 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:54:33 PHT] verified 18/21 | driver=1 watcher=1 escalations=2
+[11:54:33 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:55:34 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:56:34 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:57:34 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-P4-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[11:57:34 PHT] driver terminal-exited
+{
+  "run_id": "plancore-orchestrator-redesign",
+  "parked": [
+    "P4",
+    "R7"
+  ],
+  "gate_review": [],
+  "release_review": [],
+  "security_review_required": [],
+  "terminal_drain": true,
+  "ended_at": "2026-08-01T03:56:47Z"
+}[15:42:47 PHT] verified 18/21 | driver=1 watcher=1 escalations=3
+[15:42:47 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-P4-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[15:43:47 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-P4-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[15:44:47 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-P4-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[15:45:48 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-P4-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[15:46:48 PHT] verified 19/21 | driver=1 watcher=1 escalations=3
+[15:46:48 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-P4-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[15:47:48 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-P4-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[15:48:48 PHT] verified 20/21 | driver=1 watcher=1 escalations=3
+[15:48:48 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-P4-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[15:49:48 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-P4-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[15:50:48 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-P4-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[15:51:49 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-P4-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[15:52:49 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-P4-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[15:53:49 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-P4-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[15:54:49 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-P4-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[15:55:49 PHT] verified 21/21 | driver=0 watcher=0 escalations=3
+[15:55:49 PHT] ESCALATION OPEN — see dispatch/escalations/
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-P4-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c1.json
+/home/agjrom/websites/Helm/plan/plancore-orchestrator-redesign/dispatch/escalations/RAISE-R7-c2.json
+[15:55:49 PHT] ALL 21 VERIFIED

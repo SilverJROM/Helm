@@ -1,0 +1,805 @@
+diff --git a/plan/plancore-orchestrator-redesign/queue.md b/plan/plancore-orchestrator-redesign/queue.md
+index a1599f0..fc6bb98 100644
+--- a/plan/plancore-orchestrator-redesign/queue.md
++++ b/plan/plancore-orchestrator-redesign/queue.md
+@@ -1,19 +1,19 @@
+ # queue — plancore-orchestrator-redesign
+ 
+-- [PENDING] 1: S0
+-- [PENDING] 2: D1
+-- [PENDING] 3: D2
+-- [PENDING] 4: D3
+-- [PENDING] 5: B1
+-- [PENDING] 6: B2
+-- [PENDING] 7: B3
+-- [PENDING] 8: B4
+-- [PENDING] 9: R1
+-- [PENDING] 10: R2
+-- [PENDING] 11: R3
+-- [PENDING] 12: R4
+-- [PENDING] 13: R5
+-- [PENDING] 14: R6
++- [DONE] 1: S0  <!-- driver-advanced a48562b981 -->
++- [DONE] 2: D1  <!-- driver-advanced 8bab0cc717 -->
++- [DONE] 3: D2  <!-- driver-advanced 8905059a91 -->
++- [DONE] 4: D3  <!-- driver-advanced 2aadbfa61e -->
++- [DONE] 5: B1  <!-- driver-advanced 9f9b16707f -->
++- [DONE] 6: B2  <!-- driver-advanced f3e4439bf7 -->
++- [DONE] 7: B3  <!-- driver-advanced 94be10ff7b -->
++- [DONE] 8: B4  <!-- driver-advanced 12143af225 -->
++- [DONE] 9: R1  <!-- driver-advanced 6c0c2338d2 -->
++- [DONE] 10: R2  <!-- driver-advanced 3a00ea5209 -->
++- [DONE] 11: R3  <!-- driver-advanced 0d72f173d3 -->
++- [DONE] 12: R4  <!-- driver-advanced 287727f9d6 -->
++- [DONE] 13: R5  <!-- driver-advanced 88bf414f7a -->
++- [DONE] 14: R6  <!-- driver-advanced 3e3b21f2bf -->
+ - [PENDING] 15: R7
+ - [PENDING] 16: R8
+ - [PENDING] 17: P1
+diff --git a/plan/plancore-orchestrator-redesign/tg-status.log b/plan/plancore-orchestrator-redesign/tg-status.log
+index a6cc597..71fd856 100644
+--- a/plan/plancore-orchestrator-redesign/tg-status.log
++++ b/plan/plancore-orchestrator-redesign/tg-status.log
+@@ -1,3 +1,9 @@
+ [2026-08-01T07:10:09+08:00] TG -> HTTP 200 (try 1)
+ [2026-08-01T07:10:09+08:00] TEST message sent
+ [2026-08-01T07:10:13+08:00] cadence START pid=1280200 — every 90min PHT
++[2026-08-01T08:40:14+08:00] facts: effort=plancore-orchestrator-redesign (co-planners author + debate; plancore is coordinator-only, no plan content) scope=24 slices (P0+P1+P2+D12); D1-D11 deferred by JROM verified=0/24 verified_ids= none remaining=1 in_flight=P0 in_flight_running_min=0 next_up=none current_phase=P0 stop-corruption worker_seats_live=0 blocked_count=0 raceguard_pin=3 (must be 3) janitor=0 (must be 0) latest_heartbeat=none time_now_pht=2026-08-01 08:40 PHT 
++[2026-08-01T08:40:42+08:00] TG -> HTTP 200 (try 1)
++[2026-08-01T08:40:42+08:00] reported verified=0/24 inflight=P0
++[2026-08-01T10:10:42+08:00] facts: effort=plancore-orchestrator-redesign (co-planners author + debate; plancore is coordinator-only, no plan content) scope=24 slices (P0+P1+P2+D12); D1-D11 deferred by JROM verified=0/24 verified_ids= none remaining=1 in_flight=P0 in_flight_running_min=0 next_up=none current_phase=P0 stop-corruption worker_seats_live=0 blocked_count=0 raceguard_pin=3 (must be 3) janitor=0 (must be 0) latest_heartbeat=none time_now_pht=2026-08-01 10:10 PHT 
++[2026-08-01T10:11:05+08:00] TG -> HTTP 200 (try 1)
++[2026-08-01T10:11:05+08:00] reported verified=0/24 inflight=P0
+diff --git a/src/services/planning-review-round-block-diff.test.ts b/src/services/planning-review-round-block-diff.test.ts
+new file mode 100644
+index 0000000..4586a50
+--- /dev/null
++++ b/src/services/planning-review-round-block-diff.test.ts
+@@ -0,0 +1,342 @@
++process.env.USE_FAKE_TMUX = '1';
++
++/**
++ * R7 gate — non-convergence = visible BLOCKED + operator-legible final-positions diff (R3.15).
++ *
++ * Scope: on cap exhaustion / monotone fail of the proposer/signer exchange, `blockedReason`
++ * carries a textual/hunk summary of final candidate vs signer's last draft (+ remaining
++ * objections) — never bare hash pairs alone. A durable report is written under
++ * `planning-drafts/non-convergence-diff.txt`. Pure helpers (`unifiedLineDiff`,
++ * `buildAndPersistNonConvergenceDiff`) are unit-tested too.
++ */
++import { describe, it, expect, beforeEach, afterEach } from 'vitest';
++import fs from 'node:fs/promises';
++import fsSync from 'node:fs';
++import os from 'node:os';
++import path from 'node:path';
++import { FakeTransport } from './fake-transport.js';
++import { BriefWriterService } from './brief-writer-service.js';
++import {
++  runReviewRound,
++  unifiedLineDiff,
++  buildAndPersistNonConvergenceDiff,
++  nonConvergenceDiffPath,
++  type RunReviewRoundOptions,
++} from './planning-review-round.js';
++import {
++  draftPlanPath,
++  candidatePlanPath,
++  atomicWriteFile,
++} from './seat-draft-store.js';
++import { planRevision } from './plan-revision.js';
++
++describe('unifiedLineDiff (R7 / R3.15 pure helper)', () => {
++  it('renders a textual hunk summary with removed/added lines — never a bare hash pair', () => {
++    const a = '# Plan A\nline one\nline shared\nline only A\n';
++    const b = '# Plan B\nline one\nline shared\nline only B\n';
++    const diff = unifiedLineDiff('final-candidate', a, 'signer-last-draft', b);
++
++    expect(diff).toMatch(/^--- final-candidate/m);
++    expect(diff).toMatch(/^\+\+\+ signer-last-draft/m);
++    expect(diff).toMatch(/^-# Plan A/m);
++    expect(diff).toMatch(/^\+# Plan B/m);
++    expect(diff).toMatch(/^-line only A/m);
++    expect(diff).toMatch(/^\+line only B/m);
++    // Must not be "just two hex strings".
++    expect(diff).not.toMatch(/^[0-9a-f]{12}\s+[0-9a-f]{12}$/);
++    expect(diff).toMatch(/removed \d+, added \d+/);
++  });
++
++  it('reports identical positions without inventing a false delta', () => {
++    const text = '# Same\nbody\n';
++    const diff = unifiedLineDiff('left', text, 'right', text);
++    expect(diff).toMatch(/identical/);
++    expect(diff).not.toMatch(/^-# Same/m);
++  });
++});
++
++describe('buildAndPersistNonConvergenceDiff (R7 / R3.15)', () => {
++  let runDir: string;
++
++  beforeEach(async () => {
++    runDir = await fs.mkdtemp(path.join(os.tmpdir(), 'helm-r7-diff-'));
++  });
++
++  afterEach(async () => {
++    if (runDir) await fs.rm(runDir, { recursive: true, force: true }).catch(() => {});
++  });
++
++  it('writes a durable report and a blockedReason-ready summary that includes content, not just sha12', () => {
++    const candidate = path.join(runDir, 'candidate-plan.md');
++    const draft = path.join(runDir, 'draft-partner.md');
++    fsSync.writeFileSync(candidate, '# Candidate\nshared\ncandidate-only\n');
++    fsSync.writeFileSync(draft, '# Signer draft\nshared\ndraft-only\n');
++    const candRev = planRevision(fsSync.readFileSync(candidate));
++    const draftRev = planRevision(fsSync.readFileSync(draft));
++
++    const built = buildAndPersistNonConvergenceDiff({
++      runDir,
++      cause: 'signer-objections',
++      candidatePath: candidate,
++      candidateShort12: candRev.short12,
++      otherLabel: 'signer-last-draft seat=partner',
++      otherPath: draft,
++      otherShort12: draftRev.short12,
++      objectionsNote: 'n=2; 1. Missing req_refs. 2. Bad effort.',
++    });
++
++    expect(built.path).toBe(nonConvergenceDiffPath(runDir));
++    expect(fsSync.existsSync(built.path)).toBe(true);
++    const onDisk = fsSync.readFileSync(built.path, 'utf8');
++    expect(onDisk).toMatch(/Non-convergence final-positions report \(R3\.15/);
++    expect(onDisk).toMatch(/candidate-only/);
++    expect(onDisk).toMatch(/draft-only/);
++    expect(onDisk).toMatch(/Missing req_refs/);
++    expect(onDisk).toContain(candRev.short12);
++    expect(onDisk).toContain(draftRev.short12);
++
++    expect(built.summaryForBlockedReason).toMatch(/NON-CONVERGENCE-DIFF \(R3\.15\)/);
++    expect(built.summaryForBlockedReason).toMatch(/candidate-only|draft-only|Missing req_refs/);
++    // Must not collapse to "shaA shaB" only.
++    const stripped = built.summaryForBlockedReason.replace(/[0-9a-f]{12}/g, 'HASH');
++    expect(stripped.length).toBeGreaterThan(80);
++  });
++});
++
++describe('runReviewRound — non-convergence BLOCKED + final-positions diff (R7, R3.15)', () => {
++  let runDir: string;
++  let cbPath: string;
++  let briefWriter: BriefWriterService;
++  let briefs: Map<string, string>;
++  let partnerHandles: string[];
++  let partnerRuntimeIds: (number | null)[];
++
++  /** Scripted transport: each seat responds only once genuinely spawned. */
++  class ScriptedSeatTransport extends FakeTransport {
++    public readonly events: string[] = [];
++    constructor(private readonly onSpawn: (batchId: string) => Promise<void>) {
++      super();
++    }
++    async spawn(params: Parameters<FakeTransport['spawn']>[0]): Promise<{ handle: string; role: string }> {
++      const spawned = await super.spawn(params);
++      this.events.push(`spawn:${params.batchId}`);
++      await this.onSpawn(params.batchId ?? '');
++      return spawned;
++    }
++    async reap(handle: string, reason = 'complete'): Promise<void> {
++      this.events.push(`reap:${reason}`);
++      return super.reap(handle, reason);
++    }
++  }
++
++  // Materially different drafts so reconcile actually spawns (hash mismatch).
++  const DRAFT_A = [
++    '# Draft A — seat partner',
++    '```json',
++    '[{"id":"T1","batch":"A","title":"From A","req_refs":["R1"],"assignee":"x","validator_lane":"L1","effort":"low","type":"feature"}]',
++    '```',
++    '',
++  ].join('\n');
++  const DRAFT_B = [
++    '# Draft B — seat partner-2',
++    '```json',
++    '[{"id":"T9","batch":"B","title":"From B — different shape","req_refs":["R9"],"assignee":"y","validator_lane":"L2","effort":"high","type":"bug"}]',
++    '```',
++    '',
++  ].join('\n');
++  const CANDIDATE_R2 = [
++    '# Reconciled candidate — round 2',
++    '```json',
++    '[{"id":"T1","batch":"R2","title":"Reconciled r2","req_refs":["R1"],"assignee":"x","validator_lane":"L1","effort":"low","type":"feature"}]',
++    '```',
++    '',
++  ].join('\n');
++  const CANDIDATE_R3 = [
++    '# Reconciled candidate — round 3 (still incomplete)',
++    '```json',
++    '[{"id":"T1","batch":"R3","title":"Reconciled r3","req_refs":["R1"],"assignee":"x","validator_lane":"L1","effort":"low","type":"feature"}]',
++    '```',
++    '',
++  ].join('\n');
++
++  beforeEach(async () => {
++    runDir = await fs.mkdtemp(path.join(os.tmpdir(), 'helm-r7-block-'));
++    cbPath = path.join(runDir, 'callbacks.md');
++    await fs.writeFile(cbPath, '', 'utf8');
++    briefWriter = new BriefWriterService();
++    briefs = new Map();
++    partnerHandles = [];
++    partnerRuntimeIds = [];
++  });
++
++  afterEach(async () => {
++    if (runDir) await fs.rm(runDir, { recursive: true, force: true }).catch(() => {});
++  });
++
++  async function post(line: string): Promise<void> {
++    await fs.appendFile(cbPath, `${line}\n`, 'utf8');
++  }
++
++  function baseOptions(
++    transport: FakeTransport,
++    overrides: Partial<RunReviewRoundOptions> = {},
++  ): RunReviewRoundOptions {
++    return {
++      transport,
++      briefWriter,
++      writeBrief: async (role, content) => {
++        briefs.set(role, content);
++      },
++      registerWorkerRuntime: () => partnerRuntimeIds.length + 1,
++      waitForAgreement: async () => {
++        throw new Error('legacy waitForAgreement must never be called');
++      },
++      runDir,
++      batchId: 'batch-R7',
++      brainRole: 'plancore',
++      partner: 'planner',
++      effectiveProjectDir: '/home/agjrom/websites/Helm',
++      cbPath,
++      planMdPath: path.join(runDir, 'plan.md'),
++      perRoundTimeoutMs: 1500,
++      roundCap: 3,
++      agreementFenceOffset: 0,
++      isFake: true,
++      blindDraftRound1: true,
++      coPlannerSeats: [
++        { slot: 0, provider: 'anthropic', model: 'claude-sonnet' },
++        { slot: 1, provider: 'grok', model: 'grok-4.5' },
++      ],
++      partnerHandles,
++      partnerRuntimeIds,
++      ...overrides,
++    };
++  }
++
++  async function publishRound1Drafts(batchId: string): Promise<boolean> {
++    if (batchId === 'batch-R7-partner') {
++      atomicWriteFile(draftPlanPath(runDir, 'partner'), DRAFT_A);
++      await post(`[helm callback] planner ${batchId} STATUS: DRAFT-SUBMITTED plan=ffffffffffff`);
++      return true;
++    }
++    if (batchId === 'batch-R7-partner-2') {
++      atomicWriteFile(draftPlanPath(runDir, 'partner-2'), DRAFT_B);
++      await post(`[helm callback] planner ${batchId} STATUS: DRAFT-SUBMITTED plan=ffffffffffff`);
++      return true;
++    }
++    return false;
++  }
++
++  it('cap exhaustion with open objections: blockedReason carries textual diff + durable file (not bare hashes)', async () => {
++    // roundCap=2 → round 1 drafts + one proposer/signer exchange that objects → terminal.
++    const transport = new ScriptedSeatTransport(async (batchId: string) => {
++      if (await publishRound1Drafts(batchId)) return;
++      if (batchId === 'batch-R7-r2-proposer') {
++        atomicWriteFile(candidatePlanPath(runDir), CANDIDATE_R2);
++        await post(`[helm callback] planner ${batchId} STATUS: CANDIDATE-SUBMITTED plan=ffffffffffff`);
++        return;
++      }
++      if (batchId === 'batch-R7-r2-signer') {
++        await post(
++          `[helm callback] planner ${batchId} STATUS: OBJECTIONS — n=2; 1. Missing req_refs on T2. 2. Effort enum invalid.`,
++        );
++        return;
++      }
++      throw new Error(`unexpected spawn ${batchId}`);
++    });
++
++    const result = await runReviewRound(baseOptions(transport, { roundCap: 2 }));
++
++    expect(result.agreed).toBe(false);
++    expect(result.blockedReasonKind).toBe('signer-objections');
++    expect(result.blockedReason).toMatch(/SIGNER-OBJECTIONS/);
++    expect(result.blockedReason).toMatch(/NON-CONVERGENCE-DIFF \(R3\.15\)/);
++    // Operator-legible content from the candidate and/or the signer's draft — not hash-only.
++    expect(result.blockedReason).toMatch(/Reconciled candidate|Draft [AB]|Missing req_refs|final-candidate|signer-last-draft/);
++    // Must not be reducible to two bare short12s alone.
++    const hashOnly = /^[0-9a-f]{12}\s+[0-9a-f]{12}$/;
++    expect(hashOnly.test((result.blockedReason ?? '').trim())).toBe(false);
++    expect((result.blockedReason ?? '').length).toBeGreaterThan(120);
++
++    expect(result.nonConvergenceDiffPath).toBe(nonConvergenceDiffPath(runDir));
++    expect(fsSync.existsSync(result.nonConvergenceDiffPath!)).toBe(true);
++    const report = fsSync.readFileSync(result.nonConvergenceDiffPath!, 'utf8');
++    expect(report).toMatch(/R3\.15/);
++    expect(report).toMatch(/Missing req_refs on T2/);
++    // Diff body should reference real document content from at least one side.
++    expect(report).toMatch(/Reconciled candidate|Draft [AB]|From [AB]/);
++  });
++
++  it('monotone fail: blockedReason includes final-positions diff and does not burn remaining cap', async () => {
++    const transport = new ScriptedSeatTransport(async (batchId: string) => {
++      if (await publishRound1Drafts(batchId)) return;
++      if (batchId === 'batch-R7-r2-proposer') {
++        atomicWriteFile(candidatePlanPath(runDir), CANDIDATE_R2);
++        await post(`[helm callback] planner ${batchId} STATUS: CANDIDATE-SUBMITTED plan=ffffffffffff`);
++        return;
++      }
++      if (batchId === 'batch-R7-r2-signer') {
++        await post(
++          `[helm callback] planner ${batchId} STATUS: OBJECTIONS — n=2; 1. Defect alpha. 2. Defect beta.`,
++        );
++        return;
++      }
++      if (batchId === 'batch-R7-r3-proposer') {
++        atomicWriteFile(candidatePlanPath(runDir), CANDIDATE_R3);
++        await post(`[helm callback] planner ${batchId} STATUS: CANDIDATE-SUBMITTED plan=ffffffffffff`);
++        return;
++      }
++      if (batchId === 'batch-R7-r3-signer') {
++        // Same count as r2 — NOT strictly smaller → early block.
++        await post(
++          `[helm callback] planner ${batchId} STATUS: OBJECTIONS — n=2; 1. Defect alpha still. 2. Defect beta still.`,
++        );
++        return;
++      }
++      if (batchId.startsWith('batch-R7-r4-') || batchId.startsWith('batch-R7-r5-')) {
++        throw new Error(`must not burn cap after monotone fail: ${batchId}`);
++      }
++      throw new Error(`unexpected spawn ${batchId}`);
++    });
++
++    const result = await runReviewRound(baseOptions(transport, { roundCap: 5 }));
++
++    expect(result.agreed).toBe(false);
++    expect(result.blockedReasonKind).toBe('objection-not-monotone');
++    expect(result.roundsAttempted).toBe(3);
++    expect(result.blockedReason).toMatch(/OBJECTION-NOT-MONOTONE/);
++    expect(result.blockedReason).toMatch(/NON-CONVERGENCE-DIFF \(R3\.15\)/);
++    expect(result.blockedReason).toMatch(/Defect alpha|Reconciled candidate|signer-last-draft|final-candidate/);
++    expect(result.nonConvergenceDiffPath).toBeTruthy();
++    const report = fsSync.readFileSync(result.nonConvergenceDiffPath!, 'utf8');
++    expect(report).toMatch(/round 3|objection-not-monotone|Defect alpha still/i);
++    // Cap not burned: no r4/r5 spawns.
++    expect(transport.spawnCalls.map((c) => c.batchId).some((id) => /r[45]-/.test(id ?? ''))).toBe(false);
++  });
++
++  it('agreed path does not write a non-convergence report', async () => {
++    const transport = new ScriptedSeatTransport(async (batchId: string) => {
++      if (await publishRound1Drafts(batchId)) return;
++      if (batchId === 'batch-R7-r2-proposer') {
++        atomicWriteFile(candidatePlanPath(runDir), CANDIDATE_R2);
++        await post(`[helm callback] planner ${batchId} STATUS: CANDIDATE-SUBMITTED plan=ffffffffffff`);
++        return;
++      }
++      if (batchId === 'batch-R7-r2-signer') {
++        const onDisk = await fs.readFile(candidatePlanPath(runDir), 'utf8');
++        await post(
++          `[helm callback] planner ${batchId} STATUS: SIGNED plan=${planRevision(onDisk).short12}`,
++        );
++        return;
++      }
++      throw new Error(`unexpected spawn ${batchId}`);
++    });
++
++    const result = await runReviewRound(baseOptions(transport, { roundCap: 2 }));
++
++    expect(result.agreed).toBe(true);
++    expect(result.blockedReason).toBeUndefined();
++    expect(result.nonConvergenceDiffPath).toBeUndefined();
++    expect(fsSync.existsSync(nonConvergenceDiffPath(runDir))).toBe(false);
++  });
++});
+diff --git a/src/services/planning-review-round.ts b/src/services/planning-review-round.ts
+index 388028f..674cc05 100644
+--- a/src/services/planning-review-round.ts
++++ b/src/services/planning-review-round.ts
+@@ -1,4 +1,5 @@
+ import fs from 'node:fs/promises';
++import fsSync from 'node:fs';
+ import path from 'node:path';
+ import type { ITransport } from './fake-transport.js';
+ import type { BriefWriterService } from './brief-writer-service.js';
+@@ -204,6 +205,11 @@ export interface RunReviewRoundOptions {
+  * - 'signature-mismatch': R3 (R3.11) — the signer posted SIGNED but its claimed `plan=<sha12>` did
+  *   not equal the candidate's engine-recomputed CURRENT on-disk short12 (missing/malformed/stale
+  *   claim). Fail-closed: never agreement.
++ *
++ * R7 (R3.15) does NOT introduce a new kind: cap exhaustion and monotone fail keep their existing
++ * kinds (`signer-objections` / `round-cap-exhausted` / `objection-not-monotone` / …). The operator-
++ * legible **final-positions diff** rides on `blockedReason` (and the durable
++ * `nonConvergenceDiffPath` file), never as bare hash pairs alone.
+  */
+ export type RoundBlockedReasonKind =
+   | 'artifact-not-published'
+@@ -245,6 +251,10 @@ export interface ReviewRoundResult {
+    *  the signer's decision. `agreed` above mirrors this result's `agreed` (signature on the candidate
+    *  bytes is the only thing that agrees). Always undefined when the loop never reached round 2. */
+   proposerSignerRound?: ProposerSignerRoundResult;
++  /** R7 (R3.15): absolute path of the durable final-positions report written on cap exhaustion /
++   *  monotone fail (and other terminal non-convergence of the proposer/signer exchange that has
++   *  positions to compare). Undefined when no report was written. */
++  nonConvergenceDiffPath?: string;
+ }
+ 
+ /**
+@@ -795,6 +805,236 @@ export function parseBoundedObjectionList(note: string | null | undefined): Pars
+   return { ok: true, declaredN, count: defects.length, defects };
+ }
+ 
++// ─── R7 (R3.15): non-convergence = visible BLOCKED + operator-legible final-positions diff ───
++
++/** Cap on how many unified-diff lines ride inside blockedReason (full report is always on disk). */
++export const NON_CONVERGENCE_DIFF_BLOCKED_REASON_MAX_LINES = 80;
++
++/**
++ * R7 (R3.15): durable final-positions report path under the run's planning-drafts dir.
++ * Written on cap exhaustion / monotone fail (and other terminal non-convergence with positions).
++ */
++export function nonConvergenceDiffPath(runDir: string): string {
++  return path.join(path.resolve(runDir), 'planning-drafts', 'non-convergence-diff.txt');
++}
++
++/**
++ * R7 (R3.15): line-oriented unified-style diff (no external dep). Operator-legible comparison of
++ * two text positions — never a bare hash pair. Identical inputs yield a short "identical" note.
++ */
++export function unifiedLineDiff(
++  aLabel: string,
++  aText: string,
++  bLabel: string,
++  bText: string,
++): string {
++  const aLines = aText.replace(/\r\n/g, '\n').split('\n');
++  const bLines = bText.replace(/\r\n/g, '\n').split('\n');
++  // Drop a single trailing empty element produced by a final newline so "a\n" vs "a\n" is identical.
++  if (aLines.length > 0 && aLines[aLines.length - 1] === '') aLines.pop();
++  if (bLines.length > 0 && bLines[bLines.length - 1] === '') bLines.pop();
++
++  const header = `--- ${aLabel}\n+++ ${bLabel}`;
++  if (aLines.length === bLines.length && aLines.every((l, i) => l === bLines[i])) {
++    return `${header}\n(identical — ${aLines.length} line(s))`;
++  }
++
++  // Classic LCS DP for small planning docs (plans are bounded; O(nm) is fine).
++  const n = aLines.length;
++  const m = bLines.length;
++  const dp: number[][] = Array.from({ length: n + 1 }, () => new Array<number>(m + 1).fill(0));
++  for (let i = n - 1; i >= 0; i--) {
++    for (let j = m - 1; j >= 0; j--) {
++      dp[i][j] =
++        aLines[i] === bLines[j]
++          ? dp[i + 1][j + 1] + 1
++          : Math.max(dp[i + 1][j], dp[i][j + 1]);
++    }
++  }
++
++  type Op = { kind: ' ' | '-' | '+'; line: string };
++  const ops: Op[] = [];
++  let i = 0;
++  let j = 0;
++  while (i < n && j < m) {
++    if (aLines[i] === bLines[j]) {
++      ops.push({ kind: ' ', line: aLines[i] });
++      i++;
++      j++;
++    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
++      ops.push({ kind: '-', line: aLines[i] });
++      i++;
++    } else {
++      ops.push({ kind: '+', line: bLines[j] });
++      j++;
++    }
++  }
++  while (i < n) {
++    ops.push({ kind: '-', line: aLines[i++] });
++  }
++  while (j < m) {
++    ops.push({ kind: '+', line: bLines[j++] });
++  }
++
++  // Emit a single hunk spanning the whole file (plans are short; multi-hunk is not load-bearing).
++  const body = ops.map((op) => `${op.kind}${op.line}`).join('\n');
++  const removed = ops.filter((o) => o.kind === '-').length;
++  const added = ops.filter((o) => o.kind === '+').length;
++  return (
++    `${header}\n` +
++    `@@ final-positions -${n} +${m} (removed ${removed}, added ${added}) @@\n` +
++    body
++  );
++}
++
++export interface NonConvergenceDiffInput {
++  runDir: string;
++  cause: string;
++  candidatePath: string;
++  candidateShort12: string | null;
++  /** Signer's last authored plan position (round-1 draft path for that seat). */
++  otherLabel: string;
++  otherPath: string;
++  otherShort12: string | null;
++  /** Final signer objections note, if any. */
++  objectionsNote?: string | null;
++}
++
++export interface NonConvergenceDiffResult {
++  /** Full durable report body (written to disk). */
++  fullText: string;
++  /** Absolute path written (or attempted). */
++  path: string;
++  /** Truncated form safe to append inside blockedReason. */
++  summaryForBlockedReason: string;
++}
++
++function readTextOrNull(filePath: string): string | null {
++  try {
++    return fsSync.readFileSync(filePath, 'utf8');
++  } catch {
++    return null;
++  }
++}
++
++/**
++ * R7 (R3.15): build + persist the final-positions report (candidate vs signer's last draft +
++ * remaining objections). Never reports bare hash pairs alone — hashes are metadata alongside
++ * the textual/hunk body. Failures to read a side are stated in prose, not silently omitted.
++ */
++export function buildAndPersistNonConvergenceDiff(
++  input: NonConvergenceDiffInput,
++): NonConvergenceDiffResult {
++  const outPath = nonConvergenceDiffPath(input.runDir);
++  const candidateText = readTextOrNull(input.candidatePath);
++  const otherText = readTextOrNull(input.otherPath);
++
++  const candidateLabel =
++    `final-candidate path=${input.candidatePath} sha12=${input.candidateShort12 ?? 'unreadable'}`;
++  const otherLabel =
++    `${input.otherLabel} path=${input.otherPath} sha12=${input.otherShort12 ?? 'unreadable'}`;
++
++  let positionsSection: string;
++  if (candidateText == null && otherText == null) {
++    positionsSection =
++      `--- ${candidateLabel}\n+++ ${otherLabel}\n` +
++      `(both sides unreadable on disk — cannot render a line diff; this is still a visible BLOCKED, ` +
++      `not a silent pass. Hashes alone are never treated as an adequate operator report.)`;
++  } else if (candidateText == null) {
++    positionsSection =
++      `--- ${candidateLabel}\n+++ ${otherLabel}\n` +
++      `(final candidate unreadable on disk)\n` +
++      `--- other side (full text) ---\n${otherText}`;
++  } else if (otherText == null) {
++    positionsSection =
++      `--- ${candidateLabel}\n+++ ${otherLabel}\n` +
++      `(other side unreadable on disk)\n` +
++      `--- final candidate (full text) ---\n${candidateText}`;
++  } else {
++    positionsSection = unifiedLineDiff(candidateLabel, candidateText, otherLabel, otherText);
++  }
++
++  const objectionsSection =
++    input.objectionsNote != null && String(input.objectionsNote).trim() !== ''
++      ? `## Signer final objections\n${String(input.objectionsNote).trim()}`
++      : `## Signer final objections\n(none captured)`;
++
++  const fullText =
++    `# Non-convergence final-positions report (R3.15 / R7)\n` +
++    `cause: ${input.cause}\n` +
++    `\n` +
++    `## Textual diff — final candidate vs signer's last draft position\n` +
++    `${positionsSection}\n` +
++    `\n` +
++    `${objectionsSection}\n`;
++
++  try {
++    fsSync.mkdirSync(path.dirname(outPath), { recursive: true });
++    fsSync.writeFileSync(outPath, fullText, 'utf8');
++  } catch {
++    // Best-effort durable write — blockedReason still carries the summary even if disk fails.
++  }
++
++  const lines = fullText.split('\n');
++  let summaryBody: string;
++  if (lines.length <= NON_CONVERGENCE_DIFF_BLOCKED_REASON_MAX_LINES) {
++    summaryBody = fullText.trimEnd();
++  } else {
++    summaryBody =
++      lines.slice(0, NON_CONVERGENCE_DIFF_BLOCKED_REASON_MAX_LINES).join('\n') +
++      `\n… [truncated; full report at ${outPath}]`;
++  }
++
++  const summaryForBlockedReason =
++    `\n\nNON-CONVERGENCE-DIFF (R3.15): operator-legible final positions ` +
++    `(not bare hash pairs) — full report: ${outPath}\n` +
++    summaryBody;
++
++  return { fullText, path: outPath, summaryForBlockedReason };
++}
++
++/**
++ * R7 (R3.15): resolve the signer's last authored plan path from round-1 draft publications.
++ * The signer never authors a competing document after round 1 (R3.10) — their last draft IS
++ * their final position to compare against the reconciled candidate.
++ */
++function signerLastDraftFromRoundOne(
++  drafts: PublishedDraft[] | undefined,
++  signerSeatId: string,
++): PublishedDraft | null {
++  if (!drafts || drafts.length === 0) return null;
++  return drafts.find((d) => d.seatId === signerSeatId) ?? null;
++}
++
++/**
++ * R7 (R3.15): attach final-positions diff to a non-agreeing ReviewRoundResult that already has
++ * a proposer/signer outcome with positions worth comparing. Mutates nothing; returns the fields
++ * to spread onto the result.
++ */
++function nonConvergenceFieldsForPsResult(
++  runDir: string,
++  psResult: ProposerSignerRoundResult,
++  roundOneDrafts: PublishedDraft[] | undefined,
++  cause: string,
++): Pick<ReviewRoundResult, 'nonConvergenceDiffPath'> & { blockedReasonSuffix: string } {
++  const signerDraft = signerLastDraftFromRoundOne(roundOneDrafts, psResult.signerSeatId);
++  const otherPath = signerDraft?.planPath ?? path.join(runDir, `(missing-draft-${psResult.signerSeatId})`);
++  const built = buildAndPersistNonConvergenceDiff({
++    runDir,
++    cause,
++    candidatePath: psResult.candidatePlanPath,
++    candidateShort12: psResult.candidatePlan?.short12 ?? null,
++    otherLabel: `signer-last-draft seat=${psResult.signerSeatId}`,
++    otherPath,
++    otherShort12: signerDraft?.plan?.short12 ?? null,
++    objectionsNote: psResult.objections ?? null,
++  });
++  return {
++    nonConvergenceDiffPath: built.path,
++    blockedReasonSuffix: built.summaryForBlockedReason,
++  };
++}
++
+ /**
+  * R3 (R3.10): the plan-reconcile purpose's terminal grammar is `STATUS: CANDIDATE-SUBMITTED
+  * plan=<sha12>` — mirrors DRAFT_SUBMITTED_RE's identity-only match (the `plan=` claim is
+@@ -1287,12 +1527,19 @@ export async function runProposerSignerRound(
+  * committed, the signer never answered, the signer objected, or the signer's claimed sha did not match
+  * the candidate's engine-recomputed current bytes. The full typed result rides along on
+  * `proposerSignerRound` for consumers that need the candidate paths / designation log (P2's promotion).
++ *
++ * R7 (R3.15): on terminal non-convergence that has positions to compare (objections / signature-
++ * mismatch, and silence only when a candidate already sits on disk), `blockedReason` is extended
++ * with an operator-legible final-positions diff (candidate vs signer's last draft + remaining
++ * objections) — never bare hash pairs alone — and a durable report is written under
++ * `planning-drafts/non-convergence-diff.txt`.
+  */
+ function toReviewRoundResult(
+   psResult: ProposerSignerRoundResult,
+   roundOneBatchIds: string[],
+   roundOneDraftPublications: PublishedDraft[],
+-  roundsAttempted: number
++  roundsAttempted: number,
++  runDir: string,
+ ): ReviewRoundResult {
+   const partnerBatchIds = [
+     ...roundOneBatchIds,
+@@ -1308,40 +1555,54 @@ function toReviewRoundResult(
+ 
+   if (psResult.agreed) return { agreed: true, ...base };
+ 
+-  // Bounded, already-typed blocks from the exchange itself (proposer/signer silence) pass through with
+-  // their own message; the two decision-shaped refusals are classified here.
+-  if (psResult.blockedReasonKind) {
++  // R7 (R3.15): attach final-positions diff whenever a candidate exists on disk (or we still have
++  // draft positions to show against an unreadable candidate). candidate-not-committed has no
++  // candidate yet — still report drafts vs empty candidate side so the operator sees something
++  // other than two hex strings.
++  const attachDiff =
++    psResult.signerDecision === 'objections' ||
++    psResult.signerDecision === 'signed-mismatched' ||
++    psResult.blockedReasonKind === 'signer-no-response' ||
++    psResult.blockedReasonKind === 'candidate-not-committed' ||
++    !psResult.agreed;
++
++  const attach = (kind: RoundBlockedReasonKind, reason: string): ReviewRoundResult => {
++    if (!attachDiff) {
++      return { agreed: false, ...base, blockedReasonKind: kind, blockedReason: reason };
++    }
++    const nc = nonConvergenceFieldsForPsResult(runDir, psResult, roundOneDraftPublications, kind);
+     return {
+       agreed: false,
+       ...base,
+-      blockedReasonKind: psResult.blockedReasonKind,
+-      blockedReason: psResult.blockedReason,
++      blockedReasonKind: kind,
++      blockedReason: `${reason}${nc.blockedReasonSuffix}`,
++      nonConvergenceDiffPath: nc.nonConvergenceDiffPath,
+     };
++  };
++
++  // Bounded, already-typed blocks from the exchange itself (proposer/signer silence) pass through with
++  // their own message; the two decision-shaped refusals are classified here.
++  if (psResult.blockedReasonKind) {
++    return attach(psResult.blockedReasonKind, psResult.blockedReason ?? psResult.blockedReasonKind);
+   }
+ 
+   if (psResult.signerDecision === 'objections') {
+-    return {
+-      agreed: false,
+-      ...base,
+-      blockedReasonKind: 'signer-objections',
+-      blockedReason:
+-        `SIGNER-OBJECTIONS (R3/R3.11): signer seat ${psResult.signerSeatId} (${psResult.signerBatchId}) ` +
++    return attach(
++      'signer-objections',
++      `SIGNER-OBJECTIONS (R3/R3.11): signer seat ${psResult.signerSeatId} (${psResult.signerBatchId}) ` +
+         `refused to sign candidate ${psResult.candidatePlan?.short12 ?? 'unreadable'} ` +
+         `(${psResult.candidatePlanPath}) with a bounded objection list — never agreement: ` +
+         `${psResult.objections ?? '(no note captured)'}`,
+-    };
++    );
+   }
+ 
+-  return {
+-    agreed: false,
+-    ...base,
+-    blockedReasonKind: 'signature-mismatch',
+-    blockedReason:
+-      `SIGNATURE-MISMATCH (R3/R3.11): signer seat ${psResult.signerSeatId} (${psResult.signerBatchId}) ` +
++  return attach(
++    'signature-mismatch',
++    `SIGNATURE-MISMATCH (R3/R3.11): signer seat ${psResult.signerSeatId} (${psResult.signerBatchId}) ` +
+       `posted SIGNED, but its claimed plan sha did not equal the candidate's engine-recomputed current ` +
+       `short12 ${psResult.candidatePlan?.short12 ?? '(candidate unreadable)'} (${psResult.candidatePlanPath}) — ` +
+       `a missing, malformed, or stale claim is fail-closed, never a silent pass.`,
+-  };
++  );
+ }
+ 
+ export async function runReviewRound(options: RunReviewRoundOptions): Promise<ReviewRoundResult> {
+@@ -1618,7 +1879,7 @@ export async function runReviewRound(options: RunReviewRoundOptions): Promise<Re
+       });
+       if (round === 2) round2ProposerSeatId = psResult.designatedSeatId;
+       if (psResult.agreed) {
+-        return toReviewRoundResult(psResult, partnerBatchIds, roundOneDrafts, round);
++        return toReviewRoundResult(psResult, partnerBatchIds, roundOneDrafts, round, runDir);
+       }
+ 
+       if (psResult.signerDecision === 'objections') {
+@@ -1642,6 +1903,10 @@ export async function runReviewRound(options: RunReviewRoundOptions): Promise<Re
+               ...(psResult.signerBatchId ? [psResult.signerBatchId] : []),
+             ];
+             const unspent = Math.max(0, resolvedRoundCap - round);
++            // R7 (R3.15): monotone fail is a visible BLOCKED with final-positions diff, not bare hashes.
++            const nc = nonConvergenceFieldsForPsResult(
++              runDir, psResult, roundOneDrafts, 'objection-not-monotone',
++            );
+             return {
+               agreed: false,
+               partnerBatchIds: partnerBatchIdsWithPs,
+@@ -1653,7 +1918,9 @@ export async function runReviewRound(options: RunReviewRoundOptions): Promise<Re
+                 `OBJECTION-NOT-MONOTONE (R3.13/R6): round ${round} defect count (${currentLabel}) ` +
+                 `is not strictly smaller than prior objections count (${priorLabel}) against the ` +
+                 `revised candidate — typed BLOCK early; ${unspent} remaining round-cap slot(s) unspent ` +
+-                `(cap ${resolvedRoundCap}), never burned chasing a non-shrinking objection set.`,
++                `(cap ${resolvedRoundCap}), never burned chasing a non-shrinking objection set.` +
++                nc.blockedReasonSuffix,
++              nonConvergenceDiffPath: nc.nonConvergenceDiffPath,
+             };
+           }
+         }
+@@ -1661,7 +1928,7 @@ export async function runReviewRound(options: RunReviewRoundOptions): Promise<Re
+       }
+ 
+       if (round >= resolvedRoundCap) {
+-        return toReviewRoundResult(psResult, partnerBatchIds, roundOneDrafts, round);
++        return toReviewRoundResult(psResult, partnerBatchIds, roundOneDrafts, round, runDir);
+       }
+       // R4: budget remains — round (round + 1) alternates the pen over the SAME two round-1 drafts.
+       continue;

@@ -23,7 +23,7 @@ describe('O6.1 TrackingReadService', () => {
     db.raw.prepare("INSERT INTO runs (id,project_id,batch_id,source,phase,status) VALUES (10,1,'a','native','executing','active'),(20,2,'b','ingest','planning','active')").run();
     db.raw.prepare("INSERT INTO run_tasks (run_id,label,status) VALUES (10,'a','complete'),(10,'b','failed'),(10,'c','deferred'),(10,'d','working')").run();
     db.raw.prepare("INSERT INTO worker_runtimes (project_id,run_id,role,provider,model,state) VALUES (1,10,'implementer','codex','x','running')").run();
-    db.raw.prepare("INSERT INTO helm_sessions (name,project_id,run_id,status) VALUES ('helm-a',1,10,'active')").run();
+    db.raw.prepare("INSERT INTO helm_sessions (name,project_id,run_id,owner,status) VALUES ('helm-a',1,10,'legacy:unknown','active')").run();
     const snapshot = new TrackingReadService(db).snapshot();
     expect(snapshot.runs).toHaveLength(2);
     const firstRun = snapshot.runs.find((r: any) => r.identity.id === 10)!;
@@ -36,7 +36,7 @@ describe('O6.1 TrackingReadService', () => {
     db.raw.prepare("INSERT INTO projects (id,name,directory) VALUES (1,'one','/tmp/one')").run();
     db.raw.prepare("INSERT INTO runs (id,project_id,phase,status) VALUES (1,1,'planning','active'),(2,1,'complete','complete')").run();
     db.raw.prepare("INSERT INTO worker_runtimes (project_id,run_id,role,provider,model,state) VALUES (1,2,'implementer','codex','x','running')").run();
-    db.raw.prepare("INSERT INTO helm_sessions (name,project_id,status) VALUES ('helm-orphan',1,'active')").run();
+    db.raw.prepare("INSERT INTO helm_sessions (name,project_id,owner,status) VALUES ('helm-orphan',1,'legacy:unknown','active')").run();
     const snapshot = new TrackingReadService(db).snapshot({ projectId: 1 });
     expect(snapshot.runs.find((r: any) => r.identity.id === 1)!.state).toBe('empty');
     expect(snapshot.runs.find((r: any) => r.identity.id === 2)!.state).toBe('terminal_with_active_children');

@@ -1,0 +1,14 @@
+
+ RUN  v2.1.9 /home/agjrom/websites/Helm
+
+ ✓ src/services/planning-review-round-signature-gate.test.ts (17 tests) 1228ms
+   ✓ waitForCandidateSignature — signature-on-candidate-bytes gate (R3.11, R3.14, R6.21) > R3.14: PLAN-READY is not part of this grammar — a plancore PLAN-READY line alone never resolves the wait 404ms
+   ✓ waitForCandidateSignature — signature-on-candidate-bytes gate (R3.11, R3.14, R6.21) > a signer that never posts SIGNED or OBJECTIONS times out — bounded, never a silent pass 404ms
+   ✓ waitForCandidateSignature — signature-on-candidate-bytes gate (R3.11, R3.14, R6.21) > ignores a SIGNED line from a different batchId (identity-scoped, never cross-seat) 404ms
+ ✓ src/services/planning-phase-current-plan-sha-b5.test.ts (4 tests) 474ms
+
+ Test Files  2 passed (2)
+      Tests  21 passed (21)
+   Start at  02:29:53
+   Duration  2.15s (transform 188ms, setup 13ms, collect 246ms, tests 1.70s, environment 0ms, prepare 61ms)
+

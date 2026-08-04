@@ -58,20 +58,20 @@ describe('plan-parser-service (B9 PLN2)', () => {
     // queue order: deps respected (T1/T4 indep first, T2 after T1, T3 after T2)
     // Minimal dep-order + created proof (first ready exists; after its mark a dep is ready; full drain ends null; 4 created)
     expect(createdTaskIds.length).toBe(4);
-    const r1 = queue.getNextReady(rid);
-    expect(r1).toBeTypeOf('number');
-    queue.markComplete(r1!, rid);
+    const r1 = queue.claimNextReady(rid);
+    expect(r1!.taskId).toBeTypeOf('number');
+    queue.markComplete(r1!);
 
-    const r2 = queue.getNextReady(rid);
-    expect(r2).toBeTypeOf('number'); // dep on the first becomes ready
-    queue.markComplete(r2!, rid);
+    const r2 = queue.claimNextReady(rid);
+    expect(r2!.taskId).toBeTypeOf('number'); // dep on the first becomes ready
+    queue.markComplete(r2!);
 
-    let r = queue.getNextReady(rid);
+    let r = queue.claimNextReady(rid);
     while (r != null) {
-      queue.markComplete(r, rid);
-      r = queue.getNextReady(rid);
+      queue.markComplete(r);
+      r = queue.claimNextReady(rid);
     }
-    expect(queue.getNextReady(rid)).toBeNull();
+    expect(queue.claimNextReady(rid)).toBeNull();
 
     // roundtrip fields via artifact plan.json (written by ingest)
     const planPath = path.join(runDir, 'plan.json');
@@ -234,18 +234,18 @@ describe('plan-parser-service (B9 PLN2)', () => {
     expect(compat.tasks[1].validation_criteria).toMatch(/pause on cycles/);
 
     // deps resolved in queue (T01 and T03 ready first-ish; after mark T02 becomes ready)
-    const first = queue.getNextReady(rid)!;
-    expect([keyToId['B10-T01'], keyToId['B10-T03']]).toContain(first);  // indep
-    queue.markComplete(first, rid);
+    const first = queue.claimNextReady(rid)!;
+    expect([keyToId['B10-T01'], keyToId['B10-T03']]).toContain(first.taskId);  // indep
+    queue.markComplete(first);
 
-    const second = queue.getNextReady(rid)!;
+    const second = queue.claimNextReady(rid)!;
     // remaining of the two indeps or the dep
-    queue.markComplete(second, rid);
+    queue.markComplete(second);
 
-    const third = queue.getNextReady(rid)!;
-    expect(third).toBeTypeOf('number');
-    queue.markComplete(third, rid);
-    expect(queue.getNextReady(rid)).toBeNull();
+    const third = queue.claimNextReady(rid)!;
+    expect(third.taskId).toBeTypeOf('number');
+    queue.markComplete(third);
+    expect(queue.claimNextReady(rid)).toBeNull();
 
     // cleanup this test's dir
     await fs.rm(projDir, { recursive: true, force: true }).catch(() => {});
@@ -375,8 +375,8 @@ describe('plan-parser-service (B9 PLN2)', () => {
 
     // queue drains all 19 (deps [] → all ready; proves they entered the queue, not just run_tasks)
     let seeded = 0;
-    let r = queue.getNextReady(rid);
-    while (r != null) { seeded++; queue.markComplete(r, rid); r = queue.getNextReady(rid); }
+    let r = queue.claimNextReady(rid);
+    while (r != null) { seeded++; queue.markComplete(r); r = queue.claimNextReady(rid); }
     expect(seeded).toBe(19);
 
     await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
@@ -422,8 +422,8 @@ describe('plan-parser-service (B9 PLN2)', () => {
     // run_tasks created for all 11 (deps resolved: T01/T02 ready first)
     const runTasks = dbs.raw.prepare('SELECT * FROM run_tasks WHERE run_id = ? ORDER BY id').all(rid) as any[];
     expect(runTasks.length).toBe(11);
-    const first = queue.getNextReady(rid)!;
-    expect(first).toBeTypeOf('number');
+    const first = queue.claimNextReady(rid)!;
+    expect(first.taskId).toBeTypeOf('number');
 
     await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
   });
@@ -507,8 +507,8 @@ describe('plan-parser-service (B9 PLN2)', () => {
     const t02 = compat.tasks.find((t) => t.task_key === 'T02')!;
     expect(t02.deps).toEqual(['T01']); // NOT silently []
     // T02 is gated behind T01 in the queue (predecessor honored)
-    const first = queue.getNextReady(rid)!;
-    expect(first).toBeTypeOf('number');
+    const first = queue.claimNextReady(rid)!;
+    expect(first.taskId).toBeTypeOf('number');
     await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
 
     // dangling + numeric deps are rejected at validation (so ingest can't silently drop them)

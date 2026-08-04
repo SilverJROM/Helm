@@ -2,7 +2,9 @@ import Database from "better-sqlite3";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import fs from "node:fs";
-import { SCHEMA_VERSION, SCHEMA_SQL, V89_IBRAIN_DEFINITION_MD, V89_KNOWN_CANONICAL_PLANCORE_HASHES, V89_PLANCORE_DEFINITION_MD, applyFreshDbExtras, applyB04CanonicalModelSeeds, applyB12bRoleTierSeeds, applyB17TeamTierSeeds, applyB1TeamsSeeds, applyB3AgentRoleCapabilitySeeds, applyB2HelmAgentSeeds, applyB09aCanonicalRosterSeeds, applyB09bPruneNonCanonicalAgents, applyB25OrphanModelHygiene, applyB25dDeleteUnknownProviderMasterRuntimes, applyB6AgentMemorySeeds, applyB11PanelistRetirement, seedRoutingRules } from "./schema.js";
+import { SCHEMA_VERSION, SCHEMA_SQL, V89_IBRAIN_DEFINITION_MD, V89_KNOWN_CANONICAL_PLANCORE_HASHES, V89_PLANCORE_DEFINITION_MD, V110_DISCOVERY_ALLOWED_STATUSES, V110_DISCOVERY_DEFINITION_MD, V110_DISCOVERY_REQUIRED_ARTIFACTS, V110_DISCOVERY_TERMINAL_STATUSES, V110_KNOWN_STALE_DISCOVERY_HASHES, applyFreshDbExtras, applyB04CanonicalModelSeeds, applyB12bRoleTierSeeds, applyB17TeamTierSeeds, applyB1TeamsSeeds, applyB3AgentRoleCapabilitySeeds, applyB2HelmAgentSeeds, applyB09aCanonicalRosterSeeds, applyB09bPruneNonCanonicalAgents, applyB25OrphanModelHygiene, applyB25dDeleteUnknownProviderMasterRuntimes, applyB6AgentMemorySeeds, applyB11PanelistRetirement, applyHousekeeperSeed, seedRoutingRules } from "./schema.js";
+import { deriveSessionOwner } from "../services/session-registry-service.js";
+import { allocateLifecycleGeneration } from "../services/lifecycle-cas.js";
 
 // Schema-data constants live in ./schema.ts. Migration logic stub here
 // ready for P1-2 to extend (per brief: seed schema_version to 1 only).
@@ -66,13 +68,14 @@ export class DatabaseService {
       applyB09aCanonicalRosterSeeds(this.db);  // B09a: R2.8–R2.9 project+house canonical roster (after agent_type exists)
       applyB3AgentRoleCapabilitySeeds(this.db);  // v89: discovery exists after B09a, so bind its role default
       applyB09bPruneNonCanonicalAgents(this.db);  // B09b: R2.11 prune non-canonical + FK cleanup (after B09a seeds)
+      applyHousekeeperSeed(this.db);  // S15: housekeeper house+tiered main+2 (after models + B09a so prune allowlist holds)
       applyB25OrphanModelHygiene(this.db);  // B25 fix1: remap orphan agents.model + prune unreferenced orphan models
       applyB25dDeleteUnknownProviderMasterRuntimes(this.db);  // B25d: no unknown-provider master_runtimes
       applyB1TeamsSeeds(this.db);  // B1: after full SCHEMA_SQL (teams present)
       applyB6AgentMemorySeeds(this.db);  // B6: HB13 three-color memory seeds (after agents/projects exist)
       seedRoutingRules(this.db);  // A3: seed the 9 core routing rules VERBATIM from OrchestratorLoop's hardcoded FSM
       // AC-2: name-map classification on fresh seeds (same map as v94 migration backfill)
-      this.db.exec("UPDATE agents SET classification='tiered' WHERE name IN ('implementer','validator')");
+      this.db.exec("UPDATE agents SET classification='tiered' WHERE name IN ('implementer','validator','housekeeper')");
       this.db.exec("UPDATE agents SET classification='team'   WHERE name = 'planner'");
       this.db.exec("UPDATE agents SET classification='solo'   WHERE name IN ('discovery','plancore','ibrain','panelist')");
       // B11 / AC-3: retire panelist as product seat (hidden seed + unbind role_defaults/bindings)
@@ -3089,9 +3092,16 @@ ALTER TABLE role_capabilities_v90 RENAME TO role_capabilities;
       // INSERT...SELECT preserving every row and all columns. Because run_tasks/run_events/etc reference
       // runs(id), FKs must be OFF for the DROP+rename (mirrors the v49 project_agents rebuild pattern):
       // toggle off BEFORE BEGIN, re-validate with foreign_key_check, restore on both paths.
+      // Columns absent on pre-v56 shapes (cycle_id, seals, …) are selected as NULL so v85/v88 upgrade
+      // fixtures (and real old DBs) still rebuild cleanly.
       if (current && current.version < 91) {
         if (hasTable('runs')) {
           const before = (this.db.prepare('SELECT COUNT(*) AS c FROM runs').get() as { c: number }).c;
+          const rcols = new Set(
+            (this.db.prepare('PRAGMA table_info(runs)').all() as any[]).map((c) => c.name as string)
+          );
+          const col = (name: string, fallback = 'NULL') =>
+            rcols.has(name) ? name : fallback;
           const fkWasOn = this.db.pragma('foreign_keys', { simple: true }) === 1;
           this.db.pragma('foreign_keys = OFF');
           this.db.exec('BEGIN IMMEDIATE;');
@@ -3116,8 +3126,10 @@ CREATE TABLE runs_new (
 );
 INSERT INTO runs_new (id, project_id, cycle_id, batch_id, north_star_ref, status, phase, started_at,
   ended_at, external_run_id, generation, source, state_revision, register_seal_hash, terminal_seal_hash)
-SELECT id, project_id, cycle_id, batch_id, north_star_ref, status, phase, started_at,
-  ended_at, external_run_id, generation, source, state_revision, register_seal_hash, terminal_seal_hash
+SELECT id, ${col('project_id')}, ${col('cycle_id')}, ${col('batch_id')}, ${col('north_star_ref')},
+  status, phase, ${col('started_at', "datetime('now')")}, ${col('ended_at')}, ${col('external_run_id')},
+  ${col('generation', '0')}, ${col('source', "'native'")}, ${col('state_revision', '0')},
+  ${col('register_seal_hash')}, ${col('terminal_seal_hash')}
 FROM runs;
 DROP TABLE runs;
 ALTER TABLE runs_new RENAME TO runs;
@@ -3299,6 +3311,442 @@ ALTER TABLE runs_new RENAME TO runs;
         }
         this.db.prepare('UPDATE schema_version SET version = 100').run();
       }
+
+      // v101 / S04 AC1: helm_sessions.owner — decision authority for reaping (helm|human|legacy:unknown).
+      // Two-track: fresh SCHEMA_SQL has the column; this upgrades live/pre-existing DBs.
+      // Nullable until S07 name/context backfill. Janitor remains off for the whole effort.
+      if (current && current.version < 101) {
+        if (hasTable('helm_sessions')) {
+          const cols = this.db.prepare('PRAGMA table_info(helm_sessions)').all() as any[];
+          if (!cols.some((c) => c.name === 'owner')) {
+            this.db.exec(
+              "ALTER TABLE helm_sessions ADD COLUMN owner TEXT CHECK(owner IS NULL OR owner IN ('helm','human','legacy:unknown'))"
+            );
+          }
+        }
+        this.db.prepare('UPDATE schema_version SET version = 101').run();
+      }
+
+      // v102 / S07 AC5: one-time fail-safe owner backfill (name + kind context).
+      // Only WHERE owner IS NULL; already-set authority is never rewritten. Remainder → legacy:unknown.
+      // Uses deriveSessionOwner (single source of truth). Janitor remains off.
+      if (current && current.version < 102) {
+        if (hasTable('helm_sessions')) {
+          const cols = this.db.prepare('PRAGMA table_info(helm_sessions)').all() as any[];
+          if (cols.some((c) => c.name === 'owner')) {
+            const nullRows = this.db
+              .prepare(`SELECT name, kind FROM helm_sessions WHERE owner IS NULL`)
+              .all() as Array<{ name: string; kind: string | null }>;
+            const setOwner = this.db.prepare(
+              `UPDATE helm_sessions SET owner = ? WHERE name = ? AND owner IS NULL`
+            );
+            for (const row of nullRows) {
+              setOwner.run(deriveSessionOwner(row.name, row.kind), row.name);
+            }
+          }
+        }
+        this.db.prepare('UPDATE schema_version SET version = 102').run();
+      }
+
+      // v103 / S15 AC28+AC31: seed housekeeper house+tiered main grok45 + spark/haiku backups.
+      // Idempotent; definition_md + default_model_id only when empty/NULL; escalations INSERT OR IGNORE.
+      // Janitor remains off. No new agent-configuration schema.
+      if (current && current.version < 103) {
+        applyHousekeeperSeed(this.db);
+        this.db.prepare('UPDATE schema_version SET version = 103').run();
+      }
+
+      // v104 / S18a: housekeeper investigation dispatch evidence.
+      // Investigation-only; no status repair, markIdle, markReaped, or reap in this migration.
+      if (current && current.version < 104) {
+        if (hasTable('helm_sessions')) {
+          this.db.exec(`
+CREATE TABLE IF NOT EXISTS housekeeper_investigations (
+  id INTEGER PRIMARY KEY,
+  helm_session_id INTEGER REFERENCES helm_sessions(id) ON DELETE SET NULL,
+  session_name TEXT NOT NULL,
+  owner TEXT NOT NULL CHECK(owner = 'helm'),
+  status TEXT NOT NULL CHECK(status IN ('no_dispatch','dispatching','dispatched')) DEFAULT 'dispatching',
+  trigger_reason TEXT NOT NULL,
+  observation_json TEXT NOT NULL,
+  pane_tail TEXT NOT NULL,
+  pane_tail_provenance TEXT NOT NULL,
+  envelope_json TEXT NOT NULL,
+  usage_json TEXT NOT NULL,
+  selected_provider TEXT,
+  selected_model TEXT,
+  selected_slug TEXT,
+  selected_rung_index INTEGER,
+  selected_reason TEXT,
+  dispatch_handle TEXT,
+  dispatched_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_housekeeper_investigations_session ON housekeeper_investigations(session_name, created_at);
+CREATE INDEX IF NOT EXISTS idx_housekeeper_investigations_status ON housekeeper_investigations(status);
+`);
+        }
+        this.db.prepare('UPDATE schema_version SET version = 104').run();
+      }
+
+      // v105 / S18b: housekeeper callback/apply contract + cooldown state signature.
+      // Additive only; done applies by marking helm_sessions idle in the service, never by reaping.
+      if (current && current.version < 105) {
+        if (hasTable('housekeeper_investigations')) {
+          const tableSql = (this.db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='housekeeper_investigations'`).get() as any)?.sql as string | undefined;
+          if (tableSql && !tableSql.includes('applied_done')) {
+            this.db.exec(`
+ALTER TABLE housekeeper_investigations RENAME TO housekeeper_investigations_v104;
+CREATE TABLE housekeeper_investigations (
+  id INTEGER PRIMARY KEY,
+  helm_session_id INTEGER REFERENCES helm_sessions(id) ON DELETE SET NULL,
+  session_name TEXT NOT NULL,
+  owner TEXT NOT NULL CHECK(owner = 'helm'),
+  status TEXT NOT NULL CHECK(status IN ('no_dispatch','dispatching','dispatched','applied_done','needs_human','apply_rejected')) DEFAULT 'dispatching',
+  trigger_reason TEXT NOT NULL,
+  state_signature TEXT,
+  observation_json TEXT NOT NULL,
+  pane_tail TEXT NOT NULL,
+  pane_tail_provenance TEXT NOT NULL,
+  envelope_json TEXT NOT NULL,
+  usage_json TEXT NOT NULL,
+  selected_provider TEXT,
+  selected_model TEXT,
+  selected_slug TEXT,
+  selected_rung_index INTEGER,
+  selected_reason TEXT,
+  dispatch_handle TEXT,
+  dispatched_at TEXT,
+  callback_verdict TEXT CHECK(callback_verdict IS NULL OR callback_verdict IN ('done','needs-human')),
+  callback_evidence TEXT,
+  callback_rationale TEXT,
+  applied_at TEXT,
+  apply_error TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+INSERT INTO housekeeper_investigations (
+  id, helm_session_id, session_name, owner, status, trigger_reason, observation_json,
+  pane_tail, pane_tail_provenance, envelope_json, usage_json,
+  selected_provider, selected_model, selected_slug, selected_rung_index, selected_reason,
+  dispatch_handle, dispatched_at, created_at
+)
+SELECT
+  id, helm_session_id, session_name, owner, status, trigger_reason, observation_json,
+  pane_tail, pane_tail_provenance, envelope_json, usage_json,
+  selected_provider, selected_model, selected_slug, selected_rung_index, selected_reason,
+  dispatch_handle, dispatched_at, created_at
+FROM housekeeper_investigations_v104;
+DROP TABLE housekeeper_investigations_v104;
+`);
+          }
+          const cols = this.db.prepare('PRAGMA table_info(housekeeper_investigations)').all() as any[];
+          const hasCol = (name: string) => cols.some((c) => c.name === name);
+          if (!hasCol('state_signature')) this.db.exec(`ALTER TABLE housekeeper_investigations ADD COLUMN state_signature TEXT`);
+          if (!hasCol('callback_verdict')) this.db.exec(`ALTER TABLE housekeeper_investigations ADD COLUMN callback_verdict TEXT CHECK(callback_verdict IS NULL OR callback_verdict IN ('done','needs-human'))`);
+          if (!hasCol('callback_evidence')) this.db.exec(`ALTER TABLE housekeeper_investigations ADD COLUMN callback_evidence TEXT`);
+          if (!hasCol('callback_rationale')) this.db.exec(`ALTER TABLE housekeeper_investigations ADD COLUMN callback_rationale TEXT`);
+          if (!hasCol('applied_at')) this.db.exec(`ALTER TABLE housekeeper_investigations ADD COLUMN applied_at TEXT`);
+          if (!hasCol('apply_error')) this.db.exec(`ALTER TABLE housekeeper_investigations ADD COLUMN apply_error TEXT`);
+        }
+        if (hasTable('housekeeper_investigations')) {
+          this.db.exec(`
+CREATE INDEX IF NOT EXISTS idx_housekeeper_investigations_signature
+  ON housekeeper_investigations(session_name, state_signature, created_at);
+`);
+        }
+        this.db.prepare('UPDATE schema_version SET version = 105').run();
+      }
+
+      // v106 / B01 (janitor-audit-remediation, D01): shared lifecycle_seq allocator +
+      // helm_sessions.generation. Additive only; no kill path touched. Seeds the sequence above
+      // every existing generation (native + ingest), backfills native runs only (external_run_id
+      // IS NULL — never rewrites an ingest row's (project_id, external_run_id, generation) UNIQUE
+      // identity), and backfills existing helm_sessions rows to DISTINCT generations (never a
+      // constant — an all-0 backfill would make a stale snapshot and a freshly re-registered row
+      // indistinguishable for one cycle, precisely F-02).
+      if (current && current.version < 106) {
+        this.db.exec(`
+CREATE TABLE IF NOT EXISTS lifecycle_seq (
+  name TEXT PRIMARY KEY,
+  next INTEGER NOT NULL
+);
+`);
+        this.db.prepare(
+          `INSERT INTO lifecycle_seq (name, next) VALUES ('global', 1) ON CONFLICT(name) DO NOTHING`
+        ).run();
+
+        if (hasTable('helm_sessions')) {
+          const sessionCols = this.db.prepare('PRAGMA table_info(helm_sessions)').all() as any[];
+          if (!sessionCols.some((c) => c.name === 'generation')) {
+            this.db.exec(
+              `ALTER TABLE helm_sessions ADD COLUMN generation INTEGER NOT NULL DEFAULT 0 CHECK(generation >= 0)`
+            );
+          }
+        }
+
+        if (hasTable('runs')) {
+          // Seed strictly above every existing runs.generation — ingest rows may already carry a
+          // nonzero value; native rows are all 0 pre-backfill per D01 Fact 1.
+          const maxGenRow = this.db.prepare(`SELECT COALESCE(MAX(generation), 0) AS maxGen FROM runs`).get() as { maxGen: number };
+          const seedNext = Math.max(1, maxGenRow.maxGen + 1);
+          this.db.prepare(`UPDATE lifecycle_seq SET next = MAX(next, ?) WHERE name = 'global'`).run(seedNext);
+
+          // Backfill native rows ONLY — idx_runs_project_external_generation is UNIQUE on
+          // (project_id, external_run_id, generation), an ingest row's durable identity that must
+          // never be rewritten (D01 Migration constraint 2).
+          const nativeRunIds = this.db.prepare(`SELECT id FROM runs WHERE external_run_id IS NULL`).all() as { id: number }[];
+          const setRunGeneration = this.db.prepare(`UPDATE runs SET generation = ? WHERE id = ?`);
+          for (const { id } of nativeRunIds) {
+            setRunGeneration.run(allocateLifecycleGeneration(this.db), id);
+          }
+        }
+
+        if (hasTable('helm_sessions')) {
+          // Backfill every existing row to a DISTINCT generation (D01 Migration constraint 3) —
+          // never a constant; an all-0 backfill is exactly the F-02 race this batch closes.
+          const sessionIds = this.db.prepare(`SELECT id FROM helm_sessions`).all() as { id: number }[];
+          const setSessionGeneration = this.db.prepare(`UPDATE helm_sessions SET generation = ? WHERE id = ?`);
+          for (const { id } of sessionIds) {
+            setSessionGeneration.run(allocateLifecycleGeneration(this.db), id);
+          }
+        }
+
+        this.db.prepare('UPDATE schema_version SET version = 106').run();
+      }
+
+      // v107 / B11 (janitor-audit-remediation, AC16): freeze session CAS token fields on
+      // housekeeper_investigations so apply-done never late-recaptures by name. Additive only.
+      if (current && current.version < 107) {
+        if (hasTable('housekeeper_investigations')) {
+          const cols = this.db.prepare('PRAGMA table_info(housekeeper_investigations)').all() as any[];
+          const hasCol = (name: string) => cols.some((c) => c.name === name);
+          if (!hasCol('session_status')) {
+            this.db.exec(
+              `ALTER TABLE housekeeper_investigations ADD COLUMN session_status TEXT NOT NULL DEFAULT 'active'`
+            );
+          }
+          if (!hasCol('session_generation')) {
+            this.db.exec(
+              `ALTER TABLE housekeeper_investigations ADD COLUMN session_generation INTEGER NOT NULL DEFAULT 0`
+            );
+          }
+        }
+        this.db.prepare('UPDATE schema_version SET version = 107').run();
+      }
+
+      // v108 / B15 (janitor-audit-remediation, AC20): helm_sessions.owner becomes NOT NULL. SQLite
+      // cannot ALTER a column to NOT NULL, so rebuild the table INSERT...SELECT preserving every
+      // row + id. Defensively re-run the S07/v102 deriveSessionOwner backfill first — v102 + B14's
+      // fail-closed create should already guarantee zero nulls by the time a DB reaches here, but a
+      // copied/older-shaped fixture must never crash on foreign data; heal instead of fail.
+      // housekeeper_investigations.helm_session_id REFERENCES helm_sessions(id) ON DELETE SET NULL
+      // makes helm_sessions an FK *target* — mirrors the v91 runs rebuild: toggle foreign_keys OFF
+      // before BEGIN (the pragma is a no-op inside a transaction), re-validate with
+      // foreign_key_check filtered to helm_sessions (live DBs may carry unrelated pre-existing
+      // orphans elsewhere — v63 agents rebuild precedent), restore the pragma on both paths.
+      if (current && current.version < 108) {
+        if (hasTable('helm_sessions')) {
+          const preCols = this.db.prepare('PRAGMA table_info(helm_sessions)').all() as any[];
+          if (preCols.some((c) => c.name === 'owner')) {
+            const nullRows = this.db
+              .prepare(`SELECT name, kind FROM helm_sessions WHERE owner IS NULL`)
+              .all() as Array<{ name: string; kind: string | null }>;
+            const setOwner = this.db.prepare(
+              `UPDATE helm_sessions SET owner = ? WHERE name = ? AND owner IS NULL`
+            );
+            for (const row of nullRows) {
+              setOwner.run(deriveSessionOwner(row.name, row.kind), row.name);
+            }
+          }
+
+          const before = (this.db.prepare('SELECT COUNT(*) AS c FROM helm_sessions').get() as { c: number }).c;
+          const fkWasOn = this.db.pragma('foreign_keys', { simple: true }) === 1;
+          this.db.pragma('foreign_keys = OFF');
+          this.db.exec('BEGIN IMMEDIATE;');
+          try {
+            this.db.exec(`
+CREATE TABLE helm_sessions_new (
+  id INTEGER PRIMARY KEY,
+  name TEXT UNIQUE NOT NULL,
+  kind TEXT,
+  project_id INTEGER,
+  run_id INTEGER,
+  owner TEXT NOT NULL CHECK(owner IN ('helm','human','legacy:unknown')),
+  status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','idle','reaped')),
+  generation INTEGER NOT NULL DEFAULT 0 CHECK(generation >= 0),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  last_used_at TEXT,
+  ended_at TEXT,
+  reason TEXT
+);
+INSERT INTO helm_sessions_new (id, name, kind, project_id, run_id, owner, status, generation, created_at, last_used_at, ended_at, reason)
+SELECT id, name, kind, project_id, run_id, owner, status, generation, created_at, last_used_at, ended_at, reason
+FROM helm_sessions;
+DROP TABLE helm_sessions;
+ALTER TABLE helm_sessions_new RENAME TO helm_sessions;
+CREATE INDEX IF NOT EXISTS idx_helm_sessions_status ON helm_sessions(status);
+CREATE INDEX IF NOT EXISTS idx_helm_sessions_run ON helm_sessions(run_id);
+`);
+            const after = (this.db.prepare('SELECT COUNT(*) AS c FROM helm_sessions').get() as { c: number }).c;
+            if (after !== before) {
+              throw new Error(`v108 helm_sessions rebuild row-count mismatch: before=${before} after=${after}`);
+            }
+            this.db.pragma('foreign_keys = ON');
+            const fkProblems = (this.db.prepare('PRAGMA foreign_key_check').all() as any[]).filter(
+              (p: any) => p.table === 'helm_sessions' || p.parent === 'helm_sessions'
+            );
+            if (fkProblems.length > 0) {
+              throw new Error(`foreign_key_check failed during v108 helm_sessions rebuild: ${JSON.stringify(fkProblems.slice(0, 5))}`);
+            }
+            this.db.prepare('UPDATE schema_version SET version = 108').run();
+            this.db.exec('COMMIT;');
+          } catch (e) {
+            try { this.db.exec('ROLLBACK;'); } catch {}
+            this.db.pragma(`foreign_keys = ${fkWasOn ? 'ON' : 'OFF'}`);
+            throw e;
+          }
+          this.db.pragma('foreign_keys = ON');
+        } else {
+          this.db.prepare('UPDATE schema_version SET version = 108').run();
+        }
+      }
+
+      // v109 / E8 FIX2 (R-cycle-session-continuity): new, self-contained table — no existing-table
+      // rebuild needed. CREATE TABLE IF NOT EXISTS is safe to run unconditionally on a live DB.
+      if (current && current.version < 109) {
+        this.db.exec(`
+CREATE TABLE IF NOT EXISTS chat_session_identities (
+  id INTEGER PRIMARY KEY,
+  project_id INTEGER NOT NULL,
+  agent_id INTEGER NOT NULL,
+  cycle_id INTEGER NOT NULL DEFAULT 0,
+  provider TEXT NOT NULL,
+  conversation_id TEXT NOT NULL,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(project_id, agent_id, cycle_id)
+);
+`);
+        this.db.prepare('UPDATE schema_version SET version = 109').run();
+      }
+
+      // v110 / S02 (discovery-planning-handoff): align Discovery seed + role_capabilities with
+      // discovery-contract (no HANDOFF; no Planning artifacts). Guarded definition repair rewrites
+      // only empty or known-stale north/old-canonical fingerprints; user-edited bodies stay
+      // byte-identical. Migration tests only — never open data/helm.db here.
+      if (current && current.version < 110) {
+        if (hasTable('agents')) {
+          const agentColumns = new Set(
+            (this.db.prepare('PRAGMA table_info(agents)').all() as any[]).map((column) => column.name)
+          );
+          if (agentColumns.has('definition_md')) {
+            const discovery = this.db
+              .prepare("SELECT id, definition_md FROM agents WHERE name = 'discovery' LIMIT 1")
+              .get() as { id: number; definition_md: string | null } | undefined;
+            if (discovery) {
+              const currentDefinition = discovery.definition_md || '';
+              const definitionHash = createHash('sha256').update(currentDefinition, 'utf8').digest('hex');
+              if (!currentDefinition.trim() || V110_KNOWN_STALE_DISCOVERY_HASHES.has(definitionHash)) {
+                const timestampSet = agentColumns.has('updated_at') ? ", updated_at = datetime('now')" : '';
+                this.db
+                  .prepare(`UPDATE agents SET definition_md = ?${timestampSet} WHERE id = ?`)
+                  .run(V110_DISCOVERY_DEFINITION_MD, discovery.id);
+              } else if (currentDefinition !== V110_DISCOVERY_DEFINITION_MD) {
+                console.warn(
+                  `[v110] custom discovery definition_md preserved (agent_id=${discovery.id}, sha256=${definitionHash})`
+                );
+              }
+            }
+          }
+        }
+
+        if (hasTable('role_capabilities')) {
+          // System table (not a user persona): force discovery caps to S01 contract enums.
+          this.db
+            .prepare(
+              `UPDATE role_capabilities
+               SET allowed_statuses = ?,
+                   terminal_statuses = ?,
+                   required_artifacts = ?,
+                   updated_at = datetime('now')
+               WHERE role = 'discovery'`
+            )
+            .run(
+              V110_DISCOVERY_ALLOWED_STATUSES,
+              V110_DISCOVERY_TERMINAL_STATUSES,
+              V110_DISCOVERY_REQUIRED_ARTIFACTS
+            );
+          this.db
+            .prepare(
+              `INSERT OR IGNORE INTO role_capabilities (
+                 role, allowed_statuses, terminal_statuses, can_write_code, requires_repro_first,
+                 panel_participant, can_escalate, session_policy, required_artifacts, timeout_ms, checkin_ms
+               ) VALUES ('discovery', ?, ?, 0, 0, 0, 0, 'fresh', ?, NULL, NULL)`
+            )
+            .run(
+              V110_DISCOVERY_ALLOWED_STATUSES,
+              V110_DISCOVERY_TERMINAL_STATUSES,
+              V110_DISCOVERY_REQUIRED_ARTIFACTS
+            );
+        }
+
+        this.db.prepare('UPDATE schema_version SET version = 110').run();
+      }
+
+      // v111 / S08 (discovery-planning-handoff): durable Discovery→Planning handoff CAS store.
+      // Fresh DBs get the table via SCHEMA_SQL; this upgrades live/pre-existing DBs.
+      // Migration tests only — never open data/helm.db here.
+      if (current && current.version < 111) {
+        this.db.exec(`
+CREATE TABLE IF NOT EXISTS discovery_handoffs (
+  id INTEGER PRIMARY KEY,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  cycle_id INTEGER NOT NULL REFERENCES cycles(id) ON DELETE CASCADE,
+  chat_session_id TEXT,
+  agent_id INTEGER REFERENCES agents(id),
+  credential_hash TEXT NOT NULL,
+  credential_consumed_at TEXT,
+  callback_role TEXT,
+  callback_status TEXT,
+  state TEXT NOT NULL CHECK(state IN (
+    'pending', 'declined', 'starting', 'started', 'quarantined', 'failed'
+  )),
+  manifest_json TEXT,
+  manifest_digest TEXT,
+  planning_run_id INTEGER REFERENCES runs(id),
+  reason TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_discovery_handoffs_cycle ON discovery_handoffs(cycle_id);
+CREATE INDEX IF NOT EXISTS idx_discovery_handoffs_project ON discovery_handoffs(project_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_discovery_handoffs_one_live
+  ON discovery_handoffs(cycle_id)
+  WHERE state IN ('pending', 'starting');
+`);
+        this.db.prepare('UPDATE schema_version SET version = 111').run();
+      }
+
+      // v112 / S13: durable Planning agreement provenance (cycle-linked success record).
+      // Fresh DBs get the table via SCHEMA_SQL; this upgrades pre-existing DBs.
+      // Migration tests only — never open data/helm.db here.
+      if (current && current.version < 112) {
+        this.db.exec(`
+CREATE TABLE IF NOT EXISTS planning_provenance (
+  id INTEGER PRIMARY KEY,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  cycle_id INTEGER NOT NULL UNIQUE REFERENCES cycles(id) ON DELETE CASCADE,
+  planning_run_id INTEGER NOT NULL REFERENCES runs(id),
+  manifest_digest TEXT NOT NULL,
+  plan_sha256 TEXT NOT NULL,
+  agreed_at TEXT NOT NULL DEFAULT (datetime('now')),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_planning_provenance_project ON planning_provenance(project_id);
+CREATE INDEX IF NOT EXISTS idx_planning_provenance_run ON planning_provenance(planning_run_id);
+`);
+        this.db.prepare('UPDATE schema_version SET version = 112').run();
+      }
     }
   }
 
@@ -3308,6 +3756,11 @@ ALTER TABLE runs_new RENAME TO runs;
 
   prepare(sql: string): Database.Statement {
     return this.db.prepare(sql);
+  }
+
+  /** B01: thin delegation so callers get a transaction-wrapped fn without reaching for `.raw`. */
+  transaction<F extends (...args: any[]) => unknown>(fn: F): Database.Transaction<F> {
+    return this.db.transaction(fn);
   }
 
   exec(sql: string): void {

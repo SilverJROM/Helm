@@ -4,13 +4,17 @@ import { RunArtifactService } from './run-artifact-service.js';
 import { TaskQueueService } from './task-queue-service.js';
 import { PlanParserService, Plan, PlannedTask } from './plan-parser-service.js';
 import type { ITransport } from './fake-transport.js';
-import { bindDispatchNonce, BriefWriterService, createDispatchNonce } from './brief-writer-service.js';
+import { BriefWriterService } from './brief-writer-service.js';
 import { roleMatches } from './role-alias.js';
 import { parseCallbackLine } from './agent-event-ingest.js';
 import { classifySeatPane } from './seat-pane-state.js';
 import { CANONICAL_CYCLE_ARTIFACTS, materializeCanonicalArtifactSet } from './cycle-artifact-paths.js';
 import { validateExecutionPlan } from './execution-plan-parser.js';
 import { finalizeWorkerRuntimeRow } from './worker-runtime-finalize.js';
+import { readPlanRevision } from './plan-revision.js';
+import { runReviewRound } from './planning-review-round.js';
+import type { RoundBlockedReasonKind } from './planning-review-round.js';
+import { atomicWriteFile } from './seat-draft-store.js';
 
 /**
  * B9 PLN1: Planning-phase orchestration (projcore-brain + co-planner).
@@ -122,12 +126,26 @@ export interface PlanningInputs {
   partnerModel?: string;       // POCFIX4: bound model from role_bindings for the auto-chosen co-planner partner role (planner or deliberation)
   planningBrainProvider?: string; // Provider from the plancore role binding.
   partnerProvider?: string;    // POCFIX5: provider for the co-planner partner
+  /**
+   * S06: ordered configured co-planner seat specs from S05 PlanningStaffingService.
+   * When non-empty, each partner spawn uses that seat's exact model/provider/effort
+   * (never a single repeated partnerModel). Partner count = length. Legacy partnerModel
+   * + panelSize path remains when absent/empty.
+   */
+  coPlannerSeats?: Array<{
+    slot: number;
+    provider: string;
+    model: string;
+    effort?: string;
+    source?: string;
+  }>;
   runId?: number;              // D-b1: if provided (interview path pre-created the run), reuse for ingest instead of createRun
   strictReadAllow?: string[];  // B-ISO1 (sol wiring review fix #4): run-scoped opt-in strict read allowlist, threaded from RunOrchestrator to the projcore + partner planning seats. undefined => read-all (unchanged).
   adaptivePlanning?: boolean;  // v92: project.adaptive_planning — when true, runPlanningPhase delegates to the adaptive tiered planner module. Default/undefined => existing single-author path.
   /** A10 (R1.3): core (non-adaptive) planning panel size — total seats (plancore + partners), from
    *  project.planning_panel_size. Default/undefined => 2 (today's plancore+1-partner behavior).
-   *  Distinct from the adaptive planner's own `panel.size` (only consulted when adaptivePlanning is on). */
+   *  Distinct from the adaptive planner's own `panel.size` (only consulted when adaptivePlanning is on).
+   *  S06: ignored for partner count when coPlannerSeats is non-empty. */
   panelSize?: number;
   /** v93: per-project adaptive planner panel (size / lead / members / backups / default effort). */
   panel?: import('./adaptive-planning-phase.js').PlannerPanel;
@@ -153,6 +171,10 @@ export interface PlanningResult {
   /** A11 (R1.6 + D7): set only when agreed===false — a mechanism-level reason naming the missing
    *  partner batch id(s) and the round-cap budget exhausted, for the caller's visible BLOCKED state. */
   blockedReason?: string;
+  /** C8: typed non-agreement cause from the round machine, set alongside blockedReason when available. */
+  blockedReasonKind?: RoundBlockedReasonKind;
+  /** C4: number of review rounds attempted before agreement or blocked return. */
+  roundsAttempted?: number;
   /** A13 (R1.29 reconvene half): task_keys the pair was reconvened for (ESCALATE or a conflicting
    *  AMEND). Empty when every task was ACCEPTed by both seats (or carried no explicit verdict at all) —
    *  never populated by the whole-plan gate itself, only by this row's per-task conflict detector. */
@@ -230,6 +252,20 @@ export class PlanningPhaseService {
       finalizeWorkerRuntimeRow(db, id, state, reason);
     } catch {
       /* best-effort bookkeeping */
+    }
+  }
+
+  // A5 (AC5/AC23): reap a retained planning seat transport handle. Best-effort/never-throw, same
+  // contract as finalizeWorkerRuntime and the existing retry-loop reap (above) — a transport-level
+  // failure to tear down a session must never block the DB finalize that follows it. Both FakeTransport
+  // and RealTransport's own reap() are already no-ops on an already-reaped handle, so calling this twice
+  // for the same handle (e.g. a respawned seat whose earlier attempt was reaped in-loop) is idempotent.
+  private async reapPlanningHandle(handle: string | null, reason: string): Promise<void> {
+    if (!handle) return;
+    try {
+      await this.transport.reap(handle, reason);
+    } catch {
+      /* best-effort — see comment above */
     }
   }
 
@@ -322,6 +358,7 @@ export class PlanningPhaseService {
     // SEPARATE module (grok red-team FIX 7 — no if-soup here). OFF (default) → the existing single-author
     // flow below runs byte-identical. The delegate emits the SAME PlanningResult so ingest is unchanged.
     if (inputs.adaptivePlanning) {
+      // R7 explicit scope pin: keep adaptive path fully delegated and defer adaptive co-author contract reconciliation.
       const { runAdaptivePlanningPhase } = await import('./adaptive-planning-phase.js');
       return runAdaptivePlanningPhase(
         { transport: this.transport, artifacts: this.artifacts, taskQueue: this.queue },
@@ -351,7 +388,6 @@ export class PlanningPhaseService {
     // Only the whole-plan agreement wait (waitForAgreement) is scaled; the canonical-doc-write poll
     // below is a separate wait (plancore finishing its write after agreement) and is untouched.
     const roundCap = Math.max(1, Math.trunc(inputs.roundCap ?? 3) || 3);
-    const effectiveTimeoutMs = PLANNING_TIMEOUT_MS * roundCap;
 
     await this.ensureDir('prompts', runDir);
     await this.ensureDir('', runDir);
@@ -391,111 +427,48 @@ export class PlanningPhaseService {
       `unanimous=${consensusPolicy.unanimous} maxRounds=${consensusPolicy.maxRounds} (source: teams.consensus_rule; settle-role clause not wired)`
     );
 
-    // Generate contract-compliant planning brief via BriefWriter (projcore role gets its own enum + full v2 sections + streaming/helper/paths etc).
-    // This fixes the live POST /runs 400 BRIEF-CONTRACT-MISSING for the planning (projcore) brief under real dispatch/RealTransport.
+    // R1.1 / B4: plancore authoring brief deleted — not repurposed. Co-planners own drafts (plan-draft).
+    // P1 (R1.2): the residual plancore spawn / writeBrief authoring path is retired below — no model
+    // call is made for plancore during initial whole-plan authoring. briefWriter still used for panel briefs.
     const briefWriter = new BriefWriterService();
     const effectiveProjectDir = inputs.projectDir || process.cwd();
-    // A12 / R1.7: pass D7 config-sourced planning_round_cap into the brief (no open-ended "iterate").
-    let planningBrief = briefWriter.generatePlanningBrief({
-      batchId,
-      northStar: effectiveNorthStar,
-      conversationLog: effectiveConversationLog,
-      mode: partner,
-      projectDir: effectiveProjectDir,
-      callbacksFile: path.join(runDir, 'callbacks.md'),
-      runDir,
-      canonicalArtifactRoot,
-      planningRoundCap: roundCap,
-    });
-    // A12: persist the planning brief immediately so the contract is on disk before plancore cold-spawn
-    // (which can take minutes). Dispatch-nonce rebind rewrites the same path after spawn.
-    try {
-      await this.artifacts.writeBrief(runDir, 'plancore', planningBrief);
-    } catch { /* best-effort early write; post-spawn write remains below */ }
 
     // A15: hoist seat runtime ids so phase exit can finalize both (A1 only finalized plancore on retry).
     // A10: partner seats are now N (>= 0), one runtime id per spawned partner.
     let plancoreRuntimeId: number | null = null;
     const partnerRuntimeIds: (number | null)[] = [];
+    // A5 (AC5/AC23): retain each seat's transport handle too — the runtime id alone finalizes the DB
+    // row, but never reaps the live transport session. A normal terminal exit (agreed or blocked) must
+    // reap before it finalizes, or the session leaks and can poison a retry. P1 (R1.2): plancore is no
+    // longer spawned, so plancoreHandle/plancoreRuntimeId stay null for the life of this call — both
+    // reapPlanningHandle and finalizeWorkerRuntime already no-op on null, so the terminal owner below
+    // is untouched (A5/A6).
+    let plancoreHandle: string | null = null;
+    const partnerHandles: string[] = [];
 
-    // POCFIX20: projcore spawn-retry. Helm's claude spawn is intermittently flaky (empty pane / brief never
-    // lands → no plan → dead run), while grok's is reliable; root cause is a hard-to-pin spawn timing/race.
-    // Cause-agnostic robustness: if projcore emits NO callback within a window, reap + respawn (up to 3x).
-    // Real path only (fake/test short-circuits to a single spawn so existing tests are unchanged).
-    {
-      const isFakeP = process.env.USE_FAKE_TMUX === '1' && process.env.NODE_ENV !== 'production';
-      const maxSpawnAttempts = isFakeP ? 1 : 3;
-      const firstCbWindowMs = isFakeP ? 0 : clampedPlanningMs('HELM_CB_FIRST_CALLBACK_MS', 120_000, 5_000, 5 * 60_000);
-      const cbPath = path.join(runDir, 'callbacks.md');
-      let lastDispatchBrief = planningBrief;
-      for (let attempt = 1; attempt <= maxSpawnAttempts; attempt++) {
-        let dispatchOffset = 0;
-        try { dispatchOffset = (await fs.stat(cbPath)).size; } catch {}
-        const dispatchNonce = createDispatchNonce();
-        const dispatchBrief = bindDispatchNonce(planningBrief, dispatchNonce);
-        lastDispatchBrief = dispatchBrief;
-        // The concrete seat is phase-owned (`plancore`). The brief/callback face intentionally
-        // remains the existing helm_pm/projcore compatibility seam so no raw role token reaches
-        // the model and callback ingest remains backward-compatible.
-        const spawned = await this.transport.spawn({ role: brainRole, brief: dispatchBrief, runDir, batchId, sessionName: inputs.sessionName, model: inputs.planningBrainModel, provider: inputs.planningBrainProvider, attemptId: 0, projectDir: effectiveProjectDir, projectId: inputs.projectId, runId: inputs.runId, ...(inputs.strictReadAllow ? { strictReadAllow: inputs.strictReadAllow } : {}) });  // B-ISO1 + A2: projectId/runId → helm_sessions via createSession
-        // A1 (R4.16): record this plancore seat so it is DB-observable with run+cycle linkage.
-        plancoreRuntimeId = this.registerWorkerRuntime(inputs.projectId, inputs.runId, brainRole, batchId, spawned.handle, inputs.planningBrainProvider, inputs.planningBrainModel);
-        if (isFakeP) break;
-        // R8: pass the live handle+brief so the first-callback wait can watchdog a brief that is
-        // still sitting un-submitted in the composer (variable codex Enter-drop window) instead of
-        // burning the whole window and respawning.
-        const first = await this.waitForFirstCallback(cbPath, brainRole, batchId, firstCbWindowMs, dispatchOffset, {
-          handle: spawned.handle,
-          brief: dispatchBrief,
-          provider: inputs.planningBrainProvider ?? 'grok',
-          runId: inputs.runId,
-        });
-        if (first.ok) break;
-        try { await this.transport.reap(spawned.handle, `${brainRole}-${first.reason}-reaped`); } catch {}
-        this.finalizeWorkerRuntime(plancoreRuntimeId, 'reaped', `${first.reason}-reaped`);
-        if (attempt === maxSpawnAttempts) {
-          throw new Error(`planning ${first.reason}: ${brainRole} emitted no first callback after ${maxSpawnAttempts} spawn attempts`);
-        }
-        await new Promise((r) => setTimeout(r, 2500));
-      }
-      planningBrief = lastDispatchBrief;
-    }
+    // A6 (AC5/AC23): ONE terminal owner for this call. Success, blocked, AND thrown planning exits all
+    // route through this same reap-then-finalize routine (A5 order preserved: every retained handle is
+    // reaped before any worker_runtimes row is finalized) instead of each exit duplicating its own
+    // cleanup — the prior asymmetry where only the pre-partner-spawn spawn-retry throw had any cleanup
+    // at all, while every later thrown exit (after partner seats exist) had none. terminalReason /
+    // terminalState are set by whichever exit is actually taken; the catch below's default covers any
+    // exception this try region raises, so a thrown exit can no longer bypass reap+finalize. Both
+    // reapPlanningHandle and finalizeWorkerRuntime are already best-effort/never-throw/idempotent, so
+    // this owner itself can never throw and never masks the real error.
+    let terminalReason = 'planning-thrown-exit';
+    let terminalState: 'done' | 'reaped' | 'failed' = 'failed';
+    const runPlanningTerminal = async (): Promise<void> => {
+      await this.reapPlanningHandle(plancoreHandle, terminalReason);
+      for (const h of partnerHandles) await this.reapPlanningHandle(h, terminalReason);
+      this.finalizeWorkerRuntime(plancoreRuntimeId, terminalState, terminalReason);
+      for (const id of partnerRuntimeIds) this.finalizeWorkerRuntime(id, terminalState, terminalReason);
+    };
 
-    // Always persist the plancore brief so prompts/plancore.brief.md exists on both planner and
-    // deliberation paths.
-    await this.artifacts.writeBrief(runDir, 'plancore', planningBrief);
-
-    // A8 (R1.2): a planning run always convenes at least one partner — 'planner' selects a single
-    // co-reviewer, 'deliberation' a cross-cutting review, but neither mode skips the partner (D1).
-    // A10 (R1.3): the NUMBER of partners is per-project config (project.planning_panel_size, total
-    // seats including plancore), not a guess from selectCoPlannerMode's north-star regex — that
-    // function only ever chose the partner's review *lens* (planner vs deliberation), never seat count.
-    // Default/undefined panelSize => 2 total seats (plancore + 1 partner), byte-identical to pre-A10
-    // behavior and correlation-id-compatible with every existing fixture hardcoding `${batchId}-partner`.
-    const panelSize = Math.max(1, Math.trunc(inputs.panelSize ?? 2) || 2);
-    const partnerCount = Math.max(0, panelSize - 1);
-    const partnerBatchIds: string[] = [];
-    for (let i = 0; i < partnerCount; i++) {
-      // Seat 0 keeps the EXACT legacy correlation id (`${batchId}-partner`, no numeric suffix) so the
-      // default 2-seat case never changes wire format for any existing consumer/fixture. Additional
-      // seats (panelSize >= 3) are numbered from 2.
-      const partnerBatchId = i === 0 ? `${batchId}-partner` : `${batchId}-partner-${i + 1}`;
-      const seatLabel = i === 0 ? 'partner' : `partner-${i + 1}`;
-      partnerBatchIds.push(partnerBatchId);
-      const partnerBrief = briefWriter.generatePanelBrief({
-        role: partner,
-        batchId: partnerBatchId,
-        seat: seatLabel,
-        lens: 'plan atomicity, deps, fields, complexity/recommended_model, validation_criteria',
-        requirement: 'Review canonical plan.md and north-star.md. Pressure-test atomicity, deps, fields, complexity/recommended_model. Return agreement or concrete gaps.',
-        projectDir: effectiveProjectDir,
-        callbacksFile: path.join(runDir, 'callbacks.md'),
-      });
-      await this.artifacts.writeBrief(runDir, i === 0 ? partner : `${partner}-${i + 1}`, partnerBrief);
-      const partnerSpawned = await this.transport.spawn({ role: partner, brief: partnerBrief, runDir, batchId: partnerBatchId, model: inputs.partnerModel, provider: inputs.partnerProvider, attemptId: 0, projectDir: effectiveProjectDir, projectId: inputs.projectId, runId: inputs.runId, ...(inputs.strictReadAllow ? { strictReadAllow: inputs.strictReadAllow } : {}) });  // B-ISO1 + A2: projectId/runId → helm_sessions via createSession
-      // A1 (R4.16): record each partner seat so it is DB-observable with run+cycle linkage.
-      partnerRuntimeIds.push(this.registerWorkerRuntime(inputs.projectId, inputs.runId, partner, partnerBatchId, partnerSpawned.handle, inputs.partnerProvider, inputs.partnerModel));
-    }
+    try {
+    // P1 (R1.2): plancore is no longer spawned for initial whole-plan authoring — no model call, no
+    // writeBrief authoring seat. The former POCFIX20 spawn-retry loop lived here; ROUND (runReviewRound
+    // below) now owns every seat that actually authors/reviews the plan. brainRole / the 'plancore'
+    // label are kept for logs, staffing (S05/S06), and topology — no renames (R1.3).
 
     // Fixture drive: simulate the exchange + agreement (tests append real [helm callback] lines + sleep).
     // The phase "blocks" here in real waits; in fixture the caller (test) drives the callbacks.md to PLAN-READY.
@@ -503,18 +476,93 @@ export class PlanningPhaseService {
     const cbPath = path.join(runDir, 'callbacks.md');
     // (In real usage the projcore/partner workers append; here tests control timing.)
 
-    // POCFIX8 (B): long timeout on real !USE_FAKE_TMUX (projcore needs minutes to think, write the canonical docs, and emit PLAN-READY); fast 4s preserved under fixture.
-    // A8 (R1.2): waitForAgreement requires BOTH the partner agreement signal AND projcore PLAN-READY in
-    // every mode — 'planner' no longer fast-paths on PLAN-READY alone. real path adds explicit file poll
-    // below for BOTH before ingest.
-    const agreed = await this.waitForAgreement(cbPath, batchId, partner, brainRole, effectiveTimeoutMs, agreementFenceOffset, partnerBatchIds);
+    // B5 (AC7/AC23): planMdPath is hoisted here (before the review round runs) so it can be passed BOTH
+    // as the race-guard path param (BROKEN-vs-not-yet-written guard) and as currentPlanPath (CLEAN-vs-
+    // current-bytes SHA binding) inside runReviewRound below, and reused again by the canonical
+    // read/ingest further down this function.
+    const planMdPath = path.join(canonicalArtifactRoot, CANONICAL_CYCLE_ARTIFACTS.plan);
 
-    // Short grace for plancore to flush canonical documents before the PLAN-READY callback is consumed.
-    await new Promise((r) => setTimeout(r, 120));
+    // C2 (AC11): the partner-spawn loop (A8/A10/S06/CONVENE-RACE-FIX) and the single waitForAgreement
+    // call now live in runReviewRound (planning-review-round.ts) — pure seam extraction, no semantic
+    // change. P1 (R1.2): runPlanningPhase no longer spawns plancore at all — ROUND is the sole spawner,
+    // and the engine hands it the context paths (north-star.md / conversation-log.md) it already
+    // resolved above (:394-411) via contextInputPaths, rather than relying on a plancore seat to have
+    // authored/read them first. runPlanningPhase remains the owner of canonical plan polling/read/ingest
+    // and terminalization (below). waitForAgreement itself (and its parser helpers) stays put on this
+    // class, untouched — B3/B4/B5's direct unit tests call it here — and is handed to the seam already
+    // bound. partnerHandles/partnerRuntimeIds are the SAME arrays the terminal owner (runPlanningTerminal)
+    // already closes over, passed in and mutated in place so a spawn that throws mid-loop still leaves
+    // every already-spawned seat reapable/finalizable (A5/A6), even though the throw itself propagates
+    // out of runReviewRound before it can return a result.
+    const { agreed, partnerBatchIds, blockedReason, blockedReasonKind, roundsAttempted, proposerSignerRound } = await runReviewRound({
+      transport: this.transport,
+      briefWriter,
+      writeBrief: (role, content) => this.artifacts.writeBrief(runDir, role, content),
+      registerWorkerRuntime: (role, correlationId, handle, provider, model) =>
+        this.registerWorkerRuntime(inputs.projectId, inputs.runId, role, correlationId, handle, provider, model),
+      waitForAgreement: this.waitForAgreement.bind(this),
+      runDir,
+      batchId,
+      brainRole,
+      partner,
+      effectiveProjectDir,
+      cbPath,
+      planMdPath,
+      contextInputPaths: [nsPath, convPath],
+      perRoundTimeoutMs: PLANNING_TIMEOUT_MS,
+      roundCap,
+      agreementFenceOffset,
+      isFake,
+      // R2 (R2.5-R2.7): round 1 is always dual blind draft, never the legacy plancore-authored
+      // diff-review path — plancore no longer authors plan.md/og-requirements.md (P1/R1.2 above), so
+      // the legacy path's precondition can never be satisfied. Missing here left both co-planner
+      // seats fail-closed waiting on canonical artifacts that would never be written (found live,
+      // cycle 13 run 33/34, 2026-08-03 07:2x PHT — confirmed via runtime callback text, not guessed).
+      blindDraftRound1: true,
+      panelSize: inputs.panelSize,
+      coPlannerSeats: inputs.coPlannerSeats,
+      partnerModel: inputs.partnerModel,
+      partnerProvider: inputs.partnerProvider,
+      projectId: inputs.projectId,
+      runId: inputs.runId,
+      strictReadAllow: inputs.strictReadAllow,
+      partnerHandles,
+      partnerRuntimeIds,
+    });
 
     const planJsonPath = path.join(runDir, 'plan.json');
-    const planMdPath = path.join(canonicalArtifactRoot, CANONICAL_CYCLE_ARTIFACTS.plan);
     const reqPath = path.join(canonicalArtifactRoot, CANONICAL_CYCLE_ARTIFACTS.requirements);
+
+    // B6 (AC9): check non-agreement BEFORE any canonical-plan polling/read/ingest. A `false` result
+    // here can mean round-cap exhaustion, a confirmed BROKEN verdict, or (B5) a current-plan-SHA
+    // mismatch — whatever the cause, it is a planning-agreement outcome, not a plan-read outcome, so
+    // it must never fall through into the poll/read block below (which can itself throw a
+    // NO-AGREED-PLAN-CANDIDATE error and mask the real, mechanism-level reason).
+    if (!agreed) {
+      // Gate blocked — do not ingest or hand off.
+      // A6: route through the one terminal owner — reason/state feed runPlanningTerminal(), which the
+      // finally below runs (reap BEFORE finalize, same A5 order as every other exit).
+      terminalReason = 'planning-not-agreed';
+      terminalState = 'reaped';
+      await this.advanceAgreementFence(runDir, batchId, path.join(runDir, 'callbacks.md'));
+      return {
+        agreed: false,
+        coPlannerUsed: partner,
+        northStarPath: nsPath,
+        reqPath,
+        planJsonPath,
+        planMdPath,
+        // B6: no canonical-plan read is attempted on the blocked path, so there is no ingested plan
+        // to return — an empty task list, never a stale/partial read of a plan that was not agreed.
+        plan: { tasks: [] },
+        createdTaskIds: [],
+        keyToId: {},
+        runId: 0,
+        blockedReason,
+        blockedReasonKind,
+        roundsAttempted
+      };
+    }
 
     const readCanonicalPlan = async (): Promise<{ markdown: string; plan: Plan }> => {
       const markdown = await fs.readFile(planMdPath, 'utf8');
@@ -523,99 +571,104 @@ export class PlanningPhaseService {
       return { markdown, plan: { tasks: parsed.normalizedTasks as unknown as PlannedTask[] } };
     };
 
-    // Real planning requires both canonical authored documents. plan.json is deliberately not accepted as
-    // the authored contract here; it is derived only after plan.md validates and the agreement gate passes.
-    if (!isFake) {
-      const pollStart = Date.now();
-      while (Date.now() - pollStart < PLANNING_TIMEOUT_MS) {
-        try {
-          await fs.access(reqPath);
-          await readCanonicalPlan();
-          break;
-        } catch {
-          await new Promise((r) => setTimeout(r, 1000));
-        }
-      }
-    }
-
-    // Fake transport may synthesize a representative canonical document. A pre-seeded plan.json remains
-    // a read-only test/cache compatibility input, but it is immediately rendered into canonical plan.md.
     let plan: Plan;
     let planMarkdown: string;
-    try {
-      if (!isFake) await fs.access(reqPath);
+    if (proposerSignerRound?.candidatePlanPath && proposerSignerRound?.candidateReqPath) {
+      // P2 (R2.5/R3.14): ROUND already confirmed R3.11's signature condition — the signer signed these
+      // EXACT candidate bytes moments ago (waitForCandidateSignature re-derives short12 at check time,
+      // R6.21) — so there is nothing left to poll or wait for. The engine is the ONLY writer of
+      // canonical plan.md/og-requirements.md: it copies the signed candidate atomically (temp + rename,
+      // same primitive the candidate itself was published with) rather than trusting/re-deriving
+      // anything an agent claims. No status token from any seat is ever treated as "ready to use"
+      // (R3.14) — this copy, gated purely on ROUND's own agreed:true + candidate paths, is the one
+      // promotion path.
+      const [candidatePlanBytes, candidateReqBytes] = await Promise.all([
+        fs.readFile(proposerSignerRound.candidatePlanPath),
+        fs.readFile(proposerSignerRound.candidateReqPath),
+      ]);
+      atomicWriteFile(planMdPath, candidatePlanBytes);
+      atomicWriteFile(reqPath, candidateReqBytes);
       const canonical = await readCanonicalPlan();
       plan = canonical.plan;
       planMarkdown = canonical.markdown;
-    } catch (e) {
-      if (isFake) {
-        try {
-          plan = this.parser.parsePlanFromJson(await fs.readFile(planJsonPath, 'utf8'));
-        } catch {
-          plan = {
-            tasks: [
-              { task_key: 'P1', atomic_work: 'Bootstrap the planning parser + types from approved plan schema', complexity: 'med', model: 'claude-sonnet', recommended_model: 'claude-sonnet', effort: 'med', needs_more_info: false, task_type: 'feature', validation_criteria: 'parser roundtrips all fields + deps into run_tasks; queue orders correctly', deps: [] },
-              { task_key: 'P2', atomic_work: 'Implement planning-phase orchestration + co-planner gate + auto pick', complexity: 'high', recommended_model: 'codex-5.5', effort: 'high', needs_more_info: false, task_type: 'feature', validation_criteria: 'auto selects planner for simple north-star; deliberation for cross-cutting; gate blocks handoff until PLAN-READY + partner agree', deps: ['P1'] }
-            ],
-            meta: { source: 'planning-phase-fixture' }
-          };
+    } else {
+      // Legacy pre-signature path (still exercised directly by B3/B4/B5's waitForAgreement unit tests
+      // and by the fixture harness until P3 finishes the production cutover — R5's own note: "keep old
+      // waitForAgreement intact for tests until P3"). Untouched apart from R1.4's error rename below.
+
+      // Short grace for plancore to flush canonical documents before the PLAN-READY callback is consumed.
+      await new Promise((r) => setTimeout(r, 120));
+
+      // Real planning requires both canonical authored documents. plan.json is deliberately not accepted as
+      // the authored contract here; it is derived only after plan.md validates and the agreement gate passes.
+      if (!isFake) {
+        const pollStart = Date.now();
+        while (Date.now() - pollStart < PLANNING_TIMEOUT_MS) {
+          try {
+            await fs.access(reqPath);
+            await readCanonicalPlan();
+            break;
+          } catch {
+            await new Promise((r) => setTimeout(r, 1000));
+          }
         }
-        const canonicalTasks = plan.tasks.map((task, index) => ({
-          id: task.task_key,
-          batch: String((task as any).batch || 'default'),
-          title: task.atomic_work,
-          req_refs: Array.isArray((task as any).req_refs) ? (task as any).req_refs : [`P-${index + 1}`],
-          assignee: (task as any).recommended_rung != null
-            ? `L${Number((task as any).recommended_rung) + 1}`
-            : (task as any).recommended_model || (task as any).model || 'L1',
-          validator_lane: (task as any).validator_rung != null
-            ? `L${Number((task as any).validator_rung) + 1}`
-            : (task as any).validator_model || 'L1',
-          effort: task.effort || task.complexity,
-          type: task.task_type,
-          deps: task.deps || [],
-          validation_criteria: task.validation_criteria,
-          user_critical: Boolean((task as any).user_critical),
-          ...((task as any).redteam != null ? { redteam: (task as any).redteam } : {}),
-          ...((task as any).exception_handling != null ? { exception_handling: (task as any).exception_handling } : {}),
-        }));
-        planMarkdown = `# Plan\n\n\`\`\`json\n${JSON.stringify(canonicalTasks, null, 2)}\n\`\`\`\n`;
-        await this.writeFileSafe(planMdPath, planMarkdown);
-        try { await fs.access(reqPath); } catch {
-          await this.writeFileSafe(reqPath, `# Requirements\n\n${canonicalTasks.map((task) => `- **${task.req_refs[0]}** — ${task.title}`).join('\n')}\n`);
-        }
+      }
+
+      // Fake transport may synthesize a representative canonical document. A pre-seeded plan.json remains
+      // a read-only test/cache compatibility input, but it is immediately rendered into canonical plan.md.
+      try {
+        if (!isFake) await fs.access(reqPath);
         const canonical = await readCanonicalPlan();
         plan = canonical.plan;
         planMarkdown = canonical.markdown;
-      } else {
-        const errMsg = `[${batchId}] PLANCORE-DID-NOT-PRODUCE-CANONICAL-PLAN: plancore must write valid ${reqPath} then ${planMdPath} before PLAN-READY. plan.json is Helm-derived and is not an authored fallback. ${(e as Error).message || e}`;
-        throw new Error(errMsg);
+      } catch (e) {
+        if (isFake) {
+          try {
+            plan = this.parser.parsePlanFromJson(await fs.readFile(planJsonPath, 'utf8'));
+          } catch {
+            plan = {
+              tasks: [
+                { task_key: 'P1', atomic_work: 'Bootstrap the planning parser + types from approved plan schema', complexity: 'med', model: 'claude-sonnet', recommended_model: 'claude-sonnet', effort: 'med', needs_more_info: false, task_type: 'feature', validation_criteria: 'parser roundtrips all fields + deps into run_tasks; queue orders correctly', deps: [] },
+                { task_key: 'P2', atomic_work: 'Implement planning-phase orchestration + co-planner gate + auto pick', complexity: 'high', recommended_model: 'codex-5.5', effort: 'high', needs_more_info: false, task_type: 'feature', validation_criteria: 'auto selects planner for simple north-star; deliberation for cross-cutting; gate blocks handoff until PLAN-READY + partner agree', deps: ['P1'] }
+              ],
+              meta: { source: 'planning-phase-fixture' }
+            };
+          }
+          const canonicalTasks = plan.tasks.map((task, index) => ({
+            id: task.task_key,
+            batch: String((task as any).batch || 'default'),
+            title: task.atomic_work,
+            req_refs: Array.isArray((task as any).req_refs) ? (task as any).req_refs : [`P-${index + 1}`],
+            assignee: (task as any).recommended_rung != null
+              ? `L${Number((task as any).recommended_rung) + 1}`
+              : (task as any).recommended_model || (task as any).model || 'L1',
+            validator_lane: (task as any).validator_rung != null
+              ? `L${Number((task as any).validator_rung) + 1}`
+              : (task as any).validator_model || 'L1',
+            effort: task.effort || task.complexity,
+            type: task.task_type,
+            deps: task.deps || [],
+            validation_criteria: task.validation_criteria,
+            user_critical: Boolean((task as any).user_critical),
+            ...((task as any).redteam != null ? { redteam: (task as any).redteam } : {}),
+            ...((task as any).exception_handling != null ? { exception_handling: (task as any).exception_handling } : {}),
+          }));
+          planMarkdown = `# Plan\n\n\`\`\`json\n${JSON.stringify(canonicalTasks, null, 2)}\n\`\`\`\n`;
+          await this.writeFileSafe(planMdPath, planMarkdown);
+          try { await fs.access(reqPath); } catch {
+            await this.writeFileSafe(reqPath, `# Requirements\n\n${canonicalTasks.map((task) => `- **${task.req_refs[0]}** — ${task.title}`).join('\n')}\n`);
+          }
+          const canonical = await readCanonicalPlan();
+          plan = canonical.plan;
+          planMarkdown = canonical.markdown;
+        } else {
+          // R1.4: plancore no longer authors this file (P1) — the only legitimate source of a
+          // canonical plan is a signed candidate (R2.5/R3.14), so a missing/invalid one is a
+          // candidate/signature-shaped failure, not a specific-agent-named one.
+          const errMsg = `[${batchId}] NO-AGREED-PLAN-CANDIDATE: no signed candidate was promoted and no valid canonical ${reqPath} / ${planMdPath} exists. plan.json is Helm-derived and is not an authored fallback. ${(e as Error).message || e}`;
+          throw new Error(errMsg);
+        }
       }
-    }
-
-    if (!agreed) {
-      // Gate blocked — do not ingest or hand off.
-      // A15: finalize planning seats so they do not stick as running after a failed gate.
-      this.finalizeWorkerRuntime(plancoreRuntimeId, 'reaped', 'planning-not-agreed');
-      for (const id of partnerRuntimeIds) this.finalizeWorkerRuntime(id, 'reaped', 'planning-not-agreed');
-      await this.advanceAgreementFence(runDir, batchId, path.join(runDir, 'callbacks.md'));
-      // A11 (R1.6 + D7): a mechanism-level reason naming the missing partner batch id(s) and the
-      // round-cap budget exhausted — never a generic/silent message. Bounded exit, visible BLOCKED
-      // (the caller, RunOrchestratorService, turns this into phase='blocked' + operator notification).
-      const blockedReason = `ROUND-CAP-EXHAUSTED (R1.6/D7): no unanimous CLEAN verdict within ${roundCap} round(s) (~${effectiveTimeoutMs}ms budget); partner batch(es) [${partnerBatchIds.join(', ') || 'none configured'}] never confirmed agreement — bounded exit, never a silent pass.`;
-      return {
-        agreed: false,
-        coPlannerUsed: partner,
-        northStarPath: nsPath,
-        reqPath,
-        planJsonPath,
-        planMdPath,
-        plan,
-        createdTaskIds: [],
-        keyToId: {},
-        runId: 0,
-        blockedReason
-      };
     }
 
     // Gate passed: snapshot the one canonical set into runDir for implementation consumers, then
@@ -636,10 +689,11 @@ export class PlanningPhaseService {
       ? await this.reconveneConflictingTasks(taskConflicts, batchId, partner, runDir, effectiveProjectDir, briefWriter, rid, this.resolveCycleId(rid), inputs)
       : [];
 
-    // A15: planning phase exit (success) — mark seats done. Orchestrator also finalizes at
-    // planning-done-yield (idempotent). Partner no longer depends on the generic janitor alone.
-    this.finalizeWorkerRuntime(plancoreRuntimeId, 'done', 'planning-phase-complete');
-    for (const id of partnerRuntimeIds) this.finalizeWorkerRuntime(id, 'done', 'planning-phase-complete');
+    // A6: route through the one terminal owner — same reason/state pattern as the blocked exit, same
+    // A5 reap-before-finalize order, run by the finally below (orchestrator also finalizes at
+    // planning-done-yield; idempotent).
+    terminalReason = 'planning-phase-complete';
+    terminalState = 'done';
     await this.advanceAgreementFence(runDir, batchId, path.join(runDir, 'callbacks.md'));
 
     return {
@@ -655,6 +709,14 @@ export class PlanningPhaseService {
       runId: rid,
       reconvenedTaskKeys
     };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      terminalReason = `planning-thrown-exit: ${msg}`;
+      terminalState = 'failed';
+      throw err;
+    } finally {
+      await runPlanningTerminal();
+    }
   }
 
   // POCFIX20: poll for the agent's FIRST callback (any STATUS) — proves the brief landed + the agent is alive.
@@ -771,10 +833,17 @@ export class PlanningPhaseService {
   // comments elsewhere claiming otherwise (it is used unchanged by orchestrator-loop.ts, panel-service.ts,
   // waitForFirstCallback below, and run-orchestrator-service.ts's waitForNorthStarReady — broadening it
   // is a wider, separate fix outside this row's scope: "rewrite the partner matcher in waitForAgreement").
-  private parseAgreementCallbackLine(line: string): { role: string; batchId: string; state: string; note: string | null } | null {
-    const match = /^\[(?:helm|projcore) callback\]\s+(\S+)\s+(\S+)\s+STATUS:\s+([A-Z-]+)(?:\s+[—-]\s+(.+))?\s*$/.exec(line);
+  // B3 (AC8): separator class widened from [—-] (em dash/hyphen only) to also accept en dash
+  // and colon — agents use all four forms and a colon/en-dash line previously failed the whole
+  // match, so the seat read as silent instead of failing closed. B3 (AC6 foundation): optional
+  // planSha extracted from the note as additive data (plan-revision.ts's short12); B5 owns
+  // enforcing it against the current plan.md bytes — B3 only parses it out when present.
+  private parseAgreementCallbackLine(line: string): { role: string; batchId: string; state: string; note: string | null; planSha: string | null } | null {
+    const match = /^\[(?:helm|projcore) callback\]\s+(\S+)\s+(\S+)\s+STATUS:\s+([A-Z-]+)(?:\s+[\-—–:]\s+(.+))?\s*$/.exec(line);
     if (!match) return null;
-    return { role: match[1], batchId: match[2], state: match[3], note: match[4] ?? null };
+    const note = match[4] ?? null;
+    const planShaMatch = note ? /\bplan=([0-9a-f]{12})\b/.exec(note) : null;
+    return { role: match[1], batchId: match[2], state: match[3], note, planSha: planShaMatch ? planShaMatch[1] : null };
   }
 
   // A9 send-back (attempt=2): byte-accurate window read (Buffer.subarray, not a char-slice) — callbacks.md
@@ -861,6 +930,7 @@ export class PlanningPhaseService {
       const reconveneBatchId = `${batchId}-reconvene-${safeKey}`;
       try {
         const brief = briefWriter.generatePanelBrief({
+          purpose: 'task-conflict-reconvene',
           role: partner,
           batchId: reconveneBatchId,
           seat: `reconvene-${safeKey}`,
@@ -910,6 +980,13 @@ export class PlanningPhaseService {
    * otherwise leave an OLD VERDICT-READY CLEAN for the same partner batch id (or an old PLAN-READY)
    * sitting in the file — same-batch stale, not the different-batch/foreign case R1.5 alone closes. A
    * prior attempt's agreement must never satisfy a later one just because the batch id was reused.
+   * B5 (AC7/AC23): a CLEAN verdict is no longer a bare enum — it must also carry a `plan=<sha12>`
+   * (B3 grammar) matching the CURRENT plan.md bytes (B1's readPlanRevision), re-derived fresh on
+   * EVERY poll pass via `currentPlanPath` (never cached at call-start), so a seat that reviewed an
+   * earlier revision and never re-emits stays excluded even after plancore rewrites plan.md mid-wait.
+   * A CLEAN with no `plan=`, a malformed SHA (B3 already nulls those), or a SHA for a superseded
+   * revision does not count. `currentPlanPath` is additive/optional — omitted (as B3/B4's existing
+   * direct unit tests do) falls back to the pre-B5 bare-enum CLEAN check, byte-identical behaviour.
    */
   private async waitForAgreement(
     cbPath: string,
@@ -918,7 +995,25 @@ export class PlanningPhaseService {
     brainRole: string,
     timeoutMs: number,
     sinceOffset = 0,
-    partnerBatchIds: string[] = [`${batchId}-partner`]
+    partnerBatchIds: string[] = [`${batchId}-partner`],
+    /** Canonical plan.md. When given, a BROKEN verdict is not dispositive until this file exists
+     *  and is non-empty — absence means plancore has not authored it yet, so no seat can have
+     *  legitimately reviewed it. Omitted by existing callers/fixtures, which keep prior behaviour. */
+    planMdPathForRaceGuard?: string,
+    /** B5: canonical plan.md, read fresh every poll pass to bind each accepted CLEAN to the plan
+     *  revision actually in effect right now. Deliberately a SEPARATE parameter from the race-guard
+     *  path above (that one only ever proves existence for the BROKEN race guard; this one proves
+     *  byte-identity for the CLEAN agreement gate) — additive/optional, omitted by B3/B4's existing
+     *  direct unit tests, which keep their pre-B5 unbound-CLEAN behaviour. */
+    currentPlanPath?: string,
+    /** P3 (R3.11/R3.14/R6.21): additive/optional, default false — every existing direct call (B3/B4/B5's
+     *  own unit tests) omits it and keeps the exact pre-P3 behaviour (brain `PLAN-READY` still required).
+     *  When true, the gate below drops the `sawPlanReady` precondition: unanimous CLEAN bound to the
+     *  CURRENT plan.md revision is sufficient on its own. P1 already retired plancore as an authoring/
+     *  spawned seat, so nothing posts PLAN-READY in production any more — requiring it here would just
+     *  deadlock every non-adaptive real run. This does NOT touch the BROKEN raceguard or the CLEAN
+     *  SHA-binding check above (B5) — a missing/malformed/stale `plan=<sha12>` is still never agreement. */
+    signatureOnly = false
   ): Promise<boolean> {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
@@ -926,7 +1021,15 @@ export class PlanningPhaseService {
         const raw = await this.readCallbacksWindow(cbPath, sinceOffset);
         const lines = raw.split(/\r?\n/).reverse(); // newest first
         let sawPlanReady = false;
-        const verdicts = new Map<string, 'CLEAN' | 'BROKEN'>(); // partnerBatchId -> latest parsed verdict
+        // B5: per-seat evidence is now {verdict, planSha} rather than a bare enum — planSha is the
+        // plan=<sha12> parsed from that seat's own NEWEST VERDICT-READY note (null if absent/malformed).
+        const verdicts = new Map<string, { verdict: 'CLEAN' | 'BROKEN'; planSha: string | null }>(); // partnerBatchId -> latest parsed evidence
+        // B4 (AC8): tracks "have we already resolved this seat's NEWEST VERDICT-READY line", separate
+        // from whether that line parsed to a valid verdict. Set on first encounter (reversed = newest
+        // first) regardless of parse outcome, so a malformed newest line locks the seat out of `verdicts`
+        // for this poll pass instead of letting the scan fall through to an older, stale CLEAN/BROKEN for
+        // the same seat — that fallthrough was the stale-side fail-open this row fixes.
+        const seenNewestVerdict = new Set<string>();
         for (const line of lines) {
           const parsed = this.parseAgreementCallbackLine(line);
           if (!parsed) continue;
@@ -934,23 +1037,64 @@ export class PlanningPhaseService {
             sawPlanReady = true;
           }
           if (
-            !verdicts.has(parsed.batchId) &&
+            !seenNewestVerdict.has(parsed.batchId) &&
             partnerBatchIds.includes(parsed.batchId) &&
             parsed.state === 'VERDICT-READY' &&
             roleMatches(partnerRole, parsed.role)
           ) {
+            seenNewestVerdict.add(parsed.batchId); // lock this seat to its NEWEST verdict line, parseable or not
             const verdictMatch = /^\s*(CLEAN|BROKEN)\b/i.exec(parsed.note || '');
-            if (verdictMatch) verdicts.set(parsed.batchId, verdictMatch[1].toUpperCase() as 'CLEAN' | 'BROKEN');
+            if (verdictMatch) {
+              verdicts.set(parsed.batchId, { verdict: verdictMatch[1].toUpperCase() as 'CLEAN' | 'BROKEN', planSha: parsed.planSha });
+            }
+            // else: newest line for this seat is malformed/unparseable — fail closed. Leaving `verdicts`
+            // unset for this batchId (rather than falling through to an older line) means the "every
+            // partnerBatchId is CLEAN" pass check below can never be satisfied by stale evidence.
           }
-          if (sawPlanReady && verdicts.size === partnerBatchIds.length) break; // every seat's latest already locked in (reversed scan)
+          if (sawPlanReady && seenNewestVerdict.size === partnerBatchIds.length) break; // every seat's newest line already locked in (reversed scan)
         }
         // R1.4/N11 (unanimous): a confirmed BROKEN from ANY partner fails the gate immediately —
         // dispositive on its own, whether or not PLAN-READY or the other seats' verdicts have arrived
         // yet. It has already arrived and is negative, so there is nothing left to wait for (never
         // byte-identical to a silent CLEAN pass, and never forced to burn the full 10min production
         // timeout to reach the same conclusion).
-        if ([...verdicts.values()].some((v) => v === 'BROKEN')) return false;
-        if (sawPlanReady && partnerBatchIds.every((id) => verdicts.get(id) === 'CLEAN')) return true;
+        if ([...verdicts.values()].some((v) => v.verdict === 'BROKEN')) {
+          // Race guard: a BROKEN cannot be a real plan defect if plan.md does not exist yet. Keep
+          // waiting so the (brief-instructed) re-review can supersede it — the reversed scan already
+          // takes each seat's LATEST verdict, so a later CLEAN legitimately replaces this one. The
+          // outer timeout still bounds the wait, so a seat that never re-emits still fails, just not
+          // instantly and not on evidence it could not have had.
+          let planPresent = true;
+          if (planMdPathForRaceGuard) {
+            try {
+              planPresent = (await fs.stat(planMdPathForRaceGuard)).size > 0;
+            } catch {
+              planPresent = false;
+            }
+          }
+          if (planPresent) return false;
+        } else if (signatureOnly || sawPlanReady) {
+          // B5 (AC7/AC23): re-derive the CURRENT plan.md revision on THIS poll pass — never cached at
+          // call-start — so a plancore rewrite mid-wait (a partner CLEAN'd R1, plan.md is now R2) is
+          // reflected immediately. `currentPlanPath` omitted (B3/B4's direct unit tests) => currentShort12
+          // stays null and the sha check is skipped entirely (pre-B5 bare-enum behaviour, untouched).
+          const currentShort12 = currentPlanPath ? readPlanRevision(currentPlanPath)?.short12 ?? null : null;
+          const allAgreed = partnerBatchIds.every((id) => {
+            const v = verdicts.get(id);
+            if (!v || v.verdict !== 'CLEAN') return false;
+            if (!currentPlanPath) return true; // legacy: no plan revision to bind against
+            // If the current plan is absent/unreadable, this is not a non-convergence outcome: the seats
+            // have signaled agreement, but the canonical plan contract is invalid. Let the caller's
+            // canonical read fail on the thrown path so A6 cleanup/finalization still owns that terminal
+            // class. No stale plan can be handed off because the read below must succeed before ingest.
+            if (currentShort12 === null) return true;
+            // Fail closed: missing plan=, malformed SHA (already null from B3's parser), or a SHA
+            // for a superseded revision (present but !== the live short12) all fall through here —
+            // none of them count as agreement on the plan revision actually in effect right now.
+            return v.planSha !== null && v.planSha === currentShort12;
+          });
+          if (allAgreed) return true;
+        }
       } catch {}
       await new Promise((r) => setTimeout(r, 20));
     }

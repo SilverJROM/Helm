@@ -78,12 +78,20 @@ export class UsageGatewayService {
     return !!r.depleted;
   }
 
-  /** Exposed for tests; same mapping as private product path. */
+  /**
+   * Normalized product rung key for provider+model.
+   * House ladder (S17/AC30): grok45, spark, haiku. Auto-fallback codex55 retained.
+   * Unrelated providers/models stay unmapped (null).
+   */
   mapToRung(provider: string, model: string): string | null {
-    // Per consensus + prior scope: codex only effective for auto-fallback today.
-    if (provider !== "codex") return null;
-    if (model === "gpt-5.5" || model === "gpt-5.4") return "codex55";
-    if (model === "gpt-5.3-codex-spark") return "spark";
+    if (provider === "codex") {
+      if (model === "gpt-5.5" || model === "gpt-5.4") return "codex55";
+      if (model === "gpt-5.3-codex-spark") return "spark";
+      return null;
+    }
+    // House-scoped mapping only (S17): grok45 main + haiku backup-2.
+    if (provider === "grok" && model === "grok-4.5") return "grok45";
+    if (provider === "claude" && model === "claude-haiku-4-5") return "haiku";
     return null;
   }
 }

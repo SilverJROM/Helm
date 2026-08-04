@@ -3,6 +3,8 @@ import { randomBytes } from "node:crypto";
 
 dotenv.config();
 
+export type HelmSessionJanitorMode = "off" | "shadow" | "on";
+
 function optional(name: string, fallback: string): string {
   return process.env[name]?.trim() || fallback;
 }
@@ -15,6 +17,21 @@ function optionalNumber(name: string, fallback: number): number {
     throw new Error(`Invalid numeric env var: ${name}`);
   }
   return parsed;
+}
+
+function parseJanitorMode(value: string): HelmSessionJanitorMode {
+  const normalized = value.trim().toLowerCase();
+  if (["off", "0", "false", "disabled", "no"].includes(normalized)) {
+    return "off";
+  }
+  if (["shadow", "1", "warn", "log", "trace"].includes(normalized)) {
+    return "shadow";
+  }
+  if (["on", "2", "true", "enabled", "yes"].includes(normalized)) {
+    return "on";
+  }
+  console.warn(`[config] Invalid HELM_SESSION_JANITOR value "${value}", defaulting to off`);
+  return "off";
 }
 
 export interface HelmConfig {
@@ -40,7 +57,9 @@ export interface HelmConfig {
   HELM_SANDBOX_BIN: string;
   // SL-R3: session-lifecycle janitor — grace TTL (ms) after a session's work is done before it is closed; janitor + startup sweep enable/disable.
   HELM_SESSION_TTL_MS: number;
-  HELM_SESSION_JANITOR: boolean;
+  HELM_SESSION_JANITOR: HelmSessionJanitorMode;
+  HELM_HOUSEKEEPER_SCHEDULER_MS: number;
+  HELM_HOUSEKEEPER_COOLDOWN_MS: number;
 }
 
 export function loadConfig(): HelmConfig {
@@ -79,8 +98,11 @@ export function loadConfig(): HelmConfig {
     PROJECT_DOC_BODY_MAX: optionalNumber("PROJECT_DOC_BODY_MAX", 1048576),
     // C3
     HELM_SANDBOX_BIN: optional("HELM_SANDBOX_BIN", ""),
-    // SL-R3: default 20min grace TTL; HELM_SESSION_JANITOR='0' disables the sweep + startup sweep.
+    // SL-R3: default off (0); shadow logs would-be actions, on performs reaping.
     HELM_SESSION_TTL_MS: optionalNumber("HELM_SESSION_TTL_MS", 1200000),
-    HELM_SESSION_JANITOR: optional("HELM_SESSION_JANITOR", "1") !== "0"
+    HELM_SESSION_JANITOR: parseJanitorMode(optional("HELM_SESSION_JANITOR", "0")),
+    // S18b: housekeeper investigation scheduler is hours-scale and separate from the session janitor.
+    HELM_HOUSEKEEPER_SCHEDULER_MS: optionalNumber("HELM_HOUSEKEEPER_SCHEDULER_MS", 6 * 60 * 60 * 1000),
+    HELM_HOUSEKEEPER_COOLDOWN_MS: optionalNumber("HELM_HOUSEKEEPER_COOLDOWN_MS", 6 * 60 * 60 * 1000),
   };
 }

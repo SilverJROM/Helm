@@ -297,13 +297,14 @@ describe('B1 ModelService (S1) + B2 agent bindings + delete ref-guard + v10 mig 
     const cs = new RoleCapabilityService(dbs);
 
     const agents = as.listAgents();
-    // B09b (R2.11) + v89: fresh roster is the canonical set including the new ibrain.
-    expect(agents.length).toBe(10);
+    // B09b (R2.11) + v89 + S15: canonical set including ibrain + housekeeper.
+    expect(agents.length).toBe(11);
     const agentNames = agents.map(a => a.name).sort();
     // NAME-LAYER rename: north→discovery, projcore→plancore (agents.name only; roles unchanged).
     expect(agentNames).toEqual([
       'agent-master',
       'discovery',
+      'housekeeper',
       'ibrain',
       'implementer',
       'jkage',
@@ -624,8 +625,8 @@ describe('D2 R-02A: model-named stub agents removed (schema v32)', () => {
       "SELECT name FROM agents WHERE name IN ('grok-4.5','grok-composer','spark','codex-5.4')"
     ).all();
     expect(stubs).toHaveLength(0);
-    // B09b + v89: fresh DB includes the additive ibrain agent.
-    expect(dbs.raw.prepare('SELECT COUNT(*) AS c FROM agents').get()).toEqual({ c: 10 });
+    // B09b + v89 + S15: fresh DB includes ibrain + housekeeper (11 canonical).
+    expect(dbs.raw.prepare('SELECT COUNT(*) AS c FROM agents').get()).toEqual({ c: 11 });
     t.cleanup();
   });
 
@@ -633,7 +634,7 @@ describe('D2 R-02A: model-named stub agents removed (schema v32)', () => {
     const t = makeTempDb();
     const seedDbs = new DatabaseService(t.dbPath); // fresh (all tables, B09b canonical roster)
     const realAgentsBefore = (seedDbs.raw.prepare('SELECT name FROM agents').all() as any[]).map(a => a.name).sort();
-    expect(realAgentsBefore).toHaveLength(10);
+    expect(realAgentsBefore).toHaveLength(11);
     const stubIds = seedStubsThenDowngrade(seedDbs.raw, 31);
     seedDbs.close();
 

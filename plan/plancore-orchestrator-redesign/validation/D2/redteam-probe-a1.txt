@@ -1,0 +1,36 @@
+== positive controls ==
+own draft cat                          ALLOW  PASS allowed
+    # plan A
+own dir ls                             ALLOW  PASS allowed
+    draft-seat-a.md
+== direct peer access ==
+peer draft cat                         DENY   PASS denied rc=1
+    cat: /home/agjrom/helm-val-d2-run-bpTgf5/planning-drafts/seat-b/draft-seat-b.md: Permission denied
+peer dir ls                            DENY   PASS denied rc=2
+    ls: cannot open directory '/home/agjrom/helm-val-d2-run-bpTgf5/planning-drafts/seat-b': Permission denied
+drafts-root enumerate                  DENY   PASS denied rc=2
+    ls: cannot open directory '/home/agjrom/helm-val-d2-run-bpTgf5/planning-drafts': Permission denied
+runDir ls                              DENY   PASS denied rc=2
+    ls: cannot open directory '/home/agjrom/helm-val-d2-run-bpTgf5': Permission denied
+== escalation attempts ==
+relative ../ traversal                 DENY   PASS denied rc=1
+    cat: ../seat-b/draft-seat-b.md: Permission denied
+symlink own->peer                      DENY   PASS denied rc=1
+    cat: /home/agjrom/helm-val-d2-run-bpTgf5/planning-drafts/seat-a/pk/draft-seat-b.md: No such file or directory
+hardlink peer into own dir             DENY   PASS denied rc=1
+    ln: failed to create hard link '/home/agjrom/helm-val-d2-run-bpTgf5/planning-drafts/seat-a/st' => '/home/agjrom/helm-val-d2-run-bpTgf5/planning-drafts/seat-b/draft-seat-b.md': Permission denied
+cp peer into fence dir                 DENY   PASS denied rc=1
+    cp: cannot open '/home/agjrom/helm-val-d2-run-bpTgf5/planning-drafts/seat-b/draft-seat-b.md' for reading: Permission denied
+grep -r runDir                         DENY   PASS denied rc=2
+    grep: /home/agjrom/helm-val-d2-run-bpTgf5: Permission denied
+find peer path                         DENY   PASS denied rc=1
+    find: ‘/home/agjrom/helm-val-d2-run-bpTgf5/planning-drafts’: Permission denied
+realpath+cat peer                      DENY   PASS denied rc=1
+    cat: /home/agjrom/helm-val-d2-run-bpTgf5/planning-drafts/seat-b/draft-seat-b.md: Permission denied
+plan/plancore-orchestrator-redesign/validation/D2/redteam-probe-a1.sh: line 12: warning: command substitution: ignored null byte in input
+tar peer dir to stdout                 DENY   PASS denied rc=2
+    tar: Removing leading `/' from member names
+clobber peer draft (write)             DENY   PASS denied rc=1
+    bash: line 1: /home/agjrom/helm-val-d2-run-bpTgf5/planning-drafts/seat-b/draft-seat-b.md: Permission denied
+== control: engine (unsandboxed) DOES see it ==
+    engine read: PEER-DRAFT-B-SECRET

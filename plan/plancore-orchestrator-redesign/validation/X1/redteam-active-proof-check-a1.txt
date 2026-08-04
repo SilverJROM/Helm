@@ -1,0 +1,2 @@
+checked_titles=33
+PASS active proof titles resolve to real it/test declarations

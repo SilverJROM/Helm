@@ -1,0 +1,7 @@
+OK acked batch_id=B3 at=2026-07-30T01:45:03Z
+role=implementer
+batch=B3
+status=WATCHING
+source=init
+line_no=0
+note=watcher started, awaiting callbacks

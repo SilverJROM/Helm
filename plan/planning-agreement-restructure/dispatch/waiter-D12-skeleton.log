@@ -1,0 +1,7 @@
+OK acked batch_id=D12-skeleton at=2026-07-30T00:21:38Z
+role=implementer
+batch=D12-skeleton
+status=WATCHING
+source=init
+line_no=0
+note=watcher started, awaiting callbacks

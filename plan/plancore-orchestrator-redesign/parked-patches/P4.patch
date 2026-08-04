@@ -1,0 +1,69 @@
+diff --git a/plan/plancore-orchestrator-redesign/queue.md b/plan/plancore-orchestrator-redesign/queue.md
+index a1599f0..75a15cd 100644
+--- a/plan/plancore-orchestrator-redesign/queue.md
++++ b/plan/plancore-orchestrator-redesign/queue.md
+@@ -1,23 +1,23 @@
+ # queue — plancore-orchestrator-redesign
+ 
+-- [PENDING] 1: S0
+-- [PENDING] 2: D1
+-- [PENDING] 3: D2
+-- [PENDING] 4: D3
+-- [PENDING] 5: B1
+-- [PENDING] 6: B2
+-- [PENDING] 7: B3
+-- [PENDING] 8: B4
+-- [PENDING] 9: R1
+-- [PENDING] 10: R2
+-- [PENDING] 11: R3
+-- [PENDING] 12: R4
+-- [PENDING] 13: R5
+-- [PENDING] 14: R6
++- [DONE] 1: S0  <!-- driver-advanced a48562b981 -->
++- [DONE] 2: D1  <!-- driver-advanced 8bab0cc717 -->
++- [DONE] 3: D2  <!-- driver-advanced 8905059a91 -->
++- [DONE] 4: D3  <!-- driver-advanced 2aadbfa61e -->
++- [DONE] 5: B1  <!-- driver-advanced 9f9b16707f -->
++- [DONE] 6: B2  <!-- driver-advanced f3e4439bf7 -->
++- [DONE] 7: B3  <!-- driver-advanced 94be10ff7b -->
++- [DONE] 8: B4  <!-- driver-advanced 12143af225 -->
++- [DONE] 9: R1  <!-- driver-advanced 6c0c2338d2 -->
++- [DONE] 10: R2  <!-- driver-advanced 3a00ea5209 -->
++- [DONE] 11: R3  <!-- driver-advanced 0d72f173d3 -->
++- [DONE] 12: R4  <!-- driver-advanced 287727f9d6 -->
++- [DONE] 13: R5  <!-- driver-advanced 88bf414f7a -->
++- [DONE] 14: R6  <!-- driver-advanced 3e3b21f2bf -->
+ - [PENDING] 15: R7
+-- [PENDING] 16: R8
+-- [PENDING] 17: P1
+-- [PENDING] 18: P2
+-- [PENDING] 19: P3
++- [DONE] 16: R8  <!-- driver-advanced 60114deca6 -->
++- [DONE] 17: P1  <!-- driver-advanced b4ff1e6c86 -->
++- [DONE] 18: P2  <!-- driver-advanced a624cce6e8 -->
++- [DONE] 19: P3  <!-- driver-advanced 5236c4af7f -->
+ - [PENDING] 20: P4
+ - [PENDING] 21: X1
+diff --git a/plan/plancore-orchestrator-redesign/tg-status.log b/plan/plancore-orchestrator-redesign/tg-status.log
+index a6cc597..0fa7c19 100644
+--- a/plan/plancore-orchestrator-redesign/tg-status.log
++++ b/plan/plancore-orchestrator-redesign/tg-status.log
+@@ -1,3 +1,6 @@
+ [2026-08-01T07:10:09+08:00] TG -> HTTP 200 (try 1)
+ [2026-08-01T07:10:09+08:00] TEST message sent
+ [2026-08-01T07:10:13+08:00] cadence START pid=1280200 — every 90min PHT
++[2026-08-01T11:41:05+08:00] facts: effort=plancore-orchestrator-redesign (co-planners author + debate; plancore is coordinator-only, no plan content) scope=24 slices (P0+P1+P2+D12); D1-D11 deferred by JROM verified=0/24 verified_ids= none remaining=1 in_flight=P0 in_flight_running_min=0 next_up=none current_phase=P0 stop-corruption worker_seats_live=0 blocked_count=0 raceguard_pin=3 (must be 3) janitor=0 (must be 0) latest_heartbeat=none time_now_pht=2026-08-01 11:41 PHT 
++[2026-08-01T11:41:33+08:00] TG -> HTTP 200 (try 1)
++[2026-08-01T11:41:33+08:00] reported verified=0/24 inflight=P0
+diff --git a/src/services/planning-phase-service.ts b/src/services/planning-phase-service.ts
+index 9ff348d..2442761 100644
+--- a/src/services/planning-phase-service.ts
++++ b/src/services/planning-phase-service.ts
+@@ -358,6 +358,7 @@ export class PlanningPhaseService {
+     // SEPARATE module (grok red-team FIX 7 — no if-soup here). OFF (default) → the existing single-author
+     // flow below runs byte-identical. The delegate emits the SAME PlanningResult so ingest is unchanged.
+     if (inputs.adaptivePlanning) {
++      // R7 explicit scope pin: keep adaptive path fully delegated and defer adaptive co-author contract reconciliation.
+       const { runAdaptivePlanningPhase } = await import('./adaptive-planning-phase.js');
+       return runAdaptivePlanningPhase(
+         { transport: this.transport, artifacts: this.artifacts, taskQueue: this.queue },

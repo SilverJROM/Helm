@@ -1,0 +1,15 @@
+Command:
+npx vitest run src/services/planning-review-round-c3.test.ts src/services/planning-review-round-gate-rescoped.test.ts --minWorkers=1 --maxWorkers=4
+
+Result: PASS
+
+Output:
+RUN  v2.1.9 /home/agjrom/websites/Helm
+
+✓ src/services/planning-review-round-c3.test.ts (7 tests) 17ms
+✓ src/services/planning-review-round-gate-rescoped.test.ts (7 tests) 19ms
+
+Test Files  2 passed (2)
+Tests  14 passed (14)
+Start at  01:06:47
+Duration  360ms (transform 96ms, setup 16ms, collect 118ms, tests 36ms, environment 0ms, prepare 58ms)

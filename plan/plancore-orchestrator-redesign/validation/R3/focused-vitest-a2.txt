@@ -1,0 +1,14 @@
+
+ RUN  v2.1.9 /home/agjrom/websites/Helm
+
+ ✓ src/services/planning-review-round-proposer-signer.test.ts (16 tests) 1653ms
+   ✓ runProposerSignerRound — asymmetric proposer/signer divergence (R3, R3.9-R3.11) > hash mismatch — proposer reconciles, signer signs (R3.9/R3.10) > typed-blocks when the proposer never commits a candidate — the signer is never spawned 404ms
+   ✓ runProposerSignerRound — asymmetric proposer/signer divergence (R3, R3.9-R3.11) > hash mismatch — proposer reconciles, signer signs (R3.9/R3.10) > typed-blocks when the signer never responds after a genuine candidate commit 406ms
+   ✓ runReviewRound — round 2 of a blind-draft run IS the proposer/signer exchange (R3 reachability) > bounds a proposer that never commits a candidate, and never spawns the signer 405ms
+   ✓ runReviewRound — round 2 of a blind-draft run IS the proposer/signer exchange (R3 reachability) > never reaches the exchange when a round-1 seat never drafts — the typed draft block is final 403ms
+
+ Test Files  1 passed (1)
+      Tests  16 passed (16)
+   Start at  01:52:35
+   Duration  1.89s (transform 106ms, setup 12ms, collect 116ms, tests 1.65s, environment 0ms, prepare 30ms)
+

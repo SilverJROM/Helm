@@ -1,0 +1,6 @@
+role=implementer
+batch=A1
+status=WATCHING
+source=init
+line_no=0
+note=watcher started, awaiting callbacks

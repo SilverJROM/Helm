@@ -1,0 +1,69 @@
+// B15 R2 §7.2 mechanism probe — DISPOSABLE DB ONLY, never data/
+import Database from 'better-sqlite3';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'helm-b15r2-'));
+const P = path.join(dir, 'fake-helm.db');
+console.log('probe dir:', dir);
+
+// --- guard predicates, transcribed from the shipped helper (tip 9b038e0) ---
+function newGuard(base: string): Record<'main'|'wal'|'shm', number|null> {
+  const suffix = { main: '', wal: '-wal', shm: '-shm' } as const;
+  const out = {} as Record<'main'|'wal'|'shm', number|null>;
+  for (const k of Object.keys(suffix) as Array<keyof typeof suffix>) {
+    const p = base + suffix[k];
+    out[k] = fs.existsSync(p) ? fs.statSync(p).mtimeMs : null;
+  }
+  return out;
+}
+// --- the PRE-fix guard (ede9faf): main file only ---
+function oldGuard(base: string): number | null {
+  return fs.existsSync(base) ? fs.statSync(base).mtimeMs : null;
+}
+
+// setup: WAL db, seeded, fully checkpointed (all connections closed)
+{
+  const s = new Database(P);
+  s.pragma('journal_mode = WAL');
+  s.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)');
+  s.prepare('INSERT INTO t (v) VALUES (?)').run('seed');
+  s.close();
+}
+
+// THE LIVE-SERVER CONFIGURATION: a long-lived connection stays open
+const holder = new Database(P);
+holder.prepare('SELECT count(*) AS c FROM t').get();
+
+const oldBefore = oldGuard(P);
+const newBefore = newGuard(P);
+
+// a *different* process/connection writes 500 committed rows
+const writer = new Database(P);
+const ins = writer.prepare('INSERT INTO t (v) VALUES (?)');
+const many = writer.transaction((n: number) => { for (let i = 0; i < n; i++) ins.run('row' + i); });
+many(500);
+writer.close();          // does NOT checkpoint: holder still has the db open
+
+const oldAfter = oldGuard(P);
+const newAfter = newGuard(P);
+
+const rows = (holder.prepare('SELECT count(*) AS c FROM t').get() as any).c;
+holder.close();
+
+const oldDetects = oldBefore !== oldAfter;
+const newDetects = JSON.stringify(newBefore) !== JSON.stringify(newAfter);
+
+console.log('\nrows committed and visible:', rows, '(seed + 500)');
+console.log('\n--- main-file mtime (the PRE-fix guard) ---');
+console.log('before =', oldBefore);
+console.log('after  =', oldAfter);
+console.log('OLD GUARD DETECTS THE WRITE:', oldDetects, oldDetects ? '' : '  <-- FALSE NEGATIVE (val §7.2)');
+console.log('\n--- main + -wal + -shm (the SHIPPED fix1 guard) ---');
+console.log('before =', JSON.stringify(newBefore));
+console.log('after  =', JSON.stringify(newAfter));
+console.log('NEW GUARD DETECTS THE WRITE:', newDetects);
+console.log('\nRESULT:', (!oldDetects && newDetects) ? 'PASS — old guard blind, new guard red' : 'UNEXPECTED');
+
+fs.rmSync(dir, { recursive: true, force: true });

@@ -1,0 +1,13 @@
+{
+  "slice": "R7",
+  "cycle": 2,
+  "attempt": 0,
+  "why": "no-progress loop guard: R7 was already driven 1x this drain and the queue still does not show it DONE. Refusing to re-dispatch \u2014 this burns a seat pair per pass with no advance. Cause is almost always an advance that did not persist (marker/queue desync from a `git reset --hard` in a later park rollback). Fix the queue/marker state, then resume.",
+  "gate_failed": null,
+  "action_options": [
+    "RETRY_WITH_DIRECTION",
+    "SKIP_TO_PROJCORE",
+    "STOP_TRUE_BLOCKED"
+  ],
+  "raised_at": "2026-08-01T03:01:08Z"
+}

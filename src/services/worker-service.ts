@@ -10,9 +10,15 @@ import { PROVIDERS } from '../config/providers.js';
 import { resolveHelmSandboxBin, makeWriteFencePolicy, makeStrictReadProfileEnv } from '../security/landlock-sandbox.js';
 import { startGovernedDocGuard, type GovernedDocGuardHandle } from './doc-path-guard.js';
 import { applyEnvelopeIsolation } from './envelope-isolation.js';
-import type { SessionRegistryService } from './session-registry-service.js';
+import {
+  sessionStatusTokenFromRow,
+  type SessionRegistryService,
+  type SessionStatusToken,
+} from './session-registry-service.js';
 import { HelmIdentityService } from './helm-identity-service.js';
 import { finalizeWorkerRuntimeRow, finalizeSessionGoneWorkers } from './worker-runtime-finalize.js';
+import { decideSessionReconcile } from './session-reconcile-decision.js';
+import { gateWorkerTimeoutByActivity } from './session-observation.js';
 
 export class WorkerService {
   private reaperInterval: NodeJS.Timeout | null = null;
@@ -21,6 +27,11 @@ export class WorkerService {
   // R7.26/B22b: userspace fence for the 3 plan/<cycle> governed docs, keyed by tmux session
   // name, for the fenced worker's lifetime (north-star.md is kernel-fenced; see helm-sandbox.c).
   private governedDocGuards = new Map<string, GovernedDocGuardHandle>();
+  /**
+   * B02 C1 fix cycle 2: create-time SessionStatusToken keyed by worker_runtimes.id.
+   * Never re-capture by session name at cleanup (replacement lifecycle would match).
+   */
+  private workerSessionTokens = new Map<number, SessionStatusToken>();
   private readonly identity?: HelmIdentityService;
 
   constructor(
@@ -183,8 +194,18 @@ VALUES (?,?,?,?,?,?,?,?,datetime('now'), ?)
       const slug = nativeProject ? nativeProject.directory_name : 'unknown';
       const sessionName = `helm-w-${slug}-${id}`;
       const target = `${sessionName}:0.0`;
+      const workerId = Number(id);
+      // B02 C1: capture CAS token at create/register — retain for launch-fail + reapWorker.
+      const sessionTokenOut: { token?: SessionStatusToken } = {};
       try {
-        await this.tmux.createSession(sessionName, projectDir); // C3 cwd lock (project-bound only)
+        await this.tmux.createSession(sessionName, projectDir, {
+          owner: 'helm',
+          kind: 'worker',
+          projectId,
+          runId: runId ?? null,
+          sessionTokenOut,
+        }); // C3 cwd lock; S05 owner=helm
+        if (sessionTokenOut.token) this.workerSessionTokens.set(workerId, sessionTokenOut.token);
         this.activeWorkerSessions.add(sessionName);
         this.db.prepare("UPDATE worker_runtimes SET session=? WHERE id=?").run(sessionName, id);
         // SL-R2: the registry hook fired on createSession registered this session 'active'; enrich the
@@ -238,13 +259,23 @@ VALUES (?,?,?,?,?,?,?,?,datetime('now'), ?)
         });
         return this.db.prepare("SELECT * FROM worker_runtimes WHERE id=?").get(id);
       } catch (e: any) {
-        try { await this.tmux.terminateSession(sessionName); } catch {}
+        // B02 C1: use create-time token only (never late get-by-name).
+        const createTok = this.workerSessionTokens.get(workerId);
+        try {
+          await this.tmux.terminateSession(
+            sessionName,
+            createTok ? { sessionToken: createTok } : { noRegistryWrite: true }
+          );
+        } catch {}
+        this.workerSessionTokens.delete(workerId);
         this.activeWorkerSessions.delete(sessionName);
         try { this.governedDocGuards.get(sessionName)?.stop(); } catch {}
         this.governedDocGuards.delete(sessionName);
         const reason = /ready-timeout/.test(String(e)) ? 'ready-timeout'
           : /feed-failed/.test(String(e)) ? 'feed-failed' : 'launch-error';
-        try { this.db.prepare("UPDATE worker_runtimes SET state='failed', exit_reason=?, ended_at=datetime('now') WHERE id=?").run(reason, id); } catch {}
+        // S02: shared finalizer (idempotent; markIdle no-ops after terminate→markReaped above).
+        // Number(id): lastInsertRowid is number|bigint under better-sqlite3 typings (tsc TS2345).
+        try { finalizeWorkerRuntimeRow(this.db.raw, Number(id), 'failed', reason); } catch {}
         throw e;
       }
     } catch (e) {
@@ -267,7 +298,15 @@ VALUES (?,?,?,?,?,?,?,?,datetime('now'), ?)
       // H3: always best-effort kill the session when one is present. getPanePid() returns null
       // on a tmux error, so gating the kill on a truthy PID could leave a live session orphaned
       // while the row is marked terminal (idempotency then blocks any future cleanup).
-      try { await this.tmux.terminateSession(session); } catch {}
+      // B02 C1: create-time token retained by worker id — never late capture by session name.
+      const createTok = this.workerSessionTokens.get(id);
+      try {
+        await this.tmux.terminateSession(
+          session,
+          createTok ? { sessionToken: createTok } : { noRegistryWrite: true }
+        );
+      } catch {}
+      this.workerSessionTokens.delete(id);
       this.activeWorkerSessions.delete(session);
       try { this.governedDocGuards.get(session)?.stop(); } catch {}
       this.governedDocGuards.delete(session);
@@ -329,20 +368,39 @@ VALUES (?,?,?,?,?,?,?,?,datetime('now'), ?)
       // running/ended_at NULL without waiting for WORKER_TIMEOUT (~30min). Explicit finalize,
       // not "hope the generic age janitor".
       try {
-        await finalizeSessionGoneWorkers(this.db.raw, (name) => this.tmux.sessionExists(name));
+        // B06/F-01: tri-state probe — an UNKNOWN existence read must never assert completion.
+        // Reuses the same S12 tri-state+fallback wiring as the reconciler (not the boolean
+        // tmux.sessionExists, which collapses socket/permission errors into a false positive).
+        await finalizeSessionGoneWorkers(this.db.raw, (name) => this.probeSessionExistsForReconcile(name));
       } catch { /* best-effort */ }
 
+      // B12 / AC17: started_at age is a **candidate selector only** — not sufficient kill evidence.
       // H1: compare in a SINGLE time format. started_at is SQLite datetime('now') ("YYYY-MM-DD
       // HH:MM:SS", space). A JS toISOString() cutoff (with 'T') would sort lexicographically
       // wrong (space < 'T'), false-reaping fresh same-day workers. Use SQLite datetime arithmetic.
       const secs = Math.max(1, Math.floor(timeoutMs / 1000));
-      const stale = this.db.prepare("SELECT id FROM worker_runtimes WHERE state IN ('launching','running') AND started_at < datetime('now', ?)").all(`-${secs} seconds`) as any[];
-      for (const w of stale) {
+      const ageCandidates = this.db.prepare(
+        "SELECT id, session FROM worker_runtimes WHERE state IN ('launching','running') AND started_at < datetime('now', ?)"
+      ).all(`-${secs} seconds`) as { id: number; session: string | null }[];
+      for (const w of ageCandidates) {
+        // Keep-biased when no session name (cannot observe activity).
+        if (!w.session) continue;
+        const sessionActivity = await this.readSessionActivityForGate(w.session);
+        const { gate } = gateWorkerTimeoutByActivity({
+          sessionActivity,
+          thresholdMs: timeoutMs,
+        });
+        // Recent or unknown activity vetoes timeout termination.
+        if (gate !== 'STALE_ALLOW_TIMEOUT') continue;
+        // Known stale activity only — existing targeted timeout path (reapWorker body unchanged).
         await this.reapWorker(w.id, 'timeout');
       }
-      // E2: additional checkin enforcement pass: for each active worker, if role has checkin_ms and
-      // elapsed since started > checkin_ms (simple proxy for missed progress check-in), reap as checkin-stale -> will mark run_task failed
-      const actives = this.db.prepare("SELECT id, role FROM worker_runtimes WHERE state IN ('launching','running')").all() as any[];
+      // B13 / AC18 (amended, D-B13-checkin-premise.md): elapsed-since-started_at is a
+      // **candidate selector only** — mirrors B12's AC17 gate on the timeout pass above,
+      // via the same gateWorkerTimeoutByActivity helper (no recorded check-in; no schema change).
+      const actives = this.db.prepare(
+        "SELECT id, role, session FROM worker_runtimes WHERE state IN ('launching','running')"
+      ).all() as { id: number; role: string; session: string | null }[];
       for (const w of actives) {
         const ci = this.getRoleCheckinMs(w.role);
         if (ci && ci > 0) {
@@ -350,6 +408,15 @@ VALUES (?,?,?,?,?,?,?,?,datetime('now'), ?)
           if (row && row.started_at) {
             const started = Date.parse(row.started_at.replace(' ', 'T') + 'Z') || Date.now();
             if (Date.now() - started > ci) {
+              // Keep-biased when no session name (cannot observe activity).
+              if (!w.session) continue;
+              const sessionActivity = await this.readSessionActivityForGate(w.session);
+              const { gate } = gateWorkerTimeoutByActivity({
+                sessionActivity,
+                thresholdMs: ci,
+              });
+              // Recent or unknown activity vetoes checkin-missed termination.
+              if (gate !== 'STALE_ALLOW_TIMEOUT') continue;
               await this.reapWorker(w.id, 'checkin-missed');
             }
           }
@@ -364,118 +431,208 @@ VALUES (?,?,?,?,?,?,?,?,datetime('now'), ?)
     }
   }
 
-  // SL-R3 (janitor) + SL-R4 (guardrails). On each tick, for each helm_sessions row whose work is
-  // DONE and whose grace TTL has elapsed, terminate the tmux session + markReaped. Config:
-  // HELM_SESSION_TTL_MS (default 20min), HELM_SESSION_JANITOR='0' disables. Best-effort — a session
-  // that no longer exists in tmux still gets markReaped so the registry converges.
-  //
-  // "done" = status='idle' (SL-R2 explicit) OR (run_id set AND that run is terminal:
-  // complete/failed/blocked) OR (no active worker_runtime bound to the session AND it is old).
+  // S12 / AC6-invariant, AC14, AC25, AC27 — assertion-based reconciler (not TTL/idle heuristics).
+  // Authority is S11 decideSessionReconcile(row, facts): REAP | CONVERGE | KEEP.
+  // Retired kill authority: grace TTL / last_used_at age, run-terminal "done", run_id-null orphan.
+  // Preserved rails: registry membership, helm- prefix, active-worker veto, final @helm_child tag,
+  // targeted terminate only, idempotent markReaped, gone-session CONVERGE without kill.
+  // HELM_SESSION_JANITOR='off|shadow|on' (default 0/off).
   async sessionJanitorTick(): Promise<void> {
     if (!this.sessionRegistry) return;
     const cfg = loadConfig() as any;
-    if (cfg.HELM_SESSION_JANITOR === false) return;
-    const ttlMs = Number(cfg.HELM_SESSION_TTL_MS) || 1200000;
-    const ttlSecs = Math.max(1, Math.floor(ttlMs / 1000));
+    const janitorMode = cfg.HELM_SESSION_JANITOR;
+    if (janitorMode === "off") return;
+    const shadowMode = janitorMode === "shadow";
 
-    // Candidate rows: anything not already reaped. We evaluate each under the guardrails below.
+    // Candidate rows: anything not already reaped. Decision + rails evaluate each.
+    // (Registry membership guardrail: we only iterate helm_sessions rows.)
+    // B02: include generation so markReaped CAS can use the snapshot token (no re-read).
     const rows = this.db.prepare(
-      "SELECT id, name, run_id, status, created_at, last_used_at FROM helm_sessions WHERE status != 'reaped'"
+      "SELECT id, name, run_id, status, owner, generation, created_at, last_used_at FROM helm_sessions WHERE status != 'reaped'"
     ).all() as any[];
 
     for (const row of rows) {
-      // --- SL-R4 GUARDRAIL 1: never touch a session not in the registry (we only iterate registry rows).
-      //     GUARDRAIL 2 (defense in depth): the name MUST start with 'helm-'. Never 01_impl_*, 03_impl_*,
-      //     the pm2/master/owner session, or any non-helm- session — even if somehow registered.
+      // SL-R4: name MUST start with 'helm-'. Never touch non-helm- sessions even if registered.
       if (!row.name || !String(row.name).startsWith('helm-')) continue;
 
-      // --- SL-R4 GUARDRAIL 3: NEVER terminate a session whose mapped run is non-terminal / active.
-      //     Determine "done" only from terminal signals; an active/live worker vetoes the reap.
-      const runTerminal = this.isRunTerminalForSession(row.run_id);
-      const hasLiveWorker = this.hasLiveWorkerForSession(row.name);
-      const isIdle = row.status === 'idle';
+      const sessionExists = await this.probeSessionExistsForReconcile(String(row.name));
+      const decision = decideSessionReconcile(
+        {
+          owner: row.owner,
+          status: row.status,
+          run_id: row.run_id,
+          name: row.name,
+        },
+        { sessionExists }
+      );
 
-      // Live worker running → HARD SKIP (active run guardrail). Even if idle was set, a live worker means keep.
-      if (hasLiveWorker) continue;
-      // If the row carries a run that is still non-terminal, skip (run active). run_id null → fall through
-      // to the age-based orphan path (no run to protect).
-      if (row.run_id != null && !runTerminal) continue;
+      if (decision.action === 'KEEP') {
+        continue;
+      }
 
-      const done = isIdle || runTerminal || row.run_id == null; // no live worker + (idle | terminal run | no run)
-      if (!done) continue;
+      if (decision.action === 'CONVERGE') {
+        // AC14/27: session provably gone — converge registry only; never kill.
+        if (shadowMode) {
+          console.warn('[session-janitor][shadow] WOULD CONVERGE row (no-write)', {
+            name: row.name,
+            reason: decision.reason,
+          });
+          continue;
+        }
+        try {
+          // B02: CAS markReaped from janitor snapshot token (no name-only write).
+          this.sessionRegistry.markReaped(
+            sessionStatusTokenFromRow(row),
+            `reconcile:${decision.reason}`
+          );
+        } catch (err) {
+          console.warn('[session-janitor] markReaped(CONVERGE) failed', { name: row.name, err: String(err) });
+        }
+        continue;
+      }
 
-      // --- SL-R3 grace TTL: age since last_used_at (fallback created_at) must exceed TTL. SQLite datetime
-      //     arithmetic to avoid the space-vs-'T' lexical bug the worker reaper documents (started_at format).
-      const pastTtl = this.db.prepare(
-        "SELECT (COALESCE(last_used_at, created_at) < datetime('now', ?)) AS aged FROM helm_sessions WHERE id = ?"
-      ).get(`-${ttlSecs} seconds`, row.id) as any;
-      if (!pastTtl || !pastTtl.aged) continue;
+      // decision.action === 'REAP' — Helm-owned + idle assertion + live session.
+      // Execution vetoes (not decision authority): active worker, non-terminal run,
+      // attached keep (S12-V1), @helm_child tag.
+      if (this.hasLiveWorkerForSession(row.name)) {
+        continue;
+      }
+      if (row.run_id != null && !this.isRunTerminalForSession(row.run_id)) {
+        continue;
+      }
 
-      // --- ST-R2 FINAL GATE (the core safety guarantee): the live session MUST carry Helm's positive
-      //     `@helm_child` ownership tag (set at createSession's choke point). This is IN ADDITION to every
-      //     guard above (registry membership, 'helm-' prefix, live-worker veto, non-terminal-run veto,
-      //     idle-TTL, HELM_SESSION_JANITOR toggle) and sits LAST, immediately before the kill. Untagged /
-      //     tag-probe-error → fail-safe SKIP: a session Helm did not create can NEVER be reaped. Safe
-      //     default: `continue` (leave the row; a genuinely-Helm session will be tagged and reaped next tick).
+      // S12-V1: attached=true → KEEP; unknown/probe failure keep-biased → KEEP.
+      // Only a positive attached===false may proceed to REAP.
+      const attached = await this.probeSessionAttachedForReconcile(String(row.name));
+      if (attached !== false) {
+        continue;
+      }
+
+      // ST-R2 FINAL GATE: live session MUST carry @helm_child. Untagged / probe error → fail-safe KEEP.
       let helmTagged = false;
       try {
         helmTagged = await this.tmux.sessionHasHelmChildTag(row.name);
       } catch (err) {
-        // Defense in depth: sessionHasHelmChildTag is itself fail-safe (returns false on any tmux error),
-        // but if the probe ever throws we STILL treat it as untagged → skip. Uncertainty NEVER escalates
-        // to a kill. NO-SPILLOVER invariant: a session Helm did not provably create is never terminated.
         helmTagged = false;
-        console.warn('[session-janitor] @helm_child probe threw → treating as NOT-Helm, SKIP', { name: row.name, err: String(err) });
+        console.warn('[session-janitor] @helm_child probe threw → treating as NOT-Helm, SKIP', {
+          name: row.name,
+          err: String(err),
+        });
       }
       if (!helmTagged) {
-        console.warn('[session-janitor] SKIP: session missing @helm_child tag → never reap (not Helm-created)', { name: row.name });
+        console.warn('[session-janitor] SKIP: session missing @helm_child tag → never reap (not Helm-created)', {
+          name: row.name,
+        });
         continue;
       }
 
-      // ST-R3: this janitor is the ONLY TTL/age-based session sweeper in Helm, and it is tag-gated (above).
-      // No broad-kill path exists (no tmux kill-server / kill-session -a / pkill tmux anywhere); the per-role
-      // orchestrator-loop reap uses targeted kill-session -t on its OWN worker sessions only.
-      // Passed every guardrail → terminate + markReaped. terminateSession is best-effort (session may be
-      // already gone); markReaped converges the registry regardless.
+      // Targeted terminate only. S12-V2: markReaped only on success, or post-fail if provably gone.
+      // In shadow mode, decide only; no termination + no persistence mutation.
+      if (shadowMode) {
+        console.warn('[session-janitor][shadow] WOULD REAP row (no terminate)', {
+          name: row.name,
+          reason: decision.reason,
+        });
+        continue;
+      }
+      // A failed kill with session still live/unknown leaves the row retryable (level-triggered).
+      // B02: carry snapshot CAS token through terminate + markReaped (no name-only write).
+      // B05 fix cycle 1 / AC5: exactStatusOnly — the janitor's own pre-terminate claim must match
+      // the snapshot's status exactly (idle), not merely "still active or idle", so a same-id/name/
+      // owner/generation row that flipped back to active since the snapshot aborts the kill.
+      const reapToken = sessionStatusTokenFromRow(row, { exactStatusOnly: true });
       try {
-        await this.tmux.terminateSession(row.name);
+        await this.tmux.terminateSession(row.name, { sessionToken: reapToken });
+        try {
+          this.sessionRegistry.markReaped(reapToken, `reconcile:${decision.reason}`);
+        } catch {}
       } catch (err) {
         console.warn('[session-janitor] terminateSession failed (best-effort)', { name: row.name, err: String(err) });
+        const afterExists = await this.probeSessionExistsForReconcile(String(row.name));
+        if (afterExists === false) {
+          // Race: session gone despite throw — converge record only (same snapshot token).
+          try {
+            this.sessionRegistry.markReaped(reapToken, 'reconcile:session_gone');
+          } catch {}
+        }
+        // else still live or unknown → leave eligible for next tick (no false reaped).
       }
-      // terminateSession's registry hook also markReaps, but call explicitly with the janitor reason so
-      // the reason is recorded even when the hook is absent or the kill threw.
-      try { this.sessionRegistry.markReaped(row.name, 'janitor-ttl'); } catch {}
     }
   }
 
-  // SL-R3 startup sweep: on boot, reap registry sessions whose run is terminal / has no live run and
-  // whose grace TTL has elapsed. Clearly-orphaned rows (run terminal or no run, no live worker) that are
-  // past TTL are reaped; SAFE — never touches active runs (same guardrails as the tick). Disable with
-  // HELM_SESSION_JANITOR='0'. Reuses sessionJanitorTick (identical guarded logic) for a single code path.
+  // S12 startup reconcile: same guarded path as the tick (level-triggered, idempotent).
+  // Disable with HELM_SESSION_JANITOR=off (or 0).
   async sweepOrphanSessionsAtStartup(): Promise<void> {
     if (!this.sessionRegistry) return;
     const cfg = loadConfig() as any;
-    if (cfg.HELM_SESSION_JANITOR === false) return;
+    if (cfg.HELM_SESSION_JANITOR === "off") return;
     await this.sessionJanitorTick();
   }
 
-  // SL-R3/R4 helper: is the run mapped to this session terminal (complete/failed/blocked)?
-  // runs.status ∈ pending|active|complete|failed and runs.phase can be 'blocked'. Terminal = either.
+  /**
+   * S12: fail-safe existence fact for decideSessionReconcile.
+   * true = live, false = provably gone, null = unknown (KEEP — never over-CONVERGE).
+   * Prefers TmuxService.sessionExistsTriState when present; maps boolean sessionExists as fallback.
+   */
+  private async probeSessionExistsForReconcile(name: string): Promise<boolean | null> {
+    const tmux = this.tmux as TmuxService & {
+      sessionExistsTriState?: (n: string) => Promise<boolean | null>;
+    };
+    try {
+      if (typeof tmux.sessionExistsTriState === 'function') {
+        const v = await tmux.sessionExistsTriState(name);
+        if (v === true || v === false || v === null) return v;
+        return null;
+      }
+      // Fallback: boolean sessionExists cannot express unknown — treat throw as unknown.
+      return await this.tmux.sessionExists(name);
+    } catch (err) {
+      console.warn('[session-janitor] existence probe failed → unknown (KEEP)', { name, err: String(err) });
+      return null;
+    }
+  }
+
+  /**
+   * S12-V1: fail-safe attachment for REAP veto.
+   * true = attached (KEEP), false = unattached (may REAP), null = unknown (KEEP, keep-biased).
+   */
+  private async probeSessionAttachedForReconcile(name: string): Promise<boolean | null> {
+    const tmux = this.tmux as TmuxService & {
+      sessionAttached?: (n: string) => Promise<boolean | null>;
+    };
+    try {
+      if (typeof tmux.sessionAttached !== 'function') {
+        // No reader → unknown → KEEP (never REAP without a positive unattached fact).
+        return null;
+      }
+      const v = await tmux.sessionAttached(name);
+      if (v === true || v === false || v === null) return v;
+      return null;
+    } catch (err) {
+      console.warn('[session-janitor] attachment probe failed → unknown (KEEP)', { name, err: String(err) });
+      return null;
+    }
+  }
+
+  // Execution veto helper: is the run mapped to this session terminal (complete/failed/blocked)?
+  // Used only as a REAP veto (defense-in-depth), never as kill authority.
   private isRunTerminalForSession(runId: number | null | undefined): boolean {
     if (runId == null) return false;
     try {
       const run = this.db.prepare("SELECT status, phase FROM runs WHERE id = ?").get(runId) as any;
-      if (!run) return true; // run row gone → nothing to protect → treat as terminal/orphan
+      // AC3/F-10: a missing row is uncertainty, not proof the run finished — veto REAP (fail-safe,
+      // matches the query-error branch below), never assert completion from absence.
+      if (!run) return false;
       const status = String(run.status || '').toLowerCase();
       const phase = String(run.phase || '').toLowerCase();
       return ['complete', 'failed'].includes(status) || ['complete', 'failed', 'blocked'].includes(phase);
     } catch {
-      return false; // unknown → do NOT treat as terminal (fail-safe: keep the session)
+      return false; // unknown → do NOT treat as terminal (fail-safe: veto REAP)
     }
   }
 
   // SL-R4 helper: is there a live (launching/running) worker_runtime bound to this session name?
-  // A live worker vetoes any reap of its session (active-run guardrail).
+  // A live worker vetoes REAP of its session (active-run guardrail).
   private hasLiveWorkerForSession(sessionName: string): boolean {
     try {
       const row = this.db.prepare(
@@ -518,6 +675,23 @@ VALUES (?,?,?,?,?,?,?,?,datetime('now'), ?)
     const def = defs.find((d: any) => d.role === role);
     if (def && def.agent) return { source: 'default', agent: def.agent };
     return null;
+  }
+
+  // B12/B13: shared activity read for both the timeout and checkin-missed reap gates.
+  // Keep-biased: missing session, missing reader, or a read failure all resolve to unknown
+  // (never fabricate staleness) — gateWorkerTimeoutByActivity treats null as KEEP_UNKNOWN.
+  private async readSessionActivityForGate(session: string): Promise<number | null> {
+    try {
+      const tmux = this.tmux as TmuxService & {
+        sessionActivity?: (n: string) => Promise<number | null>;
+      };
+      if (typeof tmux.sessionActivity === 'function') {
+        return await tmux.sessionActivity(session);
+      }
+      return null;
+    } catch {
+      return null;
+    }
   }
 
   // E2: lookup persisted role_capabilities.checkin_ms for enforcement

@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { DatabaseService } from '../db/database.js';
 import { clearRunAbort } from './run-abort-registry.js';
+import { allocateLifecycleGeneration } from './lifecycle-cas.js';
 
 export class ValidatorProtocolDefectError extends Error {
   readonly code = 'VALIDATOR_PROTOCOL_DEFECT';
@@ -194,9 +195,14 @@ export class RunArtifactService {
   // DB recorders (ST1 tables)
 
   createRun(projectId: number | null = null, batchId = 'batch-B1', northStarRef: string | null = null, cycleId: number | null = null): number {
+    // B03 / AC7+AC8: native runs must allocate from the shared lifecycle_seq (D01). Leaving the
+    // column at default 0 made generation a no-op fence after rowid recycle (every native row = 0).
+    const generation = allocateLifecycleGeneration(this.db.raw);
     const info = this.db.raw
-      .prepare(`INSERT INTO runs (project_id, cycle_id, batch_id, north_star_ref, status) VALUES (?,?,?,?, 'active')`)
-      .run(projectId, cycleId, batchId, northStarRef);
+      .prepare(
+        `INSERT INTO runs (project_id, cycle_id, batch_id, north_star_ref, status, generation) VALUES (?,?,?,?, 'active', ?)`
+      )
+      .run(projectId, cycleId, batchId, northStarRef, generation);
     const runId = Number(info.lastInsertRowid);
     // A6b: runs.id is INTEGER PRIMARY KEY without AUTOINCREMENT, so SQLite reuses free rowids after
     // CASCADE delete (e.g. project teardown). The process-local abort registry is keyed by runId and

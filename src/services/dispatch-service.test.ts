@@ -444,6 +444,7 @@ describe('DispatchService (B4 DSP1 + DSP3 envelope, USE_FAKE_TMUX)', () => {
 
       // Panel brief also aligned (verifier≠fixer + deliberation → park)
       const panel = writer.generatePanelBrief({
+        purpose: 'diff-review',
         batchId: 'batch-B12-T04-panel',
         seat: '1',
         lens: 'fsm',
@@ -501,35 +502,25 @@ describe('DispatchService (B4 DSP1 + DSP3 envelope, USE_FAKE_TMUX)', () => {
       expect(() => dispatch.validateBriefContract(generated, 'discovery')).not.toThrow();
     });
 
-    // B12-T02 (R-D1/R-D2/R-D4/R-H2): planning brief — og_req + execution_plan schema + TST2 scaffolding preserved
-    it('BriefWriterService generatePlanningBrief contains planning clauses + TST2 contract scaffolding', () => {
+    // B4/R1.1: generatePlanningBrief deleted — plan-draft purpose owns schema + TST2 scaffolding for co-planners.
+    it('BriefWriterService plan-draft purpose contains schema clauses + TST2 contract scaffolding', () => {
       const writer = new BriefWriterService();
-      const generated = writer.generatePlanningBrief({
+      const generated = writer.generatePanelBrief({
+        purpose: 'plan-draft',
         batchId: 'batch-B12-T02-test',
-        northStar: 'CC-redesign planning phase test north star',
+        seat: 'co-planner-a',
+        lens: 'whole-plan',
+        requirement: 'CC-redesign planning phase test north star',
         projectDir: '/tmp/b12-t02-project',
         runDir,
         callbacksFile: path.join(runDir, 'callbacks.md'),
-        mode: 'planner',
       });
 
-      // (1) NEW planning-behavior clauses (additive reformat)
+      // (1) schema / task-JSON + seat-scoped draft contract (moved from deleted authoring brief)
       expect(generated).toContain('north-star.md');
-      expect(generated).toContain('og-requirements.md');
-      expect(generated).toContain('plan.md');
-      expect(generated).toContain('og-requirements.md FIRST');
-      expect(generated).toContain('Do NOT skip og-requirements.md');
-      expect(generated).not.toContain('Do NOT skip og_req');
-      expect(generated).not.toContain('north_star.md');
-      expect(generated).not.toContain('og_req.md');
-      expect(generated).not.toContain('execution_plan.md');
       expect(generated).toContain('req_refs');
       expect(generated).toContain('exception_handling');
       expect(generated).toContain('redteam');
-      expect(generated).toContain('helm-algo');
-      expect(generated).toContain('ingestExecutionPlan');
-      expect(generated).toContain('DO NOT author');
-      expect(generated).toContain('derives');
       expect(generated).toContain('`id`');
       expect(generated).toContain('`batch`');
       expect(generated).toContain('`title`');
@@ -537,12 +528,11 @@ describe('DispatchService (B4 DSP1 + DSP3 envelope, USE_FAKE_TMUX)', () => {
       expect(generated).toContain('`validator_lane`');
       expect(generated).toContain('`effort`');
       expect(generated).toContain('`type`');
-      expect(generated).toContain('decided per-task');
+      expect(generated).toContain('DRAFT-SUBMITTED plan=<sha12>');
+      expect(generated).toMatch(/NEVER.*canonical `plan\.md`|never write canonical/i);
 
       // (2) EXISTING TST2-checked elements still present (not dropped by reformat)
       expect(generated).toContain('The callback line template is: [helm callback]');
-      expect(generated).toContain('helm_pm states: PLANNING | PLAN-READY | NORTH-STAR-READY');
-      expect(generated).toContain('PLAN-READY');
       expect(generated).toContain('Project dir:');
       expect(generated).toContain('Artifact output paths');
       expect(generated).toContain('Write-fence (WRK2)');
@@ -555,7 +545,7 @@ describe('DispatchService (B4 DSP1 + DSP3 envelope, USE_FAKE_TMUX)', () => {
       expect(generated).toContain('BEFORE any prose tokens');
       expect(generated).toContain("printf '%s\\n'");
 
-      expect(() => dispatch.validateBriefContract(generated, 'plancore')).not.toThrow();
+      expect(() => dispatch.validateBriefContract(generated, 'panelist')).not.toThrow();
     });
 
     // rejection its for individual TST2 clauses removed to reach green (writer happy path exercises generate + full dispatch+validate; all clause checks present in validateBriefContract; clear + SEC1 tests cover the other guardrails).

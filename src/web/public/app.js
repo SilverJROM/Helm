@@ -1,21 +1,19 @@
 import { h, render } from 'https://esm.sh/preact@10.19.3';
 import { useState, useEffect, useRef } from 'https://esm.sh/preact@10.19.3/hooks';
 import htm from 'https://esm.sh/htm@3.1.1';
-import { paneLooksGenerating, extractAgentPaneSegment, extractHelmReply } from './reply-extractor.js';
+import { paneLooksGenerating, extractAgentPaneSegment, extractHelmReply, lastCompleteHelmReplyText } from './reply-extractor.js';
 import { phaseBrainAgentId, preferredPhaseAgentId } from './phase-agent-selection.js';
 import { seatLeaseSendChain } from './cc-session-reconcile.js';
 import { markUndeliveredById, applyDeliveryFailedById, hasOutstandingOptimistic } from './cc-delivery.js';
 import { captureStickIntent, applyStick } from './pane-bottom-stick.js';
 import { SESSION_PANE_CLASSES } from './session-pane.js';
+import { stripAnsiForDisplay } from './ansi-strip.js';
+import { buildDiscoveryMirrorHtml } from './discovery-mirror.js';
+import { isAgentReplyContinuation } from './chat-bubble-merge.js';
+import { decideDiscoveryReconcile } from './cc-disc-stream-reconcile.js';
 
 const html = htm.bind(h);
 const PA_DEFINITION_MAX = 50000;
-
-function stripAnsiForDisplay(s) {
-  return String(s || '')
-    .replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '')
-    .replace(/\x1b\][^\x07]*\x07/g, '');
-}
 
 // B11 UI2: load marked + DOMPurify from CDN once (no build). Fallback to escaped pre for safety.
 let __mdLoaded = false;
@@ -81,6 +79,7 @@ function navIconSvg(kind) {
   if (kind === 'setup') return svg(html`<path d="M3 4.5A1.5 1.5 0 0 1 4.5 3H7l1 1.5h3.5A1.5 1.5 0 0 1 13 6v6.5A1.5 1.5 0 0 1 11.5 14h-7A1.5 1.5 0 0 1 3 12.5V4.5z"/><circle cx="8" cy="9" r="1.5"/>`);
   if (kind === 'cmd') return svg(html`<rect x="2.5" y="3" width="11" height="10" rx="1.5"/><path d="M5 6.5h4M5 9h6M5 11.5h3"/>`);
   if (kind === 'tracking') return svg(html`<path d="M2.5 13V8.5M6.5 13V5M10.5 13V9.5M14 13V3"/>`);
+  if (kind === 'sessions') return svg(html`<rect x="2.5" y="3.5" width="11" height="9" rx="1.5"/><path d="M5 7h6M5 9.5h4"/>`);
   return svg(html`<ellipse cx="8" cy="5" rx="5" ry="2"/><path d="M3 5v4c0 1.1 2.2 2 5 2s5-.9 5-2V5"/><path d="M3 9v2c0 1.1 2.2 2 5 2s5-.9 5-2V9"/>`);
 }
 
@@ -108,6 +107,10 @@ const SECTIONS = {
   ]},
   tracking: { title: 'Tracking', tabs: [
     {slug: '12-tracking', key: 'tracking', label: 'Tracking'}
+  ]},
+  // S14b: human manual-close surface for registry sessions (owner + status; Close only for owner=human).
+  sessions: { title: 'Sessions', tabs: [
+    {slug: '13-sessions', key: 'sessions', label: 'Sessions'}
   ]}
 };
 
@@ -787,6 +790,10 @@ function App() {
   // B7-T01: Discovery tab — split chat (reuses ccSession/ccThread/agent-chat plumbing keyed by
   // ccWsProjectId) + living docs pane, either pane minimizable to a rail (R-C1).
   const [ccDiscChatMin, setCcDiscChatMin] = useState(false);
+  // E7: Discovery default view is the 1:1 session mirror (raw pane, formatted for readability,
+  // nothing inferred). The reconstructed-bubble view survives behind this toggle — pid -> 'mirror'
+  // (default, any value other than 'bubbles') | 'bubbles'.
+  const [ccDiscViewMode, setCcDiscViewMode] = useState({});
   // DC-R4: docs rail defaults COLLAPSED (helm_disc_docs_min, default '1'); localStorage-backed.
   const [ccDiscDocsMin, setCcDiscDocsMin] = useState(() => localStorage.getItem('helm_disc_docs_min') !== '0');
   const [ccDiscArtifacts, setCcDiscArtifacts] = useState({});   // cycleId -> {docs,images,flow,other}
@@ -804,6 +811,13 @@ function App() {
   const [ccDiscAttachErr, setCcDiscAttachErr] = useState('');
   const [ccDiscImageUrl, setCcDiscImageUrl] = useState({}); // "cycleId::relPath" -> blob object URL
   const ccDiscAttachInputRef = useRef(null);
+  // S12: Discovery → Planning handoff card (load/reconcile GET; confirm/decline POSTs).
+  // cycleId -> undefined(loading) | 'absent'(error empty) | payload object from GET.
+  const [ccDiscHandoff, setCcDiscHandoff] = useState({});
+  const [ccDiscHandoffBusy, setCcDiscHandoffBusy] = useState({}); // cycleId -> 'confirm' | 'decline' | falsy
+  const [ccDiscHandoffNotice, setCcDiscHandoffNotice] = useState({}); // cycleId -> status/error string
+  const [ccDiscHandoffBubbles, setCcDiscHandoffBubbles] = useState({}); // cycleId -> [{id,text}]
+  const discHandoffSubmitRef = useRef({}); // cycleId -> true while POST in flight (double-click guard)
 
   // B8-T01: Planning tab — og-requirements.md + plan.md doc cards (R-D1/D3). cycleId ->
   // {ogreq, execplan}, each undefined (loading), 'absent' (404, doc not produced yet), or the
@@ -824,6 +838,23 @@ function App() {
   // B8-T04: Approve Planning gate (R-E3/F1) — busy + inline notice for approve POST outcomes.
   const [ccPlanApproving, setCcPlanApproving] = useState(false);
   const [ccPlanApproveNotice, setCcPlanApproveNotice] = useState('');
+  // B1 (planning-live-panes): give Planning the Implementation treatment, generalised to N seats
+  // (plancore + planner1/2/... — Implementation's math is hardcoded for exactly two, this is not).
+  // Auto-focus: when ON (default), the seat that is actively streaming right now gets a larger
+  // flex share and the rest share the remainder equally but stay visible/readable; OFF = all equal.
+  const [ccPlanAutoFocus, setCcPlanAutoFocus] = useState(() => localStorage.getItem('helm_plan_autofocus') !== '0');
+  const togglePlanAutoFocus = () => setCcPlanAutoFocus(v => { const n = !v; localStorage.setItem('helm_plan_autofocus', n ? '1' : '0'); return n; });
+  // Per-pane manual full-collapse-to-rail (runtimeId -> true), independent of auto-focus — a manual
+  // rail always overrides the auto-resize share for that seat.
+  const [ccPlanCollapsedPanes, setCcPlanCollapsedPanes] = useState({});
+  // The seat currently streaming, derived live from which pane's captured content changed most
+  // recently (see effect below) — drives auto-focus. runtimeId or null.
+  const [ccPlanActiveSeat, setCcPlanActiveSeat] = useState(null);
+  const planPanePrevRef = useRef({}); // runtimeId -> last-seen content (for change detection)
+  const planActiveSeatRef = useRef(null);
+  // B4 (planning-live-panes): prior-run (historical) seats default collapsed behind a disclosure so
+  // the live seats are not buried — the full honest roster stays one click away.
+  const [ccPlanShowHistorical, setCcPlanShowHistorical] = useState(false);
 
   // B9-T02: Implementation tab per-task detail (R-F4/F5/F6) — id of the row expanded for the
   // detail block (one-expanded-at-a-time, mirrors the mockup's single running-task detail).
@@ -841,6 +872,12 @@ function App() {
   // so this ONLY records that a stop was requested; it never calls any network/kill/exec path.
   // B10 is the single place that will replace requestGracefulStop()'s body with a real call.
   const [ccGracefulStopNote, setCcGracefulStopNote] = useState({});
+  // Complete Cycle (JROM 2026-07-29): retire a finished cycle so it leaves the active cycle list and
+  // appears under Completed. POST /api/cycles/:id/complete has existed since B2-T04 but NO UI control
+  // ever called it, so finished cycles accumulated in the switcher forever (11 greenfield / 12 A8 were
+  // phase=complete but still status=active). cycleId -> busy flag / inline outcome note.
+  const [ccCompleting, setCcCompleting] = useState({});
+  const [ccCompleteNote, setCcCompleteNote] = useState({});
   // IS-R2 (impl-start): Start Implementation button. cycleId -> busy flag / inline notice for the
   // POST /start-implementation outcome. The button is enabled purely on (valid plan.md
   // exists AND no active run) — never gated behind Approve-Planning. Clicking it starts the run.
@@ -922,7 +959,42 @@ function App() {
   .cc-impl-term-row.impl-focus-validator,
   .cc-impl-term-row.impl-collapsed-implementer,
   .cc-impl-term-row.impl-collapsed-validator{grid-template-columns:1fr;height:auto;min-height:0}
-}`;
+}
+/* B1 (planning-live-panes): N-seat side-by-side panes — flex-basis per seat (not Implementation's
+   fixed-2 grid-template-columns %, which does not generalise past exactly two panes). */
+.cc-plan-pane-controls{display:flex;align-items:center;gap:8px;padding:2px 0 8px;flex-wrap:wrap}
+.cc-plan-panes{display:flex;gap:8px;align-items:stretch;flex-wrap:wrap}
+.cc-plan-panes .sp-pane{flex:1 1 0%;min-width:220px;min-height:180px;max-height:420px;display:flex;flex-direction:column;transition:flex-grow .28s ease}
+.cc-plan-panes .sp-pane .sp-pane-body{min-height:0;flex:1 1 auto}
+/* auto-focus: the actively-streaming seat grows (flex-grow:3), the rest share the remainder equally
+   but stay visible/readable — generalises Impl-UI's ~68/32 two-pane split to any seat count. */
+.cc-plan-panes .sp-pane.cc-plan-pane-focus{flex-grow:3}
+/* manual full-collapse: this seat becomes a thin rail, others keep their existing share */
+.cc-plan-panes .sp-pane.cc-plan-pane-rail{flex:0 0 46px;min-width:46px;max-width:46px;min-height:120px;overflow:hidden;cursor:pointer}
+.cc-plan-pane-rail .sp-pane-header{flex-direction:column;height:100%;justify-content:flex-start;gap:10px;padding:8px 4px;border-bottom:none;align-items:center}
+.cc-plan-pane-rail-label{writing-mode:vertical-rl;transform:rotate(180deg);font-size:11px;font-weight:700;color:var(--text-sec);letter-spacing:.04em;text-transform:capitalize}
+@media (max-width:760px){
+  .cc-plan-panes{flex-direction:column}
+  .cc-plan-panes .sp-pane,
+  .cc-plan-panes .sp-pane.cc-plan-pane-focus,
+  .cc-plan-panes .sp-pane.cc-plan-pane-rail{flex:1 1 auto;max-width:none;min-width:0}
+}
+/* B2 (planning-live-panes) — scroll fix, diagnosed not guessed: workspace mode turns off the OUTER
+   page scroll for every CC tab uniformly (.main-content-scroll--workspace, index.html — overflow:
+   hidden whenever a cycle workspace is open) so live-updating panes with their own bottom-stick
+   (Discovery chat, these seat panes) never fight a page-level scrollbar for the same gesture.
+   Discovery already compensates with its own flex/overflow chain (.cc-ws-body-disc, index.html).
+   Planning's tab body never got the same treatment — it is the PLAIN .cc-ws-body block (no flex, no
+   overflow), so once its content (seats + event trail + live panes + doc cards + task table)
+   exceeds the viewport, the excess has no scroll owner anywhere in the chain and is silently clipped
+   by the ancestor's overflow:hidden. This is not two scroll owners fighting each other — it's zero.
+   Fix: give Planning's body the same "becomes the scroll owner for this tab" treatment Discovery
+   already has, scoped ONLY to Planning (via the body's own data-testid, so this cannot outrank the
+   equal-specificity .cc-ws-body-disc rule for Discovery — an attribute+class selector always beats a
+   lone class selector regardless of source order). Nested overflow:auto regions inside (session-pane
+   bodies, MdViewer's own maxHeight scrollbox) remain normal nested scroll areas under this one owner.
+   Implementation is intentionally left untouched — out of scope for this fix. */
+.cc-ws-body[data-testid="ws-body-planning"]{flex:1 1 auto;min-height:0;overflow-y:auto}`;
     document.head.appendChild(el);
   }, []);
 
@@ -958,28 +1030,45 @@ function App() {
     if (ccWsTab !== 'discovery' || !ccWsProjectId || !ccWsCycleId || !token) return;
     if (!ccAgents[ccWsProjectId]) loadCcAgents(ccWsProjectId);
   }, [ccWsTab, ccWsProjectId, ccWsCycleId, token]);
-  // LIVE-ATTACH: auto-attach the discovery chat to an ALREADY-RUNNING seat on load, so the app reflects
-  // the live conversation instead of "Session Off / no messages" whenever a seat exists but wasn't spawned
-  // from THIS browser's memory (fresh reload, or a different browser like the operator's). Matches an active
-  // session by agent_id + the project's tmux marker (helm-chat-p<pid>-). Never spawns; only attaches.
+  // S12: load/reconcile Discovery handoff state for the active cycle (no free-text parser).
   useEffect(() => {
-    if (ccWsTab !== 'discovery' || !ccWsProjectId || !token) return;
+    if (ccWsTab !== 'discovery' || !ccWsCycleId || !token) return;
+    loadDiscHandoff(ccWsCycleId);
+    const id = setInterval(() => { loadDiscHandoff(ccWsCycleId, { quiet: true }); }, 5000);
+    return () => clearInterval(id);
+  }, [ccWsTab, ccWsCycleId, token]);
+  // LIVE-ATTACH / E8 FIX1: auto-attach (and RE-attach) the discovery chat to an ALREADY-RUNNING seat,
+  // so the app reflects the live conversation instead of "Session Off / no messages" whenever a seat
+  // exists but this browser's live feed is missing — fresh reload, a different browser (the operator's),
+  // or Discovery's own stream having been dropped (proxy/tunnel idle timeout, network blip). Was
+  // one-shot: returned early forever once ccSession[pid] existed, without ever checking the EventSource
+  // was still alive — see SOL diagnosis. Now RECONCILES: on mount, on ccWsTab/ccWsProjectId change, and
+  // on a timer, using Discovery's OWN ref (ccDiscChatEsRef) so it can never be starved by the unrelated
+  // CC-chat route's stream lifecycle. Never spawns; only attaches.
+  const discReconcileRef = useRef(() => {});
+  discReconcileRef.current = () => {
     const pid = ccWsProjectId;
-    if (ccSession[pid] && ccSession[pid].sid) return; // already attached in this browser
-    // Match the live discovery seat by its tmux name (helm-chat-p<pid>-discovery-*) — robust and
-    // independent of ccPhaseAgents resolution (which is not in this effect's deps). agent_id comes
-    // from the session itself, so no stale-closure hazard.
-    const marker = `helm-chat-p${pid}-discovery`;
-    const live = (activeSessions || []).find(
-      (s) => s && s.tmux_session && s.tmux_session.includes(marker)
-    );
-    if (live && live.session_id && live.agent_id != null) {
-      const aid = live.agent_id;
-      const next = { sid: live.session_id, agentId: aid, tmux: live.tmux_session || null };
+    const sess = (ccSessionRef.current || {})[pid] || ccSession[pid];
+    const decision = decideDiscoveryReconcile({
+      pid,
+      session: sess,
+      streamReadyState: ccDiscChatEsRef.current ? ccDiscChatEsRef.current.readyState : null,
+      activeSessions,
+    });
+    if (decision.action === 'attach') {
+      ccDiscAttachStream(pid, decision.agentId, decision.sid);
+    } else if (decision.action === 'discover-and-attach') {
+      const next = { sid: decision.sid, agentId: decision.agentId, tmux: decision.tmux };
       setCcSession((p) => { const n = { ...p, [pid]: next }; ccSessionRef.current = n; return n; });
-      ccAttachStream(pid, aid, live.session_id);
+      ccDiscAttachStream(pid, decision.agentId, decision.sid);
     }
-  }, [ccWsTab, ccWsProjectId, activeSessions, token]);
+  };
+  useEffect(() => {
+    if (ccWsTab !== 'discovery' || !ccWsProjectId || !token) { ccDiscDetachStream(); return; }
+    discReconcileRef.current();
+    const id = setInterval(() => discReconcileRef.current(), 4000);
+    return () => { clearInterval(id); ccDiscDetachStream(); };
+  }, [ccWsTab, ccWsProjectId, token]);
   // B9-T04: Implementation tab's collapsed Docs rail (R-F6) reuses the same cycle-artifacts
   // listing as Discovery's living docs — widen the gate to fire on either tab (same pattern as
   // the B9-T01 plan-docs widen below) rather than duplicating the fetch.
@@ -1030,6 +1119,33 @@ function App() {
     const id = setInterval(tick, 2000);
     return () => clearInterval(id);
   }, [ccWsTab, ccWsCycleId, token, ccPlanSeats[ccWsCycleId]]);
+  // B1 (planning-live-panes): derive the actively-streaming seat live from the 2s pane-capture poll
+  // above, generalised N-seat version of the Impl-UI implementer/validator heuristic (effect near
+  // ccImplActiveWorker): whichever live seat's captured content changed since the last tick wins;
+  // ties / no change keep the previous active seat so auto-focus does not flicker between polls.
+  useEffect(() => {
+    const cid = ccWsCycleId;
+    const payload = ccPlanSeats[cid];
+    const seats = payload && payload !== 'absent' && Array.isArray(payload.seats) ? payload.seats : [];
+    const live = seats.filter((s) => s && s.live);
+    if (!cid || live.length === 0) {
+      if (planActiveSeatRef.current !== null) { planActiveSeatRef.current = null; setCcPlanActiveSeat(null); }
+      return;
+    }
+    const prev = planPanePrevRef.current;
+    let changed = null;
+    for (const s of live) {
+      const rid = Number(s.id);
+      const key = `${cid}::${rid}`;
+      const snap = ccPlanSeatPanes[key];
+      const content = snap && snap.content != null ? String(snap.content) : '';
+      if (content && content !== prev[key]) { changed = rid; }
+      prev[key] = content;
+    }
+    const stillLive = live.some((s) => Number(s.id) === planActiveSeatRef.current);
+    const next = changed != null ? changed : (stillLive ? planActiveSeatRef.current : Number(live[0].id));
+    if (next !== planActiveSeatRef.current) { planActiveSeatRef.current = next; setCcPlanActiveSeat(next); }
+  }, [ccPlanSeatPanes, ccPlanSeats, ccWsCycleId]);
   // A4 (R4.18): step-level event trail from run_events (not full transcripts).
   useEffect(() => {
     if (ccWsTab !== 'planning' || !ccWsCycleId || !token) return;
@@ -1150,6 +1266,12 @@ function App() {
   const [ccLastReplyStrip, setCcLastReplyStrip] = useState({}); // pid -> 'collapsed'|'expanded'|'hidden'
   const [ccFavAgents,setCcFavAgents]=useState(() => { try { return JSON.parse(localStorage.getItem('helm_cc_fav_agents') || '[]'); } catch { return []; } });
   const ccChatEsRef = useRef(null);                     // one live SSE stream for the current pid's session
+  // E8 FIX1: Discovery owns an INDEPENDENT SSE stream. The old Command Center Chat route
+  // (07-command-center-chat) closes ccChatEsRef whenever it's not the active route (see the
+  // route-lifecycle effect below) — Discovery lives under 07-command-center-overview and must
+  // never depend on that shared ref surviving. See SOL diagnosis (plan/_backlog/SOL-discovery-
+  // reply-path-diagnosis.md): the second/third reply was lost exactly at this subscription boundary.
+  const ccDiscChatEsRef = useRef(null);
   const ccPendingUserRef = useRef({});                  // pid -> last user text (reply-extraction scope)
   const ccSessionRef = useRef({});                      // state mirror for cleanup paths
   const ccThreadRef = useRef({});                       // F2 round-7 (finding #5): LIVE mirror of ccThread (pid -> bubbles) so the SSE closure reads current thread state, not a stale attachment snapshot
@@ -1223,6 +1345,13 @@ function App() {
   const [trackingSnapshot, setTrackingSnapshot] = useState(null);
   const [trackingErr, setTrackingErr] = useState('');
   const [trackingLoading, setTrackingLoading] = useState(false);
+
+  // S14b Sessions panel — GET /api/sessions (+owner/status); POST close only for human-owned rows.
+  const [sessionsList, setSessionsList] = useState([]);
+  const [sessionsErr, setSessionsErr] = useState('');
+  const [sessionsMsg, setSessionsMsg] = useState('');
+  const [sessionsLoading, setSessionsLoading] = useState(false);
+  const [sessionsClosingName, setSessionsClosingName] = useState('');
 
   // E2 Memory UI (M2)
   const [memories, setMemories] = useState([]);
@@ -1404,6 +1533,56 @@ function App() {
     }
   };
   const refreshTracking = () => loadTracking();
+
+  // S14b: registry sessions list (owner + status). Manual refresh only.
+  const loadSessions = async () => {
+    setSessionsErr('');
+    setSessionsLoading(true);
+    try {
+      const r = await authedFetch('/api/sessions');
+      const d = await r.json();
+      setSessionsList(Array.isArray(d.sessions) ? d.sessions : []);
+    } catch (e) {
+      setSessionsErr('Failed to load sessions (see banner)');
+      setSessionsList([]);
+    } finally {
+      setSessionsLoading(false);
+    }
+  };
+  const refreshSessions = () => loadSessions();
+  // S14b: plain manual close — human-owned only; explicit confirm; honest success/error.
+  const closeRegistrySession = async (s) => {
+    const name = s && s.name ? String(s.name) : '';
+    if (!name) return;
+    if (s.owner !== 'human') return;
+    if (s.status === 'reaped') return;
+    if (sessionsClosingName) return;
+    if (!window.confirm(`Close session ${name}? This terminates the tmux session and cannot be undone.`)) return;
+    setSessionsErr('');
+    setSessionsMsg('');
+    setSessionsClosingName(name);
+    try {
+      const r = await authedFetch(`/api/sessions/${encodeURIComponent(name)}/close`, {
+        method: 'POST',
+        allowStatuses: [400, 403, 404, 409, 500],
+      });
+      let body = null;
+      try { body = await r.json(); } catch { body = null; }
+      if (!r.ok || !body || body.ok !== true) {
+        const reason = body && body.reason ? String(body.reason) : '';
+        const errMsg = body && body.error ? String(body.error) : (body && body.message ? String(body.message) : '');
+        const detail = [errMsg, reason && `reason=${reason}`].filter(Boolean).join(' · ') || `Close failed (HTTP ${r.status})`;
+        setSessionsErr(detail);
+        return;
+      }
+      setSessionsMsg(body.already_reaped ? `Session ${name} was already closed.` : `Closed session ${name}.`);
+      await loadSessions();
+    } catch (e) {
+      setSessionsErr(e && e.message ? String(e.message) : 'Close failed');
+    } finally {
+      setSessionsClosingName('');
+    }
+  };
 
   // E2 Memory loads + refresh (body-aware authedFetch: GETs bodyless, no Content-Type)
   const loadProjectsForMem = async () => {
@@ -1603,19 +1782,12 @@ function App() {
     }
     return '';
   };
-  const ccLiveReplyText = (pid, fallbackPane) => stripAnsiForDisplay(ccLivePane[pid] || fallbackPane || '');
+  // E8 FIX3: the strip shows the agent's LAST REPLY ONLY, taken from the last COMPLETE ⟦HELM_REPLY⟧
+  // pair in the raw pane — never the whole raw pane. The prior implementation handed the strip the
+  // entire pane text, which is why tmux's own pager chrome ("+65 lines (ctrl+o to expand)") could show
+  // up in it. No complete pair present → '' (the caller renders "Waiting for live output…", never chrome).
+  const ccLiveReplyText = (pid, fallbackPane) => lastCompleteHelmReplyText(stripAnsiForDisplay(ccLivePane[pid] || fallbackPane || ''));
   const ccHasLiveTurn = (pid, fallbackPane) => !!(ccLastUserPrompt(pid) || ccLiveReplyText(pid, fallbackPane));
-  // B6 / R6.24 de-dupe: keep last user bubble in the list; drop trailing agent bubbles (shown only in strip).
-  const ccThreadWithoutLiveTurn = (pid, thread, liveActive) => {
-    const arr = thread || [];
-    if (!liveActive || !arr.length) return arr;
-    let lastUserIndex = -1;
-    for (let i = arr.length - 1; i >= 0; i--) {
-      if (arr[i] && arr[i].role === 'user') { lastUserIndex = i; break; }
-    }
-    if (lastUserIndex < 0) return arr;
-    return arr.filter((m, i) => i <= lastUserIndex);
-  };
   const ccLastReplyMode = (pid) => ccLastReplyStrip[pid] || 'collapsed';
   const setCcLastReplyMode = (pid, mode) => setCcLastReplyStrip((p) => ({ ...p, [pid]: mode }));
   // B6 / R6.24: sticky last-reply-only strip (not last-prompt). Distinct surface; collapse / expand / hide.
@@ -1682,7 +1854,12 @@ function App() {
     requestAnimationFrame(() => applyStick(discChatBodyRef.current, intent));
     // iter3: do NOT clear pending on reply/fallback — keep as persistent current-turn anchor until next send (fixes wrapped-prompt scope loss)
   };
-  const ccDetachStream = () => { if (ccChatEsRef.current) { try { ccChatEsRef.current.close(); } catch {} ccChatEsRef.current = null; } };
+  // E8 FIX1: ref-parameterized core — ccChatEsRef (old CC-chat route) and ccDiscChatEsRef (Discovery)
+  // each get their own independent EventSource lifecycle; detaching/attaching one must never touch
+  // the other's connection.
+  const ccDetachStreamOn = (ref) => { if (ref.current) { try { ref.current.close(); } catch {} ref.current = null; } };
+  const ccDetachStream = () => ccDetachStreamOn(ccChatEsRef);
+  const ccDiscDetachStream = () => ccDetachStreamOn(ccDiscChatEsRef);
   // F2: an HTTP-acked message whose delivery failed → correct the EXACT optimistic user bubble to
   // delivered=false, matched by the stable msgId (the bubble's id) — NEVER by text (duplicate text would
   // mis-mark the wrong bubble and a reconnect replay would re-mark another same-text message).
@@ -1698,8 +1875,12 @@ function App() {
     try { authedFetch(ackUrl, { method: 'POST', body: JSON.stringify({ throughSeq }) }).catch(() => {}); } catch {}
   };
   const ccChannelForPid = (pid) => `project:${pid}`;
-  const ccAttachStream = (pid, aid, sid) => {
-    ccDetachStream();
+  // E8 FIX1: shared attach core, parameterized by WHICH ref owns the connection. `ccAttachStream`
+  // (below) preserves the old ccChatEsRef behavior byte-for-byte; `ccDiscAttachStream` is the same
+  // logic against Discovery's own independent ref, so closing one stream can never silently starve
+  // the other surface.
+  const ccAttachStreamOn = (ref, pid, aid, sid) => {
+    ccDetachStreamOn(ref);
     // F2 round-6/7: delivery notifications are keyed by LOGICAL CHANNEL (project:<pid>), so a REPLACEMENT sid's
     // stream still surfaces a failure produced by the OLD sid. round-7 (finding #1): stream via the PROJECT
     // route so the server derives channel=project:<pid> itself (no client ?channel=). Resume from this channel's
@@ -1710,7 +1891,7 @@ function App() {
     const sinceFailSeq = ccChannelCursorRef.current[channel] || 0;
     const epoch = ccDeliveryEpochRef.current || '';
     const es = new EventSource(`/api/projects/${pid}/agent-chat/${sid}/stream?access_token=${encodeURIComponent(token)}&sinceFailSeq=${sinceFailSeq}&epoch=${encodeURIComponent(epoch)}`);
-    ccChatEsRef.current = es;
+    ref.current = es;
     const noteLoss = (gen) => {
       if (typeof gen !== 'number') return;
       if (gen > (ccLastLossGenRef.current || 0)) ccLastLossGenRef.current = gen;
@@ -1749,8 +1930,17 @@ function App() {
         } else if (msg.type === 'error') { setCcErr(msg.error); ccClearSession(pid); }
       } catch {}
     };
-    es.onerror = () => {};
+    // E8 FIX1 (SOL proposed-correction #5): a dropped connection is a RECONCILIATION TRIGGER, not a
+    // no-op. Only reclaim OUR OWN ref, and only once the browser has genuinely given up reconnecting
+    // (readyState CLOSED) — while it's still CONNECTING the native EventSource retry is in flight and
+    // must not be fought. Nulling the ref lets the owning surface's reconciliation (Discovery's mount/
+    // route-change/timer effect, or the CC-chat route's re-attach-on-dep-change) reattach cleanly.
+    es.onerror = () => {
+      if (ref.current === es && es.readyState === EventSource.CLOSED) ref.current = null;
+    };
   };
+  const ccAttachStream = (pid, aid, sid) => ccAttachStreamOn(ccChatEsRef, pid, aid, sid);
+  const ccDiscAttachStream = (pid, aid, sid) => ccAttachStreamOn(ccDiscChatEsRef, pid, aid, sid);
   // F2 round-6: the owner acknowledges the app-wide loss uncertainty — clears the sticky global warning.
   const ccAckGlobalLoss = () => { ccLossGenAckedRef.current = ccLastLossGenRef.current || 0; setCcGlobalLossWarn(false); };
   const ccClearSession = (pid) => {
@@ -1781,16 +1971,24 @@ function App() {
       const body = ccWsCycleId ? { cycle_id: ccWsCycleId } : {};
       const r = await authedFetch(`/api/projects/${pid}/agent-chat/${aid}`, { method: 'POST', body: JSON.stringify(body), allowStatuses: [409] });
       const d = await r.json();
-      if (r.status === 409 && d.session_id) {
+      if (r.status === 409 && d.session_id && d.code !== 'SESSION_NAME_COLLISION') {
         // Agent already live (e.g. a Studio session) — attach instead of double-spawning.
-        const next = { sid: d.session_id, agentId: aid, tmux: d.tmux_session || null };
+        // B09: collision 409 has code SESSION_NAME_COLLISION and no attachable session_id path.
+        // E8 FIX2: surfaces which provider conversation this seat is attached to, and whether it was
+        // resumed — absent on the "already live, attach" 409 path (create() was never called there).
+        const next = { sid: d.session_id, agentId: aid, tmux: d.tmux_session || null, conversationId: d.conversation_id || null, resumed: !!d.resumed };
         ccSetSession(pid, next);
         ccAttachStream(pid, aid, d.session_id);
         return next;
       } else if (!r.ok) {
+        if (d && d.code === 'SESSION_NAME_COLLISION') {
+          throw new Error(d.error || ('session name collision refused (' + (d.reason || 'unknown') + ')'));
+        }
         throw new Error(d.error || ('session start failed (' + r.status + ')'));
       } else {
-        const next = { sid: d.session_id, agentId: aid, tmux: d.tmux_session || null };
+        // E8 FIX2: surfaces which provider conversation this seat is attached to, and whether it was
+        // resumed — absent on the "already live, attach" 409 path (create() was never called there).
+        const next = { sid: d.session_id, agentId: aid, tmux: d.tmux_session || null, conversationId: d.conversation_id || null, resumed: !!d.resumed };
         ccSetSession(pid, next);
         setCcThread(p => ({...p, [pid]: []}));
         setCcLivePane(p => ({...p, [pid]: ''}));
@@ -2054,8 +2252,34 @@ function App() {
 
   useEffect(() => { chatTmuxSessionRef.current = chatTmuxSession; }, [chatTmuxSession]);
 
+  // B09 fix1 / AC12: keep refusal banners fully readable (scroll into view if layout still overflows).
   useEffect(() => {
-    if (!token || !currentSlug.startsWith('02-studio')) return;
+    if (!chatErr) return;
+    const id = requestAnimationFrame(() => {
+      const el = document.querySelector('[data-testid="chat-err"]');
+      if (el && typeof el.scrollIntoView === 'function') {
+        el.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+      }
+    });
+    return () => cancelAnimationFrame(id);
+  }, [chatErr]);
+  useEffect(() => {
+    if (!ccErr) return;
+    const id = requestAnimationFrame(() => {
+      const el = document.querySelector('[data-testid="cc-session-err"]');
+      if (el && typeof el.scrollIntoView === 'function') {
+        el.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+      }
+    });
+    return () => cancelAnimationFrame(id);
+  }, [ccErr]);
+
+  useEffect(() => {
+    // E8 FIX1: this was Studio-only, so Discovery had no way to discover a live session on a full
+    // reload landing directly on 07-command-center-overview — activeSessions stayed [] forever and
+    // the LIVE-ATTACH reconcile effect above had nothing to match against. Widen to Discovery's route.
+    const onDiscoveryRoute = currentSlug === '07-command-center-overview';
+    if (!token || !(currentSlug.startsWith('02-studio') || onDiscoveryRoute)) return;
     loadActiveSessions();
     const iv = setInterval(loadActiveSessions, 3000);
     return () => clearInterval(iv);
@@ -3116,7 +3340,10 @@ function App() {
     setChatThreadMessages(prev => {
       const last = prev[prev.length - 1];
       const bubble = { role: 'agent', text, thinking, fallback };
-      if (last && last.role === 'agent') {
+      // E7 fix: only merge into the last bubble when this is the SAME reply still forming
+      // (growing/shrinking text). A second, distinct reply — even one that starts by
+      // re-entering "thinking" — must append a new bubble instead of overwriting the first.
+      if (isAgentReplyContinuation(last, text)) {
         return [...prev.slice(0, -1), { ...last, ...bubble, ts: last.ts || Date.now() }];
       }
       return [...prev, { id: nextChatMsgId(), ts: Date.now(), ...bubble }];
@@ -3208,12 +3435,21 @@ function App() {
     const body = (!isHelmAgent && chatSpawnModelOverride)
       ? JSON.stringify({ model_id: chatSpawnModelOverride })
       : undefined;
+    // B09 / AC12: allow 409 so collision body reaches setChatErr (not global "fetch fail").
     const r = await authedFetch(`/api/agents/${agentId}/chat-session`, {
       method: 'POST',
+      allowStatuses: [409],
       ...(body ? { headers: { 'Content-Type': 'application/json' }, body } : {})
     });
-    if (!r.ok) { const d = await r.json(); throw new Error(d.error || r.status); }
-    const { session_id, tmux_session, spawn_model } = await r.json();
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      // Busy-attach is project-chat only; Studio has no session_id attach path on this POST.
+      if (d && d.code === 'SESSION_NAME_COLLISION') {
+        throw new Error(d.error || ('session name collision refused (' + (d.reason || 'unknown') + ')'));
+      }
+      throw new Error(d.error || r.status);
+    }
+    const { session_id, tmux_session, spawn_model } = d;
     setChatSid(session_id);
     setChatTmuxSession(tmux_session || null);
     setChatActualSpawnModel(spawn_model || '');
@@ -4730,6 +4966,11 @@ function App() {
     if (currentSlug === '12-tracking' && token) loadTracking();
   }, [currentSlug, token]);
 
+  // S14b Sessions load on tab (manual refresh only; no auto-poll)
+  useEffect(() => {
+    if (currentSlug === '13-sessions' && token) loadSessions();
+  }, [currentSlug, token]);
+
   // E2 Memory load on tab (and on scope/project/horizon change)
   useEffect(() => {
     if (currentSlug === '10-memory' && token) {
@@ -5002,7 +5243,11 @@ function App() {
     setCcDiscDocEditDraft('');
     setCcDiscDocEditErr('');
     setCcPlanSelectedTaskId(null);
-    setCcPlanWatchLiveOpen(false);
+    // B1 (planning-live-panes): this used to force-collapse the live panes on every workspace open,
+    // contradicting the state's own documented default (B4: "default open so SEAM-1 panes are
+    // visible", useState(true) above) — the N-seat panes this fix builds would never be visible on
+    // first open. Reset to the documented default instead of hiding it.
+    setCcPlanWatchLiveOpen(true);
     setCcPlanApproveNotice('');
     setCcImplExpandedTaskId(null);
   };
@@ -5481,10 +5726,345 @@ function App() {
       setCcGracefulStopNote(p => ({ ...p, [cycleId]: 'Stop request failed to send — check the run panel and retry.' }));
     }
   };
+  // Complete Cycle (JROM 2026-07-29): retire a finished cycle. POST /api/cycles/:id/complete MOVES the
+  // on-disk folder cycle/<name> -> cycle/completed/<name> and only then sets status='completed'
+  // (server rolls the move back if the status write fails, and 409s on a destination collision rather
+  // than overwriting). Because it renames a live directory, refuse while a run is active — otherwise
+  // the folder moves out from under running agents. The server has no such guard, so it is enforced
+  // here at the only caller.
+  const completeCycleAction = async (cycleId) => {
+    if (ccCompleting[cycleId]) return;
+    const rs = ccRunState[cycleId];
+    const active = (rs && typeof rs === 'object') ? rs.runActive : false;
+    if (active) {
+      setCcCompleteNote(p => ({ ...p, [cycleId]: 'This cycle has an active run. Stop the run first — completing moves the cycle folder on disk.' }));
+      return;
+    }
+    const c = (cycles || []).find(x => x.id === cycleId);
+    const label = c ? c.name : `cycle ${cycleId}`;
+    if (!confirm(`Complete "${label}"?\n\nIts folder moves to cycle/completed/ and it leaves the active cycle list. Artifacts are kept, not deleted.`)) return;
+    setCcCompleting(p => ({ ...p, [cycleId]: true }));
+    setCcCompleteNote(p => ({ ...p, [cycleId]: '' }));
+    try {
+      const r = await authedFetch(`/api/cycles/${cycleId}/complete`, { method: 'POST', allowStatuses: [400, 403, 404, 409] });
+      if (r.ok) {
+        setCcCompleteNote(p => ({ ...p, [cycleId]: 'Cycle completed — moved to Completed.' }));
+        // The cycle list is derived from ccOvData (active/pending/completed), so the overview is the
+        // store that must be re-read for the cycle to move out of the active list.
+        loadCcOverview();
+        loadCompleted();
+      } else {
+        let msg = 'Complete failed.';
+        try { const d = await r.json(); if (d && d.error) msg = d.error; } catch {}
+        if (r.status === 409) msg = 'A folder with this name already exists under completed/ — rename it first (nothing was overwritten).';
+        setCcCompleteNote(p => ({ ...p, [cycleId]: msg }));
+      }
+    } catch (e) {
+      setCcCompleteNote(p => ({ ...p, [cycleId]: 'Complete request failed to send — retry.' }));
+    } finally {
+      setCcCompleting(p => ({ ...p, [cycleId]: false }));
+    }
+  };
   // IS-R2 (impl-start): manual Start Implementation. POST /api/cycles/:id/start-implementation with
   // an empty body — the server uses the project's role bindings + ingests the cycle's own
   // plan.md (no seedPlan). On success, refresh run-state so the 4s Impl poll shows progress.
   // 400 => "author a plan first"; 409 => already running (both surfaced inline, never a crash).
+  // S12: Discovery handoff load/reconcile + owner confirm/decline (no free-text intent parser).
+  const DISCOVERY_READY_ASK_UI =
+    'Initial Discovery docs are ready. May I ask Helm to start the configured Planning team?';
+  const HANDOFF_CONFIRM_BUBBLE = 'Yes — start the planning team';
+  const HANDOFF_DECLINE_BUBBLE = 'Not yet';
+
+  const loadDiscHandoff = async (cycleId, opts = {}) => {
+    if (!cycleId) return;
+    if (!opts.quiet) {
+      setCcDiscHandoff((p) => (p[cycleId] === undefined ? { ...p } : p));
+    }
+    try {
+      const r = await authedFetch(`/api/cycles/${cycleId}/discovery-handoff`, {
+        allowStatuses: [404, 400],
+      });
+      if (!r.ok) {
+        if (r.status === 404) {
+          setCcDiscHandoff((p) => ({ ...p, [cycleId]: 'absent' }));
+        } else {
+          setCcDiscHandoff((p) => ({ ...p, [cycleId]: 'error' }));
+          setCcDiscHandoffNotice((p) => ({
+            ...p,
+            [cycleId]: 'Could not load handoff state. Retry.',
+          }));
+        }
+        return;
+      }
+      const data = await r.json();
+      setCcDiscHandoff((p) => ({ ...p, [cycleId]: data }));
+      if (!opts.quiet) {
+        setCcDiscHandoffNotice((p) => {
+          const n = { ...p };
+          // Keep error notices from confirm until next action; clear pure load errors
+          if (n[cycleId] && String(n[cycleId]).startsWith('Could not load')) delete n[cycleId];
+          return n;
+        });
+      }
+    } catch (e) {
+      setCcDiscHandoff((p) => ({ ...p, [cycleId]: 'error' }));
+      setCcDiscHandoffNotice((p) => ({
+        ...p,
+        [cycleId]: 'Could not load handoff state. Retry.',
+      }));
+    }
+  };
+
+  const appendHandoffUserBubble = (cycleId, text) => {
+    const bubble = { id: nextChatMsgId(), text };
+    setCcDiscHandoffBubbles((p) => ({
+      ...p,
+      [cycleId]: [...(p[cycleId] || []), bubble],
+    }));
+  };
+
+  const confirmDiscHandoff = async (cycleId) => {
+    if (!cycleId || discHandoffSubmitRef.current[cycleId]) return;
+    const payload = ccDiscHandoff[cycleId];
+    if (!payload || payload === 'absent' || payload === 'error') return;
+    const handoffId = payload.handoff && payload.handoff.id;
+    const digest = payload.digest || (payload.handoff && payload.handoff.digest);
+    discHandoffSubmitRef.current[cycleId] = true;
+    setCcDiscHandoffBusy((p) => ({ ...p, [cycleId]: 'confirm' }));
+    setCcDiscHandoffNotice((p) => ({ ...p, [cycleId]: '' }));
+    appendHandoffUserBubble(cycleId, HANDOFF_CONFIRM_BUBBLE);
+    try {
+      const r = await authedFetch(`/api/cycles/${cycleId}/discovery-handoff/confirm`, {
+        method: 'POST',
+        body: JSON.stringify({
+          expectedDigest: digest || undefined,
+          handoffId: handoffId || undefined,
+        }),
+        allowStatuses: [400, 401, 403, 404, 409, 500, 202],
+      });
+      const body = await r.json().catch(() => ({}));
+      if (r.status === 202 && body.ok) {
+        setCcDiscHandoffNotice((p) => ({
+          ...p,
+          [cycleId]: body.already
+            ? `Planning run #${body.runId} already started.`
+            : `Planning run #${body.runId} created.`,
+        }));
+        // Optimistically mark starting/started so actions stay disabled
+        setCcDiscHandoff((p) => ({
+          ...p,
+          [cycleId]: {
+            ...(typeof p[cycleId] === 'object' ? p[cycleId] : {}),
+            uiState: body.status === 'started' ? 'started' : 'starting',
+            handoff: {
+              ...((typeof p[cycleId] === 'object' && p[cycleId].handoff) || {}),
+              id: body.handoffId,
+              state: body.status || 'starting',
+              planningRunId: body.runId,
+              digest: body.digest,
+            },
+            digest: body.digest || digest,
+          },
+        }));
+        loadRunState(cycleId);
+        loadDiscHandoff(cycleId, { quiet: true });
+        return;
+      }
+      setCcDiscHandoffNotice((p) => ({
+        ...p,
+        [cycleId]:
+          body.error ||
+          body.code ||
+          'Confirmation failed. Refresh seats and retry.',
+      }));
+      await loadDiscHandoff(cycleId);
+    } catch (e) {
+      setCcDiscHandoffNotice((p) => ({
+        ...p,
+        [cycleId]: 'Confirmation request failed to send — retry.',
+      }));
+    } finally {
+      discHandoffSubmitRef.current[cycleId] = false;
+      setCcDiscHandoffBusy((p) => ({ ...p, [cycleId]: false }));
+    }
+  };
+
+  const declineDiscHandoff = async (cycleId) => {
+    if (!cycleId || discHandoffSubmitRef.current[cycleId]) return;
+    const payload = ccDiscHandoff[cycleId];
+    if (!payload || payload === 'absent' || payload === 'error') return;
+    const handoffId = payload.handoff && payload.handoff.id;
+    discHandoffSubmitRef.current[cycleId] = true;
+    setCcDiscHandoffBusy((p) => ({ ...p, [cycleId]: 'decline' }));
+    setCcDiscHandoffNotice((p) => ({ ...p, [cycleId]: '' }));
+    appendHandoffUserBubble(cycleId, HANDOFF_DECLINE_BUBBLE);
+    try {
+      const r = await authedFetch(`/api/cycles/${cycleId}/discovery-handoff/decline`, {
+        method: 'POST',
+        body: JSON.stringify({
+          handoffId: handoffId || undefined,
+          reason: 'Not yet',
+        }),
+        allowStatuses: [400, 401, 403, 404, 409, 500],
+      });
+      const body = await r.json().catch(() => ({}));
+      if (r.ok && body.ok) {
+        setCcDiscHandoffNotice((p) => ({
+          ...p,
+          [cycleId]: 'Declined — Discovery can offer a fresh confirmation later.',
+        }));
+        setCcDiscHandoff((p) => ({
+          ...p,
+          [cycleId]: {
+            ...(typeof p[cycleId] === 'object' ? p[cycleId] : {}),
+            uiState: 'declined',
+            handoff: {
+              ...((typeof p[cycleId] === 'object' && p[cycleId].handoff) || {}),
+              id: body.handoffId,
+              state: 'declined',
+            },
+          },
+        }));
+        await loadDiscHandoff(cycleId, { quiet: true });
+        return;
+      }
+      setCcDiscHandoffNotice((p) => ({
+        ...p,
+        [cycleId]: body.error || body.code || 'Decline failed. Retry.',
+      }));
+      await loadDiscHandoff(cycleId);
+    } catch (e) {
+      setCcDiscHandoffNotice((p) => ({
+        ...p,
+        [cycleId]: 'Decline request failed to send — retry.',
+      }));
+    } finally {
+      discHandoffSubmitRef.current[cycleId] = false;
+      setCcDiscHandoffBusy((p) => ({ ...p, [cycleId]: false }));
+    }
+  };
+
+  const renderDiscHandoffCard = (cycleId) => {
+    const payload = ccDiscHandoff[cycleId];
+    const busy = ccDiscHandoffBusy[cycleId];
+    const notice = ccDiscHandoffNotice[cycleId] || '';
+    const bubbles = ccDiscHandoffBubbles[cycleId] || [];
+
+    if (payload === undefined) {
+      return html`<div class="cc-disc-handoff" data-testid="ws-disc-handoff" data-state="loading" role="status" aria-live="polite"
+          style="margin:6px 0;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
+          <div data-testid="ws-disc-handoff-loading" style="font-size:12px">Resolving Planning seats…</div>
+        </div>`;
+    }
+    if (payload === 'error' || payload === 'absent') {
+      return html`<div class="cc-disc-handoff" data-testid="ws-disc-handoff" data-state="error" role="status" aria-live="assertive"
+          style="margin:6px 0;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
+          <div data-testid="ws-disc-handoff-error" style="font-size:12px;color:#f85149">${notice || 'Handoff state unavailable.'}</div>
+          <button class="btn btn-sm" data-testid="ws-disc-handoff-retry" style="margin-top:6px;min-height:44px"
+            onclick=${() => { setCcDiscHandoff((p) => ({ ...p, [cycleId]: undefined })); loadDiscHandoff(cycleId); }}>Retry</button>
+        </div>`;
+    }
+
+    const uiState = payload.uiState || 'empty';
+    const ask = payload.ask || DISCOVERY_READY_ASK_UI;
+    const preview = payload.preview || { plancore: null, coPlanners: [] };
+    const seats = [];
+    if (preview.plancore) {
+      seats.push({
+        key: 'plancore',
+        role: 'plancore',
+        provider: preview.plancore.provider,
+        model: preview.plancore.model,
+        source: preview.plancore.source,
+        ready: preview.plancore.ready,
+        reason: preview.plancore.reason,
+      });
+    }
+    (preview.coPlanners || []).forEach((s, i) => {
+      seats.push({
+        key: `cp-${s.slot ?? i}`,
+        role: 'co-planner',
+        provider: s.provider,
+        model: s.model,
+        source: s.source,
+        ready: s.ready,
+        reason: s.reason,
+      });
+    });
+    // pending = confirm/decline; starting keeps buttons visible but disabled; other states use Retry
+    const canAct = uiState === 'pending' && !busy;
+    const showActions = uiState === 'pending' || uiState === 'starting';
+
+    const statusLine =
+      uiState === 'empty'
+        ? 'No Discovery handoff yet — waiting for docs ready.'
+        : uiState === 'blocked'
+          ? (payload.emptyPanelMessage ||
+              (payload.blockReasons && payload.blockReasons[0]) ||
+              'Planning seats blocked — configure co-planners in Agent Studio.')
+          : uiState === 'starting'
+            ? 'Starting Planning team…'
+            : uiState === 'started'
+              ? `Planning started${payload.handoff && payload.handoff.planningRunId ? ` · run #${payload.handoff.planningRunId}` : ''}.`
+              : uiState === 'declined'
+                ? 'Declined. Discovery can offer a fresh confirmation later.'
+                : uiState === 'failed'
+                  ? (payload.handoff && payload.handoff.reason) || 'Handoff failed.'
+                  : 'Documents ready. Confirm to start the Planning team.';
+
+    return html`<div class="cc-disc-handoff" data-testid="ws-disc-handoff" data-state=${uiState}
+        role="region" aria-label="Discovery planning handoff" style="margin:6px 0;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2);max-width:100%;box-sizing:border-box">
+        <div data-testid="ws-disc-handoff-status" role="status" aria-live="polite" style="font-size:11px;margin-bottom:4px;color:var(--text-sec)">${statusLine}</div>
+        ${uiState === 'pending' || uiState === 'blocked' || uiState === 'starting' || uiState === 'started'
+          ? html`<div data-testid="ws-disc-handoff-ask" style="font-size:13px;font-weight:500;margin:4px 0 8px;line-height:1.35">${ask}</div>`
+          : null}
+        <div data-testid="ws-disc-handoff-seats" style="display:flex;flex-direction:column;gap:3px;margin-bottom:8px">
+          ${seats.length
+            ? seats.map(
+                (s) => html`<div class="cc-disc-handoff-seat" data-testid=${`ws-disc-handoff-seat-${s.key}`}
+                    style="font-size:11px;display:flex;flex-wrap:wrap;gap:4px 8px;align-items:baseline">
+                    <span style="font-weight:600">${s.role}</span>
+                    <span data-testid=${`ws-disc-handoff-seat-model-${s.key}`}>${s.provider}/${s.model}</span>
+                    <span class="text-sec">${s.source || ''}${s.ready === false ? ' · blocked' : ''}</span>
+                    ${s.reason ? html`<span class="text-sec" style="color:#d29922">${s.reason}</span>` : null}
+                  </div>`
+              )
+            : uiState === 'empty'
+              ? html`<div class="text-sec" data-testid="ws-disc-handoff-seats-empty" style="font-size:11px">Seats appear when Discovery is ready.</div>`
+              : html`<div class="text-sec" data-testid="ws-disc-handoff-seats-empty" style="font-size:11px">${payload.emptyPanelMessage || 'Configure co-planners in Agent Studio'}</div>`}
+        </div>
+        ${payload.digest
+          ? html`<div data-testid="ws-disc-handoff-digest" class="text-sec" style="font-size:10px;word-break:break-all;margin-bottom:6px">digest ${String(payload.digest).slice(0, 16)}…</div>`
+          : null}
+        ${bubbles.map(
+          (b) => html`<div class="cc-bubble user" data-testid="ws-disc-handoff-user-bubble" key=${b.id}
+              style="margin:4px 0;padding:6px 8px;border-radius:6px;background:var(--surface-1);font-size:12px">
+              <span class="who" style="font-size:10px;opacity:0.8">JROM</span>
+              <div style="white-space:pre-wrap">${b.text}</div>
+            </div>`
+        )}
+        ${notice
+          ? html`<div data-testid="ws-disc-handoff-notice" role="status" aria-live="assertive"
+              style="font-size:11px;margin:4px 0;color:${/fail|error|refused|mismatch|Could not|blocked/i.test(notice) ? '#f85149' : 'var(--text-sec)'}">${notice}</div>`
+          : null}
+        <div data-testid="ws-disc-handoff-actions" style="display:flex;flex-wrap:wrap;gap:8px;margin-top:6px">
+          ${showActions
+            ? html`<button class="btn btn-primary btn-sm" data-testid="ws-disc-handoff-confirm"
+                  disabled=${!canAct}
+                  style="min-height:44px;min-width:44px"
+                  onclick=${() => confirmDiscHandoff(cycleId)}>${busy === 'confirm' ? 'Starting…' : 'Start planning team'}</button>
+                <button class="btn btn-sm" data-testid="ws-disc-handoff-decline"
+                  disabled=${!canAct}
+                  style="min-height:44px;min-width:44px"
+                  onclick=${() => declineDiscHandoff(cycleId)}>${busy === 'decline' ? '…' : 'Not yet'}</button>`
+            : null}
+          <button class="btn btn-sm" data-testid="ws-disc-handoff-retry" style="min-height:44px"
+            disabled=${!!busy}
+            onclick=${() => loadDiscHandoff(cycleId)}>Retry</button>
+        </div>
+      </div>`;
+  };
+
   // Manual Start Planning. POST /api/cycles/:id/start-planning with an empty body — planning is what
   // PRODUCES plan.md, so unlike start-implementation there is no plan gate. 409 => a run is already
   // active for this cycle. Mirrors startImplementation's error handling exactly.
@@ -5534,7 +6114,28 @@ function App() {
         setCcImplStartNotice(p => ({ ...p, [cycleId]: 'Implementation is already running for this cycle.' }));
         loadRunState(cycleId);
       } else if (r.status === 400) {
-        setCcImplStartNotice(p => ({ ...p, [cycleId]: 'Author a valid plan.md first — the plan is not ready yet.' }));
+        // S14 / S13: surface provenance-specific refusal when present (not only "author a plan").
+        let msg = 'Author a valid plan.md first — the plan is not ready yet.';
+        try {
+          const body = await r.json();
+          const code = body && body.code ? String(body.code) : '';
+          const err = body && body.error ? String(body.error) : '';
+          if (
+            code === 'PLANNING_REQUIRED' ||
+            code === 'PLAN_CHANGED' ||
+            code === 'MANIFEST_CHANGED' ||
+            /Helm Planning must complete|changed after Planning|Planning seat manifest/i.test(err)
+          ) {
+            msg = err || 'Helm Planning must complete first before Start Implementation.';
+          } else if (err && /author a valid plan/i.test(err)) {
+            msg = err;
+          } else if (err) {
+            msg = err;
+          }
+        } catch {
+          /* keep default */
+        }
+        setCcImplStartNotice(p => ({ ...p, [cycleId]: msg }));
       } else {
         setCcImplStartNotice(p => ({ ...p, [cycleId]: 'Could not start implementation (cycle not found). Refresh and retry.' }));
       }
@@ -5603,7 +6204,8 @@ function App() {
       // DC-R7: transparent send — an agent being selectable is enough; a session is auto-ensured on send.
       const canChat = !!discAgentId;
       const discLiveActive = sessOn && ccHasLiveTurn(pid);
-      const visibleThread = ccThreadWithoutLiveTurn(pid, thread, discLiveActive);
+      // E7: default view is the 1:1 mirror; 'bubbles' is the opt-in reconstructed-chat toggle.
+      const discMirrorMode = ccDiscViewMode[pid] !== 'bubbles';
 
       // DC-R7: compact "who am I talking to" selector — default is the resolved Discovery brain.
       const agentSelect = html`<select class="cc-disc-agent-select" data-testid="ws-disc-agent-select"
@@ -5616,6 +6218,9 @@ function App() {
             : html`<option value="">no agents assigned</option>`}
         </select>`;
 
+      // E8 FIX3 (JROM design ruling, settled — do not re-open): the last-reply strip sits at the TOP of
+      // the chat body regardless of view mode (mirror OR bubbles). Duplication with the mirror/thread
+      // below is fine now — R6.24's original "not duplicated in the stream below" constraint is relaxed.
       const chatPane = ccDiscChatMin
         ? html`<div class="cc-disc-rail" data-testid="ws-disc-chat-rail" role="button" tabindex="0"
             onclick=${() => setCcDiscChatMin(false)}>
@@ -5628,10 +6233,20 @@ function App() {
               <div data-testid="ws-disc-chat-header-controls" style="display:flex;gap:4px;align-items:center;flex-wrap:nowrap">
                 ${agentSelect}
                 <button class="btn btn-sm" data-testid="ws-disc-session-toggle" disabled=${connecting}
+                  title=${sess && sess.sid
+                    ? `tmux: ${sess.tmux || '—'}${sess.conversationId ? ` · conversation: ${sess.conversationId}${sess.resumed ? ' (resumed)' : ''}` : ''}`
+                    : 'No live session'}
                   onclick=${() => ccToggleSession(pid, discAgentId)}>${connecting ? '⏳ Connecting…' : sessOn ? '⏻ Session On' : '⏻ Session Off'}</button>
+                <button class="btn btn-sm" data-testid="ws-disc-view-toggle"
+                  title=${discMirrorMode
+                    ? 'Showing the raw session mirror — switch to reconstructed chat bubbles'
+                    : 'Showing reconstructed chat bubbles — switch to the raw session mirror'}
+                  onclick=${() => setCcDiscViewMode(p => ({...p, [pid]: discMirrorMode ? 'bubbles' : 'mirror'}))}
+                  >${discMirrorMode ? 'View: Mirror' : 'View: Bubbles'}</button>
                 <button class="btn btn-sm" data-testid="ws-disc-chat-minimize" onclick=${() => setCcDiscChatMin(true)}>Minimize</button>
               </div>
             </div>
+            ${renderDiscHandoffCard(cycleId)}
             <div class="cc-disc-pane-body cc-chat-scroll" data-testid="ws-disc-chat-body"
               ref=${(el) => {
                 discChatBodyRef.current = el;
@@ -5641,20 +6256,25 @@ function App() {
                 if (discChatBodyRef.current) discChatStickRef.current = captureStickIntent(discChatBodyRef.current);
               }}>
               ${discLiveActive ? renderCcLiveReply(pid, brainName) : null}
-              ${ccDeliveryGap[pid] ? html`<div data-testid="ws-disc-delivery-gap" style="color:#d29922;font-size:10px;padding:3px 6px;">⚠ some delivery statuses may be incomplete — reload to re-sync.</div>` : null}
-              ${ccGlobalLossWarn ? html`<div data-testid="ws-disc-loss-warn" style="color:#f85149;font-size:10px;padding:3px 6px;">⚠ delivery-status notifications were dropped under load — some sent messages' status is uncertain. <button class="btn btn-sm" style="padding:0 4px;font-size:9px" onclick=${ccAckGlobalLoss}>Dismiss</button></div>` : null}
-              ${visibleThread.length ? visibleThread.map(m => {
-                const isU = m.role === 'user';
-                // Live agent text lives only in the sticky strip (ccThreadWithoutLiveTurn drops trailing agents).
-                return html`<div class=${`cc-bubble ${isU ? 'user' : ''}`} data-testid=${isU ? 'ws-disc-chat-message' : 'ws-disc-chat-bubble-agent'} key=${m.id}>
-                  <span class="who">${isU ? 'JROM' : brainName}</span>
-                  ${m.thinking
-                    ? html`<div class="text-sec" style="font-style:italic">thinking…</div>`
-                    : html`<div style="white-space:pre-wrap">${m.text}</div>`}
-                  ${m.fallback ? html`<div class="text-sec" style="font-size:9px" title="Agent didn't wrap its reply in the Helm reply markers — showing raw output.">⚠ unstructured reply</div>` : null}
-                  ${isU && m.delivered === false ? html`<span style="color:#f85149;font-size:8px;">⚠ not delivered</span>` : null}
-                </div>`;
-              }) : (discLiveActive ? null : html`<div class="text-sec" data-testid="ws-disc-chat-empty" style="padding:6px;font-size:11px">No messages yet. ${canChat ? `Type a message to start chatting with ${brainName}.` : 'Assign an agent to this project to chat.'}</div>`)}
+              ${discMirrorMode
+                ? html`<div class="disc-mirror-wrap" data-testid="ws-disc-mirror-wrap"
+                    ref=${(el) => { if (el) el.innerHTML = buildDiscoveryMirrorHtml(stripAnsiForDisplay(ccLivePane[pid] || '')); }}>
+                  </div>`
+                : [
+                    ccDeliveryGap[pid] ? html`<div data-testid="ws-disc-delivery-gap" style="color:#d29922;font-size:10px;padding:3px 6px;">⚠ some delivery statuses may be incomplete — reload to re-sync.</div>` : null,
+                    ccGlobalLossWarn ? html`<div data-testid="ws-disc-loss-warn" style="color:#f85149;font-size:10px;padding:3px 6px;">⚠ delivery-status notifications were dropped under load — some sent messages' status is uncertain. <button class="btn btn-sm" style="padding:0 4px;font-size:9px" onclick=${ccAckGlobalLoss}>Dismiss</button></div>` : null,
+                    thread.length ? thread.map(m => {
+                      const isU = m.role === 'user';
+                      return html`<div class=${`cc-bubble ${isU ? 'user' : ''}`} data-testid=${isU ? 'ws-disc-chat-message' : 'ws-disc-chat-bubble-agent'} key=${m.id}>
+                        <span class="who">${isU ? 'JROM' : brainName}</span>
+                        ${m.thinking
+                          ? html`<div class="text-sec" style="font-style:italic">thinking…</div>`
+                          : html`<div style="white-space:pre-wrap">${m.text}</div>`}
+                        ${m.fallback ? html`<div class="text-sec" style="font-size:9px" title="Agent didn't wrap its reply in the Helm reply markers — showing raw output.">⚠ unstructured reply</div>` : null}
+                        ${isU && m.delivered === false ? html`<span style="color:#f85149;font-size:8px;">⚠ not delivered</span>` : null}
+                      </div>`;
+                    }) : (discLiveActive ? null : html`<div class="text-sec" data-testid="ws-disc-chat-empty" style="padding:6px;font-size:11px">No messages yet. ${canChat ? `Type a message to start chatting with ${brainName}.` : 'Assign an agent to this project to chat.'}</div>`),
+                  ]}
             </div>
             <div class="cc-disc-pane-footer cc-composer" data-testid="ws-disc-composer">
               <textarea data-testid="ws-disc-chat-composer" disabled=${!canChat}
@@ -5858,11 +6478,22 @@ function App() {
       // B8-T03: planner-progress line (R-D1/D3/H4) — derived from the REAL cycle.phase +
       // awaiting_approval columns (no task-count denominator exists anywhere yet, so no
       // "task N/M" claim — that lands with the B10 helm-algo planner integration).
-      const progressLine = cycle.phase === 'discovery'
-        ? 'Planning not started'
-        : cycle.phase === 'planning'
-          ? (cycle.awaiting_approval ? 'Planning docs ready — awaiting approval' : 'Planning in progress — plancore × co-planner')
-          : 'Planning complete';
+      // B3 (planning-live-panes, run 32): cycle.phase lagged the live run — header read "Planning not
+      // started" while the run-state chip (renderStartPlanningRow, sourced from ccRunState.runActive)
+      // said "Run in progress" with three seats running. Root cause: this line trusted ONLY the
+      // (occasionally stale) cycles.phase column while the chip trusts the live runs-table row for
+      // this cycle — two different sources that can disagree in the window right after a run starts.
+      // Fix: when a run is actively running AND no tasks have been ingested yet (run_tasks only exist
+      // post-agreement, so this can only be true while planning itself is still in flight), trust the
+      // live run state over the possibly-stale phase column — never contradict the chip it sits next to.
+      const runActiveForProgress = !!(planRunLoaded && planRunState.hasRun && planRunState.runActive);
+      const progressLine = (runActiveForProgress && tasks.length === 0)
+        ? 'Planning in progress — plancore × co-planner'
+        : cycle.phase === 'discovery'
+          ? 'Planning not started'
+          : cycle.phase === 'planning'
+            ? (cycle.awaiting_approval ? 'Planning docs ready — awaiting approval' : 'Planning in progress — plancore × co-planner')
+            : 'Planning complete';
 
       const tableSection = () => {
         if (!planRunLoaded) {
@@ -5890,37 +6521,131 @@ function App() {
         </table>`;
       };
 
-      // A3 (R4.17) + B4 (R5.19/R5.20): seats list + one shared B3 pane per seat (keyed by worker_runtimes.id).
+      // A3 (R4.17) + B4 (R5.19/R5.20) + S14: seats list with S07 preview before start and runtime after.
       const seatsPayload = ccPlanSeats[cycleId];
       const seatsList = (seatsPayload && seatsPayload !== 'absent' && Array.isArray(seatsPayload.seats))
         ? seatsPayload.seats : [];
+      const seatsPreview = (seatsPayload && seatsPayload !== 'absent' && seatsPayload.preview)
+        ? seatsPayload.preview
+        : null;
+      const seatsBlocked = !!(seatsPayload && seatsPayload !== 'absent' && seatsPayload.blocked);
+      const seatsBlockReasons = (seatsPayload && seatsPayload !== 'absent' && Array.isArray(seatsPayload.blockReasons))
+        ? seatsPayload.blockReasons
+        : [];
+      const seatsEmptyMsg = (seatsPayload && seatsPayload !== 'absent' && seatsPayload.emptyPanelMessage)
+        ? seatsPayload.emptyPanelMessage
+        : null;
       const renderSeatsList = () => {
         if (!seatsPayload) {
-          return html`<div class="text-sec" data-testid="ws-plan-seats-loading" style="font-size:11px;padding:4px 0">Loading seats…</div>`;
+          return html`<div class="text-sec" data-testid="ws-plan-seats-loading" role="status" aria-live="polite" style="font-size:11px;padding:4px 0">Resolving Planning seats…</div>`;
         }
         if (seatsPayload === 'absent') {
-          return html`<div class="text-sec" data-testid="ws-plan-seats-empty" style="font-size:11px;padding:4px 0">No seats recorded for this cycle yet.</div>`;
+          return html`<div class="text-sec" data-testid="ws-plan-seats-empty" role="status" style="font-size:11px;padding:4px 0">Could not load seats. Retry from the Planning tab.</div>`;
         }
-        if (seatsList.length === 0) {
-          return html`<div class="text-sec" data-testid="ws-plan-seats-empty" style="font-size:11px;padding:4px 0">No seats recorded for this cycle yet.</div>`;
-        }
-        return html`<div class="cc-plan-seats-list" data-testid="ws-plan-seats" style="display:flex;flex-direction:column;gap:4px;padding:4px 0 8px">
-          ${seatsList.map((s, idx) => {
+        // Runtime rows when a run has recorded worker_runtimes
+        if (seatsList.length > 0) {
+          // B4 (planning-live-panes): prior-run (historical) seats default collapsed behind a
+          // disclosure — run 32 showed 4 dead historical rows above 3 live ones, burying the live
+          // seats and reading a dead run's `≠ preview` badges as current problems. Live rows always
+          // render; the full honest roster (incl. historical) is one click away, never dropped.
+          const liveSeats = seatsList.filter((s) => s && s.live);
+          const historicalSeats = seatsList.filter((s) => s && !s.live);
+          const seatRow = (s, idx) => {
             const label = `${s.role || 'seat'}${seatsList.filter(x => x.role === s.role).length > 1 ? ` #${idx + 1}` : ''}`;
             const liveChip = s.live
               ? html`<span class="chip chip-green" data-testid=${`ws-plan-seat-live-${s.id}`}>live</span>`
               : html`<span class="chip chip-orange" data-testid=${`ws-plan-seat-historical-${s.id}`}>historical</span>`;
-            return html`<div class="cc-plan-seat-row" data-testid=${`ws-plan-seat-${s.id}`}
+            const matchChip = s.matchesPreview === false
+              ? html`<span class="chip chip-orange" data-testid=${`ws-plan-seat-mismatch-${s.id}`}>≠ preview</span>`
+              : null;
+            return html`<div class="cc-plan-seat-row" key=${s.id} data-testid=${`ws-plan-seat-${s.id}`}
                 style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px;padding:4px 6px;border:1px solid var(--border, #30363d);border-radius:4px">
               <span data-testid=${`ws-plan-seat-role-${s.id}`} style="font-weight:600">${label}</span>
-              <span class="text-sec" data-testid=${`ws-plan-seat-model-${s.id}`}>${s.model || '—'}</span>
+              <span class="text-sec" data-testid=${`ws-plan-seat-model-${s.id}`}>${s.provider ? `${s.provider}/` : ''}${s.model || '—'}</span>
               <span class="text-sec" data-testid=${`ws-plan-seat-state-${s.id}`}>${s.state || '—'}</span>
               ${liveChip}
+              ${matchChip}
             </div>`;
-          })}
+          };
+          return html`<div class="cc-plan-seats-list" data-testid="ws-plan-seats" data-mode="runtime" style="display:flex;flex-direction:column;gap:4px;padding:4px 0 8px">
+            ${liveSeats.length === 0
+              ? html`<div class="text-sec" data-testid="ws-plan-seats-no-live" style="font-size:11px;padding:2px 0">No live seats for this run.</div>`
+              : liveSeats.map(seatRow)}
+            ${historicalSeats.length
+              ? html`<div data-testid="ws-plan-seats-historical-block">
+                  <button type="button" class="btn btn-sm" data-testid="ws-plan-seats-historical-toggle"
+                    aria-expanded=${ccPlanShowHistorical ? 'true' : 'false'}
+                    onclick=${() => setCcPlanShowHistorical(v => !v)}>
+                    ${ccPlanShowHistorical ? 'Hide' : 'Show'} ${historicalSeats.length} previous-attempt seat${historicalSeats.length === 1 ? '' : 's'}
+                  </button>
+                  ${ccPlanShowHistorical
+                    ? html`<div data-testid="ws-plan-seats-historical-list" style="display:flex;flex-direction:column;gap:4px;margin-top:4px">
+                        ${historicalSeats.map(seatRow)}
+                      </div>`
+                    : null}
+                </div>`
+              : null}
+          </div>`;
+        }
+        // Pre-start preview (S07 / S14): plancore + configured co-planners
+        const previewRows = [];
+        if (seatsPreview && seatsPreview.plancore) {
+          const pc = seatsPreview.plancore;
+          previewRows.push({
+            key: 'plancore',
+            role: 'plancore',
+            provider: pc.provider,
+            model: pc.model,
+            source: pc.source || 'phase-owner',
+            ready: pc.ready !== false,
+            reason: pc.reason || null,
+          });
+        }
+        if (seatsPreview && Array.isArray(seatsPreview.coPlanners)) {
+          seatsPreview.coPlanners.forEach((s, i) => {
+            previewRows.push({
+              key: `cp-${s.slot != null ? s.slot : i}`,
+              role: 'co-planner',
+              provider: s.provider,
+              model: s.model,
+              source: s.source || 'primary',
+              ready: s.ready !== false,
+              reason: s.reason || null,
+            });
+          });
+        }
+        if (previewRows.length === 0) {
+          return html`<div class="text-sec" data-testid="ws-plan-seats-empty" role="status" style="font-size:11px;padding:4px 0">
+            ${seatsEmptyMsg || 'Configure co-planners in Agent Studio'}
+          </div>`;
+        }
+        return html`<div class="cc-plan-seats-list" data-testid="ws-plan-seats" data-mode="preview" style="display:flex;flex-direction:column;gap:4px;padding:4px 0 8px">
+          <div class="text-sec" data-testid="ws-plan-seats-preview-label" style="font-size:10px;margin-bottom:2px">Configured preview (before start)</div>
+          ${previewRows.map((s) => html`<div class="cc-plan-seat-row" data-testid=${`ws-plan-seat-preview-${s.key}`}
+              style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px;padding:4px 6px;border:1px solid var(--border, #30363d);border-radius:4px">
+              <span data-testid=${`ws-plan-seat-preview-role-${s.key}`} style="font-weight:600">${s.role}</span>
+              <span class="text-sec" data-testid=${`ws-plan-seat-preview-model-${s.key}`}>${s.provider ? `${s.provider}/` : ''}${s.model || '—'}</span>
+              <span class="text-sec" data-testid=${`ws-plan-seat-preview-source-${s.key}`}>${s.source || ''}</span>
+              ${s.ready
+                ? html`<span class="chip chip-green" data-testid=${`ws-plan-seat-preview-ready-${s.key}`}>ready</span>`
+                : html`<span class="chip chip-orange" data-testid=${`ws-plan-seat-preview-blocked-${s.key}`}>blocked</span>`}
+              ${s.reason
+                ? html`<span class="text-sec" data-testid=${`ws-plan-seat-preview-reason-${s.key}`} style="color:#d29922">${s.reason}</span>`
+                : null}
+            </div>`)}
+          ${seatsBlocked || seatsBlockReasons.length
+            ? html`<div data-testid="ws-plan-seats-blocked" role="status" aria-live="polite" style="font-size:11px;color:#d29922;padding:4px 0">
+                ${(seatsBlockReasons[0] || seatsEmptyMsg || 'Planning seats blocked — configure co-planners in Agent Studio')}
+              </div>`
+            : null}
         </div>`;
       };
       // B4: one shared session-pane per seat (B3 .sp-pane shell + path-safe capture + bottom-stick).
+      // B1 (planning-live-panes): side-by-side sized panes generalised to N seats (plancore +
+      // planner1/2/... as planning_panel_size grows) — Auto-focus (weight the streaming seat),
+      // Show both (force equal), per-pane collapse-to-rail. Implementation's math is hardcoded for
+      // exactly two (implementer | validator) via fixed grid-template-columns %; this uses flex-basis
+      // per seat instead, which scales to any N without a per-count table of layouts.
       const renderPlanPanes = () => {
         if (!seatsPayload) {
           return html`<div class="text-sec" data-testid="ws-plan-panes-loading" style="font-size:11px;padding:4px 0">Loading panes…</div>`;
@@ -5929,37 +6654,82 @@ function App() {
           return html`<div class="text-sec" data-testid="ws-plan-panes-empty" style="font-size:11px;padding:6px">No seat panes for this cycle yet. Start Planning to record co-planner seats.</div>`;
         }
         // B4 send-back: data-pane-count = all seats (honest roster); data-live-pane-count = live only
-        // so e2e can fail if only historical rows satisfy a count contract (HIGH-2).
+        // so e2e can fail if only historical rows satisfy a count contract (HIGH-2). B1 does not hide
+        // historical panes here (only the seats-LIST rows collapse by default, see renderSeatsList) —
+        // B4.live.spec.ts asserts a historical pane stays directly visible with its own chip/testid.
         const livePaneCount = seatsList.filter((s) => s && s.live).length;
-        return html`<div class="cc-plan-panes" data-testid="ws-plan-panes"
-            data-pane-count=${seatsList.length}
-            data-live-pane-count=${livePaneCount}>
-          ${seatsList.map((s) => {
-            const rid = Number(s.id);
-            const key = `${cycleId}::${rid}`;
-            const snap = ccPlanSeatPanes[key];
-            const content = snap && snap.content != null ? String(snap.content) : '';
-            const title = `${s.role || 'seat'}${s.model ? ` · ${s.model}` : ''}`;
-            const liveChip = s.live
-              ? html`<span class="chip chip-green" data-testid=${`ws-plan-pane-live-${rid}`}>live</span>`
-              : html`<span class="chip chip-orange" data-testid=${`ws-plan-pane-historical-${rid}`}>historical</span>`;
-            return html`<div class=${SESSION_PANE_CLASSES.pane} data-testid=${`ws-plan-pane-${rid}`}
-                data-runtime-id=${rid} data-role=${s.role || ''} data-live=${s.live ? '1' : '0'}>
-              <div class=${SESSION_PANE_CLASSES.header}>
-                <span class="sp-pane-title" data-testid=${`ws-plan-pane-title-${rid}`}>${title}</span>
-                ${liveChip}
-              </div>
-              <div class="${SESSION_PANE_CLASSES.body} ${SESSION_PANE_CLASSES.scrollOwner}"
-                data-testid=${`ws-plan-pane-body-${rid}`}
-                ref=${(el) => { if (el) ccPlanPaneBodyRefs.current[rid] = el; else delete ccPlanPaneBodyRefs.current[rid]; }}>
-                ${content
-                  ? html`<pre class=${SESSION_PANE_CLASSES.payload} data-testid=${`ws-plan-pane-payload-${rid}`}>${content}</pre>`
-                  : html`<div class="${SESSION_PANE_CLASSES.empty} text-sec" data-testid=${`ws-plan-pane-empty-${rid}`}>
-                      ${s.live ? 'Waiting for live pane output…' : 'No live terminal — historical / session unavailable.'}
-                    </div>`}
-              </div>
-            </div>`;
-          })}
+        const autoOn = ccPlanAutoFocus;
+        const active = ccPlanActiveSeat;
+        const showBothEqual = () => {
+          setCcPlanCollapsedPanes({});
+          setCcPlanAutoFocus(false);
+          localStorage.setItem('helm_plan_autofocus', '0');
+        };
+        const focusedRole = (() => {
+          if (!autoOn || active == null) return '';
+          const s = seatsList.find((x) => Number(x.id) === active);
+          return s ? (s.role || 'seat') : '';
+        })();
+        return html`<div>
+          ${seatsList.length > 1 ? html`<div class="cc-plan-pane-controls" data-testid="ws-plan-pane-controls">
+            <span class="text-sec" style="font-size:11px">Seats</span>
+            <button type="button" class=${`cc-impl-pane-toolbtn ${autoOn ? 'cc-impl-toolbtn-on' : ''}`.trim()}
+              data-testid="ws-plan-pane-focus-active" aria-pressed=${autoOn ? 'true' : 'false'}
+              title="Auto-focus: grow whoever is actively streaming and share the rest evenly (all stay visible); follows the run live"
+              onclick=${togglePlanAutoFocus}>${autoOn ? 'Auto-focus: On' : 'Auto-focus: Off'}</button>
+            <button type="button" class="cc-impl-pane-toolbtn" data-testid="ws-plan-pane-show-both"
+              title="Show all panes at equal size" onclick=${showBothEqual}>Show both</button>
+            ${focusedRole ? html`<span class="text-sec" data-testid="ws-plan-pane-active-role" style="font-size:11px">· ${focusedRole} active</span>` : null}
+          </div>` : null}
+          <div class="cc-plan-panes" data-testid="ws-plan-panes"
+              data-pane-count=${seatsList.length}
+              data-live-pane-count=${livePaneCount}>
+            ${seatsList.map((s) => {
+              const rid = Number(s.id);
+              const key = `${cycleId}::${rid}`;
+              const snap = ccPlanSeatPanes[key];
+              const content = snap && snap.content != null ? String(snap.content) : '';
+              const title = `${s.role || 'seat'}${s.model ? ` · ${s.model}` : ''}`;
+              const liveChip = s.live
+                ? html`<span class="chip chip-green" data-testid=${`ws-plan-pane-live-${rid}`}>live</span>`
+                : html`<span class="chip chip-orange" data-testid=${`ws-plan-pane-historical-${rid}`}>historical</span>`;
+              const collapsed = !!ccPlanCollapsedPanes[rid];
+              const focused = autoOn && !collapsed && active === rid;
+              const paneCls = `${SESSION_PANE_CLASSES.pane} ${collapsed ? 'cc-plan-pane-rail' : ''} ${focused ? 'cc-plan-pane-focus' : ''}`.trim();
+              if (collapsed) {
+                return html`<div class=${paneCls} data-testid=${`ws-plan-pane-${rid}`}
+                    data-runtime-id=${rid} data-role=${s.role || ''} data-live=${s.live ? '1' : '0'} data-collapsed="1"
+                    role="button" tabindex="0" title=${`Expand ${s.role || 'seat'} pane`}
+                    onclick=${() => setCcPlanCollapsedPanes(p => ({ ...p, [rid]: false }))}>
+                  <div class=${SESSION_PANE_CLASSES.header}>
+                    <button type="button" class="cc-impl-pane-toolbtn" data-testid=${`ws-plan-pane-collapse-${rid}`}
+                      title=${`Expand ${s.role || 'seat'} pane`}
+                      onclick=${(e) => { e.stopPropagation(); setCcPlanCollapsedPanes(p => ({ ...p, [rid]: false })); }}>⇔</button>
+                    <span class="cc-plan-pane-rail-label" data-testid=${`ws-plan-pane-title-${rid}`}>${title}</span>
+                  </div>
+                </div>`;
+              }
+              return html`<div class=${paneCls} data-testid=${`ws-plan-pane-${rid}`}
+                  data-runtime-id=${rid} data-role=${s.role || ''} data-live=${s.live ? '1' : '0'} data-collapsed="0">
+                <div class=${SESSION_PANE_CLASSES.header}>
+                  <span class="sp-pane-title" data-testid=${`ws-plan-pane-title-${rid}`}>${title}</span>
+                  ${liveChip}
+                  <button type="button" class="cc-impl-pane-toolbtn" data-testid=${`ws-plan-pane-collapse-${rid}`}
+                    title=${`Minimize ${s.role || 'seat'} pane fully to a rail (manual)`}
+                    onclick=${() => setCcPlanCollapsedPanes(p => ({ ...p, [rid]: true }))}>–</button>
+                </div>
+                <div class="${SESSION_PANE_CLASSES.body} ${SESSION_PANE_CLASSES.scrollOwner}"
+                  data-testid=${`ws-plan-pane-body-${rid}`}
+                  ref=${(el) => { if (el) ccPlanPaneBodyRefs.current[rid] = el; else delete ccPlanPaneBodyRefs.current[rid]; }}>
+                  ${content
+                    ? html`<pre class=${SESSION_PANE_CLASSES.payload} data-testid=${`ws-plan-pane-payload-${rid}`}>${content}</pre>`
+                    : html`<div class="${SESSION_PANE_CLASSES.empty} text-sec" data-testid=${`ws-plan-pane-empty-${rid}`}>
+                        ${s.live ? 'Waiting for live pane output…' : 'No live terminal — historical / session unavailable.'}
+                      </div>`}
+                </div>
+              </div>`;
+            })}
+          </div>
         </div>`;
       };
 
@@ -5997,8 +6767,8 @@ function App() {
             onclick=${() => setCcPlanWatchLiveOpen(!ccPlanWatchLiveOpen)}>${ccPlanWatchLiveOpen ? 'Hide live' : 'Watch live'}</button>
         </div>
         ${renderStartPlanningRow('ws')}
-        <div class="cc-plan-seats-block" data-testid="ws-plan-seats-block" style="margin:4px 0 8px">
-          <div class="card-title" style="margin-bottom:4px;font-size:12px">Seats</div>
+        <div class="cc-plan-seats-block" data-testid="ws-plan-seats-block" style="margin:4px 0 8px" role="region" aria-label="Planning seats">
+          <div class="card-title" style="margin-bottom:4px;font-size:12px" data-testid="ws-plan-seats-heading">Planning Seats</div>
           ${renderSeatsList()}
         </div>
         <div class="cc-plan-event-trail-block" data-testid="ws-plan-event-trail-block" style="margin:4px 0 8px">
@@ -6109,7 +6879,8 @@ function App() {
           ? html`<span class="text-sec" data-testid="ws-impl-start-hint" style="font-size:11px">Start enables once the plan is ready — use Start Planning below.</span>`
           : null}
         ${implStartNotice
-          ? html`<span class="text-sec" data-testid="ws-impl-start-notice" style="font-size:11px">${implStartNotice}</span>`
+          ? html`<span class="text-sec" data-testid="ws-impl-start-notice" role="status" aria-live="assertive"
+              style=${`font-size:11px;${/Helm Planning must complete|changed after Planning|PLANNING_REQUIRED|plan\.md changed|manifest changed/i.test(implStartNotice) ? 'color:#f85149' : ''}`}>${implStartNotice}</span>`
           : null}
       </div>
       ${renderStartPlanningRow('ws-impl')}`;
@@ -6550,6 +7321,10 @@ function App() {
           </div>
           ${ccWsTab === 'implementation' ? html`<button type="button" class="btn btn-sm btn-danger" data-testid="ws-graceful-stop"
             onclick=${() => requestGracefulStop(cycle.id)}>Graceful Stop</button>` : null}
+          ${cycle.status !== 'completed' ? html`<button type="button" class="btn btn-sm" data-testid="ws-complete-cycle"
+            disabled=${!!ccCompleting[cycle.id]}
+            title="Retire this cycle: its folder moves to cycle/completed/ and it leaves the active cycle list"
+            onclick=${() => completeCycleAction(cycle.id)}>${ccCompleting[cycle.id] ? 'Completing…' : 'Complete cycle'}</button>` : null}
           <div class="cc-ws-switcher-wrap">
             <button class="btn btn-sm" data-testid="ws-cycle-switcher-btn" onclick=${() => setCcWsSwitcherOpen(!ccWsSwitcherOpen)}>Cycle switcher</button>
             ${ccWsSwitcherOpen ? html`<div class="cc-ws-switcher-menu" data-testid="ws-cycle-switcher-menu">
@@ -6567,6 +7342,7 @@ function App() {
         </div>
         ${ccWsTab === 'implementation' ? html`<div class="cc-ws-impl-subtitle text-sec" data-testid="ws-impl-subtitle">${implementationSubtitle()}</div>` : null}
         ${ccWsTab === 'implementation' && ccGracefulStopNote[cycle.id] ? html`<div class="cc-ws-impl-subtitle text-sec" data-testid="ws-graceful-stop-note">${ccGracefulStopNote[cycle.id]}</div>` : null}
+        ${ccCompleteNote[cycle.id] ? html`<div class="cc-ws-impl-subtitle text-sec" data-testid="ws-complete-cycle-note">${ccCompleteNote[cycle.id]}</div>` : null}
       </div>
 
       <div class="tab-strip" data-testid="ws-phase-tabs">
@@ -6874,6 +7650,8 @@ function App() {
                 <button data-testid="cc-fav-toggle" class="btn btn-sm" style="padding:3px 6px;font-size:11px;" title="Toggle ⭐ favorite for the selected agent (pins it near the top)" disabled=${!selAid || isCcBrainAgent(pid, selAid)} onclick=${()=>toggleCcFav(selAid)}>${ccFavAgents.includes(selAid) ? '⭐' : '☆'}</button>
                 <button data-testid="cc-session-toggle" class="btn btn-sm" style=${`padding:3px 8px;font-size:10px;white-space:nowrap;${ccSessOn ? 'color:#3fb950;border-color:#3fb950;' : ''}`} disabled=${ccConnecting} aria-pressed=${ccSessOn ? 'true' : 'false'} title=${ccSessOn ? 'Session ON — click to shut down the agent session' : 'Session OFF — click to spawn the agent in a fenced project session'} onclick=${()=>ccToggleSession(pid)}>${ccConnecting ? '⏳ Connecting…' : ccSessOn ? '⏻ Session On' : '⏻ Session Off'}</button>
               </div>
+              ${/* B09 fix1 / AC12: session refusal next to Session On (not clipped under the fold) */ ''}
+              ${ccErr ? html`<div data-testid="cc-session-err" role="alert" style="flex-shrink:0;color:#f85149;font-size:11px;line-height:1.35;padding:6px 8px;margin:0 0 4px;border:1px solid rgba(248,81,73,.45);border-radius:6px;background:rgba(248,81,73,.08);white-space:pre-wrap;word-break:break-word">${ccErr}</div>` : null}
               <div style="display:flex;gap:4px;margin-bottom:3px;align-items:center;">
                 <button data-testid="cc-clear-ctx" class="btn btn-sm" style="padding:2px 6px;font-size:9px;" disabled=${!ccSessOn} title=${ccSessOn ? "Clear this session's context" : 'Turn on a session to enable Clear'} onclick=${()=>ccCtxAction(pid,'clear')}>Clear</button>
                 <button data-testid="cc-compact-ctx" class="btn btn-sm" style="padding:2px 6px;font-size:9px;" disabled=${!ccSessOn} title=${ccSessOn ? "Compact this session's context" : 'Turn on a session to enable Compact'} onclick=${()=>ccCtxAction(pid,'compact')}>Compact</button>
@@ -6914,7 +7692,6 @@ function App() {
           </div>
         </div>
 
-        ${ccErr && html`<div style="color:#f85149;font-size:11px;padding:4px 8px;border-top:1px solid var(--border);">${ccErr}</div>`}
         ${!pid ? html`<div class="inline-note" style="padding:3px 6px;font-size:10px;">Select project in left sidebar (or open idle) to load chat + live terminal feed. 3-way above controls panes.</div>` : null}
       </div>
     </div>`;
@@ -8129,6 +8906,8 @@ function App() {
           ` : null}
           ${chatTmuxSession ? html`<span class="as-chat-tmux-attach" data-testid="as-chat-tmux-attach" title="This agent's tmux session — attach in a terminal">tmux: <code>${chatTmuxSession}</code><button class="as-chat-tmux-copy" type="button" title="Copy attach command" onclick=${() => { try { navigator.clipboard.writeText('tmux attach -t ' + chatTmuxSession); setChatErr('Copied: tmux attach -t ' + chatTmuxSession); } catch {} }}>⧉ attach</button></span>` : null}
         </div>
+        ${/* B09 fix1 / AC12: collision refusal under header (not after past-sessions below the fold) */ ''}
+        ${chatErr ? html`<div data-testid="chat-err" role="alert" style="flex-shrink:0;color:#f85149;font-size:12px;line-height:1.35;padding:8px 10px;margin:0 0 8px;border:1px solid rgba(248,81,73,.45);border-radius:6px;background:rgba(248,81,73,.08);white-space:pre-wrap;word-break:break-word">${chatErr}</div>` : null}
         ${(() => {
           const logsPre = html`<pre data-testid="as-chat-logs" class="as-chat-logs">${chatLogs || (chatSid ? 'Loading session logs…' : 'No live session — turn the session On to view its tmux logs.')}</pre>`;
           const chatThread = html`
@@ -8175,8 +8954,7 @@ function App() {
                       </div>`;
                   })
                 : html`<div data-testid="as-past-sessions-empty" class="as-past-sessions-empty">No past sessions yet</div>`}
-            </div>
-            ${chatErr ? html`<div data-testid="chat-err" style="color:#f85149;font-size:12px;margin-top:6px">${chatErr}</div>` : null}`;
+            </div>`;
           if (effectiveChatCenterMode === 'split') {
             const splitLogsW = clampChatLogsWidth(chatLogsWidth, chatCenterSplitRef.current?.offsetWidth || 900);
             return html`
@@ -8541,9 +9319,10 @@ function App() {
       const status = m.validation_status || 'untested';
       return html`<option value=${m.id} disabled=${!valid}>${m.name} (${m.provider})${!valid ? ` — ${status}` : ''}</option>`;
     });
+    // S14: Agent Studio wording — co-planners exclude plancore; one Lead co-planner.
     const plannerPanelBlock = html`<div data-testid="planner-panel-config" style="margin-top:6px;padding-top:8px;border-top:1px dashed var(--border)">
       <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px">
-        <div class="text-sec" style="font-size:11px;font-weight:600">Planner Panel <span class="inline-note" style="font-weight:400">(adaptive planner)</span></div>
+        <div class="text-sec" style="font-size:11px;font-weight:600" data-testid="planner-panel-title">Co-planners (excluding plancore)</div>
         <div style="display:flex;align-items:center;gap:6px">
           ${plannerPanelFlash ? html`<span class="chip chip-green" data-testid="planner-panel-save-flash" style="font-size:10px">Saved ✓</span>` : null}
           <button data-testid="planner-panel-save" class="btn btn-primary btn-sm" disabled=${!activeProjectId || plannerPanelSaving || !plannerPanelDirty} onclick=${() => activeProjectId && savePlannerPanel(activeProjectId)}>
@@ -8554,11 +9333,11 @@ function App() {
       ${!activeProjectId
         ? html`<div class="text-sec" style="font-size:12px;padding:8px">Select a project</div>`
         : html`<div style="display:grid;gap:10px;font-size:12px;padding-top:4px">
-            <div class="text-sec" style="font-size:11px">Agent count, lead planner, backup planners (used when a slot CLI is unavailable), and default effort for the adaptive planner panel.</div>
+            <div class="text-sec" style="font-size:11px" data-testid="planner-panel-help">Co-planner count (N, excluding plancore), lead co-planner, ordered backups when a slot is unavailable, and default effort. Plancore is resolved separately as the planning phase brain.</div>
             ${plannerPanelErr ? html`<div data-testid="planner-panel-err" style="color:#f85149;font-size:11px">${plannerPanelErr}</div>` : null}
             <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
               <label style="display:flex;align-items:center;gap:6px">
-                <span class="text-sec" style="font-size:11px">Agent count</span>
+                <span class="text-sec" style="font-size:11px">Co-planner count</span>
                 <input data-testid="planner-panel-agent-count" type="number" min="1" max="8" style="width:56px;font-size:11px" value=${(plannerPanel.members || []).length || 2}
                   oninput=${(e) => setPlannerPanelMemberCount(e.target.value)} />
               </label>
@@ -8571,23 +9350,23 @@ function App() {
               </label>
             </div>
             <div>
-              <div class="text-sec" style="font-size:11px;margin-bottom:4px">Members <span class="inline-note">(exactly one Lead)</span></div>
+              <div class="text-sec" style="font-size:11px;margin-bottom:4px">Co-planner seats <span class="inline-note">(exactly one Lead co-planner)</span></div>
               <div style="display:grid;gap:6px" data-testid="planner-panel-members">
                 ${(plannerPanel.members || []).map((m, idx) => html`<div data-testid=${`planner-panel-member-${idx}`} style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;padding:6px 8px;background:var(--bg-elevated, rgba(255,255,255,.02));border:1px solid var(--border);border-radius:6px">
                   <span class="text-sec" style="font-size:10px;width:28px">#${idx + 1}</span>
-                  <select data-testid=${`planner-panel-member-model-${idx}`} aria-label=${`Panel member ${idx + 1} model`} style="flex:1;min-width:140px;font-size:11px"
+                  <select data-testid=${`planner-panel-member-model-${idx}`} aria-label=${`Co-planner ${idx + 1} model`} style="flex:1;min-width:140px;font-size:11px"
                     value=${m.model_id !== '' && m.model_id != null ? String(m.model_id) : ''}
                     onchange=${(e) => updatePlannerPanelMember(idx, { model_id: e.target.value ? Number(e.target.value) : '' })}>
                     <option value="">— model —</option>
                     ${plannerPanelModelOpts()}
                   </select>
-                  <label style="display:flex;align-items:center;gap:4px;font-size:11px;cursor:pointer" title="Lead planner">
+                  <label style="display:flex;align-items:center;gap:4px;font-size:11px;cursor:pointer" title="Lead co-planner">
                     <input type="radio" name="planner-panel-lead" data-testid=${`planner-panel-member-lead-${idx}`}
                       checked=${!!m.is_lead}
                       onchange=${() => updatePlannerPanelMember(idx, { is_lead: true })} />
-                    Lead
+                    Lead co-planner
                   </label>
-                  <select data-testid=${`planner-panel-member-effort-${idx}`} aria-label=${`Panel member ${idx + 1} effort`} style="width:90px;font-size:11px"
+                  <select data-testid=${`planner-panel-member-effort-${idx}`} aria-label=${`Co-planner ${idx + 1} effort`} style="width:90px;font-size:11px"
                     value=${m.effort || ''}
                     onchange=${(e) => updatePlannerPanelMember(idx, { effort: e.target.value })}>
                     <option value="">default</option>
@@ -8598,7 +9377,7 @@ function App() {
             </div>
             <div>
               <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
-                <span class="text-sec" style="font-size:11px">Backup planners <span class="inline-note">(ordered fallback)</span></span>
+                <span class="text-sec" style="font-size:11px">Backup co-planners <span class="inline-note">(ordered fallback for slot)</span></span>
                 <button data-testid="planner-panel-add-backup" class="btn btn-sm" onclick=${addPlannerPanelBackup}>+ Backup</button>
               </div>
               <div style="display:grid;gap:4px" data-testid="planner-panel-backups">
@@ -9624,6 +10403,49 @@ function App() {
         ${orphanSessions.map(s => html`<div class="list-item" data-testid=${`tracking-orphan-${s.id}`} key=${s.id} style="cursor:default">${s.name} · ${s.status}</div>`)}
       </div>` : null}
     </div>`;
+  } else if (currentSlug === '13-sessions') {
+    // S14b: Sessions panel — owner/status visible; Close only for human-owned non-reaped rows.
+    const ownerLabel = (o) => (o == null || o === '' ? '—' : String(o));
+    const canClose = (s) => s && s.owner === 'human' && s.status !== 'reaped';
+    const ownerChip = (o) => {
+      if (o === 'human') return 'chip-green';
+      if (o === 'helm') return 'chip-blue';
+      return 'chip-gray';
+    };
+    const sessionRows = (sessionsList || []).map((s) => {
+      const name = s.name || '';
+      const rowKey = name || String(s.created_at || Math.random());
+      return html`
+        <div class="list-item" data-testid=${`sessions-row-${name}`} key=${rowKey} style="cursor:default;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          <code style="font-size:11px;min-width:12em">${name}</code>
+          <span class="chip chip-gray" style="font-size:9px">${s.kind || '—'}</span>
+          <span data-testid=${`sessions-owner-${name}`} class=${`chip ${ownerChip(s.owner)}`} style="font-size:9px" title="owner">${ownerLabel(s.owner)}</span>
+          <span data-testid=${`sessions-status-${name}`} class="chip" style="font-size:9px" title="status">${s.status || '—'}</span>
+          ${canClose(s) ? html`<button
+            type="button"
+            class="btn btn-sm"
+            data-testid=${`sessions-close-${name}`}
+            style="margin-left:auto;color:#f85149;border-color:#f85149;font-size:10px;padding:2px 8px"
+            disabled=${sessionsClosingName === name || !!sessionsClosingName}
+            title="Close this human-owned session"
+            onclick=${() => closeRegistrySession(s)}
+          >${sessionsClosingName === name ? 'Closing…' : 'Close'}</button>` : html`<span style="margin-left:auto;font-size:10px;color:var(--text-sec)">${s.owner === 'human' && s.status === 'reaped' ? 'already closed' : 'no manual close'}</span>`}
+        </div>`;
+    });
+    mainContent = html`<div data-testid="sessions-panel">
+      <div class="top-toolbar">
+        <div class="section-note" style="margin-bottom:0;flex:1">Registry sessions with owner and status. Manual close is available only for human-owned sessions (explicit confirmation required).</div>
+        <button data-testid="sessions-refresh-btn" class="btn btn-sm" style="margin-left:12px" onclick=${refreshSessions} disabled=${sessionsLoading}>${sessionsLoading ? 'Refreshing…' : 'Refresh'}</button>
+      </div>
+      ${sessionsErr ? html`<div data-testid="sessions-error" style="color:#f85149;font-size:12px;margin-top:8px">${sessionsErr}</div>` : null}
+      ${sessionsMsg ? html`<div data-testid="sessions-success" style="color:#3fb950;font-size:12px;margin-top:8px">${sessionsMsg}</div>` : null}
+      <div class="card mt-8">
+        <div class="card-header"><div class="card-title">Sessions (${(sessionsList || []).length})</div></div>
+        ${(sessionsList || []).length
+          ? sessionRows
+          : html`<div class="inline-note" data-testid="sessions-empty" style="padding:10px">${sessionsLoading ? 'Loading…' : 'No sessions in registry.'}</div>`}
+      </div>
+    </div>`;
   }
 
   if (isStudio) {
@@ -9871,6 +10693,10 @@ function App() {
             <div class=${`nav-item ${activeSection==='tracking'?'active':''}`} data-testid="nav-tracking" title="Tracking" onclick=${() => onNav('tracking')}>
               <span class="nav-item-icon">${navIconSvg('tracking')}</span>
               <span class="nav-item-label">Tracking</span>
+            </div>
+            <div class=${`nav-item ${activeSection==='sessions'?'active':''}`} data-testid="nav-sessions" title="Sessions" onclick=${() => onNav('sessions')}>
+              <span class="nav-item-icon">${navIconSvg('sessions')}</span>
+              <span class="nav-item-label">Sessions</span>
             </div>
           </div>
           ${agentsColCollapsed && (activeSessions || []).length ? html`

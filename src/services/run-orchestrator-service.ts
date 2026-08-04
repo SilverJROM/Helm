@@ -9,7 +9,7 @@ import { RunArtifactService } from './run-artifact-service.js';
 import { PlanningPhaseService } from './planning-phase-service.js';
 import { PlanParserService } from './plan-parser-service.js';
 import { parseExecutionPlan } from './execution-plan-parser.js';
-import { TaskQueueService } from './task-queue-service.js';
+import { TaskQueueService, type TaskTerminalToken } from './task-queue-service.js';
 import { OrchestratorLoop, RunAbortedError, TERMINAL_RUN_PHASES, TERMINAL_RUN_STATUSES } from './orchestrator-loop.js';
 import { getRunAbort, clearRunAbort } from './run-abort-registry.js';
 import { ProjectService } from './project-service.js';
@@ -39,6 +39,25 @@ import {
 import type { PlannerPanelService } from './planner-panel-service.js';
 import type { PlannerPanel } from './adaptive-planning-phase.js';
 import { makeGrokAwareProviderModelAvailability } from './grok-auth-availability.js';
+import { finalizeBrainSessionRow } from './worker-runtime-finalize.js';
+import type { LifecycleToken } from './lifecycle-cas.js';
+import {
+  PlanningStaffingService,
+  toCorePlanningStaffingArgs,
+  buildManifestDigestPayload,
+  computeManifestDigest,
+  type CorePlanningStaffingArgs,
+  type PlanningStaffingManifest,
+  type CoPlannerSeatSpec,
+} from './planning-staffing-service.js';
+import type { DatabaseService } from '../db/database.js';
+import { DiscoveryHandoffService } from './discovery-handoff-service.js';
+import { isDiscoveryPhase } from './discovery-contract.js';
+import {
+  assertPlanningProvenanceForImplementation,
+  recordProvenanceAfterAgreement,
+  PLANNING_REQUIRED_MESSAGE,
+} from './planning-provenance-service.js';
 
 // CYCLE-BUILDDIR: a cycle-plan run builds the deliverable in this subdir OF the cycle workspace (never the
 // workspace root — that holds north-star.md, which puts helm-sandbox in PROTECTED-ROOT mode and blocks
@@ -85,6 +104,36 @@ export interface RunStatus {
   status: string;
   tasks: any[];
   current: any | null;
+}
+
+/** S10: owner-confirmed handoff → Planning from existing Discovery docs (no interview). */
+export interface ConfirmedHandoffPlanningInput {
+  projectId: number;
+  cycleId: number;
+  /** S08 handoff id; must be state=starting (S11 CAS pending→starting). */
+  handoffId: number;
+  /** Optional UI digest; must match frozen handoff digest and live revalidation. */
+  expectedDigest?: string | null;
+  batchId?: string;
+  precreatedRunId?: number;
+  strictReadAllow?: string[];
+}
+
+export class ConfirmedHandoffPlanningError extends Error {
+  constructor(
+    message: string,
+    public readonly code:
+      | 'MISSING_HANDOFF'
+      | 'BAD_STATE'
+      | 'MISMATCH'
+      | 'MISSING_DOCS'
+      | 'NO_CYCLE'
+      | 'UNKNOWN_PROJECT'
+      | 'STAFFING'
+  ) {
+    super(message);
+    this.name = 'ConfirmedHandoffPlanningError';
+  }
 }
 
 export class RunOrchestratorService {
@@ -196,10 +245,8 @@ export class RunOrchestratorService {
     }
   }
 
-  // A10 (R1.3): read the project's core (non-adaptive) planning panel size — total seats including
-  // plancore, default 2 (fail-safe on any read error) — threaded into runPlanningPhase so it spawns
-  // exactly that many seats instead of the removed north-star-regex guess. Independent of
-  // isAdaptivePlanning: this config only applies on the default/OFF path.
+  // S05 / AC20: planning_panel_size = N co-planners excluding plancore (default 2).
+  // Independent of adaptive_planning. Callers that need A10 total-seat panelSize use N+1.
   private resolvePlanningPanelSize(projectId?: number): number {
     if (projectId == null) return 2;
     try {
@@ -210,6 +257,40 @@ export class RunOrchestratorService {
       return Number.isFinite(n) && n >= 1 ? Math.trunc(n) : 2;
     } catch {
       return 2;
+    }
+  }
+
+  /**
+   * S05 fix1: resolve core-path Planning seats via PlanningStaffingService when a panel is
+   * configured (adaptive ON or OFF). Never substitutes generic `planner` for configured seats.
+   * Empty panel → legacy partner binding + N co-planner count from DB.
+   * S06 will replace partnerModel with ordered per-seat identities; until then count + first
+   * ready co-planner model are wired so N partners are spawned from the panel.
+   */
+  private resolveCorePlanningStaffing(projectId: number): CorePlanningStaffingArgs {
+    const legacyN = this.resolvePlanningPanelSize(projectId);
+    const legacy: CorePlanningStaffingArgs = {
+      usedPanel: false,
+      panelSizeTotal: Math.max(1, legacyN + 1),
+    };
+    if (!this.deps.assignmentService) return legacy;
+    try {
+      const db = this.deps.artifacts['db'] as DatabaseService;
+      const svc = new PlanningStaffingService(
+        db,
+        this.deps.assignmentService,
+        this.deps.plannerPanelService
+      );
+      const manifest = svc.resolveManifest(projectId, {
+        throwOnEmpty: false,
+        throwOnMismatch: false,
+      });
+      return toCorePlanningStaffingArgs(manifest);
+    } catch (e: any) {
+      console.warn(
+        `[RunOrchestrator] PlanningStaffingService resolve failed for project ${projectId}: ${e?.message || e}`
+      );
+      return legacy;
     }
   }
 
@@ -267,22 +348,60 @@ export class RunOrchestratorService {
     }
   }
 
+  /**
+   * A1 / AC1: true once a run has genuinely left planning — read BEFORE any terminal UPDATE
+   * overwrites runs.phase, since transitionRunToBlocked/detached-start-failed both stamp the row
+   * blocked/failed first. Mirrors stopRun's own priorPhase gate (`['starting','interview','planning']`
+   * = pre-executing), plus a run_tasks count as a second signal (belt-and-suspenders against a phase
+   * write and the run_tasks ingest landing on either side of a crash). Defaults to true (assume
+   * started) on any read ambiguity/error — this predicate must never suppress genuine execution-
+   * failure cleanup, only skip assertImplementationBrainComplete when planning-only failure is certain.
+   */
+  private hasExecutionStarted(runId: number): boolean {
+    try {
+      const db = this.deps.artifacts['db'].raw;
+      const run: any = db.prepare('SELECT phase FROM runs WHERE id = ?').get(runId);
+      const phase = String(run?.phase ?? '');
+      if (phase && !['starting', 'interview', 'planning'].includes(phase)) return true;
+      const taskRow: any = db.prepare('SELECT COUNT(*) AS n FROM run_tasks WHERE run_id = ?').get(runId);
+      return Number(taskRow?.n ?? 0) > 0;
+    } catch {
+      return true;
+    }
+  }
+
   // #52: `kind` distinguishes a genuine FAILURE (status=failed) from an operator-recoverable PAUSE
   // (status=paused) — both set phase=blocked, but a run that merely halted for missing config or a
   // grok relogin is NOT failed, and recording it as such contradicted its own completion summary and
   // false-alarmed status-keyed monitoring. Default 'failure' preserves every existing caller verbatim.
+  /**
+   * @param expectedGeneration B04 fix cycle 2 (validator V1): when the caller reached this from a
+   *   detached startRunDetached continuation, its captured runs.generation. Gates this method's own
+   *   terminal UPDATE plus its finalizeRunWorkerRuntimes/assertImplementationBrainComplete calls so a
+   *   stale continuation cannot blocked-fail a recycled occupant of the same numeric id. Omitted by
+   *   callers with no captured token (unchanged pre-B04 behavior).
+   */
   private transitionRunToBlocked(
     runId: number,
     message: string,
     project?: any,
-    kind: 'failure' | 'operator-pause' = 'failure'
+    kind: 'failure' | 'operator-pause' = 'failure',
+    expectedGeneration?: number
   ): void {
     const db = this.deps.artifacts['db'].raw;
     const status = kind === 'operator-pause' ? 'paused' : 'failed';
+    const gated = expectedGeneration != null && Number.isFinite(Number(expectedGeneration));
+    // A1: snapshot pre-terminal execution state BEFORE the blocked/failed UPDATE below overwrites
+    // runs.phase — assertImplementationBrainComplete below must not run on a planning-only failure.
+    const executionStarted = kind === 'failure' ? this.hasExecutionStarted(runId) : true;
     try {
-      const changed = db.prepare(
-        "UPDATE runs SET phase = 'blocked', status = ?, ended_at = datetime('now') WHERE id = ? AND phase NOT IN ('complete','failed','blocked','paused')"
-      ).run(status, runId);
+      const changed = gated
+        ? db.prepare(
+            "UPDATE runs SET phase = 'blocked', status = ?, ended_at = datetime('now') WHERE id = ? AND generation = ? AND phase NOT IN ('complete','failed','blocked','paused')"
+          ).run(status, runId, expectedGeneration)
+        : db.prepare(
+            "UPDATE runs SET phase = 'blocked', status = ?, ended_at = datetime('now') WHERE id = ? AND phase NOT IN ('complete','failed','blocked','paused')"
+          ).run(status, runId);
       if (changed.changes !== 1) return;
       const run: any = db.prepare(
         'SELECT r.batch_id, p.name AS project_name FROM runs r LEFT JOIN projects p ON p.id = r.project_id WHERE r.id = ?'
@@ -296,9 +415,34 @@ export class RunOrchestratorService {
       // A7 / R3.15: true blocked-failure terminalizes the cycle board. Operator-pause (A6 park,
       // missing deploy/final-test config) is recoverable — leave cycles.phase alone.
       if (kind === 'failure') {
-        this.terminalizeCycleAtRunEnd({ runId });
-        // A15: seat ledger — finalize non-terminal worker_runtimes for this run.
-        void this.finalizeRunWorkerRuntimes(runId, 'run-blocked-failure');
+        // A4 / AC4: a planning-only failure must not terminalize the cycle (no phase='complete',
+        // no topology freeze) — it must land retryable. Reuse the executionStarted snapshot taken
+        // above, before the terminal UPDATE overwrote runs.phase.
+        if (executionStarted) {
+          this.terminalizeCycleAtRunEnd({ runId });
+        }
+        // A15 + S03: finalize workers first, THEN assert ibrain (no race where a just-registered
+        // ibrain ledger row is picked up by finalizeRunWorkerRuntimes and reaped — D-a3 keep-alive).
+        const projId =
+          project?.id != null
+            ? Number(project.id)
+            : Number(
+                (db.prepare('SELECT project_id FROM runs WHERE id = ?').get(runId) as any)?.project_id
+              );
+        void (async () => {
+          try {
+            await this.finalizeRunWorkerRuntimes(runId, 'run-blocked-failure', expectedGeneration);
+            if (Number.isFinite(projId) && executionStarted) {
+              this.assertImplementationBrainComplete({
+                projectId: projId,
+                runId,
+                reason: 'run-blocked-failure',
+                state: 'failed',
+                expectedGeneration,
+              });
+            }
+          } catch { /* best-effort terminal bookkeeping */ }
+        })();
       }
     } catch { /* terminal transition and operator alert are best-effort */ }
   }
@@ -315,6 +459,13 @@ export class RunOrchestratorService {
     const batchId = input.batchId || `r${Date.now().toString(36)}`;
     const runDir = resolveRunDir(input.projectId, batchId); // #46: single resolver
     const runId = this.deps.artifacts.createRun(input.projectId, batchId, path.join(runDir, CANONICAL_CYCLE_ARTIFACTS.northStar), input.cycleId ?? null);
+    // B04 / AC8: freeze the run's lifecycle token (id + B03 allocator generation) at the authoritative
+    // dispatch boundary — the instant the row exists. The background continuation below closes over
+    // this const and never re-reads runs.generation from the (possibly recycled) runId later.
+    const runRow = this.deps.artifacts['db'].raw
+      .prepare('SELECT generation FROM runs WHERE id = ?')
+      .get(runId) as { generation: number } | undefined;
+    const runToken: LifecycleToken = { id: runId, generation: Number(runRow?.generation ?? 0) };
     // A6b: process-local TaskQueueService is keyed by runId. SQLite reuses free runs.id after CASCADE
     // delete; a prior run's stuck inFlight / failedTasks / allTasks then makes getNextReady() return
     // null forever → DB has pending run_tasks but drainDispatch immediately pending-after-drain stalls
@@ -338,15 +489,54 @@ export class RunOrchestratorService {
     } catch { /* transcript persist is best-effort */ }
     void this.startRun({ ...input, batchId, precreatedRunId: runId }).catch((e: any) => {
       console.error(`[run-orchestrator] detached startRun failed for run ${runId} (project ${input.projectId}, batch ${batchId}): ${e?.stack || e?.message || e}`);
+      // B04 / AC8: the failure UPDATE is the CAS gate for this whole terminal chain — it compares
+      // runs.id + runs.generation against the token frozen at dispatch. changes !== 1 means the row
+      // is already terminal, gone, or a new occupant recycled this id; the old chain must no-op
+      // rather than mark the recycled row failed or reap/finalize its live workers (D01: changes===0
+      // is stale/KEEP, never refresh-and-retry).
+      // A1: snapshot pre-terminal execution state BEFORE the CAS UPDATE below overwrites runs.phase
+      // to 'failed' — assertImplementationBrainComplete below must not run on a planning-only failure.
+      const executionStarted = this.hasExecutionStarted(runToken.id);
+      let casApplied = false;
       try {
-        this.deps.artifacts['db'].raw
-          .prepare(`UPDATE runs SET phase = 'failed', status = 'failed', ended_at = datetime('now') WHERE id = ? AND phase NOT IN ('complete','failed','blocked')`)
-          .run(runId);
-      } catch {}
-      // A7 / R3.15: detached failure is a true terminal — advance cycle board if linked.
-      this.terminalizeCycleAtRunEnd({ runId, cycleId: input.cycleId ?? null });
-      // A15: seat ledger on detached failure.
-      void this.finalizeRunWorkerRuntimes(runId, 'detached-start-failed');
+        const result = this.deps.artifacts['db'].raw
+          .prepare(
+            `UPDATE runs SET phase = 'failed', status = 'failed', ended_at = datetime('now')
+             WHERE id = ? AND generation = ? AND phase NOT IN ('complete','failed','blocked')`
+          )
+          .run(runToken.id, runToken.generation) as { changes?: number };
+        casApplied = Number(result?.changes || 0) === 1;
+      } catch { /* casApplied stays false — treat as stale, do not run terminal bookkeeping */ }
+      if (!casApplied) {
+        console.warn(
+          `[run-orchestrator] detached startRun failure for run ${runToken.id} generation ${runToken.generation} is stale/already-terminal — skipping cycle/worker/brain terminal bookkeeping`
+        );
+        return;
+      }
+      // A7 / R3.15: detached failure advances the cycle board if linked — but only when it is a
+      // genuine execution failure. A4 / AC4: a detached start that never left planning must not
+      // terminalize the cycle; reuse the executionStarted snapshot taken above the CAS UPDATE.
+      if (executionStarted) {
+        this.terminalizeCycleAtRunEnd({ runId: runToken.id, cycleId: input.cycleId ?? null });
+      }
+      // A15 + S03: finalize workers first, then ibrain assert (true terminal; no reap — D-a3).
+      // B04: both independently re-compare runs.generation against runToken at their own pre-reap/
+      // pre-mutate selection — defense against recycling in the window between the CAS above and
+      // these awaited operations.
+      void (async () => {
+        try {
+          await this.finalizeRunWorkerRuntimes(runToken.id, 'detached-start-failed', runToken.generation);
+          if (executionStarted) {
+            this.assertImplementationBrainComplete({
+              projectId: input.projectId,
+              runId: runToken.id,
+              reason: 'detached-start-failed',
+              state: 'failed',
+              expectedGeneration: runToken.generation,
+            });
+          }
+        } catch { /* best-effort terminal bookkeeping */ }
+      })();
     });
     return { runId, batchId };
   }
@@ -380,7 +570,13 @@ export class RunOrchestratorService {
    * Best-effort reaps the tmux session then shared finalizeWriter → reaped + ended_at.
    * Used at true run terminals and planning-done-yield so seats never stick as running.
    */
-  private async finalizeRunWorkerRuntimes(runId: number, reason: string): Promise<number> {
+  /**
+   * @param expectedGeneration B04 / AC8: when supplied, the shared finalizer only selects/reaps
+   *   worker_runtimes rows whose run still carries this exact runs.generation — a stale caller
+   *   (recycled runId) selects nothing. Omitted by every pre-existing synchronous call site, whose
+   *   generation cannot have moved within their own still-live run's execution.
+   */
+  private async finalizeRunWorkerRuntimes(runId: number, reason: string, expectedGeneration?: number): Promise<number> {
     try {
       const { finalizeRunWorkerRuntimes: finalizeRun } = await import('./worker-runtime-finalize.js');
       const db = this.deps.artifacts['db'].raw;
@@ -388,9 +584,85 @@ export class RunOrchestratorService {
         try {
           await this.deps.transport.reap(`${session}:0.0`, reason);
         } catch { /* best-effort */ }
-      });
+      }, expectedGeneration);
     } catch {
       return 0;
+    }
+  }
+
+  /**
+   * S03 / AC24 brains: assert the named implementation brain (helm-ibrain-*) complete at a true
+   * run terminal only. A2 keeps finalizeBrainSessionRow update-only; this assertion owns creating
+   * the real run-linked ibrain runtime row at the true terminal boundary when execution began.
+   * Does NOT reap/terminate — preserves D-a3 close-confirm keep-alive. Never call on intermediate yield.
+   */
+  private assertImplementationBrainComplete(opts: {
+    projectId: number;
+    runId: number;
+    session?: string | null;
+    reason: string;
+    state?: 'done' | 'failed' | 'reaped';
+    provider?: string;
+    model?: string;
+    /** B04 / AC8: captured runs.generation — a mismatch makes finalizeBrainSessionRow a no-op. */
+    expectedGeneration?: number;
+  }): void {
+    try {
+      const db = this.deps.artifacts['db'].raw;
+      let session = String(opts.session ?? '').trim();
+      if (!session) {
+        const proj: any = db.prepare('SELECT name FROM projects WHERE id = ?').get(opts.projectId);
+        if (!proj?.name) return;
+        const slug = String(proj.name).toLowerCase().replace(/[^a-z0-9]+/g, '_');
+        session = `helm-ibrain-${slug}`;
+      }
+      let provider = String(opts.provider ?? '').trim();
+      let model = String(opts.model ?? '').trim();
+      if ((!provider || !model) && this.deps.assignmentService) {
+        try {
+          const resolved = this.deps.assignmentService.resolveProjectRole(opts.projectId, 'ibrain');
+          provider ||= String(resolved?.agent?.provider ?? '').trim();
+          model ||= String(resolved?.agent?.model ?? '').trim();
+        } catch {
+          /* best-effort: fall through to the update-only finalizer if no concrete binding exists */
+        }
+      }
+      if (provider && model) {
+        const existing: any = db
+          .prepare(
+            `SELECT id FROM worker_runtimes
+             WHERE run_id = ? AND session = ?
+             ORDER BY id DESC LIMIT 1`
+          )
+          .get(opts.runId, session);
+        if (!existing?.id) {
+          db.prepare(
+            `INSERT INTO worker_runtimes
+               (project_id, role, provider, model, session, correlation_id, state, spawned_by, run_id, started_at)
+             VALUES (?, 'ibrain', ?, ?, ?, ?, 'running', 'run-orchestrator', ?, datetime('now'))`
+          ).run(
+            opts.projectId,
+            provider,
+            model,
+            session,
+            `ibrain:${opts.runId}:${opts.reason}`,
+            opts.runId
+          );
+        }
+      }
+      finalizeBrainSessionRow(db, {
+        projectId: opts.projectId,
+        runId: opts.runId,
+        session,
+        role: 'ibrain',
+        reason: opts.reason,
+        state: opts.state ?? 'done',
+        provider,
+        model,
+        expectedGeneration: opts.expectedGeneration,
+      });
+    } catch {
+      /* best-effort bookkeeping — never block the run terminal path */
     }
   }
 
@@ -454,12 +726,13 @@ export class RunOrchestratorService {
    * what awaiting_approval is — and getCycleRunState's runActive check already treats phase='blocked'
    * as inactive, so a fresh cyclePlan run can start the moment approveCycle flips the cycle.
    */
-  private async parkRunAwaitingApproval(runId: number, runDir: string, cycleId: number, project?: any): Promise<void> {
+  private async parkRunAwaitingApproval(runId: number, runDir: string, cycleId: number, project?: any, expectedGeneration?: number): Promise<void> {
     this.transitionRunToBlocked(
       runId,
       `pause_after_planning gate (R3.14): cycle ${cycleId} is awaiting_approval — implementation queue not started until approveCycle`,
       project,
-      'operator-pause'
+      'operator-pause',
+      expectedGeneration
     );
     try {
       await this.deps.artifacts.persistState(runDir, ['interview', 'planning', 'awaiting_approval'], 'paused', runId);
@@ -507,6 +780,336 @@ export class RunOrchestratorService {
     }
   }
 
+  /**
+   * S10 — Explicit existing-doc Planning start from a confirmed Discovery handoff.
+   *
+   * Requires handoff state=`starting` and frozen manifest digest. Precreates a Planning run,
+   * reads existing cycle-folder Discovery docs (never overwrites them), skips Discovery
+   * interview spawn/wait, and calls runPlanningPhase with exact S06 co-planner seats.
+   * Missing/mismatched handoff or digest → throw before any run is created.
+   * pause_after_planning: park only after successful Planning agreement (same gate as startRun).
+   */
+  async startPlanningFromConfirmedHandoff(
+    input: ConfirmedHandoffPlanningInput
+  ): Promise<number> {
+    const projectId = Number(input.projectId);
+    const cycleId = Number(input.cycleId);
+    const handoffId = Number(input.handoffId);
+    const project = this.deps.projectService.getProject(projectId);
+    if (!project) {
+      throw new ConfirmedHandoffPlanningError('unknown project', 'UNKNOWN_PROJECT');
+    }
+    if (!this.deps.cycleService?.getCycleDocDir) {
+      throw new ConfirmedHandoffPlanningError('cycleService required for confirmed-handoff Planning', 'NO_CYCLE');
+    }
+
+    const db = this.deps.artifacts['db'] as DatabaseService;
+    const handoffs = new DiscoveryHandoffService(db);
+    const handoff = handoffs.getById(handoffId);
+    if (!handoff) {
+      throw new ConfirmedHandoffPlanningError(`handoff ${handoffId} not found`, 'MISSING_HANDOFF');
+    }
+    if (Number(handoff.project_id) !== projectId || Number(handoff.cycle_id) !== cycleId) {
+      throw new ConfirmedHandoffPlanningError(
+        'handoff project/cycle binding mismatch',
+        'MISMATCH'
+      );
+    }
+    if (handoff.state !== 'starting') {
+      throw new ConfirmedHandoffPlanningError(
+        `handoff state is ${handoff.state}, expected starting`,
+        'BAD_STATE'
+      );
+    }
+    if (!handoff.manifest_digest || !String(handoff.manifest_digest).trim()) {
+      throw new ConfirmedHandoffPlanningError('handoff missing frozen manifest_digest', 'MISMATCH');
+    }
+    if (
+      input.expectedDigest != null &&
+      String(input.expectedDigest) !== String(handoff.manifest_digest)
+    ) {
+      throw new ConfirmedHandoffPlanningError(
+        'expectedDigest does not match frozen handoff digest',
+        'MISMATCH'
+      );
+    }
+
+    // AC24: revalidate live staffing digest against frozen handoff before creating a run
+    let liveDigest: string;
+    try {
+      const staffing = new PlanningStaffingService(
+        db,
+        this.deps.assignmentService,
+        this.deps.plannerPanelService
+      );
+      const live = staffing.resolveManifest(projectId, {
+        throwOnEmpty: false,
+        throwOnMismatch: false,
+      });
+      liveDigest = live.digest;
+    } catch (e: any) {
+      throw new ConfirmedHandoffPlanningError(
+        `live staffing resolve failed: ${e?.message || e}`,
+        'STAFFING'
+      );
+    }
+    if (liveDigest !== handoff.manifest_digest) {
+      throw new ConfirmedHandoffPlanningError(
+        'live seat-manifest digest changed since handoff was frozen; refresh preview',
+        'MISMATCH'
+      );
+    }
+
+    // Frozen seats from handoff.manifest_json — recompute S05 digest from the JSON that will
+    // drive Planning seats and require it equals handoff.manifest_digest (RT R1: digest A +
+    // JSON seats B must not start Planning with B).
+    let coPlannerSeats: CoPlannerSeatSpec[] = [];
+    let planningBrainModel: string | undefined;
+    let planningBrainProvider: string | undefined;
+    try {
+      const frozen = JSON.parse(String(handoff.manifest_json || '{}')) as Partial<PlanningStaffingManifest>;
+      if (!frozen.plancore || !Array.isArray(frozen.coPlanners)) {
+        throw new ConfirmedHandoffPlanningError(
+          'frozen manifest_json missing plancore or coPlanners',
+          'MISMATCH'
+        );
+      }
+      const recomputedDigest = computeManifestDigest(
+        buildManifestDigestPayload({
+          plancore: frozen.plancore,
+          coPlanners: frozen.coPlanners,
+        })
+      );
+      if (recomputedDigest !== String(handoff.manifest_digest)) {
+        throw new ConfirmedHandoffPlanningError(
+          'frozen manifest_json does not recompute to handoff.manifest_digest (digest/JSON mismatch)',
+          'MISMATCH'
+        );
+      }
+      if (
+        input.expectedDigest != null &&
+        recomputedDigest !== String(input.expectedDigest)
+      ) {
+        throw new ConfirmedHandoffPlanningError(
+          'recomputed frozen-JSON digest does not match expectedDigest',
+          'MISMATCH'
+        );
+      }
+      // Prefer verified frozen JSON seats only after digest match (never live seats here).
+      if (frozen.plancore.model) {
+        planningBrainModel = String(frozen.plancore.model);
+        planningBrainProvider = String(frozen.plancore.provider || '');
+      }
+      const rawSeats = frozen.coPlanners;
+      coPlannerSeats = rawSeats
+        .filter((s) => s && (s.ready !== false))
+        .map((s, i) => ({
+          slot: s.slot ?? i,
+          provider: String(s.provider || ''),
+          model: String(s.model || ''),
+          effort: String(s.effort || ''),
+          source: String(s.source || 'primary'),
+        }))
+        .filter((s) => s.model);
+      if (!coPlannerSeats.length && rawSeats.length) {
+        // fall back to all configured identities if ready flags missing
+        coPlannerSeats = rawSeats.map((s: any, i: number) => ({
+          slot: s.slot ?? i,
+          provider: String(s.provider || ''),
+          model: String(s.model || ''),
+          effort: String(s.effort || ''),
+          source: String(s.source || 'primary'),
+        }));
+      }
+    } catch (e: any) {
+      if (e instanceof ConfirmedHandoffPlanningError) throw e;
+      throw new ConfirmedHandoffPlanningError(
+        `frozen manifest_json unreadable: ${e?.message || e}`,
+        'MISMATCH'
+      );
+    }
+    if (!coPlannerSeats.length) {
+      throw new ConfirmedHandoffPlanningError(
+        'frozen manifest has no co-planner seats',
+        'STAFFING'
+      );
+    }
+
+    const cycleRow: any = db
+      .prepare('SELECT id, project_id, phase, status FROM cycles WHERE id = ?')
+      .get(cycleId);
+    if (!cycleRow || Number(cycleRow.project_id) !== projectId) {
+      throw new ConfirmedHandoffPlanningError('cycle not found or project mismatch', 'NO_CYCLE');
+    }
+    // Prefer discovery phase; allow already-planning only if recovering (still no interview)
+    if (
+      !isDiscoveryPhase(cycleRow.phase) &&
+      String(cycleRow.phase).toLowerCase() !== 'planning'
+    ) {
+      throw new ConfirmedHandoffPlanningError(
+        `cycle phase is ${cycleRow.phase}, expected discovery`,
+        'BAD_STATE'
+      );
+    }
+
+    const cycleDocDir = this.deps.cycleService.getCycleDocDir(cycleId);
+    const nsPath = path.join(cycleDocDir, CANONICAL_CYCLE_ARTIFACTS.northStar);
+    const logPath = path.join(cycleDocDir, 'conversation-log.md');
+    let northStar: string;
+    let conversationLog: string;
+    try {
+      northStar = await fs.readFile(nsPath, 'utf8');
+      conversationLog = await fs.readFile(logPath, 'utf8');
+    } catch (e: any) {
+      throw new ConfirmedHandoffPlanningError(
+        `existing Discovery docs unreadable: ${e?.message || e}`,
+        'MISSING_DOCS'
+      );
+    }
+    if (!northStar.trim() || !conversationLog.trim()) {
+      throw new ConfirmedHandoffPlanningError(
+        'existing Discovery docs are empty (north-star.md / conversation-log.md)',
+        'MISSING_DOCS'
+      );
+    }
+    // Snapshot bytes so later accidental writes are not confused with "we overwrote" — we never write these paths.
+
+    const batchId =
+      (input.batchId && String(input.batchId).trim()) ||
+      `handoff-${handoffId}-${Date.now().toString(36)}`;
+    const runDir = resolveRunDir(projectId, batchId);
+    await fs.mkdir(runDir, { recursive: true });
+
+    // Create run ONLY after all validations passed
+    let runId =
+      input.precreatedRunId != null && Number.isFinite(Number(input.precreatedRunId))
+        ? Number(input.precreatedRunId)
+        : this.deps.artifacts.createRun(projectId, batchId, nsPath, cycleId);
+
+    try {
+      this.deps.artifacts['db'].raw
+        .prepare(
+          "UPDATE runs SET phase = 'planning', cycle_id = ?, status = 'active' WHERE id = ? AND phase NOT IN ('complete','failed','blocked')"
+        )
+        .run(cycleId, runId);
+    } catch { /* best-effort */ }
+
+    try {
+      this.deps.cycleService.setCyclePhase?.(cycleId, 'planning');
+    } catch {
+      try {
+        db.prepare(
+          "UPDATE cycles SET phase = 'planning' WHERE id = ? AND phase = 'discovery'"
+        ).run(cycleId);
+      } catch { /* best-effort */ }
+    }
+
+    const slug = String(project.name || 'project')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-|-$/g, '') || 'project';
+    const planningSessionName =
+      (project as any).plancore_session || `helm-plancore-${slug}`;
+
+    const phaseStaffing = new PhaseStaffingService(this.deps.assignmentService);
+    const planningBrain = phaseStaffing.resolvePhaseAgents(projectId, 'planning').brain;
+    const brainRole = planningBrain?.role || 'plancore';
+    const effBrainModel = planningBrainModel || planningBrain?.agent?.model;
+    const effBrainProvider = planningBrainProvider || planningBrain?.agent?.provider;
+
+    const runStrictAllow = input.strictReadAllow ?? resolveDeploymentStrictReadAllow();
+    if (runStrictAllow !== undefined) makeStrictReadProfileEnv(runStrictAllow);
+
+    const adaptivePanel = await this.resolveAdaptivePlannerPanel(
+      projectId,
+      project.directory
+    );
+
+    // S10: NO discovery spawn, NO waitForNorthStarReady — Planning only, existing doc bytes + frozen seats
+    const planningRes = await this.deps.planning.runPlanningPhase({
+      runDir,
+      canonicalArtifactRoot: cycleDocDir,
+      batchId,
+      northStar,
+      conversationLog,
+      mode: 'auto',
+      sessionName: planningSessionName,
+      projectId,
+      projectDir: project.directory,
+      brainRole,
+      planningBrainModel: effBrainModel,
+      planningBrainProvider: effBrainProvider,
+      partnerModel: coPlannerSeats[0]?.model,
+      partnerProvider: coPlannerSeats[0]?.provider,
+      coPlannerSeats,
+      panelSize: coPlannerSeats.length + 1,
+      roundCap: this.resolvePlanningRoundCap(projectId),
+      runId,
+      strictReadAllow: runStrictAllow,
+      adaptivePlanning: this.isAdaptivePlanning(projectId),
+      ...(adaptivePanel?.panel ? { panel: adaptivePanel.panel } : {}),
+      ...(adaptivePanel?.isModelAvailable
+        ? { isModelAvailable: adaptivePanel.isModelAvailable }
+        : {}),
+    });
+
+    if (planningRes?.runId) runId = planningRes.runId;
+
+    // Persist started + run id on the handoff (S11 may also CAS; idempotent if already started)
+    const casStarted = handoffs.casTransition(handoffId, 'starting', 'started', {
+      planningRunId: runId,
+    });
+    if (casStarted === 0 && handoffs.getById(handoffId)?.state === 'starting') {
+      // leave as-is; still return runId
+    }
+
+    const notAgreed = !!(planningRes && planningRes.agreed === false);
+    if (notAgreed) {
+      const reason =
+        planningRes?.blockedReason ||
+        'PLANNING-NOT-AGREED: co-planner verdict never arrived (gate blocked); plan not ingested';
+      this.transitionRunToBlocked(runId, reason, project, 'failure');
+      return runId;
+    }
+
+    // S13: whole-plan agreement only — never on failed/BROKEN/round-cap (gated above).
+    try {
+      await recordProvenanceAfterAgreement({
+        db,
+        cycleService: this.deps.cycleService as any,
+        projectId,
+        cycleId,
+        planningRunId: runId,
+        planMdPath: path.join(cycleDocDir, CANONICAL_CYCLE_ARTIFACTS.plan),
+        assignments: this.deps.assignmentService,
+        plannerPanel: this.deps.plannerPanelService,
+      });
+    } catch (e: any) {
+      console.warn(
+        `[RunOrchestrator] S13 provenance record non-fatal: ${e?.message || e}`
+      );
+    }
+
+    // Planning-done: finishPlanning + pause_after_planning park (no implementation queue yet)
+    this.finishPlanningAtPlanningDone(cycleId);
+    if (this.isCycleGateParked(cycleId)) {
+      await this.parkRunAwaitingApproval(runId, runDir, cycleId, project);
+      return runId;
+    }
+
+    // Non-gate projects: leave run in planning/executing boundary without starting implementation
+    // loop from this method — S10 scope is Planning start only. Mark phase complete of planning.
+    try {
+      this.deps.artifacts['db'].raw
+        .prepare(
+          "UPDATE runs SET phase = 'executing' WHERE id = ? AND phase NOT IN ('complete','failed','blocked','paused')"
+        )
+        .run(runId);
+    } catch { /* best-effort */ }
+
+    return runId;
+  }
+
   private async startRunInner(input: StartRunInput): Promise<number> {
     const { projectId, prompt } = input;
     let project = this.deps.projectService.getProject(projectId);
@@ -516,10 +1119,34 @@ export class RunOrchestratorService {
     // precreatedRunId after an external stop (or a recycled-id race before createRun was fixed)
     // must not inherit a stale abort at pre-execution / task-boundary. Same for process-local queue
     // state (stuck inFlight → getNextReady always null → unknown-pending-stall with zero attempts).
+    // B04 fix cycle 2 (validator V1): startRunDetached fires startRun fire-and-forget — when entered
+    // through it, EVERY terminal path below (transitionRunToBlocked, planning-done-yield, the
+    // run-complete/run-failed terminal block) executes inside that SAME detached continuation and is
+    // equally exposed to a project-delete-then-recycle race as the detached-start-failed catch B04
+    // originally gated. Re-read runs.generation for the precreated id here — same synchronous tick as
+    // startRunDetached's own capture (no await has run yet), so this cannot observe a later recycle —
+    // and thread it through every such path.
+    // B04 fix cycle 4 (redteam-sol R3 C2): fail CLOSED, not silently ungated, when a detached call
+    // cannot capture its generation token. The row was inserted synchronously by startRunDetached in
+    // the same tick immediately before this read, so a missing/unreadable generation here is an
+    // anomalous state — never treat it as "proceed ungated."
+    let runGenToken: number | undefined;
     if (input.precreatedRunId != null && Number.isFinite(Number(input.precreatedRunId))) {
       const rid = Number(input.precreatedRunId);
       clearRunAbort(rid);
       try { this.deps.queue.clearRun(rid); } catch { /* never block start */ }
+      let row: { generation: number } | undefined;
+      try {
+        row = this.deps.artifacts['db'].raw
+          .prepare('SELECT generation FROM runs WHERE id = ?')
+          .get(rid) as { generation: number } | undefined;
+      } catch (e: any) {
+        throw new Error(`B04: failed to capture lifecycle generation for precreated run ${rid}; refusing to dispatch ungated: ${e?.message || e}`);
+      }
+      if (!row || typeof row.generation !== 'number' || !Number.isFinite(row.generation)) {
+        throw new Error(`B04: precreated run ${rid} has no readable generation; refusing to dispatch ungated`);
+      }
+      runGenToken = row.generation;
     }
 
     // B-ISO1 (sol wiring review fix #4): resolve the RUN-SCOPED strict read policy ONCE, at run start,
@@ -702,7 +1329,7 @@ export class RunOrchestratorService {
       if (e instanceof ResolveStallError) {
         if (input.precreatedRunId != null) {
           try {
-            this.transitionRunToBlocked(input.precreatedRunId, `Resolve-time role collision requires corrected role bindings: ${e.message}`, project);
+            this.transitionRunToBlocked(input.precreatedRunId, `Resolve-time role collision requires corrected role bindings: ${e.message}`, project, 'failure', runGenToken);
             const reason = `# I7 Resolve-Time Stall (B15x)\n\n${e.message}\n\nOperator action required: adjust role bindings / redteam roster so resolved_impl ∉ {val} ∪ redteam_panel, then re-run.`;
             await fs.writeFile(path.join(runDir, 'i7-resolve-stall.md'), reason, 'utf8');
             this.deps.artifacts.recordArtifact(input.precreatedRunId, 'i7-resolve-stall', 'i7-resolve-stall.md');
@@ -731,7 +1358,7 @@ export class RunOrchestratorService {
       const invalid = async (reason: string): Promise<Error> => {
         if (input.precreatedRunId != null) {
           try {
-            this.transitionRunToBlocked(input.precreatedRunId, `Cycle-plan workspace validation failed: ${reason}`, project);
+            this.transitionRunToBlocked(input.precreatedRunId, `Cycle-plan workspace validation failed: ${reason}`, project, 'failure', runGenToken);
             await fs.writeFile(path.join(runDir, 'cycle-workspace-invalid.md'), `# Cycle-plan run refused (CYCLE-BUILDDIR fail-closed)\n\n${reason}\n\nA cyclePlan run must build in a valid, active, contained cycle workspace; there is NO fallback to the registered project root.`, 'utf8');
             this.deps.artifacts.recordArtifact(input.precreatedRunId, 'cycle-workspace-invalid', 'cycle-workspace-invalid.md');
           } catch { /* best-effort surface */ }
@@ -862,7 +1489,7 @@ export class RunOrchestratorService {
       } catch (e: any) {
         if (input.precreatedRunId != null) {
           try {
-            this.transitionRunToBlocked(input.precreatedRunId, `Seat-binary pre-flight failed: ${e?.message || e}`, project);
+            this.transitionRunToBlocked(input.precreatedRunId, `Seat-binary pre-flight failed: ${e?.message || e}`, project, 'failure', runGenToken);
             const reason = `# Seat-binary pre-flight refused this run (A1a)\n\n${e?.message || e}\n\nA rostered model's launch CLI is not on the seat shell's PATH (the "binary vanished" failure mode). Operator action: reinstall/repair the missing CLI on the seat PATH (verify with \`command -v <bin>\` in a fresh tmux shell), then re-run.`;
             await fs.writeFile(path.join(runDir, 'seat-binary-preflight.md'), reason, 'utf8');
             this.deps.artifacts.recordArtifact(input.precreatedRunId, 'seat-binary-preflight', 'seat-binary-preflight.md');
@@ -915,9 +1542,28 @@ export class RunOrchestratorService {
       try { this.deps.artifacts['db'].raw.prepare("UPDATE runs SET phase = 'executing' WHERE id = ? AND phase NOT IN ('complete','failed','blocked')").run(runId); } catch {}
     } else if (planPreexists) {
       // Autonomous/skip-interview path (existing tests with pre-seed continue to work)
+      // S05: core path resolves panel via PlanningStaffingService even when adaptive_planning=0.
+      const coreStaffing = this.resolveCorePlanningStaffing(projectId);
+      if (coreStaffing.blockReasons?.length) {
+        runId =
+          input.precreatedRunId ??
+          this.deps.artifacts.createRun(projectId, batchId, path.join(runDir, CANONICAL_CYCLE_ARTIFACTS.northStar));
+        const reason = `PLANNING-STAFFING-BLOCKED: ${coreStaffing.blockReasons.join('; ')}`;
+        console.warn(`[RunOrchestrator] run ${runId} BLOCKED pre-planning: ${reason}`);
+        this.transitionRunToBlocked(runId, reason, project, 'failure', runGenToken);
+        return runId;
+      }
       const planningSeat = resolveBrain('planning');
       // v93: when adaptive_planning ON, load per-project panel + backup-fallback probe.
       const adaptivePanel = await this.resolveAdaptivePlannerPanel(projectId, effectiveProjectDir);
+      const effPartnerModel = coreStaffing.usedPanel ? coreStaffing.partnerModel : partnerModel;
+      const effPartnerProvider = coreStaffing.usedPanel ? coreStaffing.partnerProvider : partnerProvider;
+      const effBrainModel = coreStaffing.usedPanel && coreStaffing.planningBrainModel
+        ? coreStaffing.planningBrainModel
+        : planningSeat.agent.model;
+      const effBrainProvider = coreStaffing.usedPanel && coreStaffing.planningBrainProvider
+        ? coreStaffing.planningBrainProvider
+        : planningSeat.agent.provider;
       planningRes = await this.deps.planning.runPlanningPhase({
         runDir,
         batchId,
@@ -928,13 +1574,18 @@ export class RunOrchestratorService {
         projectId,
         projectDir: effectiveProjectDir,
         brainRole: planningSeat.role,
-        planningBrainModel: planningSeat.agent.model,
-        partnerModel,
-        planningBrainProvider: planningSeat.agent.provider,
-        partnerProvider,
+        planningBrainModel: effBrainModel,
+        partnerModel: effPartnerModel,
+        planningBrainProvider: effBrainProvider,
+        partnerProvider: effPartnerProvider,
         strictReadAllow: runStrictAllow,  // B-ISO1: run-scoped strict read fence for the planning seats
         adaptivePlanning: this.isAdaptivePlanning(projectId),  // v92: opt-in adaptive tiered planner
-        panelSize: this.resolvePlanningPanelSize(projectId),  // A10: core-path planning panel size (total seats)
+        // S05 AC20: DB size is N co-planners; A10 API wants total seats (N+1)
+        panelSize: coreStaffing.panelSizeTotal,
+        // S06: ordered exact co-planner identities from S05 manifest
+        ...(coreStaffing.coPlannerSeats?.length
+          ? { coPlannerSeats: coreStaffing.coPlannerSeats }
+          : {}),
         roundCap: this.resolvePlanningRoundCap(projectId),  // A11: co-planner agreement round cap
         runId: input.precreatedRunId,  // CC-CHAT-1 B2: reuse the detached-precreated run row (no duplicate)
         canonicalArtifactRoot,
@@ -990,6 +1641,22 @@ export class RunOrchestratorService {
       const NS_TIMEOUT = parseInt(process.env.HELM_PLANNING_TIMEOUT_MS || (isFake ? '4000' : '300000'), 10);
       const nsReady = await this.waitForNorthStarReady(cbPath, batchId, NS_TIMEOUT, runId);
 
+      // S04 / AC18: waitForNorthStarReady() === false is a typed blocked transition BEFORE Discovery
+      // reap, phase mutation to planning, or runPlanningPhase. Success path below stays byte-compatible.
+      if (!nsReady) {
+        // R5a first: stopped/failed/aborted runs keep the existing active-run assertion (throws).
+        this.assertRunActive(runId, 'post-interview');
+        const reason =
+          'NORTH-STAR-READY wait returned false: Discovery interview did not signal ready; refusing Planning advance (AC18 fail-closed)';
+        console.warn(`[RunOrchestrator] run ${runId} BLOCKED post-interview: ${reason}`);
+        try {
+          await this.deps.artifacts.persistState(runDir, ['interview', 'blocked'], 'blocked', runId);
+        } catch { /* best-effort */ }
+        this.transitionRunToBlocked(runId, reason, project, 'failure', runGenToken);
+        // Leave Discovery session unreaped; do not set phase=planning; do not call runPlanningPhase.
+        return runId;
+      }
+
       // R5a: phase boundary (interview → planning). A run stopped/failed during the interview
       // must not advance into planning (the guarded UPDATE below is belt-and-braces).
       this.assertRunActive(runId, 'post-interview');
@@ -1008,8 +1675,24 @@ export class RunOrchestratorService {
       try { convForPlan = await fs.readFile(path.join(canonicalArtifactRoot, 'conversation-log.md'), 'utf8'); } catch {}
 
       const planningSeat = resolveBrain('planning');
+      // S05: resolve panel on core path (adaptive ON or OFF); never generic planner for configured seats.
+      const coreStaffing = this.resolveCorePlanningStaffing(projectId);
+      if (coreStaffing.blockReasons?.length) {
+        const reason = `PLANNING-STAFFING-BLOCKED: ${coreStaffing.blockReasons.join('; ')}`;
+        console.warn(`[RunOrchestrator] run ${runId} BLOCKED pre-planning: ${reason}`);
+        this.transitionRunToBlocked(runId, reason, project, 'failure', runGenToken);
+        return runId;
+      }
       // v93: when adaptive_planning ON, load per-project panel + backup-fallback probe.
       const adaptivePanel = await this.resolveAdaptivePlannerPanel(projectId, effectiveProjectDir);
+      const effPartnerModel = coreStaffing.usedPanel ? coreStaffing.partnerModel : partnerModel;
+      const effPartnerProvider = coreStaffing.usedPanel ? coreStaffing.partnerProvider : partnerProvider;
+      const effBrainModel = coreStaffing.usedPanel && coreStaffing.planningBrainModel
+        ? coreStaffing.planningBrainModel
+        : planningSeat.agent.model;
+      const effBrainProvider = coreStaffing.usedPanel && coreStaffing.planningBrainProvider
+        ? coreStaffing.planningBrainProvider
+        : planningSeat.agent.provider;
       planningRes = await this.deps.planning.runPlanningPhase({
         runDir,
         canonicalArtifactRoot,
@@ -1021,13 +1704,18 @@ export class RunOrchestratorService {
         projectId,
         projectDir: effectiveProjectDir,
         brainRole: planningSeat.role,
-        planningBrainModel: planningSeat.agent.model,
-        partnerModel,
-        planningBrainProvider: planningSeat.agent.provider,
-        partnerProvider,
+        planningBrainModel: effBrainModel,
+        partnerModel: effPartnerModel,
+        planningBrainProvider: effBrainProvider,
+        partnerProvider: effPartnerProvider,
         strictReadAllow: runStrictAllow,  // B-ISO1: run-scoped strict read fence for the planning seats
         adaptivePlanning: this.isAdaptivePlanning(projectId),  // v92: opt-in adaptive tiered planner
-        panelSize: this.resolvePlanningPanelSize(projectId),  // A10: core-path planning panel size (total seats)
+        // S05 AC20: DB size is N co-planners; A10 API wants total seats (N+1)
+        panelSize: coreStaffing.panelSizeTotal,
+        // S06: ordered exact co-planner identities from S05 manifest
+        ...(coreStaffing.coPlannerSeats?.length
+          ? { coPlannerSeats: coreStaffing.coPlannerSeats }
+          : {}),
         roundCap: this.resolvePlanningRoundCap(projectId),  // A11: co-planner agreement round cap
         runId,  // D-b1: reuse the interview-created run (prevents duplicate run row); phase already advanced to planning
         ...(adaptivePanel?.panel ? { panel: adaptivePanel.panel } : {}),
@@ -1081,7 +1769,7 @@ export class RunOrchestratorService {
         try { await this.deps.artifacts.persistState(runDir, ['interview', 'planning', 'blocked'], 'blocked', runId); } catch {}
         // transitionRunToBlocked also terminalizes the cycle board + finalizes worker_runtimes seat
         // ledger (kind='failure' path) — no need to duplicate those calls here.
-        this.transitionRunToBlocked(runId, reason, project);
+        this.transitionRunToBlocked(runId, reason, project, 'failure', runGenToken);
         return runId;
       }
     }
@@ -1124,7 +1812,7 @@ export class RunOrchestratorService {
     try { await this.deps.transport.reap(`${planningSessionName}:0.0`, 'planning-done-yield-to-algo'); } catch {}
     // A15: tmux reap alone left worker_runtimes state=running/ended_at NULL (A1 insert, never finalize).
     // Finalize ALL non-terminal seats for this run at planning-done yield (plancore + partner).
-    await this.finalizeRunWorkerRuntimes(runId, 'planning-done-yield-to-algo');
+    await this.finalizeRunWorkerRuntimes(runId, 'planning-done-yield-to-algo', runGenToken);
 
     // A5 / R3.13: production finishPlanning at planning-done. Only on the real planning path
     // (not cyclePlan / seedPlan skip paths — those never ran planning). Resolves cycle id from
@@ -1141,6 +1829,28 @@ export class RunOrchestratorService {
           if (r?.cycle_id != null) planningDoneCycleId = Number(r.cycle_id);
         } catch { /* leave null */ }
       }
+      // S13: record provenance only when planning agreed (notAgreed already returned above).
+      if (planningRes && planningRes.agreed !== false && planningDoneCycleId != null) {
+        try {
+          const cycleDocDir = this.deps.cycleService?.getCycleDocDir?.(planningDoneCycleId);
+          await recordProvenanceAfterAgreement({
+            db: this.deps.artifacts['db'] as DatabaseService,
+            cycleService: this.deps.cycleService as any,
+            projectId,
+            cycleId: planningDoneCycleId,
+            planningRunId: runId,
+            planMdPath: cycleDocDir
+              ? path.join(cycleDocDir, CANONICAL_CYCLE_ARTIFACTS.plan)
+              : planningRes.planMdPath || null,
+            assignments: this.deps.assignmentService,
+            plannerPanel: this.deps.plannerPanelService,
+          });
+        } catch (e: any) {
+          console.warn(
+            `[RunOrchestrator] S13 provenance record non-fatal: ${e?.message || e}`
+          );
+        }
+      }
       this.finishPlanningAtPlanningDone(planningDoneCycleId);
 
       // A6 / R3.14: honour the pause_after_planning gate. finishPlanning (just above) may have
@@ -1148,7 +1858,7 @@ export class RunOrchestratorService {
       // park it here instead of falling into runEngineTail. approveCycle (POST /api/cycles/:id/approve)
       // starts a fresh cyclePlan run against the same plan.md once JROM approves.
       if (this.isCycleGateParked(planningDoneCycleId)) {
-        await this.parkRunAwaitingApproval(runId, runDir, planningDoneCycleId as number, project);
+        await this.parkRunAwaitingApproval(runId, runDir, planningDoneCycleId as number, project, runGenToken);
         return runId;
       }
     }
@@ -1166,6 +1876,7 @@ export class RunOrchestratorService {
       implementationSessionName,
       implementationBrainProvider: implementationSeat.agent.provider,
       implementationBrainModel: implementationSeat.agent.model,
+      expectedGeneration: runGenToken,
     });
   }
 
@@ -1186,16 +1897,19 @@ export class RunOrchestratorService {
       implementationSessionName: string;
       implementationBrainProvider: string;
       implementationBrainModel: string;
+      /** B04 fix cycle 2 (validator V1): captured runs.generation when reached via startRunDetached. */
+      expectedGeneration?: number;
     }
   ): Promise<number> {
     const {
       projectId, prompt, redTeamAgents, runStrictAllow, effectiveProjectDir,
-      implementationSessionName, implementationBrainProvider, implementationBrainModel
+      implementationSessionName, implementationBrainProvider, implementationBrainModel,
+      expectedGeneration
     } = context;
 
     // B11-T03: extracted to drainDispatch for re-entrancy in final-tests→fix loop.
     // Behavior-preserving refactor (REINFORCEMENT 1): body identical to pre-B11-T03 while.
-    await this.drainDispatch(runId, runDir, batchId, project, loop, queue);
+    await this.drainDispatch(runId, runDir, batchId, project, loop, queue, expectedGeneration);
 
     // Leg D §4 (D3b) pending-after-drain: getNextReady()===null is NEVER completion. Classify the drain
     // result (cycle / deferred-block / failed-block / unknown-pending-stall / all-complete) as ONE terminal
@@ -1203,7 +1917,7 @@ export class RunOrchestratorService {
     // written, and we RETURN before final tests / run-final red-team / generic completion — a later generic
     // `complete` must not be written. Subsumes the old B10-T02 deadlock + B10-T05 parked guards (which set
     // phase=blocked but let downstream completion logic continue — the exact false-green this fixes).
-    if (await this.handlePendingAfterDrain(runId, runDir, batchId, queue)) {
+    if (await this.handlePendingAfterDrain(runId, runDir, batchId, queue, expectedGeneration)) {
       return runId;
     }
 
@@ -1221,16 +1935,16 @@ export class RunOrchestratorService {
         if (c && Number(c.final_tests_enabled) !== 0) {
           while (fixIters < MAX_FIX_ITERS) {
             fixIters++;
-            lastGateOutcome = await this.maybeRunFinalTestsGate({ runId, runDir, batchId, project, loop, queue });
+            lastGateOutcome = await this.maybeRunFinalTestsGate({ runId, runDir, batchId, project, loop, queue, expectedGeneration });
             if (!lastGateOutcome || !lastGateOutcome.injected) {
               break;
             }
             // Loop back: drain the newly injected issue fix task(s)
-            await this.drainDispatch(runId, runDir, batchId, project, loop, queue);
+            await this.drainDispatch(runId, runDir, batchId, project, loop, queue, expectedGeneration);
           }
           // REINFORCEMENT 2: MAX backstop must FAIL-SAFE VISIBLY — never let still-failing finals silently complete green.
           if (fixIters >= MAX_FIX_ITERS && lastGateOutcome && lastGateOutcome.verdict !== 'PASS') {
-            await this.doMaxFixItersVisiblePause(runId, runDir, batchId, path.join(runDir, 'callbacks.md'), lastGateOutcome);
+            await this.doMaxFixItersVisiblePause(runId, runDir, batchId, path.join(runDir, 'callbacks.md'), lastGateOutcome, expectedGeneration);
           }
         }
       }
@@ -1396,16 +2110,59 @@ export class RunOrchestratorService {
     } catch (e:any) { /* non fatal */ }
 
     // Terminal: preserve failed/deferred signals; do not generic-overwrite
+    // B04 fix cycle 2 (validator V1): this whole block executes inside the SAME fire-and-forget
+    // continuation startRunDetached launches — gate the terminal UPDATE + both finalizers on the
+    // captured generation exactly as the detached-start-failed catch does.
+    // B04 fix cycle 3 (validator V3): when gated, ALSO check changes and return before
+    // persistState/terminalizeCycleAtRunEnd/the finalizers — mirroring transitionRunToBlocked's own
+    // `if (changed.changes !== 1) return` and the detached-start-failed catch's `casApplied` gate.
+    // Previously the UPDATE gained the generation predicate but its result was discarded, so a stale
+    // continuation still fell through to terminalizeCycleAtRunEnd and flipped the RECYCLED occupant's
+    // cycle board to 'complete' even though the worker/brain finalizers below were correctly gated.
     const finalRunStatus = hadFailed ? 'failed' : 'complete';
     const finalPhase = hadFailed ? 'failed' : 'complete';
-    try { this.deps.artifacts['db'].raw.prepare(`UPDATE runs SET phase = ?, status = ?, ended_at = datetime('now') WHERE id = ? AND phase NOT IN ('complete','failed','blocked')`).run(finalPhase, finalRunStatus, runId); } catch {}
+    const genGated = expectedGeneration != null && Number.isFinite(Number(expectedGeneration));
+    if (genGated) {
+      let casApplied = false;
+      try {
+        const result = this.deps.artifacts['db'].raw
+          .prepare(`UPDATE runs SET phase = ?, status = ?, ended_at = datetime('now') WHERE id = ? AND generation = ? AND phase NOT IN ('complete','failed','blocked')`)
+          .run(finalPhase, finalRunStatus, runId, expectedGeneration) as { changes?: number };
+        casApplied = Number(result?.changes || 0) === 1;
+      } catch { /* casApplied stays false — treat as stale, do not fall through */ }
+      if (!casApplied) {
+        console.warn(
+          `[run-orchestrator] runEngineTail terminal for run ${runId} generation ${expectedGeneration} is stale/already-terminal — skipping persistState/cycle/worker/brain terminal bookkeeping`
+        );
+        return runId;
+      }
+    } else {
+      try {
+        this.deps.artifacts['db'].raw
+          .prepare(`UPDATE runs SET phase = ?, status = ?, ended_at = datetime('now') WHERE id = ? AND phase NOT IN ('complete','failed','blocked')`)
+          .run(finalPhase, finalRunStatus, runId);
+      } catch {}
+    }
     try {
       await this.deps.artifacts.persistState(runDir, ['interview', 'planning', 'executing', finalPhase], finalRunStatus, runId);
     } catch {}
     // A7 / R3.15: success or task-failed completion advances the cycle board to terminal `complete`.
     this.terminalizeCycleAtRunEnd({ runId });
     // A15: seat ledger clean on run terminal (success or task-failed).
-    await this.finalizeRunWorkerRuntimes(runId, hadFailed ? 'run-failed' : 'run-complete');
+    await this.finalizeRunWorkerRuntimes(runId, hadFailed ? 'run-failed' : 'run-complete', expectedGeneration);
+
+    // S03 / AC24: ibrain completion assertion at true run terminal ONLY.
+    // finalizeBrainSessionRow → finalizeWorkerRuntimeRow → S02 markIdle. No tmux reap (D-a3 below).
+    this.assertImplementationBrainComplete({
+      projectId,
+      runId,
+      session: implementationSessionName,
+      reason: hadFailed ? 'run-failed' : 'run-complete',
+      state: hadFailed ? 'failed' : 'done',
+      provider: implementationBrainProvider,
+      model: implementationBrainModel,
+      expectedGeneration,
+    });
 
     // D-a3: do NOT reap on completion (was silent reap). Instead set the close-confirm state
     // (an ibrain master_runtimes row with no closed_reason yet).
@@ -1698,17 +2455,27 @@ export class RunOrchestratorService {
     // session, not a worker_runtimes row — reap it too so a stopped
     // interview doesn't leave a live TUI burning tokens. (In 'executing' the normal flow already
     // reaped it at 'planning-done-yield-to-algo'.)
-    if (['starting', 'interview', 'planning'].includes(String(run.phase))) {
+    const priorPhase = String(run.phase);
+    if (['starting', 'interview', 'planning'].includes(priorPhase)) {
       try {
         const proj: any = db.prepare('SELECT name, plancore_session FROM projects WHERE id = ?').get(run.project_id);
         if (proj) {
           const pslug = (proj.name || 'proj').toLowerCase().replace(/[^a-z0-9]+/g, '_');
-          const sess = String(run.phase) === 'interview'
+          const sess = priorPhase === 'interview'
             ? `helm-discovery-${pslug}`
             : (proj.plancore_session || `helm-plancore-${pslug}`);
           await this.deps.transport.reap(`${sess}:0.0`, 'run-stopped-preexec');
         }
       } catch { /* best-effort */ }
+    } else {
+      // S03: executing (or later) stop — assert ibrain complete without inventing a reap of the
+      // named brain (D-a3 keep-alive; worker seats already finalized/reaped above).
+      this.assertImplementationBrainComplete({
+        projectId: Number(run.project_id),
+        runId,
+        reason: 'run-stopped',
+        state: 'reaped',
+      });
     }
     console.warn(`[run-orchestrator] run ${runId} STOP requested (${stopReason}); marked terminal + abort flag set (reaped ${reapedWorkers} worker rows)`);
     return { ok: true, phase: 'failed', status: 'failed', reapedWorkers };
@@ -1862,6 +2629,18 @@ export class RunOrchestratorService {
     if (!parsed.ok) {
       throw new Error(`author a valid plan.md first: ${parsed.errors.join('; ')}`);
     }
+    // S13 / AC27–28: after plan is schema-valid, require cycle-linked Planning agreement + matching bytes.
+    const gate = await assertPlanningProvenanceForImplementation({
+      db: this.deps.artifacts['db'] as DatabaseService,
+      cycleService: this.deps.cycleService as any,
+      projectId,
+      cycleId,
+      assignments: this.deps.assignmentService,
+      plannerPanel: this.deps.plannerPanelService,
+    });
+    if (!gate.ok) {
+      throw new Error(gate.message || PLANNING_REQUIRED_MESSAGE);
+    }
     // The complete canonical set was materialized from the cycle workspace before this seed runs.
     const nsPath = path.join(runDir, CANONICAL_CYCLE_ARTIFACTS.northStar);
     const rid = precreatedRunId ?? this.deps.artifacts.createRun(projectId, batchId, nsPath, cycleId);
@@ -1904,7 +2683,16 @@ export class RunOrchestratorService {
    * Returns false only when there is genuinely no pending-after-drain block (normal completion may proceed;
    * end-of-run failed/deferred handling still applies).
    */
-  private async handlePendingAfterDrain(runId: number, runDir: string, batchId: string, queue: TaskQueueService = this.deps.queue): Promise<boolean> {
+  private async handlePendingAfterDrain(
+    runId: number,
+    runDir: string,
+    batchId: string,
+    queue: TaskQueueService = this.deps.queue,
+    /** B04 fix cycle 3 (validator V2, critical): captured runs.generation when reached via
+     * startRunDetached. Reachable with ZERO worker_runtimes rows on the cyclePlan/seedPlan path
+     * (no interview/planning spawn), the one window where the run row is genuinely FK-deletable. */
+    expectedGeneration?: number
+  ): Promise<boolean> {
     const db = this.deps.artifacts['db'].raw;
     const q: any = queue;
     const qState = q && typeof q.classifyDrainState === 'function'
@@ -1950,7 +2738,7 @@ export class RunOrchestratorService {
 
     // Blocked-run convention (matches every existing blocked-run UPDATE). Blocked dependents keep their
     // truthful `pending` status (we never mark them complete/failed).
-    this.transitionRunToBlocked(runId, `Pending-after-drain classifier: ${kind}. ${reason}`, undefined);
+    this.transitionRunToBlocked(runId, `Pending-after-drain classifier: ${kind}. ${reason}`, undefined, 'failure', expectedGeneration);
 
     const note = [
       `# Pending After Drain — RUN BLOCKED (Leg D §4 / D3b)`,
@@ -2005,8 +2793,10 @@ export class RunOrchestratorService {
       expected: string;
       northStarAnchors: string;
     };
+    /** B04 fix cycle 3 (validator V2): captured runs.generation when reached via startRunDetached. */
+    expectedGeneration?: number;
   }): Promise<void> {
-    const { runId, runDir, batchId, taskKey, project, loop } = params;
+    const { runId, runDir, batchId, taskKey, project, loop, expectedGeneration } = params;
 
     // Leg D §5: the deploy gate keys off run_tasks.batch (persisted normalized label), NOT the task_key
     // prefix. Resolve the just-completed task's durable batch; a task key with NO B#- prefix deploy-gates
@@ -2070,7 +2860,7 @@ This run will not advance past batch ${batchPrefix}.
       } catch {}
 
       // #52: missing deploy config is operator-recoverable (add dev_url/config), not a failure.
-      this.transitionRunToBlocked(runId, `Batch ${batchPrefix} deploy configuration is missing; operator configuration is required.`, project, 'operator-pause');
+      this.transitionRunToBlocked(runId, `Batch ${batchPrefix} deploy configuration is missing; operator configuration is required.`, project, 'operator-pause', expectedGeneration);
 
       // Emit a visible callback for the gate (helps watcher + artifacts)
       try {
@@ -2106,7 +2896,7 @@ This run will not advance past batch ${batchPrefix}.
       try {
         await fs.appendFile(cbPath, `\n[helm callback] implementer ${batchId} STATUS: BLOCKED — batch ${batchPrefix} deploy failed: ${deployRes.note}\n`, 'utf8');
       } catch {}
-      this.transitionRunToBlocked(runId, `Batch ${batchPrefix} deploy failed: ${deployRes.note}`, project);
+      this.transitionRunToBlocked(runId, `Batch ${batchPrefix} deploy failed: ${deployRes.note}`, project, 'failure', expectedGeneration);
       return;
     }
 
@@ -2184,7 +2974,7 @@ Use the exact JROM-clone standards: adversarial, verify against requirements con
       await fs.appendFile(cbPath, `\n[helm callback] validator ${batchId} STATUS: FAIL — B10-T06 batch ${batchPrefix} DEV UI-proof rejected; run blocked at batch boundary\n`, 'utf8');
     } catch {}
     try {
-      this.transitionRunToBlocked(runId, `Batch ${batchPrefix} DEV UI proof was rejected.`, project);
+      this.transitionRunToBlocked(runId, `Batch ${batchPrefix} DEV UI proof was rejected.`, project, 'failure', expectedGeneration);
       this.deps.artifacts.recordArtifact(runId, 'batch-deploy-proof-failed', `batch-${batchPrefix}-deploy-proof-failed.md`);
     } catch {}
   }
@@ -2200,10 +2990,48 @@ Use the exact JROM-clone standards: adversarial, verify against requirements con
     batchId: string,
     project: any,
     loop: OrchestratorLoop,
-    queue: TaskQueueService = this.deps.queue
+    queue: TaskQueueService = this.deps.queue,
+    /** B04 fix cycle 3 (validator V2): captured runs.generation when reached via startRunDetached. */
+    expectedGeneration?: number
   ): Promise<void> {
-    let nextTaskId: number | null;
-    while ((nextTaskId = queue.getNextReady(runId)) != null) {
+    // B04 fix cycle 4 (redteam-sol R3 C2, CRITICAL): expectedGeneration was previously forwarded only
+    // to terminal writers below — this claim loop itself had no ownership check at all.
+    // TaskQueueService is keyed by numeric runId; a recycled occupant clears and re-enqueues under the
+    // SAME id (task-queue-service.ts clearRun/enqueue), so a stale continuation could claim the NEW
+    // occupant's own token. That token legitimately carries the new occupant's own fresh generation —
+    // B03's per-task terminal CAS is not a defense against this, because the claim itself is not
+    // stale from the queue's point of view. The harm is that the STALE continuation would then execute
+    // the work with ITS OWN (wrong) project/plan/runDir context and mark the new occupant's task
+    // complete. Fence every claim attempt on runs.id + generation BEFORE calling claimNextReady —
+    // never claim-then-reject (a claim mutates queue state; rejecting after the fact would still have
+    // consumed the new occupant's dispatch slot).
+    const genGated = expectedGeneration != null && Number.isFinite(Number(expectedGeneration));
+    const ownsCurrentGeneration = (): boolean => {
+      if (!genGated) return true; // no captured token (non-detached call) — unchanged, ungated behavior
+      try {
+        const row = this.deps.artifacts['db'].raw
+          .prepare('SELECT generation FROM runs WHERE id = ?')
+          .get(runId) as { generation: number } | undefined;
+        return !!row && Number(row.generation) === Number(expectedGeneration);
+      } catch {
+        return false; // read failure — fail closed, never assume ownership
+      }
+    };
+    let claim: TaskTerminalToken | null = null;
+    while (true) {
+      if (!ownsCurrentGeneration()) {
+        if (genGated) {
+          console.warn(
+            `[run-orchestrator] drainDispatch stopped for run ${runId} generation ${expectedGeneration} — no longer current (stale continuation); no further claims`
+          );
+        }
+        break;
+      }
+      claim = queue.claimNextReady(runId);
+      if (claim == null) break;
+      // B03 C1: freeze token at claim; carry through await — never rebuild from taskId maps at mark*.
+      const terminalToken = claim;
+      const nextTaskId = terminalToken.taskId;
       // R5a: task boundary — re-check before EVERY task dispatch (run-74 zombie evidence:
       // a run UPDATEd to failed kept spawning implementer sessions for 30+ min).
       this.assertRunActive(runId, 'task-boundary');
@@ -2266,6 +3094,20 @@ validation_criteria: ${validationCriteria}
 `;
       const fullImplBrief = base.replace('<!-- PROJCORE-STATUS-CONTRACT v2 -->', `<!-- PROJCORE-STATUS-CONTRACT v2 -->${taskBody}`).trim();
 
+      // B04 fix cycle 5 (validator R4): re-check ownership immediately before loop.runTask. The
+      // awaited loadPlanFromRunDir above is a window where the run row can be deleted and recycled by
+      // a new occupant between the pre-claim fence (top of this loop) and here — the claimed
+      // terminalToken stays structurally valid (a real, frozen token), so dispatching now would
+      // execute THIS continuation's own stale project/plan/runDir/brief against the numeric task id
+      // the new occupant now owns. Do not runTask and do not mark* — leave the new occupant's queue
+      // slot untouched; only its own continuation may claim and complete it.
+      if (!ownsCurrentGeneration()) {
+        console.warn(
+          `[run-orchestrator] drainDispatch aborted for run ${runId} task ${nextTaskId} — generation ${expectedGeneration} no longer current after plan load (stale continuation); loop.runTask skipped`
+        );
+        break;
+      }
+
       try {
         const tres = await loop.runTask({
           brief: fullImplBrief,
@@ -2282,7 +3124,7 @@ validation_criteria: ${validationCriteria}
           briefContract,
         });
         if (tres.finalStatus === 'PASS') {
-          queue.markComplete(nextTaskId, runId);
+          queue.markComplete(terminalToken);
           // B10-T06: after any PASS, check if this completed a batch. If so, run deploy + DEV UI-proof gate.
           // Only acts on batch boundary (last task of the batch PASSed). Does not affect per-task flow.
           // Leg D §5: keying the gate off the persisted `batch` means it now fires for EVERY labeled-batch
@@ -2300,22 +3142,23 @@ validation_criteria: ${validationCriteria}
               loop,
               nextTaskId,
               briefContract,
+              expectedGeneration,
             });
           }
         } else if (tres.finalStatus === 'DEFERRED') {
-          queue.markDeferred(nextTaskId, runId);
+          queue.markDeferred(terminalToken);
         } else if (tres.finalStatus === 'BLOCKED') {
           // phase=blocked + critical-repro-pause.md already written inside loop (R-F3 operator-facing); stop dispatch
           console.log(`[RunOrchestrator] user-critical repro pause triggered for run ${runId}`);
           break;
         } else {
-          queue.markFailed(nextTaskId, runId);
+          queue.markFailed(terminalToken);
         }
       } catch (e: any) {
         // R5a: a run-abort stops the WHOLE loop (task already reaped/marked by the loop's own
         // abort path) — mark the in-flight task failed for bookkeeping and propagate.
         if (e instanceof RunAbortedError) {
-          try { queue.markFailed(nextTaskId, runId); } catch {}
+          try { queue.markFailed(terminalToken); } catch {}
           throw e;
         }
         // Surfacing a swallowed runTask exception is important: a silent catch here hid an issue-path
@@ -2325,7 +3168,7 @@ validation_criteria: ${validationCriteria}
           const aid = this.deps.artifacts.recordAttempt(nextTaskId, 99);
           this.deps.artifacts.recordValidation(aid, 'FAIL', `runTask exception: ${e?.message || e}`);
         } catch {}
-        queue.markFailed(nextTaskId, runId);
+        queue.markFailed(terminalToken);
       }
     }
   }
@@ -2348,8 +3191,10 @@ validation_criteria: ${validationCriteria}
     project: any;
     loop: OrchestratorLoop;
     queue?: TaskQueueService;
+    /** B04 fix cycle 3 (validator V2): captured runs.generation when reached via startRunDetached. */
+    expectedGeneration?: number;
   }): Promise<{ verdict: 'PASS' | 'FAIL' | 'RECURRENCE_PAUSE' | 'SKIPPED'; injected?: number }> {
-    const { runId, runDir, batchId, project } = params;
+    const { runId, runDir, batchId, project, expectedGeneration } = params;
     const queue = params.queue ?? this.deps.queue;
 
     // Load cycle final_tests_enabled (respect B11-T01). Default-on if no cycle row.
@@ -2409,7 +3254,7 @@ This run will not advance past Final Tests for this cycle.
 
       // #52: missing final-test config is an operator-recoverable PAUSE, not a failure. The run's tasks
       // all passed; it merely cannot run final tests until dev_url/smoke/e2e are configured.
-      this.transitionRunToBlocked(runId, 'Final-test configuration is missing; operator configuration is required.', project, 'operator-pause');
+      this.transitionRunToBlocked(runId, 'Final-test configuration is missing; operator configuration is required.', project, 'operator-pause', expectedGeneration);
 
       try {
         await fs.appendFile(cbPath, `\n[helm callback] implementer ${batchId} STATUS: BLOCKED — final tests paused (no smokeCmd / e2eCmd / devUrl)\n`, 'utf8');
@@ -2507,7 +3352,7 @@ This run will not advance past Final Tests for this cycle.
         const seen = await this.hasSeenFinalFailureSig(runDir, sig);
         if (seen) {
           // Primary terminator: same failure after escalation chain for the prior fix task → pause, no re-inject
-          await this.doFinalTestRecurrencePause(runId, runDir, batchId, sig, finalVerdict, cbPath);
+          await this.doFinalTestRecurrencePause(runId, runDir, batchId, sig, finalVerdict, cbPath, expectedGeneration);
           return { verdict: 'RECURRENCE_PAUSE' };
         }
         await this.recordSeenFinalFailureSig(runDir, sig);
@@ -2593,7 +3438,7 @@ This run will not advance past Final Tests for this cycle.
     } catch {}
   }
 
-  private async doFinalTestRecurrencePause(runId: number, runDir: string, batchId: string, sig: string, finalVerdict: any, cbPath: string): Promise<void> {
+  private async doFinalTestRecurrencePause(runId: number, runDir: string, batchId: string, sig: string, finalVerdict: any, cbPath: string, expectedGeneration?: number): Promise<void> {
     const pauseNote = `# Final Test Failure Recurred — Pause (B11-T03)
 
 Same failure signature detected after prior fix task (which exhausted B10-T04 repro + B10-T05 escalation chain).
@@ -2613,7 +3458,7 @@ Operator action required.
       this.deps.artifacts.recordArtifact(runId, 'final-test-recurrence-pause', 'final-test-recurrence-pause.md');
     } catch {}
 
-    this.transitionRunToBlocked(runId, `Final-test failure ${sig} recurred after the escalation chain; operator action is required.`);
+    this.transitionRunToBlocked(runId, `Final-test failure ${sig} recurred after the escalation chain; operator action is required.`, undefined, 'failure', expectedGeneration);
 
     try {
       await fs.appendFile(cbPath, `\n[helm callback] implementer ${batchId} STATUS: BLOCKED — final-test failure ${sig} recurred after escalation chain; paused (no infinite loop)\n`, 'utf8');
@@ -2622,7 +3467,7 @@ Operator action required.
     console.log(`[RunOrchestrator B11-T03] RECURRENCE PAUSE for sig ${sig} — final-test-recurrence-pause.md + phase=blocked`);
   }
 
-  private async doMaxFixItersVisiblePause(runId: number, runDir: string, batchId: string, cbPath: string, lastOutcome: any): Promise<void> {
+  private async doMaxFixItersVisiblePause(runId: number, runDir: string, batchId: string, cbPath: string, lastOutcome: any, expectedGeneration?: number): Promise<void> {
     const note = `# Max Fix Iterations Reached — Final Tests Still Failing (B11-T03)
 
 MAX_FIX_ITERS=3 backstop hit while final tests have not passed (distinct or non-converging failures).
@@ -2641,7 +3486,7 @@ Operator intervention required. Recurrence sig is primary; this is the visible h
       this.deps.artifacts.recordArtifact(runId, 'final-tests-max-fix-iters-reached', 'final-tests-max-fix-iters-reached.md');
     } catch {}
 
-    this.transitionRunToBlocked(runId, 'Final tests remain failing after the maximum automatic fix iterations; operator action is required.');
+    this.transitionRunToBlocked(runId, 'Final tests remain failing after the maximum automatic fix iterations; operator action is required.', undefined, 'failure', expectedGeneration);
 
     try {
       await fs.appendFile(cbPath, `\n[helm callback] implementer ${batchId} STATUS: BLOCKED — max fix iterations reached while final tests still failing; visible pause (no fake pass)\n`, 'utf8');

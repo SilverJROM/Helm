@@ -17,6 +17,7 @@ import { registerAuthRoutes } from "./api/routes/auth-routes.js";
 import { registerProjectAgentRoutes } from "./api/routes/project-agent-routes.js";
 import { registerPhaseAgentRoutes } from "./api/routes/phase-agent-routes.js";
 import { registerPlannerPanelRoutes } from "./api/routes/planner-panel-routes.js";
+import { registerDiscoveryHandoffRoutes } from "./api/routes/discovery-handoff-routes.js";
 import { registerProjectRoleRosterRoutes } from "./api/routes/project-role-roster-routes.js";
 import {
   isLoopbackAddress,
@@ -29,7 +30,8 @@ import { AgentAssignmentService } from "./services/agent-assignment-service.js";
 import { PhaseStaffingService } from "./services/phase-staffing.js";
 import { ToolkitService } from "./services/toolkit-service.js";
 import { MasterModelService } from "./services/master-model-service.js";
-import { TmuxService } from "./tmux/tmux-service.js";
+import { TmuxService, SessionNameCollisionError } from "./tmux/tmux-service.js";
+import { buildTmuxSessionRegistryHook } from "./tmux/session-registry-hook.js";
 import { AgentEventsService } from "./services/agent-events-service.js";
 import { parseCallbacksMd, toRunChatMessages, mergeChatMessages, CallbackTsCache, tsToMs } from "./services/run-chat-merge.js";
 import { ProviderResolverService } from "./services/provider-resolver-service.js";
@@ -37,7 +39,13 @@ import { createScopedChatSidPre } from "./services/delivery-channel.js";
 import { MasterRuntimeService } from "./services/master-runtime-service.js";
 import { WorkerService } from "./services/worker-service.js";
 import { HelmIdentityService, requireActiveNativeProject } from "./services/helm-identity-service.js";
-import { SessionRegistryService } from "./services/session-registry-service.js";
+import { SessionRegistryService, sessionStatusTokenFromRow } from "./services/session-registry-service.js";
+import { SessionCloseService } from "./services/session-close-service.js";
+import { registerSessionCloseRoutes } from "./api/routes/session-close-routes.js";
+import { HousekeeperService } from "./services/housekeeper-service.js";
+import { HouseUsageSelector } from "./services/house-usage-selector.js";
+import { registerHousekeeperRoutes } from "./api/routes/housekeeper-routes.js";
+import { configureWorkerRuntimeFinalize } from "./services/worker-runtime-finalize.js";
 import { UsageGatewayService } from "./services/usage-gateway-service.js";
 import { ModelService } from "./services/model-service.js";
 import { RoleTierService } from "./services/role-tier-service.js";
@@ -53,6 +61,7 @@ import { PlumbingWatcherService } from "./services/plumbing-watcher-service.js";
 import { ProjectService, serializeProjectTags } from "./services/project-service.js";
 import { ProjectAgentService } from "./services/project-agent-service.js";
 import { PlannerPanelService } from "./services/planner-panel-service.js";
+import { buildCycleSeatReadiness } from "./services/cycle-seat-preview.js";
 import { ProjectDocsService } from "./services/project-docs-service.js";
 import { ProjectStatusService } from "./services/project-status-service.js";
 import { TaskService } from "./services/task-service.js";
@@ -122,6 +131,10 @@ class FakeTmuxService {
   async terminateSession(_name: string) { }
   async terminatePane(_target: string) { }
   async forceKillPane(_target: string) { }
+  // S14a V4: human-close tag gate under USE_FAKE_TMUX=1 — treat fake sessions as Helm-created.
+  async sessionHasHelmChildTag(_name: string) { return true; }
+  async sessionActivity(_name: string) { return null; }
+  async sessionAttached(_name: string) { return null; }
   async capturePane(target: string, _lines = 200) { return this.panes.get(target) ?? this.basePane(); }
   async waitForReady(_target: string, _signal = '❯', _timeoutMs = 30000) { return true; }
 
@@ -134,6 +147,17 @@ class FakeTmuxService {
   async compactContext(target: string, provider: string = 'codex') {
     return { issued: true, verified: true, postCapture: '❯ ready\n> ready\nHuman: ' };
   }
+}
+
+class HousekeeperNoopTransport implements ITransport {
+  async spawn(params: Parameters<ITransport['spawn']>[0]): Promise<{ handle: string; role: string }> {
+    return {
+      handle: `housekeeper-noop:${params.sessionName ?? params.role}`,
+      role: params.role,
+    };
+  }
+
+  async reap(_handle: string, _reason = 'complete'): Promise<void> {}
 }
 
 const __filename = fileURLToPath(import.meta.url);
@@ -276,18 +300,21 @@ async function main(): Promise<void> {
   // Helm session (RealTransport, WorkerService, MasterRuntimeService, ChatSessionService,
   // ModelValidationService) is captured centrally. Real TmuxService only (FakeTmuxService has no hook).
   const sessionRegistry = new SessionRegistryService(db);
+  // S14a: human manual close (owner=human only). Uses shared tmuxService; tests inject fake via service unit tests.
+  const sessionCloseService = new SessionCloseService(sessionRegistry, tmuxService as any);
+  // AC19 / F-07: extracted to buildTmuxSessionRegistryHook (session-registry-hook.ts) — onCreate no
+  // longer swallows a register() failure, since TmuxService.publishCreatedSession now fail-closes the
+  // create and tears down the just-created session on a thrown onCreate.
   if (typeof (tmuxService as any).setRegistryHook === 'function') {
-    (tmuxService as any).setRegistryHook({
-      // A2 (R4.16): forward optional projectId/runId/kind from createSession so helm_sessions
-      // rows land linked at the choke point (planning seats no longer NULL).
-      onCreate: (name: string, opts?: { projectId?: number | null; runId?: number | null; kind?: string }) => {
-        try { sessionRegistry.register(name, opts ?? {}); } catch {}
-      },
-      onTerminate: (name: string) => { try { sessionRegistry.markReaped(name); } catch {} },
-      // SL-R2/R4: active-input refreshes last_used_at so the TTL means "idle for TTL" (in-use sessions kept).
-      onUse: (name: string) => { try { sessionRegistry.touch(name); } catch {} }
-    });
+    (tmuxService as any).setRegistryHook(buildTmuxSessionRegistryHook(sessionRegistry));
   }
+  // S02 + B02: wire CAS markIdle into shared worker_runtimes finalizer (no SQL dup).
+  // First successful terminal transition asserts helm_sessions idle so the janitor later sees ownership truth.
+  configureWorkerRuntimeFinalize({
+    markIdle: (token, reason) => {
+      try { sessionRegistry.markIdle(token, reason); } catch {}
+    },
+  });
   const modelValidationService = new ModelValidationService(db, undefined, {}, tmuxService);
   // B2 (kloo/D3+D5): runtime discovery of kloo routes (profiles.json) + per-route live model catalog.
   const klooDiscovery = new KlooDiscoveryService();
@@ -335,7 +362,9 @@ async function main(): Promise<void> {
     resolverService,
     memoryService,
     projectService,
-    fenceDir: process.env.HELM_FENCE_DIR || process.cwd()
+    fenceDir: process.env.HELM_FENCE_DIR || process.cwd(),
+    // E8 FIX2 / R-cycle-session-continuity: durable resumable-conversation lookup/persist.
+    db: db.raw,
   });
 
   // F2 round-8 (finding #1): SID↔scope binding. ONE shared pre-handler resolves the session and verifies the
@@ -386,7 +415,17 @@ async function main(): Promise<void> {
   // (or landed unlinked). Workers already used this shared instance; planning now matches.
   const orchT: ITransport = useFakeTmux
     ? new FakeTransport()
-    : new RealTransport({ artifacts: runArtifactService, tmux: tmuxService });
+    : new RealTransport({
+        artifacts: runArtifactService,
+        tmux: tmuxService,
+      });
+  const housekeeperService = new HousekeeperService(
+    db,
+    sessionRegistry,
+    tmuxService as any,
+    new HouseUsageSelector({ gateway: usageGateway }),
+    new HousekeeperNoopTransport(),
+  );
   const planningPhase = new PlanningPhaseService(orchT, runArtifactService, taskQueue);
   const escalationService = new EscalationService(db, usageGateway, assignmentService);  // B9fix2 F4: project escalation ladder via resolver
   const panelService = new PanelService(orchT, runArtifactService);
@@ -1052,18 +1091,19 @@ async function main(): Promise<void> {
     return { sessions: await chatSessionService.listActiveSessions() };
   });
 
-  // SL-R1: guarded read of the session-lifecycle registry (every Helm-created tmux session + status).
-  app.get('/api/sessions', { preHandler: [authMiddleware, requireOwnerPre] }, async () => {
-    const sessions = sessionRegistry.list().map((s) => ({
-      name: s.name,
-      kind: s.kind,
-      status: s.status,
-      project_id: s.project_id,
-      run_id: s.run_id,
-      created_at: s.created_at,
-      ended_at: s.ended_at
-    }));
-    return { sessions };
+  // S14a: GET /api/sessions (+owner) + POST /api/sessions/:name/close (human-only). Extracted for inject tests.
+  registerSessionCloseRoutes(app, {
+    sessionRegistry,
+    sessionCloseService,
+    authMiddleware,
+    requireOwnerPre,
+    requireLocalLaunchPre,
+  });
+  registerHousekeeperRoutes(app, {
+    housekeeperService,
+    authMiddleware,
+    requireOwnerPre,
+    requireLocalLaunchPre,
   });
 
   app.post('/api/agents/:agentId/chat-session', { preHandler: [authMiddleware, requireOwnerPre, requireLocalLaunchPre] }, async (request: any, reply: any) => {
@@ -1084,6 +1124,15 @@ async function main(): Promise<void> {
       // tmux_session + spawn_model surfaced so the UI can show them + JROM can `tmux attach -t <name>`.
       return { session_id: result.sessionId, tmux_session: result.tmuxSession, spawn_model: result.spawnModel };
     } catch (e: any) {
+      // B09 / AC12: preserve B08 typed collision as a stable 409 refusal (not a generic 500).
+      if (e?.code === 'SESSION_NAME_COLLISION' || e instanceof SessionNameCollisionError || e?.name === 'SessionNameCollisionError') {
+        return reply.code(409).send({
+          error: String(e.message || 'session name collision refused'),
+          code: 'SESSION_NAME_COLLISION',
+          reason: e.reason ?? 'exists_unknown',
+          session_name: e.sessionName ?? null,
+        });
+      }
       if (e.message?.includes('not validated')) return reply.code(409).send({ error: e.message });
       return reply.code(500).send({ error: e.message });
     }
@@ -1304,8 +1353,26 @@ async function main(): Promise<void> {
     }
     try {
       const result = await chatSessionService.create(agentId, body.model_id, pid, { projectFenceDir: project.directory, activeCycle });
-      return { session_id: result.sessionId, tmux_session: result.tmuxSession, spawn_model: result.spawnModel, project_dir: project.directory };
+      // E8 FIX2 / R-cycle-session-continuity req #6: surface which conversation this seat is
+      // attached to (and whether it's a resumed one) so the operator can see it, not just infer it.
+      return {
+        session_id: result.sessionId,
+        tmux_session: result.tmuxSession,
+        spawn_model: result.spawnModel,
+        project_dir: project.directory,
+        conversation_id: result.conversationId,
+        resumed: result.resumed,
+      };
     } catch (e: any) {
+      // B09 / AC12: preserve B08 typed collision as a stable 409 refusal (not a generic 500).
+      if (e?.code === 'SESSION_NAME_COLLISION' || e instanceof SessionNameCollisionError || e?.name === 'SessionNameCollisionError') {
+        return reply.code(409).send({
+          error: String(e.message || 'session name collision refused'),
+          code: 'SESSION_NAME_COLLISION',
+          reason: e.reason ?? 'exists_unknown',
+          session_name: e.sessionName ?? null,
+        });
+      }
       if (e.message?.includes('not validated')) return reply.code(409).send({ error: e.message });
       return reply.code(500).send({ error: e.message });
     }
@@ -1808,14 +1875,15 @@ async function main(): Promise<void> {
     }
   });
 
-  // A3 SEAM-1 (R4.17): GET /api/cycles/:id/seats — every worker_runtimes seat for runs of this cycle,
-  // live OR historical (reaped/done/failed kept). Pane key = persisted worker_runtimes.id.
-  // live = state launching|running AND tmux target still exists. No schema migration; join via runs.
+  // A3 SEAM-1 (R4.17) + S07: GET /api/cycles/:id/seats — runtime worker_runtimes (live/historical)
+  // PLUS S05 PlanningStaffingService preview (pre-start) and digest-mapped roster (post-start).
+  // Read-only: no writes, spawns, or credentials. Pane key = worker_runtimes.id when present.
   app.get('/api/cycles/:id/seats', { preHandler: [authMiddleware, requireOwnerPre] }, async (request: any, reply: any) => {
     const id = Number(request.params.id);
     if (!Number.isInteger(id) || id <= 0) return reply.code(400).send({ error: 'invalid cycle id' });
-    const cycle: any = db.prepare('SELECT id FROM cycles WHERE id = ?').get(id);
+    const cycle: any = db.prepare('SELECT id, project_id FROM cycles WHERE id = ?').get(id);
     if (!cycle) return reply.code(404).send({ error: 'unknown cycle' });
+    const projectId = Number(cycle.project_id);
     const rows: any[] = db.prepare(
       `SELECT wr.id, wr.role, wr.provider, wr.model, wr.session, wr.state,
               wr.run_id AS runId, wr.correlation_id AS batchId,
@@ -1825,7 +1893,7 @@ async function main(): Promise<void> {
        WHERE runs.cycle_id = ?
        ORDER BY wr.id ASC`
     ).all(id);
-    const seats = [];
+    const runtimeBase = [];
     for (const r of rows) {
       const stateLive = r.state === 'launching' || r.state === 'running';
       let tmuxAlive = false;
@@ -1836,7 +1904,7 @@ async function main(): Promise<void> {
           tmuxAlive = false;
         }
       }
-      seats.push({
+      runtimeBase.push({
         id: r.id,
         role: r.role,
         provider: r.provider,
@@ -1844,14 +1912,52 @@ async function main(): Promise<void> {
         session: r.session || null,
         state: r.state,
         runId: r.runId,
-        cycleId: id,
         batchId: r.batchId || null,
         startedAt: r.startedAt || null,
         endedAt: r.endedAt || null,
         live: !!(stateLive && tmuxAlive)
       });
     }
-    return { seats };
+
+    // S07: S05 manifest preview + map runtimes against digest/identities (no side effects).
+    const readiness = buildCycleSeatReadiness({
+      db,
+      assignments: assignmentService,
+      plannerPanel: plannerPanelService,
+      cycleId: id,
+      projectId,
+      runtimeSeats: runtimeBase,
+    });
+
+    // Backward-compatible `seats` = runtime list (A3); enriched fields for Planning tab / handoff card.
+    return {
+      seats: readiness.runtime.seats.length
+        ? readiness.runtime.seats.map((s) => ({
+            id: s.id,
+            role: s.role,
+            provider: s.provider,
+            model: s.model,
+            session: s.session,
+            state: s.state,
+            runId: s.runId,
+            cycleId: id,
+            batchId: s.batchId,
+            startedAt: s.startedAt,
+            endedAt: s.endedAt,
+            live: s.live,
+            matchesPreview: s.matchesPreview,
+            previewRole: s.previewRole,
+            previewSlot: s.previewSlot,
+          }))
+        : [],
+      mode: readiness.mode,
+      digest: readiness.digest,
+      blocked: readiness.blocked,
+      blockReasons: readiness.blockReasons,
+      emptyPanelMessage: readiness.emptyPanelMessage,
+      preview: readiness.preview,
+      runtime: readiness.runtime,
+    };
   });
 
   // A3 SEAM-1 path-safe capture: session resolved ONLY from (cycleId, runtimeId) in DB.
@@ -1980,6 +2086,20 @@ async function main(): Promise<void> {
   registerPlannerPanelRoutes(app, {
     projectService,
     plannerPanelService,
+    authMiddleware,
+    requireOwnerPre,
+    requireLocalLaunchPre,
+  });
+
+  // S09: Discovery structured ready callback (credential auth; no owner browser token; no Planning start).
+  // S11: owner+loopback confirm/decline bridge (CAS pending→starting → S10 once; 202 after durable run).
+  registerDiscoveryHandoffRoutes(app, {
+    db,
+    assignmentService,
+    cycleService,
+    plannerPanelService,
+    artifacts: runArtifactService,
+    orchestrator: runOrchestratorService,
     authMiddleware,
     requireOwnerPre,
     requireLocalLaunchPre,
@@ -2794,6 +2914,22 @@ async function main(): Promise<void> {
     if (!projectService.getProject(pid)) return reply.code(404).send({ error: 'unknown project' });
     const body = request.body || {};
 
+    // S11 / AC29: bodyless (and any direct) start-planning cannot bypass a live owner handoff.
+    // Owner must confirm via POST /api/cycles/:id/discovery-handoff/confirm.
+    try {
+      const { DiscoveryHandoffService } = await import('./services/discovery-handoff-service.js');
+      const handoffs = new DiscoveryHandoffService(db);
+      const live = handoffs.getLive(cid);
+      if (live && (live.state === 'pending' || live.state === 'starting')) {
+        return reply.code(409).send({
+          error:
+            'pending discovery handoff requires owner confirm at /api/cycles/:id/discovery-handoff/confirm',
+          code: 'HANDOFF_CONFIRM_REQUIRED',
+          handoffId: live.id,
+        });
+      }
+    } catch { /* if handoff store unavailable, fall through */ }
+
     // Never two concurrent runs for a cycle (mirrors IS-R4; makes a double-click idempotent).
     try {
       const rs = runArtifactService.getCycleRunState(cid);
@@ -2853,6 +2989,33 @@ async function main(): Promise<void> {
         planValid = doc.valid === true;
       } catch { planValid = false; }
       if (!planValid) return reply.code(400).send({ error: 'author a valid plan.md first' });
+      // S13 / AC27–28: valid plan.md alone is not enough — require cycle-linked Planning agreement
+      // with byte-matching plan + confirmed manifest digest.
+      try {
+        const {
+          assertPlanningProvenanceForImplementation,
+          PLANNING_REQUIRED_CODE,
+        } = await import('./services/planning-provenance-service.js');
+        const gate = await assertPlanningProvenanceForImplementation({
+          db,
+          cycleService,
+          projectId: pid,
+          cycleId: cid,
+          assignments: assignmentService,
+          plannerPanel: plannerPanelService,
+        });
+        if (!gate.ok) {
+          return reply.code(400).send({
+            error: gate.message,
+            code: gate.code || PLANNING_REQUIRED_CODE,
+          });
+        }
+      } catch (e: any) {
+        return reply.code(400).send({
+          error: e?.message || 'Planning provenance check failed',
+          code: 'PLANNING_REQUIRED',
+        });
+      }
       cyclePlan = true;
       prompt = (body.prompt || `implement cycle ${cid} from plan.md`).trim();
     }
@@ -3316,7 +3479,17 @@ async function main(): Promise<void> {
       return reply.code(409).send({ error: 'already closed' });
     }
     try {
-      await tmuxService.terminateSession(session);
+      // B02 C1: acquire token once at close decision (not a create path; no late re-capture loop).
+      // Prefer retained identity from registry at the start of this close handler only.
+      const closeRow = sessionRegistry.get(session);
+      const closeTok =
+        closeRow && closeRow.status !== 'reaped'
+          ? sessionStatusTokenFromRow(closeRow)
+          : undefined;
+      await tmuxService.terminateSession(
+        session,
+        closeTok ? { sessionToken: closeTok } : { noRegistryWrite: true }
+      );
     } catch (e: any) {
       // best effort; continue to mark closed
     }
@@ -3526,6 +3699,7 @@ async function main(): Promise<void> {
         try { await chatSessionService.terminate(sid); } catch {}
       }
       workerService.stopReaper();
+      housekeeperService.stopScheduler();
       await workerService.reapAll();
       runtimeService.stopSupervisor();
       // P2-3: stop auto-fallback before dbs (like supervisor)
@@ -3556,6 +3730,7 @@ async function main(): Promise<void> {
         try { await chatSessionService.terminate(sid); } catch {}
       }
       workerService.stopReaper();
+      housekeeperService.stopScheduler();
       await workerService.reapAll();
       // P2-3: stop auto-fallback (before app.close)
       runtimeService.stopAutoFallback();
@@ -3569,6 +3744,10 @@ async function main(): Promise<void> {
 
   await app.listen({ port: config.port, host: config.host });
   console.log(`Helm listening on ${config.host}:${config.port}`);
+
+  housekeeperService.startScheduler(config.HELM_HOUSEKEEPER_SCHEDULER_MS, {
+    investigationCooldownMs: config.HELM_HOUSEKEEPER_COOLDOWN_MS,
+  });
 
   // R2 (CC-CHAT-3): CLI freshness preflight — once, best-effort, fire-and-forget AFTER listen so
   // it can never block or fail boot (belt-and-suspenders on top of the R1 interstitial interceptor;

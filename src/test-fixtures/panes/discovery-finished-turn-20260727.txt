@@ -1,3 +1,4 @@
+# HELM_PROVENANCE: source_session=discovery:e667274d7b3f39d7 capture_date=2026-07-27
 CLAUDE_CODE_DISABLE_CLAUDE_MDS=1 CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 CLAUDE_CODE_DISABLE_BUNDLED_SKILLS
 =1 /home/agjrom/websites/Helm/dist/tools/helm-sandbox /home/agjrom/tools/memory_mcp claude --model cl
 aude-opus-5 --dangerously-skip-permissions --disallowedTools AskUserQuestion ExitPlanMode --setting-s
@@ -173,4 +174,3 @@ t be answered and will hang the session. Ask every question as plain text and le
 ❯ 
 ─────────────────────────────────────────────────────────────────────────────────────────────────────
   ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent
-

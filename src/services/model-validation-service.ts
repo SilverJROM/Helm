@@ -4,6 +4,7 @@ import { DatabaseService } from '../db/database.js';
 import { TmuxService } from '../tmux/tmux-service.js';
 import { KlooDiscoveryService, type KlooValidateResult } from './kloo-discovery-service.js';
 import { applyEnvelopeIsolation, HELM_ENVELOPE_DIRECTIVE } from './envelope-isolation.js';
+import type { SessionStatusToken } from './session-registry-service.js';
 
 // Minimal seam so tests can inject a stub discovery without hitting the network.
 export interface KlooValidator {
@@ -302,8 +303,17 @@ export class ModelValidationService {
     const marker = `HELM_VALID_${nonce}`;
     const prompt = `Reply with exactly ${marker} and no other text.`;
 
+    // B02 C1: create-time token retained for finally teardown (never late SELECT-by-name).
+    let createToken: SessionStatusToken | undefined;
     try {
-      await this.tmux!.createSession(sessionName);
+      // S05: validation probe seats are Helm-owned.
+      const sessionTokenOut: { token?: SessionStatusToken } = {};
+      await this.tmux!.createSession(sessionName, undefined, {
+        owner: 'helm',
+        kind: 'test',
+        sessionTokenOut,
+      });
+      createToken = sessionTokenOut.token;
       const baseCmd = `codex -m ${model.model_id} --dangerously-bypass-approvals-and-sandbox`;
       const { envPrefix: _envPrefix, launchCmd } = applyEnvelopeIsolation('codex', baseCmd);
       // envPrefix is '' for codex; launchCmd carries -c project_doc_max_bytes=0
@@ -329,7 +339,12 @@ export class ModelValidationService {
       }
       return { status: 'invalid', detail: `timeout: no response after ${timeoutMs}ms` };
     } finally {
-      try { await this.tmux!.terminateSession(sessionName); } catch {}
+      try {
+        await this.tmux!.terminateSession(
+          sessionName,
+          createToken ? { sessionToken: createToken } : { noRegistryWrite: true }
+        );
+      } catch {}
     }
   }
 

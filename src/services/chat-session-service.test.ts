@@ -28,6 +28,8 @@ import {
 import nodeFsSync from 'node:fs';
 import nodePathSync from 'node:path';
 import nodeOsSync from 'node:os';
+import Database from 'better-sqlite3';
+import { storeChatIdentity, getStoredChatIdentity } from './chat-session-identity.js';
 
 // The persona/rules/memories now live in a SIDECAR file the agent reads (create() pastes only a lean
 // prompt). Read that file to assert what the agent actually receives.
@@ -552,14 +554,14 @@ describe('B5 bootstrap injection (R-15, R-17)', () => {
     const block = formatActiveCycleBlock(cycle);
     expect(block).toContain('/tmp/example-project/cycle/any-project-cycle_0706');
     expect(block).toContain('All Helm work for this selected cycle');
-    expect(block).toContain('north-star.md');
-    expect(block).toContain('decisions/*.md');
+    // S01: planning phase keeps Planning contract only (no Discovery dual-block leak)
     expect(block).toContain('og-requirements.md');
     expect(block).toContain('plan.md');
     expect(block).toContain('do not use legacy names like `north_star.md`, `og_req.md`, or `execution_plan.md`');
     expect(block).not.toContain('do not use legacy names like `north-star.md`');
     expect(block).not.toContain('write exactly these files in the cycle folder:\n- `og_req.md`');
     expect(block).toContain('fenced ```json task array');
+    expect(block).not.toContain('Initial Discovery docs are ready');
 
     const msg = composeAgentSidecar(fakeAgent.definition_md, [], undefined,
       { name: 'example-project', directory: '/tmp/example-project', dev_url: null }, null, cycle);
@@ -1107,4 +1109,171 @@ describe('G1 CC chat submit-verify + terminal source (F3 primitives reuse)', () 
     expect(chatTerminal.source).toBe('chat-session');
     expect(runShape.session).not.toContain('helm-chat');
   });
+});
+
+// E8 FIX2 / R-cycle-session-continuity: reopening a chat after the in-memory ChatSessionService Map
+// is gone (server restart) currently cold-spawns AND re-prompts the agent (SOL diagnosis, "Why
+// reopening cold-spawns and re-prompts"). This suite proves the durable resume path: a stored
+// conversation id is spliced into the launch command as `--resume <uuid>` (never bare `-c`), the
+// bootstrap prompt is SKIPPED entirely (that re-send IS the re-prompt this fix removes), a cold spawn
+// captures+persists a fresh id for NEXT time, and an unresumable stored id fails open (retries once
+// as a clean cold spawn) instead of blocking the cycle.
+describe('E8 FIX2 durable chat identity (--resume <uuid>, no re-prompt, fail-open)', () => {
+  const projectDir = '/tmp/helm-e8-fix2-projdir';
+  const claudeAgent = { ...fakeAgent, provider: 'claude' as const, model: 'claude-sonnet-4-6' };
+  const assignment = {
+    getAgent: (id: number) => (id === 1 ? claudeAgent : null),
+    resolveProjectAgent: (projectId: number, agentId: number) => (
+      projectId === 7 && agentId === 1 ? { definition_md: fakeAgent.definition_md } : null
+    )
+  };
+  const claudeResolver = {
+    resolveAgentLaunchSpec: (req: any) => ({
+      provider: req.provider,
+      model: req.model,
+      launch_cmd: 'claude --model claude-sonnet-4-6 --dangerously-skip-permissions',
+      bypass_flag: null,
+      effort_flag: null,
+      callback_mechanism: 'pane',
+      session_suffix: 'claude',
+      worktree_support: { supported: false, flag: null }
+    })
+  };
+
+  function makeIdentityDb(): Database.Database {
+    const db = new Database(':memory:');
+    db.exec(`
+      CREATE TABLE chat_session_identities (
+        id INTEGER PRIMARY KEY,
+        project_id INTEGER NOT NULL,
+        agent_id INTEGER NOT NULL,
+        cycle_id INTEGER NOT NULL DEFAULT 0,
+        provider TEXT NOT NULL,
+        conversation_id TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE(project_id, agent_id, cycle_id)
+      );
+    `);
+    return db;
+  }
+
+  it('a stored id carries --resume <uuid> into the launch command AND the bootstrap prompt is NOT re-sent', async () => {
+    const fakeTmux = makeFakeTmux();
+    const db = makeIdentityDb();
+    const storedId = 'f48a4da3-ad69-615e-0000-000000000000';
+    storeChatIdentity(db, { projectId: 7, agentId: 1, cycleId: 0 }, { provider: 'claude', conversationId: storedId });
+    const svc = new ChatSessionService({
+      tmux: fakeTmux, modelService: fakeModelService as any, assignmentService: assignment as any,
+      resolverService: claudeResolver as any, db
+    });
+
+    const result = await svc.create(1, undefined, 7, { projectFenceDir: projectDir });
+
+    expect(fakeTmux.commands[0]).toContain(`--resume ${storedId}`);
+    // NEVER bare -c/--continue (ambiguous the moment two seats share a cwd — R-cycle-session-continuity.md).
+    expect(fakeTmux.commands[0]).not.toMatch(/\s-c(\s|$)/);
+    expect(fakeTmux.commands[0]).not.toContain('--continue');
+    // THE re-prompt this fix exists to remove: a resumed conversation must not receive the bootstrap paste.
+    expect(fakeTmux.sent).toHaveLength(0);
+    expect(result.resumed).toBe(true);
+    expect(result.conversationId).toBe(storedId);
+    const sess = svc.getSession(result.sessionId)!;
+    expect(sess.bootstrapSent).toBe(false);
+  });
+
+  it('a DIFFERENT cycle on the same project+agent gets its own identity — no cross-cycle bleed', async () => {
+    const fakeTmux = makeFakeTmux();
+    const db = makeIdentityDb();
+    storeChatIdentity(db, { projectId: 7, agentId: 1, cycleId: 5 }, { provider: 'claude', conversationId: 'cycle-5-uuid-00000000' });
+    const svc = new ChatSessionService({
+      tmux: fakeTmux, modelService: fakeModelService as any, assignmentService: assignment as any,
+      resolverService: claudeResolver as any, db
+    });
+
+    // A NEW cycle (id 9) on the SAME project+agent must start cold — JROM's explicit carve-out
+    // (R-cycle-session-continuity.md req #4: "a NEW cycle always starts cold").
+    const result = await svc.create(1, undefined, 7, {
+      projectFenceDir: projectDir,
+      activeCycle: { id: 9, name: 'c9', folder_name: 'c9', folder_path: '/tmp/c9', phase: '', autonomy: '' }
+    });
+    expect(fakeTmux.commands[0]).not.toContain('--resume');
+    expect(result.resumed).toBe(false);
+  });
+
+  it('no stored id → cold spawn (no --resume), and a freshly-written transcript is captured + persisted for next time', async () => {
+    const tmpHome = await nodeFsSync.promises.mkdtemp(nodePathSync.join(nodeOsSync.tmpdir(), 'helm-e8-fix2-home-'));
+    const prevHome = process.env.HOME;
+    process.env.HOME = tmpHome;
+    try {
+      const fakeTmux = makeFakeTmux();
+      const db = makeIdentityDb();
+      const svc = new ChatSessionService({
+        tmux: fakeTmux, modelService: fakeModelService as any, assignmentService: assignment as any,
+        resolverService: claudeResolver as any, db
+      });
+
+      const slug = nodePathSync.resolve(projectDir).replace(/\//g, '-');
+      const transcriptDir = nodePathSync.join(tmpHome, '.claude', 'projects', slug);
+      await nodeFsSync.promises.mkdir(transcriptDir, { recursive: true });
+      // Written DURING create() (simulates Claude Code's own write) so it lands after spawnStartMs.
+      const writeTranscript = (async () => {
+        await new Promise((r) => setTimeout(r, 30));
+        await nodeFsSync.promises.writeFile(nodePathSync.join(transcriptDir, 'newly-spawned-uuid-99999999.jsonl'), '{}\n');
+      })();
+
+      const result = await svc.create(1, undefined, 7, { projectFenceDir: projectDir });
+      await writeTranscript;
+
+      expect(fakeTmux.commands[0]).not.toContain('--resume');
+      expect(fakeTmux.sent.length).toBeGreaterThan(0); // cold spawn DOES send the bootstrap, as before this fix
+      expect(result.resumed).toBe(false);
+      expect(result.conversationId).toBe('newly-spawned-uuid-99999999');
+      expect(getStoredChatIdentity(db, { projectId: 7, agentId: 1, cycleId: 0 })).toEqual({
+        provider: 'claude', conversationId: 'newly-spawned-uuid-99999999'
+      });
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME; else process.env.HOME = prevHome;
+      await nodeFsSync.promises.rm(tmpHome, { recursive: true, force: true });
+    }
+  });
+
+  it('FAIL OPEN: an unresumable stored id (resume ready-probe fails) retries ONCE as a clean cold spawn instead of blocking the cycle', async () => {
+    const oldFake = process.env.USE_FAKE_TMUX;
+    delete process.env.USE_FAKE_TMUX; // real waitForClaudeComposerReady polling (fake-tmux short-circuits to true)
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const fakeTmux = makeFakeTmux();
+      fakeTmux.capturePane = async () => {
+        const lastCmd = fakeTmux.commands[fakeTmux.commands.length - 1] || '';
+        // The resume attempt never reaches its composer (corrupt/unresumable stored id); the cold
+        // retry (no --resume in the command) reaches it immediately.
+        if (lastCmd.includes('--resume')) return 'stuck mid-resume, never reaches composer\n';
+        return 'ready\n  bypass permissions on (shift+tab to cycle)\n';
+      };
+      const db = makeIdentityDb();
+      const badId = 'stale-unresumable-uuid-000000';
+      storeChatIdentity(db, { projectId: 7, agentId: 1, cycleId: 0 }, { provider: 'claude', conversationId: badId });
+      const svc = new ChatSessionService({
+        tmux: fakeTmux, modelService: fakeModelService as any, assignmentService: assignment as any,
+        resolverService: claudeResolver as any, db
+      });
+
+      const createPromise = svc.create(1, undefined, 7, { projectFenceDir: projectDir });
+      // Drain the resume attempt's full 60s composer-ready timeout, then the cold retry's own probe.
+      await vi.advanceTimersByTimeAsync(65_000);
+      const result = await createPromise;
+
+      expect(fakeTmux.commands).toHaveLength(2); // one resume attempt, one cold retry
+      expect(fakeTmux.commands[0]).toContain(`--resume ${badId}`);
+      expect(fakeTmux.commands[1]).not.toContain('--resume');
+      expect(result.resumed).toBe(false);
+      // The bad id must not survive to poison the NEXT spawn attempt.
+      expect(getStoredChatIdentity(db, { projectId: 7, agentId: 1, cycleId: 0 })).toBeNull();
+      // Only ONE pane was ever left live — the failed resume attempt's tmux session was torn down.
+      expect(fakeTmux.terminated).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+      if (oldFake !== undefined) process.env.USE_FAKE_TMUX = oldFake;
+    }
+  }, 75_000);
 });

@@ -67,7 +67,10 @@ describe('O5.2 RunIngestService.register + POST /api/ingest/run-register', () =>
     expect(created.body.ok).toBe(true);
     expect(created.body.project_id).toBe(1);
     expect(created.body.external_run_id).toBe('9715');
-    expect(created.body.generation).toBe(0);
+    // B04 fix cycle 1 (redteam C1): the response echoes the AUTHORITATIVE written generation
+    // (max(fresh lifecycle_seq allocation, caller-supplied 0)), not necessarily the raw supplied
+    // value — never reused/never below any generation already issued in this DB's history.
+    expect(created.body.generation).toBeGreaterThanOrEqual(envelope.generation);
 
     expect(dbs.raw.prepare('SELECT COUNT(*) AS n FROM runs').get()).toEqual({ n: 1 });
     expect(dbs.raw.prepare("SELECT COUNT(*) AS n FROM run_events WHERE event_type = 'REGISTERED'").get()).toEqual({ n: 1 });
@@ -76,7 +79,7 @@ describe('O5.2 RunIngestService.register + POST /api/ingest/run-register', () =>
     expect(run.source).toBe('ingest');
     expect(run.status).toBe('active');
     expect(run.external_run_id).toBe('9715');
-    expect(run.generation).toBe(0);
+    expect(run.generation).toBe(created.body.generation);
     expect(run.register_seal_hash).toBe(envelope.payload_hash);
 
     const replay = service.register(1, envelope);

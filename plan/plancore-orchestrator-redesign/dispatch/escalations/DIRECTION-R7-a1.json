@@ -1,0 +1,14 @@
+{
+  "slice": "R7",
+  "attempt": 1,
+  "action": "RETRY_WITH_DIRECTION",
+  "note": "FALSE PARK \u2014 not a true implementer BLOCKED. Callback was STATUS: DONE commit fc7c025, but free-text note contained the substring 'BLOCKED' (product wording for R3.15 non-convergence outcome). Driver parks on any 'BLOCKED' in the callback line (projcore-driver.py ~1322), so DONE work was rolled back to base 3e3b21f.\n\nSELF-CONFLICT FLAG: R7 a1 implementer was grok45 L2; this DIRECTION is also from grok45 brain. Process-only decision (unstick false park); code correctness stays with validator tier \u2014 not judged here.\n\nRETRY instructions for next implementer:\n1. Re-apply R7 (R3.15): non-convergence = operator-legible textual/hunk diff in blockedReason + durable final-positions report; not bare hash pairs. Prefer cherry-pick/recreate from orphan commit fc7c025 or parked-patches/R7.patch (product files only \u2014 do not restore queue.md from that patch).\n2. Focused test: npx vitest run src/services/planning-review-round-block-diff.test.ts --minWorkers=1 --maxWorkers=4\n3. CRITICAL callback hygiene: STATUS: DONE note MUST NOT contain the literal substring BLOCKED (driver false-parks). Example safe note: 'commit <sha> non-conv final-positions diff (R3.15)' \u2014 never write the word BLOCKED in the callback line.\n4. Do not widen scope. Standing safety: HELM_SESSION_JANITOR=0, no merge main, hands off A1-A6 / worker-runtime-finalize.ts / E5 session path.",
+  "raised_from": "RAISE-R7-c1.json",
+  "brain": "grok45",
+  "self_conflict": true,
+  "self_conflict_detail": "R7 a1 implementer seat was grok45 (x-tlr4e0d1295cea8_impl_grok45); brain is also grok45. Decision is process-only: false-park unstick, not code review.",
+  "rationale": "gate_failed=null; why text is DONE+commit with product note 'non-convergence BLOCKED'; park caused by substring match not STATUS:BLOCKED. RETRY re-lands work with poison-word-free callback. Not STOP_TRUE_BLOCKED (no true block). Not SKIP_TO_PROJCORE (no re-plan needed).",
+  "applied": true,
+  "outcome": "unparked",
+  "applied_at": "2026-08-01T03:01:08Z"
+}

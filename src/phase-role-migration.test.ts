@@ -10,7 +10,13 @@ import {
   V89_IBRAIN_DEFINITION_MD,
   V89_KNOWN_CANONICAL_PLANCORE_HASHES,
   V89_PLANCORE_DEFINITION_MD,
+  V110_DISCOVERY_ALLOWED_STATUSES,
+  V110_DISCOVERY_DEFINITION_MD,
+  V110_DISCOVERY_REQUIRED_ARTIFACTS,
+  V110_DISCOVERY_TERMINAL_STATUSES,
+  V110_KNOWN_STALE_DISCOVERY_HASHES,
 } from './db/schema.js';
+import { createHash } from 'node:crypto';
 import { AGENT_ROLES } from './guardrails.js';
 import { ProjectService } from './services/project-service.js';
 
@@ -239,8 +245,9 @@ describe.sequential('v90 compatibility-deletion phase-role migration', () => {
   it('fresh v90 exposes exact final CHECKs, role seeds, split prompts, and no retired session column', () => {
     const dbPath = tempDbPath('fresh');
     const dbs = new DatabaseService(dbPath);
-    expect(SCHEMA_VERSION).toBe(98);
-    expect((dbs.raw.prepare('SELECT version FROM schema_version').get() as any).version).toBe(98);
+    // SCHEMA_VERSION tracks the live tip (S08 v111+); do not pin a stale integer.
+    expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(111);
+    expect((dbs.raw.prepare('SELECT version FROM schema_version').get() as any).version).toBe(SCHEMA_VERSION);
     for (const table of ['role_bindings', 'role_defaults', 'role_capabilities']) {
       expect(checkRoles(dbs.raw, table)).toEqual(V90_ROLES);
     }
@@ -257,11 +264,11 @@ describe.sequential('v90 compatibility-deletion phase-role migration', () => {
     ).all() as any[];
     expect(capabilities.map((row) => row.role)).toEqual(['discovery', 'ibrain', 'plancore']);
     expect(capabilities.find((row) => row.role === 'discovery')).toMatchObject({
-      allowed_statuses: '["INTERVIEWING","NORTH-STAR-READY","HANDOFF","BLOCKED"]',
-      terminal_statuses: '["NORTH-STAR-READY","HANDOFF","BLOCKED"]',
+      allowed_statuses: V110_DISCOVERY_ALLOWED_STATUSES,
+      terminal_statuses: V110_DISCOVERY_TERMINAL_STATUSES,
       can_write_code: 0,
       can_escalate: 0,
-      required_artifacts: '["north-star.md","decisions/"]',
+      required_artifacts: V110_DISCOVERY_REQUIRED_ARTIFACTS,
     });
     expect(capabilities.find((row) => row.role === 'plancore')).toMatchObject({
       can_write_code: 0,
@@ -313,7 +320,7 @@ describe.sequential('v90 compatibility-deletion phase-role migration', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     const dbs = new DatabaseService(dbPath);
 
-    expect((dbs.raw.prepare('SELECT version FROM schema_version').get() as any).version).toBe(98);
+    expect((dbs.raw.prepare('SELECT version FROM schema_version').get() as any).version).toBe(SCHEMA_VERSION);
     expect(dbs.raw.prepare("SELECT name FROM agents WHERE id = 1").pluck().get()).toBe('discovery');
     expect(dbs.raw.prepare("SELECT name FROM agents WHERE id = 2").pluck().get()).toBe('plancore');
     expect(dbs.raw.prepare("SELECT definition_md FROM agents WHERE id = 2").pluck().get()).toBe('# CUSTOM PLANCORE');
@@ -339,23 +346,27 @@ describe.sequential('v90 compatibility-deletion phase-role migration', () => {
     const runtime = dbs.raw.prepare(
       'SELECT tmux_session, provider, model, role, state FROM master_runtimes WHERE project_id = 10'
     ).get() as any;
-    expect(runtime).toEqual({
+    // Live row may be remapped by later seed/hygiene migrations (e.g. claude-opus-5); role/session preserved.
+    expect(runtime).toMatchObject({
       tmux_session: 'helm-projcore-cards2',
       provider: 'claude',
-      model: 'claude-opus-4-8',
       role: 'ibrain',
       state: 'running',
     });
+    expect(String(runtime.model)).toMatch(/^claude-opus-/);
     const migrationEvent = dbs.raw.prepare(
       "SELECT run_id, event_type, payload_json FROM run_events WHERE event_type = 'V90_MASTER_RUNTIME_TRANSLATED'"
     ).get() as any;
     expect(migrationEvent.run_id).toBe('run-10');
-    expect(JSON.parse(migrationEvent.payload_json)).toMatchObject({
+    // Event records the v90 translation (model id may track current ibrain/plancore seed renames).
+    const payload = JSON.parse(migrationEvent.payload_json);
+    expect(payload).toMatchObject({
       project_id: 10,
       tmux_session: 'helm-projcore-cards2',
       from: { provider: 'projcore', model: 'run-projcore' },
-      to: { provider: 'claude', model: 'claude-opus-4-8', role: 'ibrain' },
+      to: { provider: 'claude', role: 'ibrain' },
     });
+    expect(String(payload.to?.model)).toMatch(/^claude-opus-/);
     assertV90Safety(dbs.raw);
     dbs.close();
   });
@@ -364,7 +375,7 @@ describe.sequential('v90 compatibility-deletion phase-role migration', () => {
     const dbPath = tempDbPath('v88');
     createLegacyPhaseRoleDb(dbPath, 88, '');
     const first = new DatabaseService(dbPath);
-    expect((first.raw.prepare('SELECT version FROM schema_version').get() as any).version).toBe(98);
+    expect((first.raw.prepare('SELECT version FROM schema_version').get() as any).version).toBe(SCHEMA_VERSION);
     expect(first.raw.prepare("SELECT definition_md FROM agents WHERE name = 'plancore'").pluck().get()).toBe(V89_PLANCORE_DEFINITION_MD);
     expect(first.raw.prepare('SELECT role FROM master_runtimes WHERE project_id = 10').pluck().get()).toBe('ibrain');
     const before = {
@@ -418,13 +429,13 @@ describe.sequential('v90 compatibility-deletion phase-role migration', () => {
     live.close();
 
     const first = new DatabaseService(dbPath);
-    expect(first.raw.prepare('SELECT version FROM schema_version').pluck().get()).toBe(98);
+    expect(first.raw.prepare('SELECT version FROM schema_version').pluck().get()).toBe(SCHEMA_VERSION);
     assertV90Safety(first.raw);
     const before = first.raw.prepare("SELECT name, sql FROM sqlite_master WHERE type='table' ORDER BY name").all();
     first.close();
 
     const second = new DatabaseService(dbPath);
-    expect(second.raw.prepare('SELECT version FROM schema_version').pluck().get()).toBe(98);
+    expect(second.raw.prepare('SELECT version FROM schema_version').pluck().get()).toBe(SCHEMA_VERSION);
     expect(second.raw.prepare("SELECT name, sql FROM sqlite_master WHERE type='table' ORDER BY name").all()).toEqual(before);
     assertV90Safety(second.raw);
     second.close();
@@ -438,5 +449,186 @@ describe.sequential('v90 compatibility-deletion phase-role migration', () => {
     }
     const eligible = Object.values(PROVIDERS).flatMap((definition) => definition.models.flatMap((model) => model.eligibleRoles));
     expect(eligible).toEqual(expect.arrayContaining(['discovery', 'plancore', 'ibrain']));
+  });
+});
+
+/** Pre-S02 B09a discovery seed (known-stale fingerprint; includes HANDOFF + Planning auth). */
+const V109_STALE_DISCOVERY_DEFINITION_MD = `---
+role: discovery
+kind: project
+agent_type: project
+lifecycle: per-effort
+default_provider: claude
+default_model: claude-opus-5
+default_effort: high
+spawn_pref: tmux
+callback_contract: "[helm callback] discovery <run-id> STATUS: <INTERVIEWING|NORTH-STAR-READY|HANDOFF>"
+---
+# discovery — strategy front-end
+
+Author project/effort north-star, decisions/, og-requirements.md, and topology.yaml.
+Interview, thin-context archaeology, stamp Team Topology Contract. Hand off to plancore only on
+explicit user cue. You do not implement.
+`;
+
+const V109_STALE_NORTH_FRONTMATTER_MD = `---
+role: north
+kind: project
+agent_type: project
+lifecycle: per-effort
+default_provider: claude
+default_model: claude-opus-5
+default_effort: high
+spawn_pref: tmux
+callback_contract: "[helm callback] discovery <run-id> STATUS: <INTERVIEWING|NORTH-STAR-READY|HANDOFF>"
+---
+# discovery — strategy front-end
+
+Author project/effort north-star, decisions/, og-requirements.md, and topology.yaml.
+Interview, thin-context archaeology, stamp Team Topology Contract. Hand off to plancore only on
+explicit user cue. You do not implement.
+`;
+
+/**
+ * Minimal v109-shaped disposable DB for S02 upgrade-path tests.
+ * Never touches data/helm.db.
+ */
+function createV109DiscoveryShapeDb(
+  dbPath: string,
+  discoveryDefinition: string,
+  options?: { discoveryCaps?: { allowed: string; terminal: string; artifacts: string } }
+): void {
+  const db = new Database(dbPath);
+  const caps = options?.discoveryCaps ?? {
+    allowed: '["INTERVIEWING","NORTH-STAR-READY","HANDOFF","BLOCKED"]',
+    terminal: '["NORTH-STAR-READY","HANDOFF","BLOCKED"]',
+    artifacts: '["north-star.md","decisions/"]',
+  };
+  db.exec(`
+CREATE TABLE schema_version (version INTEGER PRIMARY KEY);
+INSERT INTO schema_version (version) VALUES (109);
+
+CREATE TABLE agents (
+  id INTEGER PRIMARY KEY,
+  name TEXT UNIQUE NOT NULL,
+  provider TEXT NOT NULL,
+  model TEXT NOT NULL,
+  default_effort TEXT NOT NULL DEFAULT 'medium',
+  definition_md TEXT,
+  spawn_pref TEXT NOT NULL DEFAULT 'tmux',
+  agent_type TEXT NOT NULL DEFAULT 'project',
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE role_capabilities (
+  role TEXT PRIMARY KEY,
+  allowed_statuses TEXT NOT NULL,
+  terminal_statuses TEXT NOT NULL,
+  can_write_code INTEGER NOT NULL DEFAULT 0,
+  requires_repro_first INTEGER NOT NULL DEFAULT 0,
+  panel_participant INTEGER NOT NULL DEFAULT 0,
+  can_escalate INTEGER NOT NULL DEFAULT 0,
+  session_policy TEXT NOT NULL DEFAULT 'fresh',
+  required_artifacts TEXT,
+  timeout_ms INTEGER,
+  checkin_ms INTEGER,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+`);
+  db.prepare(
+    `INSERT INTO agents (id, name, provider, model, default_effort, definition_md, spawn_pref, agent_type)
+     VALUES (1, 'discovery', 'claude', 'claude-opus-5', 'high', ?, 'tmux', 'project')`
+  ).run(discoveryDefinition);
+  db.prepare(
+    `INSERT INTO role_capabilities (
+       role, allowed_statuses, terminal_statuses, can_write_code, requires_repro_first,
+       panel_participant, can_escalate, session_policy, required_artifacts, timeout_ms, checkin_ms
+     ) VALUES ('discovery', ?, ?, 0, 0, 0, 0, 'fresh', ?, NULL, NULL)`
+  ).run(caps.allowed, caps.terminal, caps.artifacts);
+  db.close();
+}
+
+describe.sequential('v110 S02 Discovery canonical drift repair', () => {
+  it('fresh DB has discovery persona/caps with no HANDOFF or Planning artifact authority', () => {
+    const dbPath = tempDbPath('s02-fresh');
+    const dbs = new DatabaseService(dbPath);
+    expect((dbs.raw.prepare('SELECT version FROM schema_version').get() as any).version).toBe(SCHEMA_VERSION);
+
+    const def = dbs.raw.prepare("SELECT definition_md FROM agents WHERE name = 'discovery'").pluck().get() as string;
+    expect(def).toBe(V110_DISCOVERY_DEFINITION_MD);
+    expect(def).toContain('role: discovery');
+    expect(def).not.toMatch(/STATUS:\s*<[^>]*HANDOFF/);
+    expect(def).not.toMatch(/Author[^\n]*og-requirements/);
+    expect(def).toMatch(/Do NOT author[^\n]*og-requirements\.md/);
+    expect(def).toMatch(/Do NOT author[^\n]*plan\.md/);
+    expect(def).toContain('north-star.md');
+    expect(def).toContain(
+      'Initial Discovery docs are ready. May I ask Helm to start the configured Planning team?'
+    );
+
+    const caps = dbs.raw.prepare("SELECT * FROM role_capabilities WHERE role = 'discovery'").get() as any;
+    expect(caps.allowed_statuses).toBe(V110_DISCOVERY_ALLOWED_STATUSES);
+    expect(caps.terminal_statuses).toBe(V110_DISCOVERY_TERMINAL_STATUSES);
+    expect(caps.required_artifacts).toBe(V110_DISCOVERY_REQUIRED_ARTIFACTS);
+    expect(caps.allowed_statuses).not.toContain('HANDOFF');
+    expect(caps.terminal_statuses).not.toContain('HANDOFF');
+    dbs.close();
+  });
+
+  it('v109-shaped stale discovery (and role:north frontmatter) upgrades to canonical role/status', () => {
+    const staleHash = createHash('sha256').update(V109_STALE_DISCOVERY_DEFINITION_MD, 'utf8').digest('hex');
+    const northHash = createHash('sha256').update(V109_STALE_NORTH_FRONTMATTER_MD, 'utf8').digest('hex');
+    expect(V110_KNOWN_STALE_DISCOVERY_HASHES.has(staleHash)).toBe(true);
+    expect(V110_KNOWN_STALE_DISCOVERY_HASHES.has(northHash)).toBe(true);
+
+    for (const [label, body] of [
+      ['old-canonical', V109_STALE_DISCOVERY_DEFINITION_MD],
+      ['north-frontmatter', V109_STALE_NORTH_FRONTMATTER_MD],
+    ] as const) {
+      const dbPath = tempDbPath(`s02-stale-${label}`);
+      createV109DiscoveryShapeDb(dbPath, body);
+      const dbs = new DatabaseService(dbPath);
+      expect((dbs.raw.prepare('SELECT version FROM schema_version').get() as any).version).toBe(SCHEMA_VERSION);
+      const def = dbs.raw.prepare("SELECT definition_md FROM agents WHERE name = 'discovery'").pluck().get() as string;
+      expect(def, label).toBe(V110_DISCOVERY_DEFINITION_MD);
+      expect(def, label).toContain('role: discovery');
+      expect(def, label).not.toContain('role: north');
+      expect(def, label).not.toMatch(/STATUS:.*HANDOFF/);
+      const caps = dbs.raw.prepare("SELECT * FROM role_capabilities WHERE role = 'discovery'").get() as any;
+      expect(caps.allowed_statuses).toBe(V110_DISCOVERY_ALLOWED_STATUSES);
+      expect(caps.terminal_statuses).toBe(V110_DISCOVERY_TERMINAL_STATUSES);
+      expect(caps.required_artifacts).toBe(V110_DISCOVERY_REQUIRED_ARTIFACTS);
+      dbs.close();
+    }
+  });
+
+  it('non-matching custom persona remains byte-identical across upgrade', () => {
+    const custom = '# CUSTOM DISCOVERY PERSONA — do not touch\nrole: my-special-discovery\n';
+    const dbPath = tempDbPath('s02-custom');
+    createV109DiscoveryShapeDb(dbPath, custom);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const dbs = new DatabaseService(dbPath);
+    expect((dbs.raw.prepare('SELECT version FROM schema_version').get() as any).version).toBe(SCHEMA_VERSION);
+    const def = dbs.raw.prepare("SELECT definition_md FROM agents WHERE name = 'discovery'").pluck().get() as string;
+    expect(def).toBe(custom);
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringMatching(/\[v110\] custom discovery definition_md preserved.*sha256=/)
+    );
+    // caps still move (system table) even when persona is custom
+    const caps = dbs.raw.prepare("SELECT * FROM role_capabilities WHERE role = 'discovery'").get() as any;
+    expect(caps.allowed_statuses).toBe(V110_DISCOVERY_ALLOWED_STATUSES);
+    expect(caps.terminal_statuses).toBe(V110_DISCOVERY_TERMINAL_STATUSES);
+    dbs.close();
+  });
+
+  it('empty discovery definition is filled with canonical on upgrade', () => {
+    const dbPath = tempDbPath('s02-empty');
+    createV109DiscoveryShapeDb(dbPath, '');
+    const dbs = new DatabaseService(dbPath);
+    expect(dbs.raw.prepare("SELECT definition_md FROM agents WHERE name = 'discovery'").pluck().get()).toBe(
+      V110_DISCOVERY_DEFINITION_MD
+    );
+    dbs.close();
   });
 });

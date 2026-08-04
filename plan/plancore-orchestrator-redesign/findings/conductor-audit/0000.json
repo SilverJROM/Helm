@@ -1,0 +1,27 @@
+{
+  "type": "escalate",
+  "slice": "P4",
+  "reason": "claude-esc-budget-exhausted",
+  "edge_packet": {
+    "run_id": "plancore-orchestrator-redesign",
+    "batch": "P4",
+    "trigger": "gate:ESCALATE",
+    "failed_conjuncts": [
+      "verdict=FAIL"
+    ],
+    "defect_class": "FOCUSED_SPEC_MISSING",
+    "row_tiers": {
+      "impl": "L1",
+      "val": "L1",
+      "deliberation": "no",
+      "redteam": "budget"
+    },
+    "available_destinations": [
+      "RE_DISPATCH",
+      "CO_PLANNERS",
+      "NORTH",
+      "PANEL",
+      "JROM"
+    ]
+  }
+}

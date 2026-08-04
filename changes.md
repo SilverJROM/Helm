@@ -1,5 +1,35 @@
 # [batch-DEBT-F3] Exact-tuple residual identity (not reason substring)
 
+# S18b send-back 2/7 — housekeeper callback apply safety
+
+## User Report
+Implementer L3 codex55 S18b SEND-BACK attempt 2/7. Base FAIL commit af88456 branch s18b-housekeeper-apply.
+Read plan/janitor-consent-redesign/validation/S18b-validation.md fully.
+
+BLOCKING only:
+V1: Record investigation callback verdict/evidence/rationale BEFORE markIdle. If audit write fails, do not mutate session. Prefer transaction or write-then-mutate with fail-closed.
+V2: Refuse done when evidence/rationale empty/malformed — keep-biased (needs-human or refuse), zero markIdle.
+V3: Idempotent apply — if investigation already terminal (applied_done/needs_human), no-op second done (no second markIdle); reject conflicting later verdict overwrites.
+
+Add focused synthetic tests for all three.
+HARD SAFETY: HELM_SESSION_JANITOR=0; zero terminate; no reap; markIdle only on valid done.
+Commit; append:
+[projcore callback] impl S18b STATUS: DONE — COMPLETE | send-back 2/7 | commit=<hash>; V1-V3; ...
+
+## Mechanism
+`HousekeeperService.applyCallback()` had no terminal-state guard, accepted empty `done` proof, and called `markIdle()` before the investigation audit update. The fix validates `done` proof before mutation, treats `applied_done`/`needs_human` as immutable terminal states, and writes the `applied_done` audit row inside a SQLite transaction before calling `markIdle()`.
+
+## Files
+- `src/services/housekeeper-service.ts`: fail-closed proof validation, terminal idempotency/conflict handling, audit-before-idle transaction.
+- `src/s18a-housekeeper-dispatch.test.ts`: focused synthetic regressions for V1 audit write failure, V2 empty proof refusal, and V3 duplicate/conflicting callback idempotency.
+
+## Verify
+- `HELM_SESSION_JANITOR=0 npx vitest run src/s18a-housekeeper-dispatch.test.ts` → 14/14 pass.
+- `npm run typecheck` → pass.
+- `HELM_SESSION_JANITOR=0 npx vitest run src/s15-housekeeper-seed.test.ts src/s17-house-usage-selector.test.ts src/s18a-housekeeper-dispatch.test.ts` → 28/28 pass.
+- `git diff --check 687797b..HEAD` → pass.
+- Safety: synthetic tests assert zero terminate/reap; `markIdle` occurs only once for the first valid `done`.
+
 ## Mechanism
 B25c residual carve-outs keyed on `reason.includes('projcore')` (substring ≠ identity).
 Live orphan was deleted in B25d (v77); DEBT-F3 permanently replaces the disease with:
@@ -638,3 +668,156 @@ See `plan/c01-agent-studio-rebuild/batch-B06/changes.md` for full R8.29 justific
 
 Evidence: `plan/c01-agent-studio-rebuild/validation/b06/` (12/12 checks PASS) + `validation/b06-models-cascade.md`.
 Also: `plan/c01-agent-studio-rebuild/batch-B06/changes.md` (gitignored batch-* dir; full write-up).
+
+## S18b Housekeeper Callback/Apply
+
+## User Report
+
+Implementer L3 codex55 for S18b. Base 687797b branch s18b-housekeeper-apply.
+Read plan.md S18b row and housekeeper-service from S18a.
+
+Scope: complete housekeeper callback/apply: accept only done|needs-human; persist evidence+rationale; re-check owner=helm at apply; done may only markIdle never reap; uncertainty needs-human; one investigation per seat per unchanged state cooldown; then enable hours-scale scheduler.
+HARD SAFETY: HELM_SESSION_JANITOR=0; synthetic only; zero terminate; no reap.
+Tests per plan. Elite redteam expected after.
+Append PROPOSED then implement (exec pre-approved for plan-locked S18b).
+DONE: [projcore callback] impl S18b STATUS: DONE — COMPLETE | commit=...
+
+## PROPOSED
+
+- Extend `housekeeper_investigations` to v105 with callback verdict/evidence/rationale/apply metadata plus a stable state signature for cooldown.
+- Add `applyCallback`: accept only `done` and `needs-human`; persist bounded evidence/rationale; re-read `helm_sessions.owner` before applying; `done` calls only `SessionRegistryService.markIdle`; no terminate/reap calls.
+- Add cooldown suppression for repeated investigations of the same session when the stored state signature is unchanged.
+- Add an owner/local protected apply route and a six-hour scheduler/cooldown config, wired to the existing housekeeper no-op transport.
+- Keep tests synthetic with `HELM_SESSION_JANITOR=0`, fake tmux/transport, and explicit zero terminate/reap assertions.
+
+## Implemented
+
+- `src/services/housekeeper-service.ts`: callback/apply contract, owner recheck, evidence/rationale persistence, stable unchanged-state cooldown, and scheduler helpers.
+- `src/api/routes/housekeeper-routes.ts`: `POST /api/housekeeper/investigations/:id/apply`.
+- `src/db/schema.ts` + `src/db/database.ts`: schema v105, v104→v105 table rebuild for widened status CHECK, additive callback/cooldown columns, old synthetic fixture guards.
+- `src/config/config.ts` + `src/index.ts`: hours-scale scheduler config and startup/shutdown wiring.
+- `src/s18a-housekeeper-dispatch.test.ts`: S18b apply/cooldown coverage; done marks idle only; needs-human keeps active; owner flip rejects; invalid uncertainty verdict rejects; zero terminate/reap.
+
+## Verification
+
+- `npm run typecheck` — PASS.
+- `npm test -- --run src/s18a-housekeeper-dispatch.test.ts src/b18-inheritance.test.ts src/b19-freeze.test.ts src/b04-models-seed.test.ts src/b09a-roster-seed.test.ts` — PASS, 42 tests.
+- `npm test` full suite was attempted and failed outside S18b: 34 files failed / 57 tests failed, including pre-existing real tmux delivery timeouts, exact `SCHEMA_VERSION` expectations still pinned to 98, live model oracle residuals, and unrelated provider/model expectations. The S18b targeted suite and representative migration guard files pass after the v105 guard fix.
+
+## E6b Structural Reply Extractor Tests
+
+Test-only changes:
+- Added three E6b structural tests to `src/reply-extractor.test.ts`:
+  - app.js extractor call-site shape parity
+  - display-level bubble text assertions for every captured pane fixture
+  - pane fixture provenance headers
+- Added provenance headers to the two pane fixtures under `src/test-fixtures/panes/`.
+- Did not edit `src/web/public/reply-extractor.js` or `src/web/public/app.js` except for the required temporary pre-fix swap proof, then restored the fixed extractor.
+
+Fixed-code verification:
+```text
+HELM_DB_PATH=/tmp/helm-test-$$.db npx vitest run src/reply-extractor.test.ts --poolOptions.forks.maxForks=2
+
+ RUN  v2.1.9 /home/agjrom/websites/Helm
+
+ ✓ src/reply-extractor.test.ts (22 tests) 12ms
+
+ Test Files  1 passed (1)
+      Tests  22 passed (22)
+   Start at  21:59:00
+   Duration  158ms (transform 41ms, setup 11ms, collect 31ms, tests 12ms, environment 0ms, prepare 28ms)
+```
+
+Pre-fix extractor red proof:
+```text
+cp src/web/public/reply-extractor.js /tmp/current-reply-extractor.js
+git show f9bb022~1:src/web/public/reply-extractor.js > /tmp/prefix.js
+cp /tmp/prefix.js src/web/public/reply-extractor.js
+HELM_DB_PATH=/tmp/helm-test-$$.db npx vitest run src/reply-extractor.test.ts --poolOptions.forks.maxForks=2
+
+ RUN  v2.1.9 /home/agjrom/websites/Helm
+
+ ❯ src/reply-extractor.test.ts (22 tests | 4 failed) 18ms
+   × G1 reply-extractor (Studio + CC parity) > E6: real Discovery pane with composer echo extracts reply when pending is passed 4ms
+     → expected 'thinking' to be 'reply' // Object.is equality
+   × G1 reply-extractor (Studio + CC parity) > E6b structural: app.js extractor call-site shapes are covered by this suite 4ms
+     → expected '' to contain 'Status: INTERVIEWING'
+   × G1 reply-extractor (Studio + CC parity) > E6b structural: display-level bubble text is clean for every captured pane fixture 1ms
+     → discovery-sent-echoed-in-composer-20260728.txt: expected '' to contain 'Status: INTERVIEWING'
+   × G1 reply-extractor (Studio + CC parity) > E6b structural: pane fixtures carry provenance headers and still replay to real replies 1ms
+     → discovery-sent-echoed-in-composer-20260728.txt: expected '' to contain 'Status: INTERVIEWING'
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 4 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/reply-extractor.test.ts > G1 reply-extractor (Studio + CC parity) > E6: real Discovery pane with composer echo extracts reply when pending is passed
+AssertionError: expected 'thinking' to be 'reply' // Object.is equality
+
+Expected: "reply"
+Received: "thinking"
+
+ ❯ src/reply-extractor.test.ts:455:21
+    453|     const sent = '(a) — recall output is unreadable, keep text mode fr…
+    454|     const r = extractHelmReply(pane, sent);
+    455|     expect(r.state).toBe('reply');
+       |                     ^
+    456|     expect(r.text).toContain('Status: INTERVIEWING');
+    457|     expect(r.text).not.toContain('bypass permissions');
+
+ FAIL  src/reply-extractor.test.ts > G1 reply-extractor (Studio + CC parity) > E6b structural: app.js extractor call-site shapes are covered by this suite
+AssertionError: expected '' to contain 'Status: INTERVIEWING'
+
+- Expected
++ Received
+
+- Status: INTERVIEWING
+
+ ❯ src/reply-extractor.test.ts:511:18
+    509|     const pane = readPaneFixture('discovery-sent-echoed-in-composer-20…
+    510|     const { text } = appDisplayText(pane, '(a) — recall output is unre…
+    511|     expect(text).toContain('Status: INTERVIEWING');
+       |                  ^
+    512|     expect(text).not.toContain('bypass permissions');
+    513|   });
+
+ FAIL  src/reply-extractor.test.ts > G1 reply-extractor (Studio + CC parity) > E6b structural: display-level bubble text is clean for every captured pane fixture
+AssertionError: discovery-sent-echoed-in-composer-20260728.txt: expected '' to contain 'Status: INTERVIEWING'
+
+- Expected
++ Received
+
+- Status: INTERVIEWING
+
+ ❯ src/reply-extractor.test.ts:524:34
+    522|       expect(text, fixture.file).not.toBe(fixture.pending);
+    523|       expect(text.startsWith(fixture.pending), fixture.file).toBe(fals…
+    524|       expect(text, fixture.file).toContain(fixture.reply);
+       |                                  ^
+    525|     }
+    526|   });
+
+ FAIL  src/reply-extractor.test.ts > G1 reply-extractor (Studio + CC parity) > E6b structural: pane fixtures carry provenance headers and still replay to real replies
+AssertionError: discovery-sent-echoed-in-composer-20260728.txt: expected '' to contain 'Status: INTERVIEWING'
+
+- Expected
++ Received
+
+- Status: INTERVIEWING
+
+ ❯ src/reply-extractor.test.ts:543:34
+    541|     for (const fixture of PANE_FIXTURES) {
+    542|       const { text } = appDisplayText(readPaneFixture(fixture.file), f…
+    543|       expect(text, fixture.file).toContain(fixture.reply);
+       |                                  ^
+    544|       expect(text, fixture.file).not.toBe(fixture.pending);
+    545|     }
+
+ Test Files  1 failed (1)
+      Tests  4 failed | 18 passed (22)
+   Start at  21:58:56
+   Duration  167ms (transform 40ms, setup 12ms, collect 32ms, tests 18ms, environment 0ms, prepare 29ms)
+```
+
+Restored fixed extractor after the proof with:
+```text
+cp /tmp/current-reply-extractor.js src/web/public/reply-extractor.js
+```

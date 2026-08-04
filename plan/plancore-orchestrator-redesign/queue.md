@@ -1,0 +1,23 @@
+# queue — plancore-orchestrator-redesign
+
+- [DONE] 1: S0  <!-- driver-advanced a48562b981 -->
+- [DONE] 2: D1  <!-- driver-advanced 8bab0cc717 -->
+- [DONE] 3: D2  <!-- driver-advanced 8905059a91 -->
+- [DONE] 4: D3  <!-- driver-advanced 2aadbfa61e -->
+- [DONE] 5: B1  <!-- driver-advanced 9f9b16707f -->
+- [DONE] 6: B2  <!-- driver-advanced f3e4439bf7 -->
+- [DONE] 7: B3  <!-- driver-advanced 94be10ff7b -->
+- [DONE] 8: B4  <!-- driver-advanced 12143af225 -->
+- [DONE] 9: R1  <!-- driver-advanced 6c0c2338d2 -->
+- [DONE] 10: R2  <!-- driver-advanced 3a00ea5209 -->
+- [DONE] 11: R3  <!-- driver-advanced 0d72f173d3 -->
+- [DONE] 12: R4  <!-- driver-advanced 287727f9d6 -->
+- [DONE] 13: R5  <!-- driver-advanced 88bf414f7a -->
+- [DONE] 14: R6  <!-- driver-advanced 3e3b21f2bf -->
+- [DONE] 15: R7  <!-- driver-advanced 10cc7bf997 -->
+- [DONE] 16: R8  <!-- driver-advanced 60114deca6 -->
+- [DONE] 17: P1  <!-- driver-advanced b4ff1e6c86 -->
+- [DONE] 18: P2  <!-- driver-advanced a624cce6e8 -->
+- [DONE] 19: P3  <!-- driver-advanced 5236c4af7f -->
+- [DONE] 20: P4  <!-- driver-advanced b668f15c53 -->
+- [DONE] 21: X1  <!-- driver-advanced 58d075eaff -->

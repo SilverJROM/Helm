@@ -17,32 +17,64 @@ function findAfterLastUserPromptRobust(pane, afterUserText) {
   if (!sent) {
     return getAfterLastUserPrompt(pane);
   }
-  // 1. try exact lastIndexOf
-  let idx = pane.lastIndexOf(sent);
-  if (idx >= 0) {
-    let after = pane.slice(idx + sent.length);
-    return boundCurrentTurn(after);
-  }
-  // 2. normalize ws to single space in both, find last in norm, but map to original by flexible search
+  // 1. gather exact matches.
+  const exactMatches = findAllLiteralMatches(pane, sent);
+  // 2. normalize ws to single space in both, then map to original by flexible search.
   const normSent = normalizeWs(sent);
   const normPane = normalizeWs(pane);
   const normIdx = normPane.lastIndexOf(normSent);
-  if (normIdx < 0) {
-    return getAfterLastUserPrompt(pane);
+  const flexMatches = [];
+  if (normIdx >= 0) {
+    const words = sent.split(/\s+/).map(w => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+    const flexRe = new RegExp(words.join('\\s+'), 'g');
+    let m;
+    while ((m = flexRe.exec(pane)) !== null) {
+      flexMatches.push({ index: m.index, length: m[0].length });
+    }
   }
-  // flexible regex on original (words with \s+ between)
-  const words = sent.split(/\s+/).map(w => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
-  const flexRe = new RegExp(words.join('\\s+'), 'g');
-  let last = null;
-  let m;
-  while ((m = flexRe.exec(pane)) !== null) {
-    last = m;
-  }
-  if (last) {
-    let after = pane.slice(last.index + last[0].length);
-    return boundCurrentTurn(after);
+  const matches = dedupePromptMatches([...exactMatches, ...flexMatches]);
+  if (matches.length) {
+    return afterBestUserPromptMatch(pane, matches);
   }
   return getAfterLastUserPrompt(pane);
+}
+
+function findAllLiteralMatches(text, needle) {
+  const matches = [];
+  let from = 0;
+  while (from <= text.length) {
+    const index = text.indexOf(needle, from);
+    if (index < 0) break;
+    matches.push({ index, length: needle.length });
+    from = index + needle.length;
+  }
+  return matches;
+}
+
+function dedupePromptMatches(matches) {
+  const seen = new Set();
+  return matches
+    .sort((a, b) => a.index - b.index || a.length - b.length)
+    .filter(match => {
+      const key = `${match.index}:${match.length}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+}
+
+function afterBestUserPromptMatch(pane, matches) {
+  const fallback = matches[matches.length - 1];
+  let best = null;
+  for (const match of matches) {
+    const after = boundCurrentTurn(pane.slice(match.index + match.length));
+    const content = stripChrome(after.replace(/─/g, '')).trim();
+    if (content && !looksLikeChrome(content)) {
+      best = match;
+    }
+  }
+  const chosen = best || fallback;
+  return boundCurrentTurn(pane.slice(chosen.index + chosen.length));
 }
 
 function boundCurrentTurn(after) {
@@ -208,17 +240,17 @@ function extractHelmReply(pane, afterUserText) {
   if (!pane || !pane.trim()) return { state: 'empty', text: '' };
 
   let scope = findAfterLastUserPromptRobust(pane, afterUserText);
-  if (!scope) {
-    return { state: 'thinking', text: '' };
-  }
 
   const scopeHasMarkers = HELM_REPLY_OPEN_RE.test(scope) || HELM_REPLY_CLOSE_RE.test(scope);
   HELM_REPLY_OPEN_RE.lastIndex = 0;
   const paneHasMarkers = pane.includes('⟦HELM_REPLY⟧') || pane.includes('[[HELM_REPLY]]') ||
     pane.includes('⟦/HELM_REPLY⟧') || pane.includes('[[/HELM_REPLY]]');
-  if (!afterUserText && !scopeHasMarkers && paneHasMarkers) {
+  if (!scopeHasMarkers && paneHasMarkers && !paneLooksGenerating(pane)) {
     const footerOnly = stripChrome(scope.replace(/─/g, '')).trim();
     if (!footerOnly) scope = pane;
+  }
+  if (!scope) {
+    return { state: 'thinking', text: '' };
   }
 
   // within bounded scope only
@@ -285,6 +317,29 @@ function extractHelmReply(pane, afterUserText) {
   return { state: 'fallback', text };
 }
 
+/**
+ * E8 FIX3: the last-reply STRIP is a distinct surface from the current-turn bubble extractors above —
+ * it must show the agent's LAST REPLY ONLY, deliberately marked with ⟦HELM_REPLY⟧ delimiters, never
+ * raw pane / tmux chrome (pager text like "+65 lines (ctrl+o to expand)", composer echoes, etc.).
+ * Scans the WHOLE pane (not scoped to "after the last user prompt" — the strip must keep showing the
+ * last reply even while a later, not-yet-submitted composer draft sits below it) for every complete
+ * OPEN...CLOSE pair and returns the text of the LAST one. No complete pair anywhere → '' (never falls
+ * back to raw pane).
+ */
+function lastCompleteHelmReplyText(pane) {
+  if (!pane) return '';
+  const text = String(pane);
+  HELM_REPLY_OPEN_RE.lastIndex = 0;
+  let lastReply = '';
+  let openMatch;
+  while ((openMatch = HELM_REPLY_OPEN_RE.exec(text)) !== null) {
+    const afterOpen = text.slice(openMatch.index + openMatch[0].length);
+    const closeMatch = afterOpen.match(HELM_REPLY_CLOSE_RE);
+    if (closeMatch) lastReply = afterOpen.slice(0, closeMatch.index).trim();
+  }
+  return lastReply;
+}
+
 // Re-export the consts for tests that may want them.
 export {
   HELM_REPLY_OPEN_RE,
@@ -292,6 +347,7 @@ export {
   paneLooksGenerating,
   extractAgentPaneSegment,
   extractHelmReply,
+  lastCompleteHelmReplyText,
   stripChrome,
   looksLikeChrome
 };
@@ -301,5 +357,6 @@ export default {
   HELM_REPLY_CLOSE_RE,
   paneLooksGenerating,
   extractAgentPaneSegment,
-  extractHelmReply
+  extractHelmReply,
+  lastCompleteHelmReplyText
 };

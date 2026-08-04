@@ -803,6 +803,27 @@ select option{background:var(--surface)}
 }
 .cc-chat-scroll { flex: 1; overflow: auto; padding: 2px 4px; }
 .cc-composer { padding: 4px 6px; }
+
+/* E7: Discovery session mirror — 1:1 pane render, presentational classification only.
+   .disc-mirror-chrome dims (never hides) the trailing composer/footer block; .disc-mirror-callback
+   highlights [helm callback] ... STATUS: ... beats; .disc-mirror-delim subdues HELM_REPLY markers. */
+.disc-mirror-pane { display: flex; flex-direction: column; min-height: 0; }
+.disc-mirror-payload {
+  margin: 0;
+  font-family: ui-monospace, 'JetBrains Mono', monospace;
+  font-size: 11px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--terminal-text);
+  background: var(--terminal-bg);
+  padding: 6px;
+  border: 0;
+  border-radius: 4px;
+}
+.disc-mirror-chrome { opacity: 0.5; }
+.disc-mirror-callback { color: var(--accent); font-weight: 600; }
+.disc-mirror-delim { opacity: 0.45; }
+.disc-mirror-empty { font-size: 11px; color: var(--text-sec); padding: 8px 4px; }
 .cc-term-content { font-family: ui-monospace,'JetBrains Mono',monospace; font-size: 10px; white-space: pre-wrap; background: var(--terminal-bg); color: var(--terminal-text); padding: 4px; flex:1; overflow:auto; border:0; }
 @media (max-width: 480px) {
   .cc-3col { flex-direction: column; height: auto; min-height: 320px; }

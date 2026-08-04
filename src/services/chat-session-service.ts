@@ -13,6 +13,25 @@ import { MemoryService, type MemoryRow } from './memory-service.js';
 import { ProjectService, type Project } from './project-service.js';
 import { PROVIDERS, seatReadySignal } from '../config/providers.js';
 import { applyEnvelopeIsolation } from './envelope-isolation.js';
+import type Database from 'better-sqlite3';
+import {
+  CLAUDE_CONVERSATION_ID_RE,
+  getStoredChatIdentity,
+  removeStoredChatIdentity,
+  storeChatIdentity,
+  waitForClaudeConversationId,
+  type ChatIdentityKey,
+} from './chat-session-identity.js';
+import {
+  formatDiscoveryPhaseContract,
+  formatPlanningPhaseContract,
+  isDiscoveryPhase,
+  isPlanningPhase,
+} from './discovery-contract.js';
+import {
+  formatDiscoveryReadyCallbackInstruction,
+  issueDiscoveryCallbackCredential,
+} from './discovery-callback-credentials.js';
 
 // C1 KEY-C1: agent test-chat transport (SSE+POST, DELIB consensus 2026-06-21).
 // Ephemeral in-memory session store — a test-chat session is a tmux pane running the
@@ -77,6 +96,11 @@ export interface ChatSession {
   fenceDir?: string;
   // NOTE (F2, round-6): delivery failures live in a ChatSessionService-level ledger keyed by LOGICAL CHANNEL
   // (NOT sid), decoupled from session lifecycle — see channelLedger.
+  /**
+   * B02 C1 fix cycle 2: create/register SessionStatusToken retained for terminate.
+   * Never re-captured by name at cleanup.
+   */
+  sessionToken?: import('./lifecycle-cas.js').SessionStatusToken;
 }
 
 export interface ChatSessionDeps {
@@ -91,6 +115,10 @@ export interface ChatSessionDeps {
   // (which may emphasise reference/source paths like a migration's origin app).
   projectService?: ProjectService;
   fenceDir?: string;
+  // E8 FIX2 / R-cycle-session-continuity: when present, create() persists/looks up a resumable
+  // provider conversation id per (project, agent, cycle) chat identity. Absent (e.g. most existing
+  // tests) → identical behavior to before this fix, always cold-spawns.
+  db?: Database.Database;
   nowFn?: () => number;
 }
 
@@ -183,6 +211,20 @@ export class AgentBusyError extends Error {
   }
 }
 
+/**
+ * E8 FIX2 / R-cycle-session-continuity: raised INTERNALLY when a `--resume <uuid>` attempt fails its
+ * ready probe. Never surfaces to an HTTP caller — `create()`'s public wrapper catches this exact type
+ * and retries once as a clean cold spawn (fail-open req #5: "a failed resume must never block a cycle
+ * from starting"). A plain Error from the SAME ready-probe check (no resume attempted) is a genuine
+ * spawn failure and is NOT retried.
+ */
+class ResumeAttemptFailedError extends Error {
+  constructor(msg: string) {
+    super(msg);
+    this.name = 'ResumeAttemptFailedError';
+  }
+}
+
 /** Last N non-empty lines of a pane — the current footer/status region (not scrollback). */
 export function paneFooterRegion(pane: string, maxLines = 8): string {
   const lines = stripAnsi(pane).split('\n').map((l) => l.trim()).filter((l) => l.length > 0);
@@ -263,25 +305,21 @@ export function formatActiveCycleBlock(activeCycle?: ActiveCycleContext | null):
     '',
     'All Helm work for this selected cycle must be created or moved inside that cycle folder. Treat project-level `plan/` folders as legacy/scratch unless the operator explicitly names them.',
     '',
-    'For active-cycle Discovery / intake artifacts, write standardized files in the cycle folder:',
-    '- `north-star.md` — normalized source of truth from the operator file/brief/notes.',
-    '- `conversation-log.md` — relevant operator answers or source-file summary when available.',
-    '- `decisions/*.md` — concrete planning assumptions and decisions.',
-    '- `attachments/` and `mockups/` — referenced source files/images when applicable.',
-    '',
-    'For active-cycle Planning artifacts, write exactly these files in the cycle folder:',
-    '- `og-requirements.md` — requirements contract rendered by Helm Planning.',
-    '- `plan.md` — Helm-algo machine contract rendered by Helm Planning and consumed by Implementation.',
-    '',
-    '`plan.md` must contain a fenced ```json task array. Each task needs `id`, `batch`, `title`, `req_refs`, `assignee`, `validator_lane`, `effort`, and `type`.',
-    '`assignee` is the implementer lane: `L1`, `L2`, or `L3`. Use `L2`/`L3` directly for complex work; do not force everything through `L1`. `validator_lane` is the independent validator counterpart: `L1`, `L2`, or `L3`.',
-    '`effort` MUST be exactly one of `low`, `med`, `high`, or `xhigh` — NOT T-shirt sizes like `S`/`M`/`L`/`XL` (a non-enum effort is rejected at ingest and blocks the run). `type` MUST be exactly `feature` or `issue`.',
-    '`batch` MUST be a non-empty STRING (e.g. "B1", "B2") — NOT a bare number (`1` is rejected and disables Start Implementation; write "B1"). `id`/`title` are strings and `req_refs` is a string array.',
-    'Copy this EXACT example task (every field, correct JSON types): {"id":"T01","batch":"B1","title":"Project scaffold","req_refs":["R-1"],"assignee":"L1","validator_lane":"L1","effort":"med","type":"feature"}.',
-    'Only use a literal model slug in `assignee` or `validator` when deliberately overriding Helm project bindings. Prefer lane labels so the harness stays project-agnostic.',
-    '',
     'Do not write cycle artifacts to generic phase-brain run folders, and do not use legacy names like `north_star.md`, `og_req.md`, or `execution_plan.md` for the active cycle.'
   );
+
+  // S01: phase-scoped artifact contract. Discovery omits Planning schema/writes.
+  // Planning keeps its schema. Unknown/empty phase: cycle facts only (fail-closed — no Planning leak).
+  if (isDiscoveryPhase(activeCycle.phase)) {
+    // Phase contract body is appended last by composeAgentSidecar (last-authority wins).
+    // Here we only keep cycle identity + folder rules; Discovery artifact/ASK live in
+    // formatDiscoveryPhaseContract so they appear last in the sidecar.
+    return lines.join('\n');
+  }
+  if (isPlanningPhase(activeCycle.phase)) {
+    lines.push('', formatPlanningPhaseContract());
+    return lines.join('\n');
+  }
   return lines.join('\n');
 }
 
@@ -328,7 +366,9 @@ export function composeAgentSidecar(
   agentType?: string,
   projectContext?: Pick<Project, 'name' | 'directory' | 'dev_url'> | null,
   projectDocs?: { techStack?: string | null; docPaths?: string[] } | null,
-  activeCycle?: ActiveCycleContext | null
+  activeCycle?: ActiveCycleContext | null,
+  /** S09: structured ready-callback instruction (credential + POST); Discovery cycle chats only. */
+  discoveryReadyCallbackBlock?: string | null
 ): string {
   const def = (definitionMd ?? '').trim();
   const projectBlock = formatProjectDefinitionBlock(projectContext, projectDocs);
@@ -337,7 +377,16 @@ export function composeAgentSidecar(
     ? HELM_PROJECT_WORKSPACE_RULES
     : (agentType === 'house' || agentType === 'helm') ? HELM_WORKSPACE_RULES : HELM_INFRA_RULES;
   const memoryBlock = formatAppMemoryBlock(appMemories);
-  return [projectBlock, cycleBlock, def, infraRules, memoryBlock].filter((p) => p.length > 0).join('\n\n');
+  // S01: phase contract last in precedence (last-authority wins).
+  // Discovery phase contract carries role/status/artifacts/ASK; Planning keeps its schema block
+  // (already inlined in formatActiveCycleBlock for planning phase — no second copy here).
+  const phaseContractLast =
+    activeCycle && isDiscoveryPhase(activeCycle.phase) ? formatDiscoveryPhaseContract() : '';
+  // S09: ready POST instruction sits with the Discovery phase contract (still last-authority zone).
+  const readyBlock = (discoveryReadyCallbackBlock || '').trim();
+  return [projectBlock, cycleBlock, def, infraRules, memoryBlock, phaseContractLast, readyBlock]
+    .filter((p) => p.length > 0)
+    .join('\n\n');
 }
 
 /**
@@ -553,7 +602,31 @@ export class ChatSessionService {
     return { epoch, lossGeneration, gapThroughSeq, failures };
   }
 
+  /**
+   * E8 FIX2 / R-cycle-session-continuity: public entry point. Wraps `createInternal` with ONE
+   * fail-open retry — if a resume attempt turns out to be unresumable (stale/corrupt stored id,
+   * provider refuses it), `createInternal` throws `ResumeAttemptFailedError` instead of the generic
+   * ready-probe error; caught here exactly once and retried as a clean cold spawn (`skipResumeOnce`),
+   * so a bad stored id degrades to today's cold-spawn behavior instead of blocking the cycle. Any
+   * OTHER failure (unknown agent, model not validated, genuine spawn failure) passes straight through.
+   */
   async create(
+    agentId: number,
+    overrideModelId?: string,
+    projectId?: number,
+    opts?: { projectFenceDir?: string; activeCycle?: ActiveCycleContext | null; strictReadAllow?: string[]; skipResumeOnce?: boolean }
+  ): Promise<{ sessionId: string; tmuxSession: string; spawnModel: string; conversationId: string | null; resumed: boolean }> {
+    try {
+      return await this.createInternal(agentId, overrideModelId, projectId, opts);
+    } catch (err) {
+      if (err instanceof ResumeAttemptFailedError && !opts?.skipResumeOnce) {
+        return this.createInternal(agentId, overrideModelId, projectId, { ...opts, skipResumeOnce: true });
+      }
+      throw err;
+    }
+  }
+
+  private async createInternal(
     agentId: number,
     overrideModelId?: string,
     projectId?: number,
@@ -562,8 +635,8 @@ export class ChatSessionService {
     // B-ISO1: strictReadAllow is the OPT-IN strict READ profile (mechanical reuse of the same helper
     // as master/worker/real-transport). Absent (every existing caller) → fencedLaunch byte-identical
     // (default read-all). The harness does not launch chat seats, so this is lower-priority parity.
-    opts?: { projectFenceDir?: string; activeCycle?: ActiveCycleContext | null; strictReadAllow?: string[] }
-  ): Promise<{ sessionId: string; tmuxSession: string; spawnModel: string }> {
+    opts?: { projectFenceDir?: string; activeCycle?: ActiveCycleContext | null; strictReadAllow?: string[]; skipResumeOnce?: boolean }
+  ): Promise<{ sessionId: string; tmuxSession: string; spawnModel: string; conversationId: string | null; resumed: boolean }> {
     // 1. Resolve agent → spawn provider/model.
     const agent = this.deps.assignmentService.getAgent(agentId);
     if (!agent) throw new Error(`unknown agent: ${agentId}`);
@@ -654,22 +727,62 @@ export class ChatSessionService {
     } else {
       fenceDir = await ensureTestChatSandbox(spawnProvider);
     }
+    // E8 FIX2 / R-cycle-session-continuity: resolve a resumable PROVIDER conversation id for this
+    // (project, agent, cycle) chat identity BEFORE spawning, so the launch command can carry
+    // `--resume <uuid>` instead of cold-starting. Project-fenced sessions only (test-chat/Studio has
+    // no stable cycle-scoped identity to key on) and claude only (the only provider with a concrete,
+    // verified resume mechanism here) — any other case always cold-spawns exactly as before this fix.
+    const identityKey: ChatIdentityKey | null = (projectFenceDir && projectId != null)
+      ? { projectId, agentId, cycleId: opts?.activeCycle?.id ?? 0 }
+      : null;
+    let resumeConversationId: string | null = null;
+    if (!opts?.skipResumeOnce && identityKey && spawnProvider === 'claude') {
+      const stored = getStoredChatIdentity(this.deps.db, identityKey);
+      if (stored && stored.provider === 'claude' && CLAUDE_CONVERSATION_ID_RE.test(stored.conversationId)) {
+        resumeConversationId = stored.conversationId;
+      }
+    }
+    let conversationId: string | null = null;
     // B-ISO1: compose (+ fail-closed validate) the OPT-IN strict read env BEFORE createSession, so a
     // bad allowlist refuses the spawn cleanly. Absent → '' (fencedLaunch byte-identical to read-all).
     const strictEnv = opts?.strictReadAllow !== undefined ? makeStrictReadProfileEnv(opts.strictReadAllow) : '';
-    const target = await this.deps.tmux.createSession(sessionName, fenceDir);
+    // S05 / AC3: discovery/chat is human-owned decision authority (never auto-reap candidate).
+    // B02 C1: retain create/register CAS token for fail/terminate paths.
+    const sessionTokenOut: { token?: import('./lifecycle-cas.js').SessionStatusToken } = {};
+    const target = await this.deps.tmux.createSession(sessionName, fenceDir, {
+      owner: 'human',
+      sessionTokenOut,
+    });
+    const createToken = sessionTokenOut.token;
 
     try {
       const sandboxBin = resolveHelmSandboxBin();
-      const { envPrefix, launchCmd } = applyEnvelopeIsolation(spawnProvider, spec.launch_cmd);
+      // E8 FIX2: an explicit --resume <uuid> — never bare `-c`/`--continue`, which resumes "the most
+      // recent conversation in this cwd" and is ambiguous the moment two seats share a directory
+      // (discovery/plancore/implementer/validator routinely do in Helm). See R-cycle-session-continuity.md.
+      const launchCmdBase = resumeConversationId ? `${spec.launch_cmd} --resume ${resumeConversationId}` : spec.launch_cmd;
+      const { envPrefix, launchCmd } = applyEnvelopeIsolation(spawnProvider, launchCmdBase);
       const fencedLaunch = `${strictEnv}${envPrefix}${sandboxBin} ${fenceDir} ${launchCmd}`;
+      // Real wall-clock time (NOT the injectable nowFn) — this is compared against actual filesystem
+      // mtimes below, which are always real time regardless of test clock mocking.
+      const spawnStartMs = Date.now();
       // trusted launch path (skipSafetyCheck) — mirrors RealTransport + WorkerService.
       await this.deps.tmux.sendCommand(target, fencedLaunch, true, true);
-      // R7.26/B22b-cont: start the userspace guard as soon as the fenced process exists (not
-      // gated on ready-probe success). Project-fenced sessions only — test-chat sandbox dirs
-      // have no plan/<cycle> governed docs.
+      // R7.26/B22b-cont + S03: start the userspace guard as soon as the fenced process exists
+      // (not gated on ready-probe success). Project-fenced sessions only — test-chat sandbox
+      // dirs have no plan/<cycle> or cycle/<folder> governed docs. Pass phase/role/cycle so
+      // Discovery chats also fence cycle/<folder>/{og-requirements.md,plan.md,plan.json}.
       if (projectFenceDir) {
-        this.governedDocGuards.set(sessionName, startGovernedDocGuard(fenceDir));
+        const ac = opts?.activeCycle;
+        const discoveryOwned = isDiscoveryPhase(ac?.phase);
+        this.governedDocGuards.set(
+          sessionName,
+          startGovernedDocGuard(fenceDir, {
+            role: discoveryOwned ? 'discovery' : null,
+            phase: ac?.phase ?? null,
+            cycleFolder: ac?.folder_name ?? null,
+          })
+        );
       }
 
       // 4. Wait for genuine composer-ready (mirrors RealTransport POCFIX11/18/T2 — flat readyProbe alone
@@ -681,58 +794,103 @@ export class ChatSessionService {
         target
       );
       if (!ready) {
+        // FAIL-OPEN (R-cycle-session-continuity req #5): a resume must never block the cycle. A
+        // distinct error type so the public create() wrapper can retry ONCE as a clean cold spawn —
+        // any other ready-probe failure (a genuine cold-spawn failure) throws the plain Error as before.
+        if (resumeConversationId) {
+          removeStoredChatIdentity(this.deps.db, identityKey!);
+          throw new ResumeAttemptFailedError(`resume ready probe failed for ${spawnProvider}/${spawnModel}`);
+        }
         throw new Error(`test-chat agent ready probe failed for ${spawnProvider}/${spawnModel}`);
       }
 
-      // 5. B5 L3 + B6b R-16 + AGENTROLE T3: inject identity + rules + app memories BEFORE session is exposed.
-      const endMarker = bootstrapEndMarker(sessionId);
-      const appMemories = this.deps.memoryService?.listMemories({ scope: 'app', status: 'approved' }) ?? [];
-      // Authoritative project directory/name/dev-url pulled LIVE from the project row (never a stale
-      // caller-passed value), so the agent always anchors on the real Helm-defined working directory.
-      const projectContext = projectId != null ? (this.deps.projectService?.getProject(projectId) ?? null) : null;
-      // JROM directive: the project outranks the base agent — surface the project's tech-stack + the
-      // authoritative doc paths so the agent treats them as governing (best-effort; never blocks spawn).
-      const projectDocs = projectContext?.directory ? await gatherProjectDocs(projectContext.directory) : null;
-      // SIDECAR: write the full role brief (persona + project authority + rules + memories) to a file
-      // the agent reads, and paste only a LEAN prompt into the composer. A single ~8.5KB paste dropped
-      // intermittently in the TUI (persona never landed); the lean prompt is small + reliable.
-      const sidecarContent = composeAgentSidecar(
-        bootstrapDefinitionMd,
-        appMemories,
-        agent.agent_type,
-        projectContext,
-        projectDocs,
-        opts?.activeCycle ?? null
-      );
-      const sidecarPath = path.join(os.tmpdir(), 'helm-agent-briefs', `${sessionId}.md`);
-      try {
-        await fs.mkdir(path.dirname(sidecarPath), { recursive: true });
-        await fs.writeFile(sidecarPath, sidecarContent, 'utf8');
-      } catch { /* best-effort; lean prompt still establishes identity + reply protocol */ }
-      const bootstrapPayload = composeLeanBootstrap(sessionId, {
-        agentName: agent.name,
-        projectName: projectContext?.name,
-        projectDir: projectContext?.directory,
-        sidecarPath
-      });
-      const bootstrapHash = createHash('sha256').update(bootstrapPayload).digest('hex').slice(0, 16);
-      // F2: this is an interactive SEAT — gate on the provider's composer ready glyph so a seat that has not
-      // yet reached its composer (auth/update/launch frame) is not falsely marked delivered. (Composer-ready
-      // was just awaited above, so the glyph is present for a genuinely-ready seat.)
-      const bootOk = await this.deps.tmux.sendAndSubmit(target, bootstrapPayload, { readySignal: seatReadySignal(spawnProvider) });
-      if (!bootOk) throw new Error('bootstrap sendAndSubmit failed');
-      // G1: submit-verify using F3 primitive (composerHoldsText + resubmitIfComposerHeld) for bootstrap.
-      // Ensures the HELM_REPLY_PROTOCOL (and memories) actually left the composer even on variable
-      // Enter-drop windows. Short loop; marker wait below provides additional confirmation.
-      const isFakeBoot = process.env.USE_FAKE_TMUX === '1' && process.env.NODE_ENV !== 'production';
-      if (!isFakeBoot) {
-        for (let i = 0; i < 3; i++) {
-          await new Promise((r) => setTimeout(r, 600));
-          const pressed = await this.deps.tmux.resubmitIfComposerHeld(target, bootstrapPayload);
-          if (!pressed) break;
+      let endMarker = '';
+      let bootstrapHash = '';
+      let bootstrapMarkerSeen = true;
+      const bootstrapSent = !resumeConversationId;
+      if (resumeConversationId) {
+        // E8 FIX2 / R-cycle-session-continuity: a RESUMED conversation already carries full context —
+        // identity, project docs, the reply protocol, every prior turn. Sending the bootstrap prompt
+        // again would BE the re-prompt this fix exists to remove. waitForTestChatComposerReady above
+        // already proved the resumed CLI replayed its history and reached its composer; project-fenced
+        // sessions skip the settle-wait unconditionally below too. capturePane() will show the raw
+        // (unfiltered) resumed transcript because bootstrapSent=false short-circuits
+        // sanitizePostBootstrap — exactly the "1:1 mirror" behavior E7 already established.
+      } else {
+        // 5. B5 L3 + B6b R-16 + AGENTROLE T3: inject identity + rules + app memories BEFORE session is exposed.
+        endMarker = bootstrapEndMarker(sessionId);
+        const appMemories = this.deps.memoryService?.listMemories({ scope: 'app', status: 'approved' }) ?? [];
+        // Authoritative project directory/name/dev-url pulled LIVE from the project row (never a stale
+        // caller-passed value), so the agent always anchors on the real Helm-defined working directory.
+        const projectContext = projectId != null ? (this.deps.projectService?.getProject(projectId) ?? null) : null;
+        // JROM directive: the project outranks the base agent — surface the project's tech-stack + the
+        // authoritative doc paths so the agent treats them as governing (best-effort; never blocks spawn).
+        const projectDocs = projectContext?.directory ? await gatherProjectDocs(projectContext.directory) : null;
+        // SIDECAR: write the full role brief (persona + project authority + rules + memories) to a file
+        // the agent reads, and paste only a LEAN prompt into the composer. A single ~8.5KB paste dropped
+        // intermittently in the TUI (persona never landed); the lean prompt is small + reliable.
+        // S09: Discovery cycle chats get a one-use ready-callback credential + exact POST instruction.
+        let discoveryReadyBlock: string | null = null;
+        const ac = opts?.activeCycle ?? null;
+        if (
+          projectFenceDir &&
+          projectId != null &&
+          ac &&
+          isDiscoveryPhase(ac.phase)
+        ) {
+          const issued = issueDiscoveryCallbackCredential({
+            projectId,
+            cycleId: ac.id,
+            chatSessionId: sessionId,
+            agentId,
+          });
+          discoveryReadyBlock = formatDiscoveryReadyCallbackInstruction({
+            rawCredential: issued.rawCredential,
+            projectId,
+            cycleId: ac.id,
+            chatSessionId: sessionId,
+            agentId,
+          });
         }
+        const sidecarContent = composeAgentSidecar(
+          bootstrapDefinitionMd,
+          appMemories,
+          agent.agent_type,
+          projectContext,
+          projectDocs,
+          opts?.activeCycle ?? null,
+          discoveryReadyBlock
+        );
+        const sidecarPath = path.join(os.tmpdir(), 'helm-agent-briefs', `${sessionId}.md`);
+        try {
+          await fs.mkdir(path.dirname(sidecarPath), { recursive: true });
+          await fs.writeFile(sidecarPath, sidecarContent, 'utf8');
+        } catch { /* best-effort; lean prompt still establishes identity + reply protocol */ }
+        const bootstrapPayload = composeLeanBootstrap(sessionId, {
+          agentName: agent.name,
+          projectName: projectContext?.name,
+          projectDir: projectContext?.directory,
+          sidecarPath
+        });
+        bootstrapHash = createHash('sha256').update(bootstrapPayload).digest('hex').slice(0, 16);
+        // F2: this is an interactive SEAT — gate on the provider's composer ready glyph so a seat that has not
+        // yet reached its composer (auth/update/launch frame) is not falsely marked delivered. (Composer-ready
+        // was just awaited above, so the glyph is present for a genuinely-ready seat.)
+        const bootOk = await this.deps.tmux.sendAndSubmit(target, bootstrapPayload, { readySignal: seatReadySignal(spawnProvider) });
+        if (!bootOk) throw new Error('bootstrap sendAndSubmit failed');
+        // G1: submit-verify using F3 primitive (composerHoldsText + resubmitIfComposerHeld) for bootstrap.
+        // Ensures the HELM_REPLY_PROTOCOL (and memories) actually left the composer even on variable
+        // Enter-drop windows. Short loop; marker wait below provides additional confirmation.
+        const isFakeBoot = process.env.USE_FAKE_TMUX === '1' && process.env.NODE_ENV !== 'production';
+        if (!isFakeBoot) {
+          for (let i = 0; i < 3; i++) {
+            await new Promise((r) => setTimeout(r, 600));
+            const pressed = await this.deps.tmux.resubmitIfComposerHeld(target, bootstrapPayload);
+            if (!pressed) break;
+          }
+        }
+        bootstrapMarkerSeen = await waitForBootstrapMarker(this.deps.tmux, target, endMarker);
       }
-      const bootstrapMarkerSeen = await waitForBootstrapMarker(this.deps.tmux, target, endMarker);
 
       // B5R: Studio/test-chat sessions are short bootstrap probes, so wait for idle before exposing.
       // Project-scoped Command Center sessions may read substantial project/cycle docs on first turn;
@@ -753,24 +911,46 @@ export class ChatSessionService {
         paneTarget: target,
         lastSnapshot: '',
         createdAt: (this.deps.nowFn ?? Date.now)(),
-        bootstrapSent: true,
+        bootstrapSent,
         bootstrapEndMarker: endMarker,
         bootstrapHash,
         bootstrapMarkerSeen,
         spawnProvider,
         spawnModel,
         projectId: projectFenceDir ? projectId : undefined,
-        fenceDir
+        fenceDir,
+        sessionToken: createToken,
       });
+
+      // E8 FIX2: the session is live either way by this point — capturing/persisting the resumable
+      // id is a pure bonus for the NEXT reopen and must never affect THIS one. A cold spawn captures
+      // the freshly-written transcript id; a resumed spawn already knows its id (no re-detection).
+      if (identityKey && spawnProvider === 'claude') {
+        if (resumeConversationId) {
+          conversationId = resumeConversationId;
+        } else {
+          const detected = await waitForClaudeConversationId(fenceDir, spawnStartMs).catch(() => null);
+          if (detected && CLAUDE_CONVERSATION_ID_RE.test(detected)) {
+            storeChatIdentity(this.deps.db, identityKey, { provider: 'claude', conversationId: detected });
+            conversationId = detected;
+          }
+        }
+      }
     } catch (err) {
       // Boot failed — tear down the half-created pane so we never leak a session.
-      try { await this.deps.tmux.terminateSession(sessionName); } catch {}
+      // B02 C1: create-time token only (never late get-by-name).
+      try {
+        await this.deps.tmux.terminateSession(
+          sessionName,
+          createToken ? { sessionToken: createToken } : { noRegistryWrite: true }
+        );
+      } catch {}
       try { this.governedDocGuards.get(sessionName)?.stop(); } catch {}
       this.governedDocGuards.delete(sessionName);
       throw err;
     }
 
-    return { sessionId, tmuxSession: sessionName, spawnModel };
+    return { sessionId, tmuxSession: sessionName, spawnModel, conversationId, resumed: !!resumeConversationId };
   }
 
   /**
@@ -911,7 +1091,13 @@ export class ChatSessionService {
     const sess = this.sessions.get(sessionId);
     if (!sess) return; // no-op if already gone (idempotent for DELETE + shutdown sweep)
     this.sessions.delete(sessionId);
-    try { await this.deps.tmux.terminateSession(sess.tmuxSession); } catch {}
+    try {
+      // B02 C1: create-time token retained on ChatSession (never late get-by-name).
+      await this.deps.tmux.terminateSession(
+        sess.tmuxSession,
+        sess.sessionToken ? { sessionToken: sess.sessionToken } : { noRegistryWrite: true }
+      );
+    } catch {}
     try { this.governedDocGuards.get(sess.tmuxSession)?.stop(); } catch {}
     this.governedDocGuards.delete(sess.tmuxSession);
   }

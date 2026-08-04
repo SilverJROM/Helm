@@ -1,0 +1,13 @@
+{
+  "malformedLine": "SIGNED plan=d81b83a40517XYZ",
+  "expected": "signed-mismatched",
+  "actual": {
+    "ok": true,
+    "kind": "signed-agreed",
+    "candidatePlan": {
+      "sha256": "d81b83a40517d984a290200c862d81b5fb48c973b2e7fc1865490e84e1f53ec3",
+      "short12": "d81b83a40517"
+    },
+    "claimedShort12": "d81b83a40517"
+  }
+}

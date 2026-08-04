@@ -63,12 +63,12 @@ describe('Leg D: production barrier/ordering (shared validation → ingest → d
     const idToKey: Record<number, string> = {};
     for (const [k, v] of Object.entries(keyToId)) idToKey[v] = k;
     const dispatched: string[] = [];
-    let tid = queue.getNextReady(rid);
-    while (tid != null) {
-      dispatched.push(idToKey[tid]);
-      expect(queue.getNextReady(rid), 'strict one-in-flight while a task is dispatched').toBeNull();
-      queue.markComplete(tid, rid);
-      tid = queue.getNextReady(rid);
+    let claim = queue.claimNextReady(rid);
+    while (claim != null) {
+      dispatched.push(idToKey[claim.taskId]);
+      expect(queue.claimNextReady(rid), 'strict one-in-flight while a task is dispatched').toBeNull();
+      queue.markComplete(claim);
+      claim = queue.claimNextReady(rid);
     }
     expect(dispatched).toEqual(['A1', 'A2', 'B1']);
     // B2 (task key "B1") was not dispatched before BOTH B1-batch tasks completed.
@@ -95,8 +95,8 @@ describe('Leg D: production barrier/ordering (shared validation → ingest → d
 `;
     const rid = art.createRun(null, 'batch-legd-single');
     await parser.ingestExecutionPlan(rid, md, queue, runDir);
-    let count = 0, r = queue.getNextReady(rid);
-    while (r != null) { count++; queue.markComplete(r, rid); r = queue.getNextReady(rid); }
+    let count = 0, r = queue.claimNextReady(rid);
+    while (r != null) { count++; queue.markComplete(r); r = queue.claimNextReady(rid); }
     expect(count).toBe(2);
   });
 
@@ -254,17 +254,21 @@ describe('Leg D: deploy gate keyed off run_tasks.batch', () => {
     const alpha = art.recordTask(rid, 'alpha', 'a', 'B1');
     const omega = art.recordTask(rid, 'omega', 'o', 'B1');
     const release = art.recordTask(rid, 'release', 'r', 'B2');
+    // B03: enqueue so freezeTerminalToken can seed run generation (token-only mark*).
+    queue.enqueue(rid, alpha, [], false, 'B1');
+    queue.enqueue(rid, omega, [], false, 'B1');
+    queue.enqueue(rid, release, [], false, 'B2');
 
     const project = pSvc.getProject(proj.id);
     const loop = await loopWithSeededProof(rid, 'batch-legd-dg', devUrl);
 
     // After alpha completes, B1 still has omega pending → NO deploy.
-    queue.markComplete(alpha, rid); // sets status='complete' in DB
+    queue.markComplete(queue.freezeTerminalToken(rid, alpha)!); // sets status='complete' in DB
     await (orch as any).maybeRunBatchDeployGate({ runId: rid, runDir, batchId: 'batch-legd-dg', taskKey: 'alpha', project, loop, nextTaskId: alpha });
     expect(deployCalls.length, 'no deploy while omega (B1) is still pending').toBe(0);
 
     // After omega completes, B1 is closed (the exact `batch='B1' AND status!='complete'` query returns 0) → deploy.
-    queue.markComplete(omega, rid);
+    queue.markComplete(queue.freezeTerminalToken(rid, omega)!);
     await (orch as any).maybeRunBatchDeployGate({ runId: rid, runDir, batchId: 'batch-legd-dg', taskKey: 'omega', project, loop, nextTaskId: omega });
     expect(deployCalls.length, 'deploy fires exactly once when B1 closes').toBe(1);
     expect(deployCalls[0].devUrl).toBe(devUrl);
@@ -284,10 +288,11 @@ describe('Leg D: deploy gate keyed off run_tasks.batch', () => {
 
     // Key says B99, but the persisted batch is B1 — closing it must deploy-gate B1.
     const t = art.recordTask(rid, 'B99-task', 'misleading key', 'B1');
+    queue.enqueue(rid, t, [], false, 'B1');
     const project = pSvc.getProject(proj.id);
     const loop = await loopWithSeededProof(rid, 'batch-legd-b99', devUrl);
 
-    queue.markComplete(t, rid);
+    queue.markComplete(queue.freezeTerminalToken(rid, t)!);
     await (orch as any).maybeRunBatchDeployGate({ runId: rid, runDir, batchId: 'batch-legd-b99', taskKey: 'B99-task', project, loop, nextTaskId: t });
     expect(deployCalls.length).toBe(1);
     // The deploy artifact is labeled with the normalized batch B1 (not B99).
@@ -303,9 +308,10 @@ describe('Leg D: deploy gate keyed off run_tasks.batch', () => {
     const rid = art.createRun(proj.id, 'batch-legd-def', path.join(runDir, 'north_star.md'));
     dbs.raw.prepare("UPDATE runs SET phase='executing' WHERE id=?").run(rid);
     const t = art.recordTask(rid, 'T1', 'legacy', 'default');
+    queue.enqueue(rid, t, [], false, 'default');
     const project = pSvc.getProject(proj.id);
     const loop = await loopWithSeededProof(rid, 'batch-legd-def', 'http://127.0.0.1:39996/dev');
-    queue.markComplete(t, rid);
+    queue.markComplete(queue.freezeTerminalToken(rid, t)!);
     await (orch as any).maybeRunBatchDeployGate({ runId: rid, runDir, batchId: 'batch-legd-def', taskKey: 'T1', project, loop, nextTaskId: t });
     expect(deployCalls.length).toBe(0);
   });
@@ -358,13 +364,13 @@ describe('Leg D: deploy gate keyed off run_tasks.batch', () => {
     // Seed the legacy (all-default) plan, then compute the final-fix batch exactly as the orchestrator does.
     const t1 = art.recordTask(rid, 'T1', 'legacy work', 'default');
     queue.enqueue(rid, t1, [], false, 'default');
-    queue.markComplete(t1, rid);
+    queue.markComplete(queue.freezeTerminalToken(rid, t1)!);
     const fixBatch = queue.newBatchAfterLast(rid);
     expect(fixBatch).toBe('default'); // legacy plan → final-fix stays in default (not 'default1')
 
     const fixId = art.recordTask(rid, 'FIX-FINAL-LEGACY-abc', 'final-test fix', fixBatch);
     queue.enqueueTask(rid, fixId, true, fixBatch);
-    queue.markComplete(fixId, rid);
+    queue.markComplete(queue.freezeTerminalToken(rid, fixId)!);
     const project = pSvc.getProject(proj.id);
     const loop = await loopWithSeededProof(rid, 'batch-legd-finalfix', 'http://127.0.0.1:39996/dev');
     await (orch as any).maybeRunBatchDeployGate({ runId: rid, runDir, batchId: 'batch-legd-finalfix', taskKey: 'FIX-FINAL-LEGACY-abc', project, loop, nextTaskId: fixId });
@@ -414,9 +420,9 @@ describe('Leg D: pending-after-drain blocked-run classifier + artifact', () => {
     queue.enqueue(rid, b, [], false, 'B1');
     queue.enqueue(rid, c, [], false, 'B2');
     // Drain: a fails, b completes; c barred by the failed B1.
-    expect(queue.getNextReady(rid)).toBe(a); queue.markFailed(a, rid);
-    expect(queue.getNextReady(rid)).toBe(b); queue.markComplete(b, rid);
-    expect(queue.getNextReady(rid)).toBeNull();
+    const ca = queue.claimNextReady(rid); expect(ca!.taskId).toBe(a); queue.markFailed(ca!);
+    const cb = queue.claimNextReady(rid); expect(cb!.taskId).toBe(b); queue.markComplete(cb!);
+    expect(queue.claimNextReady(rid)).toBeNull();
 
     const blocked = await (orch as any).handlePendingAfterDrain(rid, runDir, 'batch-legd-pad');
     expect(blocked).toBe(true);
@@ -444,8 +450,8 @@ describe('Leg D: pending-after-drain blocked-run classifier + artifact', () => {
     const c = art.recordTask(rid, 'B2-C', 'c', 'B2');
     queue.enqueue(rid, a, [], false, 'B1');
     queue.enqueue(rid, c, [], false, 'B2');
-    queue.getNextReady(rid); queue.markDeferred(a, rid);
-    expect(queue.getNextReady(rid)).toBeNull();
+    queue.claimNextReady(rid); queue.markDeferred(queue.freezeTerminalToken(rid, a)!);
+    expect(queue.claimNextReady(rid)).toBeNull();
     expect(await (orch as any).handlePendingAfterDrain(rid, runDir, 'batch-legd-pad2')).toBe(true);
     const note = await fs.readFile(path.join(runDir, 'pending-after-drain.md'), 'utf8');
     expect(note).toMatch(/deferred-block/);
@@ -472,7 +478,7 @@ describe('Leg D: pending-after-drain blocked-run classifier + artifact', () => {
     dbs.raw.prepare("UPDATE runs SET phase='executing' WHERE id=?").run(rid);
     const a = art.recordTask(rid, 'B1-A', 'a', 'B1');
     queue.enqueue(rid, a, [], false, 'B1');
-    queue.getNextReady(rid); queue.markComplete(a, rid);
+    queue.claimNextReady(rid); queue.markComplete(queue.freezeTerminalToken(rid, a)!);
     expect(await (orch as any).handlePendingAfterDrain(rid, runDir, 'batch-legd-pad4')).toBe(false);
   });
 });
@@ -501,7 +507,7 @@ describe('Leg D: dynamic-task batch resolution (inject)', () => {
     dbs.raw.prepare("UPDATE runs SET phase='executing' WHERE id=?").run(rid);
     const a = art.recordTask(rid, 'B1-A', 'a', 'B1');
     queue.enqueue(rid, a, [], false, 'B1');
-    queue.getNextReady(rid); // a in-flight (active batch B1)
+    queue.claimNextReady(rid); // a in-flight (active batch B1)
 
     const inherited = await orch.inject(rid, { label: 'mid-run injected' });
     const rowI = dbs.raw.prepare('SELECT batch FROM run_tasks WHERE id=?').get(inherited.injected) as any;

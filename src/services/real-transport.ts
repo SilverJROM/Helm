@@ -1,5 +1,6 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { randomBytes } from 'node:crypto';
 import type { ITransport } from './fake-transport.js';
 import { TmuxService } from '../tmux/tmux-service.js';
 import { DispatchService, type DispatchStartParams } from './dispatch-service.js';
@@ -10,6 +11,92 @@ import { PROVIDERS, seatReadySignal } from '../config/providers.js';
 import { matchInterstitial, InterstitialBlockedError } from './cli-interstitials.js';
 import { applyEnvelopeIsolation } from './envelope-isolation.js';
 import type { SeatInspection } from './seat-pane-state.js';
+import type { SessionStatusToken } from './lifecycle-cas.js';
+
+/**
+ * B02 C1 R3: spawn handle embeds a unique lifecycle id so same-name re-spawn cannot overwrite
+ * the retained create-time CAS token for an earlier handle.
+ * Format: `<sessionName>:0.0#<spawnId>` (tmux target is the part before `#`).
+ */
+export function parseLifecycleHandle(handle: string): {
+  sessionName: string;
+  tmuxTarget: string;
+  spawnId: string | null;
+} {
+  const raw = String(handle || '').trim();
+  if (!raw) return { sessionName: '', tmuxTarget: '', spawnId: null };
+  const hash = raw.indexOf('#');
+  const base = hash >= 0 ? raw.slice(0, hash) : raw;
+  const spawnId = hash >= 0 ? raw.slice(hash + 1) : null;
+  const sessionName = base.split(':')[0] || '';
+  const tmuxTarget = base.includes(':') ? base : sessionName ? `${sessionName}:0.0` : '';
+  return { sessionName, tmuxTarget, spawnId: spawnId || null };
+}
+
+export function formatLifecycleHandle(sessionName: string, spawnId: string): string {
+  return `${sessionName}:0.0#${spawnId}`;
+}
+
+/**
+ * C1 / AC13 — identity used to resolve the on-disk brief basename under prompts/.
+ * External `role` semantics stay on the spawn `role` field; uniqueness is additive here.
+ */
+export type SpawnBriefIdentity = {
+  role: string;
+  batchId?: string;
+  attemptId?: number;
+  /** Seat label (e.g. partner, partner-2). Later planning slices pass this. */
+  seatId?: string;
+  /** Review round number. Later round-loop slices pass this. */
+  round?: number;
+  /** Explicit basename override (with or without .brief.md). Wins over composition. */
+  briefFileName?: string;
+};
+
+/** Sanitize one path segment for prompts/*.brief.md (no path separators, bounded length). */
+export function sanitizeBriefToken(raw: string): string {
+  const cleaned = String(raw || '')
+    .trim()
+    .replace(/[^a-zA-Z0-9._+-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 120);
+  return cleaned || 'seat';
+}
+
+/**
+ * C1 / AC13 — pure brief basename under prompts/.
+ *
+ * - Default (role only, no disambiguators): `${role}.brief.md` — backward compatible.
+ * - With batchId / seatId / round / attemptId: include segments so concurrent same-role
+ *   seats (e.g. two deliberation partners with distinct partner batchIds) cannot collide.
+ * - briefFileName override: sanitized basename, forced `.brief.md` suffix.
+ *
+ * Note: artifacts.writeBrief already writes unique partner names in planning; the remaining
+ * collision is RealTransport always rewriting prompts/${role}.brief.md — this helper is that seam.
+ */
+export function resolveSpawnBriefFileName(id: SpawnBriefIdentity): string {
+  if (id.briefFileName != null && String(id.briefFileName).trim()) {
+    const base = path.basename(String(id.briefFileName).trim());
+    const withoutSuffix = base.replace(/\.brief\.md$/i, '');
+    return `${sanitizeBriefToken(withoutSuffix)}.brief.md`;
+  }
+  const role = sanitizeBriefToken(id.role);
+  const segs: string[] = [role];
+  if (id.seatId != null && String(id.seatId).trim()) {
+    segs.push(sanitizeBriefToken(String(id.seatId)));
+  }
+  if (id.round != null && Number.isFinite(Number(id.round))) {
+    segs.push(`r${Math.trunc(Number(id.round))}`);
+  }
+  if (id.attemptId != null && Number.isFinite(Number(id.attemptId)) && Number(id.attemptId) > 0) {
+    segs.push(`a${Math.trunc(Number(id.attemptId))}`);
+  }
+  if (id.batchId != null && String(id.batchId).trim()) {
+    segs.push(sanitizeBriefToken(String(id.batchId)));
+  }
+  if (segs.length === 1) return `${role}.brief.md`;
+  return `${segs.join('--')}.brief.md`;
+}
 
 // Hard-pin the worker identity when the host CLI supports a system-prompt override (claude).
 // Kept apostrophe-free so it embeds directly inside single quotes in the launch command (no shell escaping).
@@ -18,7 +105,8 @@ import type { SeatInspection } from './seat-pane-state.js';
 
 
 interface RealTransportDeps {
-  tmux?: TmuxService;
+  // fix1 / AC19: required, not optional — see the constructor guard below.
+  tmux: TmuxService;
   artifacts?: any; // RunArtifactService | stub (recordDispatch only needed for dispatch.start success path)
   resolver?: ProviderResolverService;
 }
@@ -40,13 +128,30 @@ export class RealTransport implements ITransport {
   // R7.26/B22b-cont: userspace fence for the 3 plan/<cycle> governed docs, keyed by tmux session
   // name, for the fenced agent's lifetime. north-star.md is kernel-fenced; see helm-sandbox.c.
   private readonly governedDocGuards = new Map<string, GovernedDocGuardHandle>();
+  /**
+   * B02 C1 R3: create-time SessionStatusToken keyed by **spawnId** (unique per lifecycle), never
+   * by session name alone. Same-name B cannot overwrite A's entry; reap(A-handle) uses token A.
+   */
+  private readonly lifecycles = new Map<
+    string,
+    { sessionName: string; token?: SessionStatusToken }
+  >();
 
-  constructor(deps: RealTransportDeps = {}) {
+  constructor(deps: RealTransportDeps) {
     const isFake = process.env.USE_FAKE_TMUX === '1' && process.env.NODE_ENV !== 'production';
     if (isFake) {
       throw new Error('RealTransport strictly behind !USE_FAKE_TMUX=1 (non-production) per batch-A1 approval; real tmux/worker paths untouched. Use FakeTransport when the flag is set.');
     }
-    this.tmux = deps.tmux ?? new TmuxService();
+    // fix1 / AC19: no silent unhooked fallback. A private `new TmuxService()` here would carry the
+    // NOOP registry hook, which (after tmux-service.ts's mandatory-token fix) can never successfully
+    // create a session — but failing loudly at construction is a clearer signal than a hidden fallback
+    // that only breaks later, or worse, quietly persists as an unhooked instance. Every real caller
+    // (src/index.ts) already passes the shared hooked instance; the runtime guard below defends
+    // `as any`/non-TS callers that bypass the now-required type.
+    if (!deps?.tmux) {
+      throw new Error('RealTransport requires an explicit hooked TmuxService (deps.tmux) — no unhooked fallback (AC19 fail-closed)');
+    }
+    this.tmux = deps.tmux;
     this.resolver = deps.resolver ?? new ProviderResolverService();
     this.artifacts = deps.artifacts ?? new NoopArtifacts();
     this.dispatch = new DispatchService(this.tmux, this.artifacts);
@@ -83,6 +188,10 @@ export class RealTransport implements ITransport {
     // for planning seats). Absent → register(name) with NULL ids (byte-identical to pre-A2).
     projectId?: number;
     runId?: number;
+    // C1 / AC13: additive seat identity for unique prompts/*.brief.md (external role unchanged).
+    seatId?: string;
+    round?: number;
+    briefFileName?: string;
   }): Promise<{ handle: string; role: string }> {
     const role = params.role;
     const runDir = params.runDir;
@@ -137,11 +246,18 @@ export class RealTransport implements ITransport {
     // Dedicated fresh session per dispatch (clean context; reuse would require explicit /clear before next)
     // Honor explicit sessionName for per-project projcore (from projects.projcore_session or default <slug>-projcore)
     const sessionName = params.sessionName || `helm-${batchId}-${role}-${Date.now().toString(36).slice(-8)}`;
-    // A2: pass projectId/runId at the createSession choke point so helm_sessions lands linked.
+    // B02 C1 R3: unique spawnId binds the create-time CAS token to this lifecycle handle.
+    const spawnId = randomBytes(8).toString('hex');
+    // A2 + S05: projectId/runId + owner=helm (brains/workers via transport) at createSession choke point.
+    const sessionTokenOut: { token?: SessionStatusToken } = {};
     const target = await this.tmux.createSession(sessionName, fenceDir, {
       projectId: params.projectId ?? null,
       runId: params.runId ?? null,
+      owner: 'helm',
+      sessionTokenOut,
     });
+    this.lifecycles.set(spawnId, { sessionName, token: sessionTokenOut.token });
+    const lifecycleHandle = formatLifecycleHandle(sessionName, spawnId);
 
     try {
       // Launch the real agent (grok-4.5 etc) under fence + skipSafety (trusted launch path, like WorkerService)
@@ -181,12 +297,23 @@ export class RealTransport implements ITransport {
       try { await this.tmux.sendKeys(target, '\x1b'); } catch {} // Esc safe after ready
       await new Promise((r) => setTimeout(r, 900));
 
-      // Write the brief param (passed by planning/panel/loop callers) to prompts/<role>.brief.md BEFORE
-      // dispatch reads the path. mkdir + write honors the 'brief' arg for any role (projcore etc).
-      // Fixes live POST /runs ENOENT (run-orchestrator wrote 'prompt.brief.md'; planning passed
-      // projcore brief string but real-transport did not persist role file; Fake used param in-mem).
+      // C1 / AC13: write prompts/<unique>.brief.md BEFORE dispatch reads the path.
+      // Legacy `${role}.brief.md` when no batchId/seat/round/attempt disambiguators; concurrent
+      // same-role reviewers (partner batchIds differ) get distinct basenames so seat-2 cannot
+      // clobber seat-1. External role passed to dispatch/return stays params.role unchanged.
+      // mkdir + write honors the 'brief' arg for any role (projcore etc).
       await fs.mkdir(path.join(runDir, 'prompts'), { recursive: true });
-      const briefPath = path.join(runDir, 'prompts', `${role}.brief.md`);
+      const briefFileName = resolveSpawnBriefFileName({
+        role,
+        // Use caller-supplied batchId only (not the dispatch default) so bare-role spawns keep
+        // prompts/${role}.brief.md; partner seats already pass distinct batchIds today.
+        batchId: params.batchId,
+        attemptId: params.attemptId,
+        seatId: params.seatId,
+        round: params.round,
+        briefFileName: params.briefFileName,
+      });
+      const briefPath = path.join(runDir, 'prompts', briefFileName);
       await fs.writeFile(briefPath, params.brief, 'utf8');
 
       const callbacksFile = path.join(runDir, 'callbacks.md');
@@ -214,9 +341,18 @@ export class RealTransport implements ITransport {
       // sendAndSubmit already re-presses Enter internally, covering grok's first-paste sensitivity.
       await this.dispatch.start(dispatchParams);
 
-      return { handle: target, role };
+      // Handle embeds spawnId so reap uses THIS lifecycle's create-time token, not a same-name B.
+      return { handle: lifecycleHandle, role };
     } catch (e) {
-      try { await this.tmux.terminateSession(sessionName); } catch {}
+      const rec = this.lifecycles.get(spawnId);
+      const createTok = rec?.token ?? sessionTokenOut.token;
+      try {
+        await this.tmux.terminateSession(
+          sessionName,
+          createTok ? { sessionToken: createTok } : { noRegistryWrite: true }
+        );
+      } catch {}
+      this.lifecycles.delete(spawnId);
       try { this.governedDocGuards.get(sessionName)?.stop(); } catch {}
       this.governedDocGuards.delete(sessionName);
       throw e;
@@ -225,9 +361,12 @@ export class RealTransport implements ITransport {
 
   /** Read-only liveness inspection. Empty capture remains unknown while sessionAlive stays true. */
   async inspectSeat(target: string, brief: string, _provider?: string): Promise<SeatInspection> {
-    const sessionAlive = await this.tmux.sessionExists(target);
+    // B02 C1 R3: handle may embed #spawnId — tmux only accepts the bare target.
+    const { tmuxTarget } = parseLifecycleHandle(target);
+    const paneTarget = tmuxTarget || target;
+    const sessionAlive = await this.tmux.sessionExists(paneTarget);
     if (!sessionAlive) return { sessionAlive: false, pane: '', composerHoldsBrief: false };
-    const pane = await this.tmux.capturePane(target, 200);
+    const pane = await this.tmux.capturePane(paneTarget, 200);
     return {
       sessionAlive: true,
       pane,
@@ -237,8 +376,10 @@ export class RealTransport implements ITransport {
 
   /** One semantic callback-repair nudge, sent only after the wait loop proves an idle composer. */
   async nudgeSeat(target: string, provider?: string): Promise<boolean> {
+    const { tmuxTarget } = parseLifecycleHandle(target);
+    const paneTarget = tmuxTarget || target;
     const nudge = 'CALLBACK REQUIRED — control returned without your callback. Do NOT redo the task. Append your DONE/BLOCKED/PASS/FAIL now.';
-    return this.tmux.sendAndSubmit(target, nudge, { readySignal: seatReadySignal(provider) });
+    return this.tmux.sendAndSubmit(paneTarget, nudge, { readySignal: seatReadySignal(provider) });
   }
 
   // Compatibility seam for any external caller left from the old kloo-only watchdog. The orchestration
@@ -387,7 +528,12 @@ export class RealTransport implements ITransport {
           await new Promise((r) => setTimeout(r, 500));
           continue; // re-capture before the ready check (the menu itself can contain › glyphs)
         }
-        const hasStable = /gpt-5/i.test(pane) || /›/.test(pane);
+        // gpt-5.6-sol review (2026-08-03 08:2x PHT, consulted per JROM): the model NAME can appear
+        // in codex's startup banner before the composer actually exists, so accepting /gpt-5/i alone
+        // let this report "genuine ready" prematurely — DispatchService's own, stricter › poll then
+        // times out on a seat this check already (wrongly) waved through. Require the real composer
+        // glyph only, matching the second gate.
+        const hasStable = /›/.test(pane);
         const noLoading = !/Starting|loading|spinner/i.test(pane);
         if (hasStable && noLoading) {
           return true;
@@ -401,23 +547,48 @@ export class RealTransport implements ITransport {
   }
 
   async reap(handle: string, reason = 'complete'): Promise<void> {
-    const sessionName = (handle || '').split(':')[0];
+    const { sessionName, tmuxTarget, spawnId } = parseLifecycleHandle(handle);
     if (!sessionName) return;
 
-    // Reuse B7 DSP7 clearContext (provider-specific: /clear for grok/codex, clear for claude + verify clean prompt + no residue)
-    try {
-      const providerGuess = /claude/i.test(handle) ? 'claude' : 'grok';
-      await this.tmux.clearContext(handle, providerGuess);
-    } catch {
-      // best-effort (matches tmux-service implementation)
+    // B02 C1 R3: token bound to spawnId on the handle — never the current name-map entry.
+    const rec = spawnId ? this.lifecycles.get(spawnId) : undefined;
+    const createTok = rec?.token;
+
+    if (createTok) {
+      // B02 C1 R4: terminateSession claims CAS first; kills only if applied.
+      // Do NOT clearContext/guard-stop before claim — those are name-bound and would hit B.
+      let killed = false;
+      try {
+        killed = await this.tmux.terminateSession(sessionName, { sessionToken: createTok });
+      } catch {
+        killed = false;
+      }
+      if (spawnId) this.lifecycles.delete(spawnId);
+      if (killed) {
+        try {
+          this.governedDocGuards.get(sessionName)?.stop();
+        } catch {}
+        this.governedDocGuards.delete(sessionName);
+      }
+      return;
     }
 
+    // No lifecycle token: explicit kill-only path (name-only handle).
     try {
-      await this.tmux.terminateSession(sessionName);
+      const providerGuess = /claude/i.test(handle) ? 'claude' : 'grok';
+      await this.tmux.clearContext(tmuxTarget, providerGuess);
     } catch {
-      // idempotent / best-effort reap
+      /* best-effort */
     }
-    try { this.governedDocGuards.get(sessionName)?.stop(); } catch {}
+    try {
+      await this.tmux.terminateSession(sessionName, { noRegistryWrite: true });
+    } catch {
+      /* best-effort */
+    }
+    if (spawnId) this.lifecycles.delete(spawnId);
+    try {
+      this.governedDocGuards.get(sessionName)?.stop();
+    } catch {}
     this.governedDocGuards.delete(sessionName);
   }
 

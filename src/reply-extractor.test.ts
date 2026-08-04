@@ -7,7 +7,7 @@
 // .js ESM module (no .d.ts). @ts-nocheck at top makes tsc skip for this test file.
 // Runtime import works under vitest. Tests the exact 4 cases required by brief.
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import {
   extractHelmReply,
   extractAgentPaneSegment,
@@ -15,6 +15,101 @@ import {
   looksLikeChrome,
   stripChrome
 } from './web/public/reply-extractor.js';
+
+const PANE_FIXTURES = [
+  {
+    file: 'discovery-finished-turn-20260727.txt',
+    pending: 'please continue discovery',
+    reply: 'Diwa v1 from cycle 11 is complete and clean on main'
+  },
+  {
+    file: 'discovery-sent-echoed-in-composer-20260728.txt',
+    pending: '(a) — recall output is unreadable, keep text mode frozen',
+    reply: 'Status: INTERVIEWING'
+  }
+];
+
+// E8: discovery-live-20260728-2251.txt (SOL diagnosis fixture — three completed HELM_REPLY turns,
+// the second reply's own content contains a box-drawing markdown table) is deliberately NOT added to
+// PANE_FIXTURES above. It exercises FIX1 (src/cc-disc-stream-reconcile.test.ts) and FIX3 (the
+// last-reply-strip suite), neither of which uses this suite's single-current-turn pending/reply
+// convention. It still carries a provenance header and is covered by the directory-wide check below.
+
+function readPaneFixture(file) {
+  const raw = readFileSync(new URL(`./test-fixtures/panes/${file}`, import.meta.url), 'utf8');
+  return raw.replace(/^# HELM_PROVENANCE: source_session=[^\n]+ capture_date=\d{4}-\d{2}-\d{2}\n/, '');
+}
+
+function appDisplayText(pane, pending) {
+  const r = extractHelmReply(pane, pending);
+  const thinking = r.state === 'thinking';
+  let text = r.text || '';
+  if (!thinking && !text) text = extractAgentPaneSegment('', pane, pending) || '';
+  return { state: r.state, thinking, text };
+}
+
+function appJsSource() {
+  return readFileSync(new URL('./web/public/app.js', import.meta.url), 'utf8');
+}
+
+function splitArgs(argsSource) {
+  const args = [];
+  let current = '';
+  let quote = null;
+  let depth = 0;
+  for (let i = 0; i < argsSource.length; i += 1) {
+    const ch = argsSource[i];
+    const prev = argsSource[i - 1];
+    if (quote) {
+      current += ch;
+      if (ch === quote && prev !== '\\') quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === '`') {
+      quote = ch;
+      current += ch;
+      continue;
+    }
+    if ('([{'.includes(ch)) depth += 1;
+    if (')]}'.includes(ch)) depth -= 1;
+    if (ch === ',' && depth === 0) {
+      args.push(current.trim());
+      current = '';
+      continue;
+    }
+    current += ch;
+  }
+  if (current.trim()) args.push(current.trim());
+  return args;
+}
+
+function argShape(arg) {
+  const clean = arg.trim();
+  if (clean === "''" || clean === '""' || clean === '``') return 'empty-literal';
+  return 'non-empty-expression';
+}
+
+function discoveredExtractorCallShapes() {
+  const source = appJsSource();
+  const calls = [];
+  const callRe = /\b(extractHelmReply|extractAgentPaneSegment)\s*\(([^)]*)\)/g;
+  let match;
+  while ((match = callRe.exec(source)) !== null) {
+    const args = splitArgs(match[2]);
+    calls.push({
+      name: match[1],
+      arity: args.length,
+      argShapes: args.map(argShape),
+      signature: `${match[1]}/${args.length}/${args.map(argShape).join(',')}`
+    });
+  }
+  return calls;
+}
+
+const exercisedDisplayCallShapes = new Set([
+  'extractHelmReply/2/non-empty-expression,non-empty-expression',
+  'extractAgentPaneSegment/3/empty-literal,non-empty-expression,non-empty-expression'
+]);
 
 describe('G1 reply-extractor (Studio + CC parity)', () => {
   it('marked ⟦HELM_REPLY⟧ reply yields state=reply with inner text (priority)', () => {
@@ -333,26 +428,17 @@ Working on it, gathering the test resul
   });
 
   it('E4: real finished Discovery pane is idle, not generating', () => {
-    const realFinishedPane = readFileSync(
-      new URL('./test-fixtures/panes/discovery-finished-turn-20260727.txt', import.meta.url),
-      'utf8'
-    );
+    const realFinishedPane = readPaneFixture('discovery-finished-turn-20260727.txt');
     expect(paneLooksGenerating(realFinishedPane)).toBe(false);
   });
 
   it('E4: real finished Discovery pane extracts the completed reply', () => {
-    const realFinishedPane = readFileSync(
-      new URL('./test-fixtures/panes/discovery-finished-turn-20260727.txt', import.meta.url),
-      'utf8'
-    );
+    const realFinishedPane = readPaneFixture('discovery-finished-turn-20260727.txt');
     expect(extractHelmReply(realFinishedPane, '').state).toBe('reply');
   });
 
   it('E4: truncated finished pane with close marker but no open marker extracts reply', () => {
-    const realFinishedPane = readFileSync(
-      new URL('./test-fixtures/panes/discovery-finished-turn-20260727.txt', import.meta.url),
-      'utf8'
-    );
+    const realFinishedPane = readPaneFixture('discovery-finished-turn-20260727.txt');
     const last80Lines = realFinishedPane.trimEnd().split('\n').slice(-80).join('\n');
     expect(extractHelmReply(last80Lines, '').state).toBe('reply');
   });
@@ -366,5 +452,107 @@ Working on it, gathering the test resul
     const r = extractHelmReply(pane, 'tell me the status');
     expect(r.state).toBe('thinking');
     expect(r.text || '').toBe('');
+  });
+
+  it('E6: real Discovery pane with composer echo extracts reply when pending is passed', () => {
+    const pane = readPaneFixture('discovery-sent-echoed-in-composer-20260728.txt');
+    const sent = '(a) — recall output is unreadable, keep text mode frozen';
+    const r = extractHelmReply(pane, sent);
+    expect(r.state).toBe('reply');
+    expect(r.text).toContain('Status: INTERVIEWING');
+    expect(r.text).not.toContain('bypass permissions');
+    expect(r.text).not.toContain('─────');
+  });
+
+  it('E6: real Discovery pane still extracts reply when pending is cleared', () => {
+    const pane = readPaneFixture('discovery-sent-echoed-in-composer-20260728.txt');
+    const r = extractHelmReply(pane, '');
+    expect(r.state).toBe('reply');
+    expect(r.text).toContain('Status: INTERVIEWING');
+  });
+
+  it('E6: single sent-text occurrence still returns the reply with pending passed', () => {
+    const sent = 'summarize the repo status';
+    const pane = `❯ ${sent}
+
+⟦HELM_REPLY⟧
+Status: READY - all requested checks passed.
+⟦/HELM_REPLY⟧
+
+❯ `;
+    const r = extractHelmReply(pane, sent);
+    expect(r.state).toBe('reply');
+    expect(r.text).toContain('Status: READY');
+  });
+
+  it('E6: genuinely generating pane still returns thinking with pending passed', () => {
+    const sent = 'summarize the repo status';
+    const pane = `❯ ${sent}
+⟦HELM_REPLY⟧
+Gathering the current status
+  esc to interrupt`;
+    const r = extractHelmReply(pane, sent);
+    expect(r.state).toBe('thinking');
+    expect(r.text || '').toBe('');
+  });
+
+  it('E6: E4 real Discovery fixture passes with cleared and plausible pending values', () => {
+    const pane = readPaneFixture('discovery-finished-turn-20260727.txt');
+    expect(extractHelmReply(pane, '').state).toBe('reply');
+    expect(extractHelmReply(pane, 'please continue discovery').state).toBe('reply');
+  });
+
+  it('E6b structural: app.js extractor call-site shapes are covered by this suite', () => {
+    const discovered = discoveredExtractorCallShapes();
+    expect(discovered).toEqual([
+      expect.objectContaining({ signature: 'extractHelmReply/2/non-empty-expression,non-empty-expression' }),
+      expect.objectContaining({ signature: 'extractAgentPaneSegment/3/empty-literal,non-empty-expression,non-empty-expression' }),
+      expect.objectContaining({ signature: 'extractHelmReply/2/non-empty-expression,non-empty-expression' }),
+      expect.objectContaining({ signature: 'extractAgentPaneSegment/3/empty-literal,non-empty-expression,non-empty-expression' })
+    ]);
+    expect(new Set(discovered.map(call => call.signature))).toEqual(exercisedDisplayCallShapes);
+
+    const pane = readPaneFixture('discovery-sent-echoed-in-composer-20260728.txt');
+    const { text } = appDisplayText(pane, '(a) — recall output is unreadable, keep text mode frozen');
+    expect(text).toContain('Status: INTERVIEWING');
+    expect(text).not.toContain('bypass permissions');
+  });
+
+  it('E6b structural: display-level bubble text is clean for every captured pane fixture', () => {
+    const boxDrawing = /[─│┌┐└┘├┤┬┴┼═║╔╗╚╝╠╣╦╩╬]/;
+    for (const fixture of PANE_FIXTURES) {
+      const pane = readPaneFixture(fixture.file);
+      const { text } = appDisplayText(pane, fixture.pending);
+      expect(text, fixture.file).not.toContain('bypass permissions');
+      expect(text, fixture.file).not.toMatch(boxDrawing);
+      expect(text, fixture.file).not.toBe(fixture.pending);
+      expect(text.startsWith(fixture.pending), fixture.file).toBe(false);
+      expect(text, fixture.file).toContain(fixture.reply);
+    }
+  });
+
+  it('E6b structural: pane fixtures carry provenance headers and still replay to real replies', () => {
+    const paneFiles = readdirSync(new URL('./test-fixtures/panes/', import.meta.url))
+      .filter(file => file.endsWith('.txt'))
+      .sort();
+    // E8: every REAL captured pane in this directory must carry provenance — widened from an exact-
+    // equality list (PANE_FIXTURES) so a fixture captured for a DIFFERENT purpose than this suite's
+    // single-current-turn pending/reply convention (e.g. discovery-live-20260728-2251.txt, used by
+    // FIX1/FIX3's own suites for its three-reply, multi-turn content) can live here too without being
+    // forced through it. PANE_FIXTURES itself must still be a subset — nothing here was removed.
+    expect(paneFiles).toEqual(expect.arrayContaining(PANE_FIXTURES.map(fixture => fixture.file)));
+
+    for (const file of paneFiles) {
+      const raw = readFileSync(new URL(`./test-fixtures/panes/${file}`, import.meta.url), 'utf8');
+      expect(raw, file).toMatch(
+        /^# HELM_PROVENANCE: source_session=[^\n]+ capture_date=\d{4}-\d{2}-\d{2}\n/
+      );
+    }
+
+    for (const fixture of PANE_FIXTURES) {
+      const { text } = appDisplayText(readPaneFixture(fixture.file), fixture.pending);
+      expect(text, fixture.file).toContain(fixture.reply);
+      expect(text, fixture.file).not.toBe(fixture.pending);
+    }
   });
 });

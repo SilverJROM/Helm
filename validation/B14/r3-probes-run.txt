@@ -1,0 +1,55 @@
+
+ RUN  v2.1.9 /home/agjrom/websites/Helm
+
+stdout | src/tmux/r3-probes.test.ts > B14 R3 validator probes > P1: CAS-refusal + rollback kill SUCCEEDS → SessionNameCollisionError identity intact → index 409 dispatch still fires
+[P1] ctor              = SessionNameCollisionError
+[P1] name              = SessionNameCollisionError
+[P1] code              = SESSION_NAME_COLLISION
+[P1] reason            = replace_refused
+[P1] sessionName       = helm-w-r3-p1
+[P1] isAggregateError  = false
+[P1] index 409 dispatch= true
+
+stdout | src/tmux/r3-probes.test.ts > B14 R3 validator probes > P2: terminate-THROWS branch + staging rollback kill fails → AggregateError, staging orphan provably survives
+[P2] ctor            = AggregateError
+[P2] isAggregateError= true
+[P2] inner           = [
+  'kill-session boom (helm-w-r3-p2)',
+  'kill-session boom (helm-w-r3-p2-stg-ms518sofcknli2)'
+]
+[P2] message         = rollback kill failed for helm-w-r3-p2-stg-ms518sofcknli2 after create failure — session may still be LIVE and untagged/unowned (orig: kill-session boom (helm-w-r3-p2))
+
+stdout | src/tmux/r3-probes.test.ts > B14 R3 validator probes > P3: staging rollback kill fails + existence UNKNOWN (null probe) → still AggregateError (fail-closed on ambiguity)
+[P3] ctor            = AggregateError
+[P3] isAggregateError= true
+[P3] probe result    = null
+[P3] message         = rollback kill failed for helm-w-r3-p3-stg-ms518spo0w5fff after create failure — session may still be LIVE and untagged/unowned (orig: session name collision refused (replace_refused): terminateSession did not close helm-w-r3-p3)
+
+stderr | src/tmux/r3-probes.test.ts > B14 R3 validator probes > P3: staging rollback kill fails + existence UNKNOWN (null probe) → still AggregateError (fail-closed on ambiguity)
+[tmux] sessionExistsTriState probe unknown → null {
+  name: 'helm-w-r3-p3-stg-ms518spo0w5fff',
+  err: 'Error: connect ECONNREFUSED /tmp/tmux-1000/default'
+}
+[tmux] sessionExistsTriState probe unknown → null {
+  name: 'helm-w-r3-p3-stg-ms518spo0w5fff',
+  err: 'Error: connect ECONNREFUSED /tmp/tmux-1000/default'
+}
+[tmux] sessionExistsTriState probe unknown → null {
+  name: 'helm-w-r3-p3-stg-ms518spo0w5fff',
+  err: 'Error: connect ECONNREFUSED /tmp/tmux-1000/default'
+}
+
+stdout | src/tmux/r3-probes.test.ts > B14 R3 validator probes > P4: rollback kill fails but staging probe PROVES GONE → bare SessionNameCollisionError (no over-escalation, 409 preserved)
+[P4] ctor              = SessionNameCollisionError
+[P4] isAggregateError  = false
+[P4] reason            = replace_refused
+[P4] probe result      = false
+[P4] index 409 dispatch= true
+
+ ✓ src/tmux/r3-probes.test.ts (4 tests) 201ms
+
+ Test Files  1 passed (1)
+      Tests  4 passed (4)
+   Start at  19:12:16
+   Duration  510ms (transform 169ms, setup 13ms, collect 189ms, tests 201ms, environment 0ms, prepare 31ms)
+

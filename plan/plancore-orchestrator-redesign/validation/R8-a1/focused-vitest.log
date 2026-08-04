@@ -1,0 +1,11 @@
+
+ RUN  v2.1.9 /home/agjrom/websites/Helm
+
+ ✓ src/services/planning-review-round-c6.test.ts (5 tests) 11ms
+ ✓ src/services/planning-review-round-no-plancore-revise.test.ts (5 tests) 24ms
+
+ Test Files  2 passed (2)
+      Tests  10 passed (10)
+   Start at  03:00:10
+   Duration  366ms (transform 100ms, setup 15ms, collect 126ms, tests 36ms, environment 0ms, prepare 55ms)
+

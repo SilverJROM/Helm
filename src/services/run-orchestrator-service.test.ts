@@ -3,7 +3,9 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import fsSync from 'node:fs';
+import { createHash } from 'node:crypto';
 import { DatabaseService } from '../db/database.js';
+import { RunIngestService, RUN_REGISTER_ENVELOPE, computeRunRegisterPayloadHash } from './run-ingest-service.js';
 import { RunArtifactService } from './run-artifact-service.js';
 import { PlanParserService } from './plan-parser-service.js';
 import { PlanningPhaseService } from './planning-phase-service.js';
@@ -642,6 +644,529 @@ describe('RunOrchestratorService (A2 wiring)', () => {
     expect(events.listByBatch(`chat-${pid}`).filter((m: any) => m.body && m.body.kind === 'run-prompt').length).toBe(1);
   }, 30000);
 
+  // B04 / AC8: startRunDetached freezes a run lifecycle token (id + B03 generation) at dispatch and
+  // requires it, unchanged, before the detached .catch() marks the run failed, advances cycle
+  // bookkeeping, reaps workers, or finalizes the ibrain session. Force startRun to reject on a
+  // controlled promise so the recycle can be injected deterministically between dispatch and failure.
+  describe('B04: detached-start-failed CAS on runs.generation (AC8)', () => {
+    it('old detached failure cannot fail a recycled run row, nor terminate its live workers', async () => {
+      const proj = projectSvc.createProject({ name: 'b04-stale', directory: '/tmp/b04-stale' });
+      const pid = proj.id;
+
+      let rejectStart!: (e: unknown) => void;
+      const controlled = new Promise<number>((_resolve, reject) => { rejectStart = reject; });
+      const startRunSpy = vi.spyOn(orch, 'startRun').mockReturnValue(controlled);
+
+      const { runId } = orch.startRunDetached({ projectId: pid, prompt: 'b04 stale detached', batchId: 'b04stale1' });
+      const staleGeneration = (db.raw.prepare('SELECT generation FROM runs WHERE id = ?').get(runId) as any).generation;
+
+      // Synthetic recycle: no live worker_runtimes reference this run yet, so the row can be deleted
+      // cleanly (FK-safe), then a NEW occupant reuses the SAME numeric id with a fresh generation and
+      // spawns its own live worker — exactly the F-09 scenario (project delete + rowid reuse).
+      const { allocateLifecycleGeneration } = await import('./lifecycle-cas.js');
+      db.raw.prepare('DELETE FROM runs WHERE id = ?').run(runId);
+      const freshGeneration = allocateLifecycleGeneration(db.raw);
+      expect(freshGeneration).not.toBe(staleGeneration);
+      db.raw
+        .prepare(
+          `INSERT INTO runs (id, project_id, cycle_id, batch_id, north_star_ref, status, phase, generation)
+           VALUES (?,?,?,?,?,'active','executing',?)`
+        )
+        .run(runId, pid, null, 'b04-recycled-batch', null, freshGeneration);
+      const newWorkerInfo = db.raw
+        .prepare(
+          `INSERT INTO worker_runtimes (project_id, role, provider, model, session, correlation_id, state, spawned_by, run_id, started_at)
+           VALUES (?,?,?,?,?,?,'running','b04-test',?, datetime('now'))`
+        )
+        .run(pid, 'implementer', 'grok', 'grok-4.5', 'helm-b04-new-occupant', 'b04-corr-stale', runId);
+      const newWorkerId = Number(newWorkerInfo.lastInsertRowid);
+
+      rejectStart(new Error('synthetic detached startRun failure'));
+      await controlled.catch(() => {});
+      await new Promise((r) => setTimeout(r, 100)); // let the .catch handler's async IIFE settle
+
+      const recycledRun = db.raw.prepare('SELECT phase, status, generation FROM runs WHERE id = ?').get(runId) as any;
+      expect(recycledRun.phase).not.toBe('failed');
+      expect(recycledRun.status).not.toBe('failed');
+      expect(recycledRun.generation).toBe(freshGeneration); // untouched — new occupant's identity intact
+
+      const newWorkerRow = db.raw.prepare('SELECT state, ended_at FROM worker_runtimes WHERE id = ?').get(newWorkerId) as any;
+      expect(newWorkerRow.state).toBe('running'); // not reaped/finalized by the stale chain
+      expect(newWorkerRow.ended_at).toBeNull();
+
+      startRunSpy.mockRestore();
+    });
+
+    it('current generation still terminalizes once: run marked failed, workers reaped, ibrain finalized', async () => {
+      const proj = projectSvc.createProject({ name: 'b04-current', directory: '/tmp/b04-current' });
+      const pid = proj.id;
+
+      let rejectStart!: (e: unknown) => void;
+      const controlled = new Promise<number>((_resolve, reject) => { rejectStart = reject; });
+      const startRunSpy = vi.spyOn(orch, 'startRun').mockReturnValue(controlled);
+
+      const { runId } = orch.startRunDetached({ projectId: pid, prompt: 'b04 current gen', batchId: 'b04current1' });
+
+      const workerInfo = db.raw
+        .prepare(
+          `INSERT INTO worker_runtimes (project_id, role, provider, model, session, correlation_id, state, spawned_by, run_id, started_at)
+           VALUES (?,?,?,?,?,?,'running','b04-test',?, datetime('now'))`
+        )
+        .run(pid, 'implementer', 'grok', 'grok-4.5', 'helm-b04-current-worker', 'b04-corr-current', runId);
+      const workerId = Number(workerInfo.lastInsertRowid);
+
+      rejectStart(new Error('synthetic detached startRun failure'));
+      await controlled.catch(() => {});
+      await new Promise((r) => setTimeout(r, 100));
+
+      const run = db.raw.prepare('SELECT phase, status, generation FROM runs WHERE id = ?').get(runId) as any;
+      expect(run.phase).toBe('failed');
+      expect(run.status).toBe('failed');
+
+      const worker = db.raw.prepare('SELECT state, ended_at FROM worker_runtimes WHERE id = ?').get(workerId) as any;
+      expect(worker.state).toBe('reaped');
+      expect(worker.ended_at).toBeTruthy();
+
+      // Second concurrent stale-catch-style call at the same (still current) token is a pure re-check —
+      // proves the terminal transition happened exactly once (phase guard already NOT IN blocked/failed).
+      const rerun = db.raw
+        .prepare(`UPDATE runs SET phase='failed' WHERE id=? AND generation=? AND phase NOT IN ('complete','failed','blocked')`)
+        .run(runId, run.generation ?? 0) as { changes?: number };
+      expect(Number(rerun?.changes || 0)).toBe(0);
+
+      startRunSpy.mockRestore();
+    });
+
+    // B04 fix cycle 1 (redteam-sol C1) / B01 residual: runs.generation is shared by the native
+    // lifecycle allocator and the caller-supplied ingest identity component. Before the fix, an
+    // ingest caller could (deliberately or by chance) supply the exact generation a deleted native
+    // run once held on the same recycled numeric id, making AC8's id+generation CAS match the wrong
+    // occupant. Production-path trace: native A (R,G) detached-pending -> A deleted (no live worker,
+    // FK-safe) -> ingest B registers reusing numeric id R and supplying G as its own generation -> B
+    // spawns a live worker -> A's stale detached catch fires. B must be completely untouched.
+    it('B01 residual C1: ingest registration reusing a deleted native run\'s exact generation on a recycled id cannot be matched by the stale native detached CAS', async () => {
+      const proj = projectSvc.createProject({ name: 'b04-ingest-collision', directory: '/tmp/b04-ingest-collision' });
+      const pid = proj.id;
+
+      let rejectStart!: (e: unknown) => void;
+      const controlled = new Promise<number>((_resolve, reject) => { rejectStart = reject; });
+      const startRunSpy = vi.spyOn(orch, 'startRun').mockReturnValue(controlled);
+
+      // Native lifecycle A: runId=R, generation=G. Kept childless (no worker) so its row can be
+      // deleted cleanly under the worker_runtimes FK.
+      const { runId: nativeRunId } = orch.startRunDetached({ projectId: pid, prompt: 'native A', batchId: 'b04ingestA' });
+      const staleGeneration = (db.raw.prepare('SELECT generation FROM runs WHERE id = ?').get(nativeRunId) as any).generation;
+
+      db.raw.prepare('DELETE FROM runs WHERE id = ?').run(nativeRunId);
+      expect((db.raw.prepare('SELECT COUNT(*) AS n FROM runs').get() as any).n).toBe(0);
+
+      // Ingest lifecycle B registers under a DIFFERENT external identity, deliberately supplying A's
+      // now-freed generation as its own caller-supplied generation — the exact redteam C1 vector.
+      const ingest = new RunIngestService(db);
+      const hashes = {
+        ready: createHash('sha256').update('ready').digest('hex'),
+        plan: createHash('sha256').update('plan').digest('hex'),
+        queue: createHash('sha256').update('queue').digest('hex'),
+        topology: createHash('sha256').update('topology').digest('hex'),
+      };
+      const fields = {
+        event_id: 'b04-ingest-collision-event',
+        external_run_id: 'ext-b04-collision',
+        generation: staleGeneration,
+        hashes,
+      };
+      const payload_hash = computeRunRegisterPayloadHash(pid, fields);
+      const registered = ingest.register(pid, { envelope: RUN_REGISTER_ENVELOPE, ...fields, payload_hash });
+      expect(registered.httpStatus).toBe(201);
+      const ingestRunId = registered.body.run_id;
+      expect(ingestRunId).toBe(nativeRunId); // recycled the exact same numeric id
+
+      // The fix: B's actual written/echoed generation must NOT equal A's stale generation.
+      expect(registered.body.generation).not.toBe(staleGeneration);
+      const bRowBefore = db.raw.prepare('SELECT generation, status, phase FROM runs WHERE id = ?').get(ingestRunId) as any;
+      expect(bRowBefore.generation).toBe(registered.body.generation);
+      expect(bRowBefore.generation).not.toBe(staleGeneration);
+
+      // B starts a live worker.
+      const workerInfo = db.raw
+        .prepare(
+          `INSERT INTO worker_runtimes (project_id, role, provider, model, session, correlation_id, state, spawned_by, run_id, started_at)
+           VALUES (?,?,?,?,?,?,'running','b04-test',?, datetime('now'))`
+        )
+        .run(pid, 'implementer', 'grok', 'grok-4.5', 'helm-b04-ingest-b-worker', 'b04-corr-ingest', ingestRunId);
+      const bWorkerId = Number(workerInfo.lastInsertRowid);
+
+      // A's stale detached promise finally rejects.
+      rejectStart(new Error('synthetic stale native detached failure'));
+      await controlled.catch(() => {});
+      await new Promise((r) => setTimeout(r, 100));
+
+      const bAfter = db.raw.prepare('SELECT phase, status, generation FROM runs WHERE id = ?').get(ingestRunId) as any;
+      expect(bAfter.phase).not.toBe('failed');
+      expect(bAfter.status).not.toBe('failed');
+      expect(bAfter.generation).toBe(bRowBefore.generation);
+
+      const bWorkerAfter = db.raw.prepare('SELECT state, ended_at FROM worker_runtimes WHERE id = ?').get(bWorkerId) as any;
+      expect(bWorkerAfter.state).toBe('running');
+      expect(bWorkerAfter.ended_at).toBeNull();
+
+      startRunSpy.mockRestore();
+    });
+
+    // B04 fix cycle 2 (validator V1): finalizeRunWorkerRuntimes was gated at only 1 of 5 production
+    // call sites — the other 4 (run-blocked-failure, planning-done-yield, run-complete/failed,
+    // run-stopped) run inside the SAME fire-and-forget startRunDetached continuation and were
+    // measured reaping a recycled occupant's live worker. transitionRunToBlocked's own terminal
+    // UPDATE was also ungated. This drives the real (unmocked) production transitionRunToBlocked —
+    // now generation-aware — with the exact captured token a stale continuation would carry, against
+    // a run id already recycled by a new occupant with a live worker.
+    it('a stale continuation driving transitionRunToBlocked cannot blocked-fail a recycled occupant nor reap its live workers', async () => {
+      const proj = projectSvc.createProject({ name: 'b04-blocked-collision', directory: '/tmp/b04-blocked-collision' });
+      const pid = proj.id;
+
+      // Native lifecycle A: runId=R, generation=G — precreated exactly as startRunDetached does
+      // (createRun, no background startRun kicked off; this test drives transitionRunToBlocked
+      // directly to isolate the fixed method from the rest of startRunInner's machinery).
+      const runDirA = path.join(os.tmpdir(), `helm-b04-blocked-a-${Date.now()}`);
+      const nativeRunId = artifacts.createRun(pid, 'b04blockedA', path.join(runDirA, CANONICAL_CYCLE_ARTIFACTS.northStar), null);
+      const staleGeneration = (db.raw.prepare('SELECT generation FROM runs WHERE id = ?').get(nativeRunId) as any).generation;
+
+      // A has no live worker yet (FK-safe delete), matching the validator's premise: the window is
+      // widest exactly where a run is still starting/pre-planning.
+      db.raw.prepare('DELETE FROM runs WHERE id = ?').run(nativeRunId);
+      expect((db.raw.prepare('SELECT COUNT(*) AS n FROM runs').get() as any).n).toBe(0);
+
+      const { allocateLifecycleGeneration } = await import('./lifecycle-cas.js');
+      const freshGeneration = allocateLifecycleGeneration(db.raw);
+      expect(freshGeneration).not.toBe(staleGeneration);
+      db.raw
+        .prepare(
+          `INSERT INTO runs (id, project_id, cycle_id, batch_id, north_star_ref, status, phase, generation)
+           VALUES (?,?,?,?,?,'active','executing',?)`
+        )
+        .run(nativeRunId, pid, null, 'b04-recycled-blocked-batch', null, freshGeneration);
+      const newWorkerInfo = db.raw
+        .prepare(
+          `INSERT INTO worker_runtimes (project_id, role, provider, model, session, correlation_id, state, spawned_by, run_id, started_at)
+           VALUES (?,?,?,?,?,?,'running','b04-test',?, datetime('now'))`
+        )
+        .run(pid, 'implementer', 'grok', 'grok-4.5', 'helm-b04-blocked-new-occupant', 'b04-corr-blocked', nativeRunId);
+      const newWorkerId = Number(newWorkerInfo.lastInsertRowid);
+
+      // A's stale continuation finally reaches a blocked-transition (e.g. resolve-time collision,
+      // seat-binary preflight, zero-tasks-ingested — all thread runGenToken captured at A's own
+      // dispatch boundary). Call the real, now generation-aware production method directly.
+      (orch as any).transitionRunToBlocked(nativeRunId, 'stale continuation reached this late', proj, 'failure', staleGeneration);
+      await new Promise((r) => setTimeout(r, 100)); // let the internal finalize/brain-assert IIFE settle
+
+      const bAfter = db.raw.prepare('SELECT phase, status, generation FROM runs WHERE id = ?').get(nativeRunId) as any;
+      expect(bAfter.phase).not.toBe('blocked');
+      expect(bAfter.status).not.toBe('failed');
+      expect(bAfter.generation).toBe(freshGeneration);
+
+      const newWorkerAfter = db.raw.prepare('SELECT state, ended_at FROM worker_runtimes WHERE id = ?').get(newWorkerId) as any;
+      expect(newWorkerAfter.state).toBe('running');
+      expect(newWorkerAfter.ended_at).toBeNull();
+      expect(fakeT.reapCalls.some((c) => c.handle.startsWith('helm-b04-blocked-new-occupant'))).toBe(false);
+    });
+
+    it('current generation transitionRunToBlocked still blocked-fails and reaps once (regression: the gate does not break the live path)', async () => {
+      const proj = projectSvc.createProject({ name: 'b04-blocked-current', directory: '/tmp/b04-blocked-current' });
+      const pid = proj.id;
+      const runDirA = path.join(os.tmpdir(), `helm-b04-blocked-current-${Date.now()}`);
+      const runId = artifacts.createRun(pid, 'b04blockedcurrent', path.join(runDirA, CANONICAL_CYCLE_ARTIFACTS.northStar), null);
+      const currentGeneration = (db.raw.prepare('SELECT generation FROM runs WHERE id = ?').get(runId) as any).generation;
+
+      const workerInfo = db.raw
+        .prepare(
+          `INSERT INTO worker_runtimes (project_id, role, provider, model, session, correlation_id, state, spawned_by, run_id, started_at)
+           VALUES (?,?,?,?,?,?,'running','b04-test',?, datetime('now'))`
+        )
+        .run(pid, 'implementer', 'grok', 'grok-4.5', 'helm-b04-blocked-current-worker', 'b04-corr-blocked-current', runId);
+      const workerId = Number(workerInfo.lastInsertRowid);
+
+      (orch as any).transitionRunToBlocked(runId, 'current-generation blocked transition', proj, 'failure', currentGeneration);
+      await new Promise((r) => setTimeout(r, 100));
+
+      const after = db.raw.prepare('SELECT phase, status FROM runs WHERE id = ?').get(runId) as any;
+      expect(after.phase).toBe('blocked');
+      expect(after.status).toBe('failed');
+
+      const worker = db.raw.prepare('SELECT state, ended_at FROM worker_runtimes WHERE id = ?').get(workerId) as any;
+      expect(worker.state).toBe('reaped');
+      expect(worker.ended_at).toBeTruthy();
+    });
+
+    // B04 fix cycle 3 (validator V2, critical): the prior fix threaded a token through transitionRunToBlocked
+    // and its 4 EARLY callers inside startRunInner's own lexical body, but 5 further transitionRunToBlocked
+    // callers reached only through runEngineTail's post-drain machinery (handlePendingAfterDrain, the deploy
+    // gate, both final-test gates) still passed expectedGeneration undefined. handlePendingAfterDrain is the
+    // most reachable: on the cyclePlan/seedPlan detached path (no interview/planning spawn) a run can reach
+    // it with ZERO worker_runtimes rows — the one window where the row is genuinely FK-deletable. This drives
+    // the REAL production chain (runEngineTail -> drainDispatch -> handlePendingAfterDrain ->
+    // transitionRunToBlocked), not a reimplementation, with the stale token exactly as startRunInner would
+    // thread it, against a queue/DB-divergence classification (a durable pending run_tasks row the in-memory
+    // queue never claimed — reproduces "zero workers ever spawn" without needing full plan ingestion).
+    it('a stale continuation reaching handlePendingAfterDrain via runEngineTail cannot blocked-fail a recycled occupant with zero worker_runtimes rows', async () => {
+      const proj = projectSvc.createProject({ name: 'b04-pending-drain', directory: '/tmp/b04-pending-drain' });
+      const pid = proj.id;
+      const runDirA = path.join(os.tmpdir(), `helm-b04-pending-drain-${Date.now()}`);
+
+      const nativeRunId = artifacts.createRun(pid, 'b04pendingdrainA', path.join(runDirA, CANONICAL_CYCLE_ARTIFACTS.northStar), null);
+      const staleGeneration = (db.raw.prepare('SELECT generation FROM runs WHERE id = ?').get(nativeRunId) as any).generation;
+
+      // A has zero worker_runtimes children so its row deletes cleanly (FK-safe).
+      db.raw.prepare('DELETE FROM runs WHERE id = ?').run(nativeRunId);
+      expect((db.raw.prepare('SELECT COUNT(*) AS n FROM runs').get() as any).n).toBe(0);
+
+      const { allocateLifecycleGeneration } = await import('./lifecycle-cas.js');
+      const freshGeneration = allocateLifecycleGeneration(db.raw);
+      expect(freshGeneration).not.toBe(staleGeneration);
+      db.raw
+        .prepare(
+          `INSERT INTO runs (id, project_id, cycle_id, batch_id, north_star_ref, status, phase, generation)
+           VALUES (?,?,?,?,?,'active','executing',?)`
+        )
+        .run(nativeRunId, pid, null, 'b04-recycled-pending-drain', null, freshGeneration);
+      const newWorkerInfo = db.raw
+        .prepare(
+          `INSERT INTO worker_runtimes (project_id, role, provider, model, session, correlation_id, state, spawned_by, run_id, started_at)
+           VALUES (?,?,?,?,?,?,'running','b04-test',?, datetime('now'))`
+        )
+        .run(pid, 'implementer', 'grok', 'grok-4.5', 'helm-b04-pending-drain-new-occupant', 'b04-corr-pending-drain', nativeRunId);
+      const newWorkerId = Number(newWorkerInfo.lastInsertRowid);
+
+      // B's OWN durable run_tasks row (own in-progress work — run_tasks.run_id cascades with runs, so
+      // this must be created AFTER the recycle, against the new occupant's row) was never enqueued into
+      // the shared in-memory `queue` under this run id either — claimNextReady returns null immediately,
+      // drainDispatch's claim loop body never runs, and no NEW worker_runtimes row is spawned by this
+      // call. classifyDrainState sees an empty in-memory queue (all-complete) but the durable store still
+      // shows this row pending — the queue/DB-divergence fail-safe — driving handlePendingAfterDrain into
+      // its blocked branch with the STALE token, exactly reproducing "zero workers ever spawn" without
+      // needing full plan ingestion machinery.
+      const bTaskInfo = db.raw
+        .prepare(`INSERT INTO run_tasks (run_id, task_key, label, status) VALUES (?, 'T1', 'B-own in-progress task', 'pending')`)
+        .run(nativeRunId);
+      const bTaskId = Number(bTaskInfo.lastInsertRowid);
+
+      const fakeLoop = {} as any; // never touched: the claim loop body in drainDispatch never executes
+      await (orch as any).runEngineTail(nativeRunId, runDirA, 'b04pendingdrainA', proj, fakeLoop, queue, {
+        projectId: pid,
+        prompt: 'stale pending-drain continuation',
+        redTeamAgents: [],
+        effectiveProjectDir: proj.directory,
+        implementationSessionName: 'helm-ibrain-b04-pending-drain',
+        implementationBrainProvider: 'grok',
+        implementationBrainModel: 'grok-4.5',
+        expectedGeneration: staleGeneration,
+      });
+
+      const bAfter = db.raw.prepare('SELECT phase, status, generation FROM runs WHERE id = ?').get(nativeRunId) as any;
+      expect(bAfter.phase).not.toBe('blocked');
+      expect(bAfter.status).not.toBe('failed');
+      expect(bAfter.generation).toBe(freshGeneration);
+
+      const newWorkerAfter = db.raw.prepare('SELECT state, ended_at FROM worker_runtimes WHERE id = ?').get(newWorkerId) as any;
+      expect(newWorkerAfter.state).toBe('running');
+      expect(newWorkerAfter.ended_at).toBeNull();
+
+      // B's own in-progress task is untouched too — the stale continuation never got to mark anything.
+      const bTaskAfter = db.raw.prepare('SELECT status FROM run_tasks WHERE id = ?').get(bTaskId) as any;
+      expect(bTaskAfter.status).toBe('pending');
+    });
+
+    // Ideally-one-other coverage: the deploy-gate/final-test-gate legs share the same
+    // transitionRunToBlocked plumbing, threaded via a plain expectedGeneration parameter forward from
+    // each private method. doMaxFixItersVisiblePause is the simplest to drive directly (no filesystem
+    // plan-cache / deploy-config discovery needed) and proves that leg's wiring independently.
+    it('a stale continuation reaching doMaxFixItersVisiblePause cannot blocked-fail a recycled occupant', async () => {
+      const proj = projectSvc.createProject({ name: 'b04-maxfix', directory: '/tmp/b04-maxfix' });
+      const pid = proj.id;
+      const runDirA = path.join(os.tmpdir(), `helm-b04-maxfix-${Date.now()}`);
+
+      const nativeRunId = artifacts.createRun(pid, 'b04maxfixA', path.join(runDirA, CANONICAL_CYCLE_ARTIFACTS.northStar), null);
+      const staleGeneration = (db.raw.prepare('SELECT generation FROM runs WHERE id = ?').get(nativeRunId) as any).generation;
+
+      db.raw.prepare('DELETE FROM runs WHERE id = ?').run(nativeRunId);
+      expect((db.raw.prepare('SELECT COUNT(*) AS n FROM runs').get() as any).n).toBe(0);
+
+      const { allocateLifecycleGeneration } = await import('./lifecycle-cas.js');
+      const freshGeneration = allocateLifecycleGeneration(db.raw);
+      expect(freshGeneration).not.toBe(staleGeneration);
+      db.raw
+        .prepare(
+          `INSERT INTO runs (id, project_id, cycle_id, batch_id, north_star_ref, status, phase, generation)
+           VALUES (?,?,?,?,?,'active','executing',?)`
+        )
+        .run(nativeRunId, pid, null, 'b04-recycled-maxfix', null, freshGeneration);
+      const newWorkerInfo = db.raw
+        .prepare(
+          `INSERT INTO worker_runtimes (project_id, role, provider, model, session, correlation_id, state, spawned_by, run_id, started_at)
+           VALUES (?,?,?,?,?,?,'running','b04-test',?, datetime('now'))`
+        )
+        .run(pid, 'implementer', 'grok', 'grok-4.5', 'helm-b04-maxfix-new-occupant', 'b04-corr-maxfix', nativeRunId);
+      const newWorkerId = Number(newWorkerInfo.lastInsertRowid);
+
+      await (orch as any).doMaxFixItersVisiblePause(
+        nativeRunId, runDirA, 'b04maxfixA', path.join(runDirA, 'callbacks.md'), { verdict: 'FAIL' }, staleGeneration
+      );
+      await new Promise((r) => setTimeout(r, 100));
+
+      const bAfter = db.raw.prepare('SELECT phase, status, generation FROM runs WHERE id = ?').get(nativeRunId) as any;
+      expect(bAfter.phase).not.toBe('blocked');
+      expect(bAfter.status).not.toBe('failed');
+      expect(bAfter.generation).toBe(freshGeneration);
+
+      const newWorkerAfter = db.raw.prepare('SELECT state, ended_at FROM worker_runtimes WHERE id = ?').get(newWorkerId) as any;
+      expect(newWorkerAfter.state).toBe('running');
+      expect(newWorkerAfter.ended_at).toBeNull();
+    });
+
+    // B04 fix cycle 4 (redteam-sol R3 C2, CRITICAL): the prior fixes gated terminal writers (the
+    // final UPDATE, transitionRunToBlocked, the finalizers) but drainDispatch itself had no ownership
+    // check before queue.claimNextReady(runId). TaskQueueService is keyed by numeric runId; a recycled
+    // occupant B clears and re-enqueues under the SAME id, so a stale continuation A could claim B's
+    // OWN token — which legitimately carries B's OWN fresh generation, so B03's per-task terminal CAS
+    // is not a defense — execute the work with A's (wrong) project/plan/runDir context via
+    // loop.runTask, and mark B's task complete. This reproduces the redteam's exact repro: drive the
+    // REAL production drainDispatch (not a reimplementation) with A's stale captured generation
+    // against B's task, already enqueued in the shared queue exactly as B's own real dispatch would
+    // have left it.
+    it('a stale drainDispatch cannot claim or complete a recycled occupant\'s already-queued task', async () => {
+      const proj = projectSvc.createProject({ name: 'b04-queue-takeover', directory: '/tmp/b04-queue-takeover' });
+      const pid = proj.id;
+      const runDirA = path.join(os.tmpdir(), `helm-b04-queue-takeover-${Date.now()}`);
+
+      const nativeRunId = artifacts.createRun(pid, 'b04queueA', path.join(runDirA, CANONICAL_CYCLE_ARTIFACTS.northStar), null);
+      const staleGeneration = (db.raw.prepare('SELECT generation FROM runs WHERE id = ?').get(nativeRunId) as any).generation;
+
+      // A has no live worker yet (FK-safe delete).
+      db.raw.prepare('DELETE FROM runs WHERE id = ?').run(nativeRunId);
+      expect((db.raw.prepare('SELECT COUNT(*) AS n FROM runs').get() as any).n).toBe(0);
+
+      const { allocateLifecycleGeneration } = await import('./lifecycle-cas.js');
+      const freshGeneration = allocateLifecycleGeneration(db.raw);
+      expect(freshGeneration).not.toBe(staleGeneration);
+      db.raw
+        .prepare(
+          `INSERT INTO runs (id, project_id, cycle_id, batch_id, north_star_ref, status, phase, generation)
+           VALUES (?,?,?,?,?,'active','executing',?)`
+        )
+        .run(nativeRunId, pid, null, 'b04-recycled-queue-takeover', null, freshGeneration);
+
+      // B's own real dispatch: a durable run_tasks row plus the SAME shared in-memory queue enqueues
+      // it under the SAME numeric runId, carrying B's OWN fresh generation — exactly how a real
+      // startRunInner's queue.clearRun + enqueue populates the shared queue after row-id reuse.
+      const bTaskInfo = db.raw
+        .prepare(`INSERT INTO run_tasks (run_id, task_key, label, status) VALUES (?, 'T1', 'B own task', 'pending')`)
+        .run(nativeRunId);
+      const bTaskId = Number(bTaskInfo.lastInsertRowid);
+      queue.clearRun(nativeRunId);
+      queue.enqueue(nativeRunId, bTaskId, [], false, 'default', freshGeneration);
+
+      const runTaskSpy = vi.fn().mockResolvedValue({ finalStatus: 'PASS' });
+      const fakeLoop = { runTask: runTaskSpy } as any;
+
+      // A's stale continuation drives the REAL drainDispatch with ITS OWN (now-stale) captured token.
+      await (orch as any).drainDispatch(nativeRunId, runDirA, 'b04queueA', proj, fakeLoop, queue, staleGeneration);
+
+      // The stale continuation must never have claimed, executed, or completed B's task.
+      expect(runTaskSpy).not.toHaveBeenCalled();
+      const bTaskAfter = db.raw.prepare('SELECT status FROM run_tasks WHERE id = ?').get(bTaskId) as any;
+      expect(bTaskAfter.status).toBe('pending');
+      expect(queue.isInFlight(nativeRunId)).toBe(false);
+
+      // B's own (current-generation) continuation can still legitimately claim and complete its task —
+      // the fence rejects only the stale caller, it does not poison the slot for the real occupant.
+      const token = queue.claimNextReady(nativeRunId);
+      expect(token).not.toBeNull();
+      expect(token!.taskId).toBe(bTaskId);
+      expect(queue.markComplete(token!)).toBe(true);
+      const bTaskFinal = db.raw.prepare('SELECT status FROM run_tasks WHERE id = ?').get(bTaskId) as any;
+      expect(bTaskFinal.status).toBe('complete');
+    });
+
+    // B04 fix cycle 5 (validator R4): the fix-cycle-4 fence checks generation only at the TOP of the
+    // claim loop, before queue.claimNextReady. A passes that check fairly (its own row, its own
+    // generation, at that instant) and claims its OWN task A1. The claimed terminalToken stays
+    // structurally valid even after the row is deleted out from under it — nothing invalidates a
+    // frozen token. Between the claim and loop.runTask, drainDispatch awaits
+    // parser.loadPlanFromRunDir(runDir); if the recycle happens DURING that await, A resumes holding
+    // a token whose numeric taskId now belongs to B, and would call loop.runTask with A's own (wrong)
+    // project/plan/runDir/brief context against B's task — the redteam's exact repro. This drives the
+    // REAL drainDispatch with a spied loadPlanFromRunDir that performs the recycle itself (mid-await,
+    // not before A ever claims), reproducing the precise timing the validator's disposable probe used.
+    it('a stale continuation recycled DURING the post-claim plan-load await cannot invoke loop.runTask against the new occupant\'s task', async () => {
+      const proj = projectSvc.createProject({ name: 'b04-r4-postclaim', directory: '/tmp/b04-r4-postclaim' });
+      const pid = proj.id;
+      const runDirA = path.join(os.tmpdir(), `helm-b04-r4-postclaim-${Date.now()}`);
+      await fs.mkdir(runDirA, { recursive: true });
+
+      // Native A: runId=R, generation=G1. A's OWN task A1 is enqueued so the pre-claim fence passes
+      // fairly and A genuinely claims its own (at that instant, legitimate) token.
+      const nativeRunId = artifacts.createRun(pid, 'b04r4postclaimA', path.join(runDirA, CANONICAL_CYCLE_ARTIFACTS.northStar), null);
+      const staleGeneration = (db.raw.prepare('SELECT generation FROM runs WHERE id = ?').get(nativeRunId) as any).generation;
+      const aTaskInfo = db.raw
+        .prepare(`INSERT INTO run_tasks (run_id, task_key, label, status) VALUES (?, 'T1', 'A own task', 'pending')`)
+        .run(nativeRunId);
+      const aTaskId = Number(aTaskInfo.lastInsertRowid);
+      queue.clearRun(nativeRunId);
+      queue.enqueue(nativeRunId, aTaskId, [], false, 'default', staleGeneration);
+
+      const { allocateLifecycleGeneration } = await import('./lifecycle-cas.js');
+      let freshGeneration = -1;
+      let bTaskId = -1;
+
+      // The recycle happens INSIDE the awaited plan-load call — after A has already claimed A1 (the
+      // claim happens synchronously at the top of the loop, before this await), matching the
+      // validator's exact reproduction timing.
+      const loadPlanSpy = vi.spyOn(parser, 'loadPlanFromRunDir').mockImplementation(async () => {
+        db.raw.prepare('DELETE FROM run_tasks WHERE id = ?').run(aTaskId); // A's own row, FK-safe cleanup
+        db.raw.prepare('DELETE FROM runs WHERE id = ?').run(nativeRunId);
+        freshGeneration = allocateLifecycleGeneration(db.raw);
+        expect(freshGeneration).not.toBe(staleGeneration);
+        db.raw
+          .prepare(
+            `INSERT INTO runs (id, project_id, cycle_id, batch_id, north_star_ref, status, phase, generation)
+             VALUES (?,?,?,?,?,'active','executing',?)`
+          )
+          .run(nativeRunId, pid, null, 'b04-recycled-r4-postclaim', null, freshGeneration);
+        const bTaskInfo = db.raw
+          .prepare(`INSERT INTO run_tasks (run_id, task_key, label, status) VALUES (?, 'T1', 'B own task', 'pending')`)
+          .run(nativeRunId);
+        bTaskId = Number(bTaskInfo.lastInsertRowid);
+        queue.clearRun(nativeRunId);
+        queue.enqueue(nativeRunId, bTaskId, [], false, 'default', freshGeneration);
+        return { tasks: [] } as any;
+      });
+
+      const runTaskSpy = vi.fn().mockResolvedValue({ finalStatus: 'PASS' });
+      const fakeLoop = { runTask: runTaskSpy } as any;
+
+      try {
+        await (orch as any).drainDispatch(nativeRunId, runDirA, 'b04r4postclaimA', proj, fakeLoop, queue, staleGeneration);
+
+        // The stale continuation must never have invoked loop.runTask — not with A1's identity, and
+        // certainly not against B's recycled task id.
+        expect(runTaskSpy).not.toHaveBeenCalled();
+
+        // B's task remains pending and legitimately claimable by B's own continuation.
+        expect(bTaskId).toBeGreaterThan(0);
+        const bTaskAfter = db.raw.prepare('SELECT status FROM run_tasks WHERE id = ?').get(bTaskId) as any;
+        expect(bTaskAfter.status).toBe('pending');
+        const token = queue.claimNextReady(nativeRunId);
+        expect(token).not.toBeNull();
+        expect(token!.taskId).toBe(bTaskId);
+        expect(token!.runGeneration).toBe(freshGeneration);
+        expect(queue.markComplete(token!)).toBe(true);
+        const bTaskFinal = db.raw.prepare('SELECT status FROM run_tasks WHERE id = ?').get(bTaskId) as any;
+        expect(bTaskFinal.status).toBe('complete');
+      } finally {
+        loadPlanSpy.mockRestore();
+      }
+    });
+  });
+
   it('D-b: startRun enters interview phase, waits for NORTH-STAR-READY (no autonomous before), transitions planning->execute; plan per-task model/effort flows (D-b1 + D-b2)', async () => {
     const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
     const proj = projectSvc.createProject({ name: 'cards', directory: '/tmp/cards' });
@@ -807,11 +1332,11 @@ describe('RunOrchestratorService (A2 wiring)', () => {
       q.enqueue(runId, 10, []); // independent
       q.enqueue(runId, 11, [12]);
       q.enqueue(runId, 12, []);
-      q.markDeferred(12, runId);
-      let next = q.getNextReady(runId);
-      expect(next).toBe(10); // continues independent
-      q.markComplete(10, runId);
-      next = q.getNextReady(runId);
+      q.markDeferred(q.freezeTerminalToken(runId, 12)!);
+      let next = q.claimNextReady(runId);
+      expect(next!.taskId).toBe(10); // continues independent
+      q.markComplete(next!);
+      next = q.claimNextReady(runId);
       expect(next).toBe(null);
       const reason = q.getParkedBlockReason(runId);
       expect(reason).not.toBeNull();
@@ -965,10 +1490,10 @@ describe('RunOrchestratorService (A2 wiring)', () => {
     const tmux = new TmuxService();
     const name = `pocfix4-dup-sess-${Date.now().toString(36)}`;
     try {
-      const t1 = await tmux.createSession(name);
+      const t1 = await tmux.createSession(name, undefined, { owner: 'helm' });
       expect(t1).toBe(`${name}:0.0`);
       // duplicate: must not throw; old killed; same target returned
-      const t2 = await tmux.createSession(name);
+      const t2 = await tmux.createSession(name, undefined, { owner: 'helm' });
       expect(t2).toBe(`${name}:0.0`);
     } finally {
       await tmux.terminateSession(name).catch(() => {});
@@ -1429,7 +1954,7 @@ describe('E-phase (E1 mid-run inject/redirect at boundary; E2 checkin+stale->run
     // simulate in-flight
     // @ts-ignore test access
     q['inFlight'][1] = 10;
-    expect(q.getNextReady(1)).toBeNull(); // blocked by in-flight
+    expect(q.claimNextReady(1)).toBeNull(); // blocked by in-flight
 
     // inject mid (simulates API during task)
     const art = { recordTask: () => 99, 'db': { raw: { prepare: () => ({ run: () => {}, get: () => null }) } } } as any;
@@ -1439,8 +1964,8 @@ describe('E-phase (E1 mid-run inject/redirect at boundary; E2 checkin+stale->run
     q['queues'][1] = q['queues'][1].filter((id: number) => id !== 10);
     // @ts-ignore
     q['inFlight'][1] = null;
-    const next = q.getNextReady(1);
-    expect(next).toBe(99); // drained at boundary after prior
+    const next = q.claimNextReady(1);
+    expect(next!.taskId).toBe(99); // drained at boundary after prior
   });
 
   it('E1: redirect/re-brief updates pending + requeues at boundary (urgent)', () => {
@@ -1450,7 +1975,7 @@ describe('E-phase (E1 mid-run inject/redirect at boundary; E2 checkin+stale->run
     // simulate redirect
     q.requeueForRedirect(1, 42);
     q['inFlight'][1] = null;
-    expect(q.getNextReady(1)).toBe(42);
+    expect(q.claimNextReady(1)!.taskId).toBe(42);
   });
 
   it('E3: new run/task writers use getTaskArtifactRoot under <proj>/helm_tasks/<list>/<task> (prompts + final + changes stub)', async () => {
@@ -1514,7 +2039,10 @@ describe('E-phase (E1 mid-run inject/redirect at boundary; E2 checkin+stale->run
     dbs.raw.prepare("INSERT OR IGNORE INTO role_capabilities (role, allowed_statuses, terminal_statuses, checkin_ms) VALUES ('implementer','[]','[]', 1000)").run();
     const arts = new RunArtifactService(dbs);
     // minimal worker svc for spawn + mark (tmux stubs succeed, assignment provides agent)
-    const tmuxStub = { createSession: async ()=>'s', sendCommand:async()=>true, sendAndSubmit:async()=>true, waitForReady:async()=>true, getPanePid:async()=>123, terminateSession:async()=>{}, capturePane: async()=> '❯ ready\n> ready\n', sendKeys:async()=>true, sendEnter:async()=>true };
+    // B13/AC18: checkin-missed now also requires known-stale tmux session_activity (not
+    // elapsed-since-started_at alone) — report activity as stale as started_at so this test's
+    // own "stale/checkin-missed" premise still reaches the reap it asserts on.
+    const tmuxStub = { createSession: async ()=>'s', sendCommand:async()=>true, sendAndSubmit:async()=>true, waitForReady:async()=>true, getPanePid:async()=>123, terminateSession:async()=>{}, capturePane: async()=> '❯ ready\n> ready\n', sendKeys:async()=>true, sendEnter:async()=>true, sessionActivity: async ()=> Math.floor((Date.now() - 5*60*1000)/1000) };
     const assignStub = { resolveProjectRole: () => ({ agent: {id: 99, provider:'grok', model:'grok-4.5', default_effort:'medium'} }) };
     const WorkerSvc = (await import('./worker-service.js')).WorkerService;
     const worker = new WorkerSvc(dbs as any, { recordEvent: () => {} } as any, tmuxStub as any, { resolveAgentLaunchSpec: ()=>({launch_cmd:'echo'}) } as any, assignStub as any );
@@ -1591,9 +2119,9 @@ describe('E-phase (E1 mid-run inject/redirect at boundary; E2 checkin+stale->run
       const t2 = dbs2.raw.prepare("INSERT INTO run_tasks (run_id, task_key, label, batch, status) VALUES (?,?,?,?, 'complete')").run(rid, 'B10T6-T02', 'closer', 'B10').lastInsertRowid as number;
 
       q2.enqueue(rid, t1, [], false, 'B10');
-      q2.markComplete(t1, rid);
+      q2.markComplete(q2.freezeTerminalToken(rid, t1)!);
       q2.enqueue(rid, t2, [], false, 'B10');
-      q2.markComplete(t2, rid);
+      q2.markComplete(q2.freezeTerminalToken(rid, t2)!);
 
       const fakeCalls: any[] = [];
       const fakeR = { async runDeploy(pd: string, cmd: string, url: string) { fakeCalls.push({projectDir: pd, deployCmd: cmd, devUrl: url}); return {success: true, note: 'ok'}; } };
@@ -1729,7 +2257,7 @@ describe('E-phase (E1 mid-run inject/redirect at boundary; E2 checkin+stale->run
       const t2 = dbs2.raw.prepare("INSERT INTO run_tasks (run_id, task_key, label, status) VALUES (?,?,?, 'pending')").run(rid, 'B11T2-T02', 'closer').lastInsertRowid as number;
 
       q2.enqueue(rid, t1, []);
-      q2.markComplete(t1, rid);
+      q2.markComplete(q2.freezeTerminalToken(rid, t1)!);
       q2.enqueue(rid, t2, []);
 
       const fakeCalls: any[] = [];
@@ -1944,7 +2472,7 @@ describe('E-phase (E1 mid-run inject/redirect at boundary; E2 checkin+stale->run
       // seed one completed so anyCompleted etc ok
       const t1 = dbs.raw.prepare("INSERT INTO run_tasks (run_id, task_key, label, status) VALUES (?,?,?, 'complete')").run(rid, 'T1', 'seed').lastInsertRowid as number;
       q.enqueue(rid, t1, []);
-      q.markComplete(t1, rid);
+      q.markComplete(q.freezeTerminalToken(rid, t1)!);
 
       const fakeCalls: any[] = [];
       const fakeFinalR = {

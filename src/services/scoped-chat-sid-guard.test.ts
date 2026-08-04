@@ -99,7 +99,7 @@ describe('resolveScopedChannel — bind route scope to the session (rules 1–4)
 class StubTmux extends TmuxService {
   async capturePane(): Promise<string> { return ''; }
   async sessionExists(): Promise<boolean> { return true; }
-  async terminateSession(): Promise<void> {}
+  async terminateSession(): Promise<boolean> { return true; }
   async sendLiteralText(): Promise<void> {}
   async sendEnter() { return { message: 'enter', blocked: false }; }
   async sendKeys(k: string) { return { message: k, blocked: false }; }

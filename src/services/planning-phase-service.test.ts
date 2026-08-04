@@ -10,6 +10,7 @@ import { RunArtifactService } from './run-artifact-service.js';
 import { TaskQueueService } from './task-queue-service.js';
 import { DatabaseService } from '../db/database.js';
 import { resolveRequirementsText } from './requirements-resolver-service.js';
+import { planRevision } from './plan-revision.js';
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -114,8 +115,10 @@ describe('planning-phase-service (B9 PLN1) + gate + auto pick', () => {
     expect(queue.getQueue(art['db'] ? 0 : 0).length || res.createdTaskIds.length > 0).toBeTruthy(); // indirect via created
   });
 
-  // (a) Default-config planning always spawns 2 seats (plancore + partner) — no mode skips the partner.
-  it('A8: default-config planning spawns exactly 2 seats (plancore + partner)', async () => {
+  // (a) Default-config planning always spawns the one partner seat — no mode skips the partner.
+  // P1 (R1.2): plancore itself is never spawned (no model call for whole-plan authoring); the
+  // PLAN-READY line below is still hand-fed to prove waitForAgreement's own gate is untouched.
+  it('A8/P1: default-config planning spawns exactly 1 partner seat (plancore is never spawned)', async () => {
     const p = phase.runPlanningPhase({
       runDir,
       batchId: 'batch-A8-two-seats',
@@ -130,12 +133,15 @@ describe('planning-phase-service (B9 PLN1) + gate + auto pick', () => {
 
     const res = await p;
     expect(res.agreed).toBe(true);
-    expect(transport.spawnCalls.length).toBe(2);
+    expect(transport.spawnCalls.length).toBe(1);
     expect(transport.spawnCalls.some((s) => s.role === 'planner')).toBe(true);
+    expect(transport.spawnCalls.some((s) => s.role === 'plancore')).toBe(false);
   });
 
   // A10 (R1.3): panel size is per-project config (total seats incl. plancore), not a north-star guess.
-  it('A10: panelSize=3 spawns exactly 3 seats (plancore + 2 partners), unanimous CLEAN from BOTH required', async () => {
+  // P1 (R1.2): plancore's own seat in that count is never actually spawned, so panelSize=3 (plancore +
+  // 2 partners) now spawns exactly 2 transport seats — the panelSize label/semantics are unchanged.
+  it('A10/P1: panelSize=3 spawns exactly 2 partner seats (plancore is never spawned), unanimous CLEAN from BOTH required', async () => {
     const batchId = 'batch-A10-three-seats';
     const cbp = path.join(runDir, 'callbacks.md');
     const p = phase.runPlanningPhase({
@@ -151,7 +157,7 @@ describe('planning-phase-service (B9 PLN1) + gate + auto pick', () => {
     // Only the FIRST (legacy-named) partner agrees so far — the gate must not pass on a partial verdict.
     await fs.appendFile(cbp, `[helm callback] planner ${batchId}-partner STATUS: VERDICT-READY — CLEAN: clean\n`);
     await sleep(60);
-    expect(transport.spawnCalls.length).toBe(3); // plancore + 2 partners spawned up front, regardless of verdict timing
+    expect(transport.spawnCalls.length).toBe(2); // 2 partners spawned up front, regardless of verdict timing (plancore is never spawned)
     expect(transport.spawnCalls.filter((s) => s.role === 'planner').length).toBe(2);
     expect(transport.spawnCalls.some((s) => s.batchId === `${batchId}-partner`)).toBe(true);
     expect(transport.spawnCalls.some((s) => s.batchId === `${batchId}-partner-2`)).toBe(true);
@@ -220,7 +226,8 @@ describe('planning-phase-service (B9 PLN1) + gate + auto pick', () => {
       expect(result.northStarPath).toBe(path.join(cycleRoot, 'north-star.md'));
       expect(result.reqPath).toBe(path.join(cycleRoot, 'og-requirements.md'));
       expect(result.planMdPath).toBe(path.join(cycleRoot, 'plan.md'));
-      expect(transport.spawnCalls[0].brief).toContain('Build the canonical handoff.');
+      // P1 (R1.2): plancore is never spawned, so there is no plancore brief to assert against here —
+      // the canonical-doc-precedence behavior this test actually covers is proven by the reads below.
       expect(await fs.readFile(path.join(runDir, 'north-star.md'), 'utf8')).toBe(discoveryNorthStar);
       expect(await fs.readFile(path.join(runDir, 'og-requirements.md'), 'utf8')).toBe(requirements);
       expect(await fs.readFile(path.join(runDir, 'plan.md'), 'utf8')).toBe(plan);
@@ -322,14 +329,18 @@ describe('planning-phase-service (B9 PLN1) + gate + auto pick', () => {
       const cbp = path.join(runDir, 'callbacks.md');
       // Drive exactly like real: canonical requirements + plan.md are written before PLAN-READY.
       await fs.writeFile(path.join(runDir, 'og-requirements.md'), '- **PX8-R1** — Planning waits for canonical artifacts.\n', 'utf8');
-      await fs.writeFile(path.join(runDir, 'plan.md'), canonicalPlanMd([{
+      const pocfix8PlanMd = canonicalPlanMd([{
         id: 'PX8-1', batch: 'B1', title: 'Add POCFIX8 planning timeout test + sandbox rule check',
         req_refs: ['PX8-R1'], assignee: 'L1', validator_lane: 'L1', effort: 'low', type: 'feature', deps: [],
         validation_criteria: 'test asserts long timeout and successful ingest under real path',
-      }]), 'utf8');
+      }]);
+      await fs.writeFile(path.join(runDir, 'plan.md'), pocfix8PlanMd, 'utf8');
+      // B5 (real/!isFake path only): CLEAN must carry plan=<short12> matching the live plan.md bytes,
+      // or the sha-binding gate never agrees and the round loop burns its full roundCap budget.
+      const pocfix8PlanShort12 = planRevision(pocfix8PlanMd).short12;
       await fs.appendFile(cbp, `[helm callback] plancore batch-POCFIX8-timeout STATUS: PLANNING\n`);
       await sleep(5);
-      await fs.appendFile(cbp, `[helm callback] planner batch-POCFIX8-timeout-partner STATUS: VERDICT-READY — CLEAN: consensus reached\n`);
+      await fs.appendFile(cbp, `[helm callback] planner batch-POCFIX8-timeout-partner STATUS: VERDICT-READY — CLEAN plan=${pocfix8PlanShort12} consensus reached\n`);
       await sleep(5);
       await fs.appendFile(cbp, `[helm callback] plancore batch-POCFIX8-timeout STATUS: PLAN-READY — plan.json present\n`);
       const res = await p;
@@ -390,7 +401,7 @@ describe('planning-phase-service (B9 PLN1) + gate + auto pick', () => {
       const stillPending = await Promise.race([pPlanner.then(() => 'resolved'), sleep(20).then(() => 'pending')]);
       expect(stillPending).toBe('pending');
 
-      // exactly one partner seat was spawned (default-config planning always spawns 2 seats total).
+      // exactly one partner seat was spawned (P1: plancore is never spawned, so this is the only seat).
       const plannerSpawns = transport.spawnCalls.filter((s) => s.role === 'planner');
       expect(plannerSpawns.length).toBe(1);
 
@@ -432,8 +443,10 @@ describe('planning-phase-service (B9 PLN1) + gate + auto pick', () => {
       expect(res.agreed).toBe(false);
       expect(res.createdTaskIds).toEqual([]);
       // A11 (R1.6): a mechanism-level reason naming the missing partner batch id — never a silent pass.
+      // Pre-existing (unrelated to P1): the round loop's own -r{round} suffixing (rounds 2+) means the
+      // final round-cap-exhausted message names the LAST attempted round's batch id, not the base one.
       expect(res.blockedReason).toBeTruthy();
-      expect(res.blockedReason).toContain('batch-A8-stall-partner');
+      expect(res.blockedReason).toMatch(/batch-A8-stall(-r\d+)?-partner/);
       expect(res.blockedReason).toMatch(/ROUND-CAP-EXHAUSTED/);
     } finally {
       if (origPlanTo === undefined) delete (process.env as any).HELM_PLANNING_TIMEOUT_MS; else process.env.HELM_PLANNING_TIMEOUT_MS = origPlanTo;
@@ -517,8 +530,9 @@ describe('planning-phase-service (B9 PLN1) + gate + auto pick', () => {
       const res = await p;
       expect(res.agreed).toBe(true);
       expect(res.reconvenedTaskKeys).toEqual([]);
-      // exactly the 2 whole-plan seats — no reconvene seats spawned for T1 or the verdict-silent T2.
-      expect(transport.spawnCalls.length - spawnsBefore).toBe(2);
+      // exactly the 1 whole-plan partner seat (P1: plancore is never spawned) — no reconvene seats
+      // spawned for T1 or the verdict-silent T2.
+      expect(transport.spawnCalls.length - spawnsBefore).toBe(1);
     });
 
     it('a seeded ESCALATE on one task convenes the pair exactly once (T1 unaffected)', async () => {
@@ -593,7 +607,7 @@ describe('planning-phase-service (B9 PLN1) + gate + auto pick', () => {
       const res = await p;
       expect(res.agreed).toBe(true);
       expect(res.reconvenedTaskKeys).toEqual([]);
-      expect(transport.spawnCalls.length - spawnsBefore).toBe(2); // whole-plan seats only, no reconvene
+      expect(transport.spawnCalls.length - spawnsBefore).toBe(1); // whole-plan partner seat only, no reconvene (P1: plancore is never spawned)
     });
 
     it('a unilateral AMEND (plancore explicit ACCEPT, partner AMEND) is not a conflict — zero convenes', async () => {
@@ -617,7 +631,7 @@ describe('planning-phase-service (B9 PLN1) + gate + auto pick', () => {
       const res = await p;
       expect(res.agreed).toBe(true);
       expect(res.reconvenedTaskKeys).toEqual([]);
-      expect(transport.spawnCalls.length - spawnsBefore).toBe(2); // whole-plan seats only, no reconvene
+      expect(transport.spawnCalls.length - spawnsBefore).toBe(1); // whole-plan partner seat only, no reconvene (P1: plancore is never spawned)
     });
 
     it('DB: a convene event is recorded against the run + cycle (auditable trigger)', async () => {
@@ -664,9 +678,10 @@ describe('planning-phase-service (B9 PLN1) + gate + auto pick', () => {
     });
   });
 
-  // A1 (R4.16): a cycle-linked planning run records plancore + partner as worker_runtimes rows
-  // with non-NULL run_id resolving to the cycle via runs.cycle_id, and dispatches is untouched (N5).
-  it('A1: cycle-linked planning run inserts worker_runtimes rows with non-NULL run_id resolving via runs.cycle_id', async () => {
+  // A1 (R4.16): a cycle-linked planning run records the partner seat as a worker_runtimes row with
+  // non-NULL run_id resolving to the cycle via runs.cycle_id, and dispatches is untouched (N5).
+  // P1 (R1.2): plancore is never spawned, so it never gets a worker_runtimes row either.
+  it('A1/P1: cycle-linked planning run inserts a worker_runtimes row for the partner (not plancore) resolving via runs.cycle_id', async () => {
     const projRow = dbs.raw.prepare('INSERT INTO projects (name, directory) VALUES (?, ?) RETURNING id')
       .get('a1-worker-runtimes-proj', '/tmp/a1-worker-runtimes-proj') as { id: number };
     const cycleRow = dbs.raw.prepare(
@@ -708,13 +723,13 @@ describe('planning-phase-service (B9 PLN1) + gate + auto pick', () => {
        WHERE wr.run_id = ? ORDER BY wr.id`
     ).all(runRow.id) as any[];
 
-    expect(rows.length).toBe(2);
+    expect(rows.length).toBe(1);
     for (const row of rows) {
       expect(row.run_id).not.toBeNull();
       expect(row.cycle_id).toBe(cycleRow.id);
       expect(row.project_id).toBe(projRow.id);
     }
-    expect(rows.some((r) => r.role === 'plancore' && r.correlation_id === 'batch-A1-worker-runtimes')).toBe(true);
+    expect(rows.some((r) => r.role === 'plancore')).toBe(false);
     expect(rows.some((r) => r.role === 'deliberation' && r.correlation_id === 'batch-A1-worker-runtimes-partner')).toBe(true);
 
     const dispatchesAfter = (dbs.raw.prepare('SELECT COUNT(*) as c FROM dispatches').get() as { c: number }).c;
@@ -723,7 +738,8 @@ describe('planning-phase-service (B9 PLN1) + gate + auto pick', () => {
 
   // A2 (R4.16): planning spawns forward projectId/runId so RealTransport can register helm_sessions
   // at the createSession choke point (FakeTransport records the args; product path uses them).
-  it('A2: planning spawns pass projectId+runId into transport.spawn for both seats', async () => {
+  // P1 (R1.2): plancore is never spawned, so only the partner seat carries these ids.
+  it('A2/P1: planning spawns pass projectId+runId into transport.spawn for the partner seat', async () => {
     const projRow = dbs.raw.prepare('INSERT INTO projects (name, directory) VALUES (?, ?) RETURNING id')
       .get('a2-helm-sessions-proj', '/tmp/a2-helm-sessions-proj') as { id: number };
     const cycleRow = dbs.raw.prepare(
@@ -756,8 +772,8 @@ describe('planning-phase-service (B9 PLN1) + gate + auto pick', () => {
     await p;
 
     const withIds = transport.spawnCalls.filter((c) => c.projectId === projRow.id && c.runId === runRow.id);
-    expect(withIds.length).toBeGreaterThanOrEqual(2);
-    expect(withIds.some((c) => c.role === 'plancore')).toBe(true);
+    expect(withIds.length).toBeGreaterThanOrEqual(1);
+    expect(withIds.some((c) => c.role === 'plancore')).toBe(false);
     expect(withIds.some((c) => c.role === 'deliberation')).toBe(true);
   });
 
@@ -857,9 +873,10 @@ describe('planning-phase-service (B9 PLN1) + gate + auto pick', () => {
       expect(res.agreed).toBe(true);
       expect(res.createdTaskIds.length).toBe(2); // whole-plan ingest, both tasks, one gate
 
-      // Exactly one plancore spawn and one partner spawn — a single whole-plan gate, never a per-task
-      // convene loop (that reconvene behaviour does not exist in the engine yet — it's A13's row).
-      expect(transport.spawnCalls.filter((s) => s.role === 'plancore').length).toBe(1);
+      // Exactly one partner spawn, zero plancore spawns (P1: plancore is never spawned) — a single
+      // whole-plan gate, never a per-task convene loop (that reconvene behaviour does not exist in the
+      // engine yet — it's A13's row).
+      expect(transport.spawnCalls.filter((s) => s.role === 'plancore').length).toBe(0);
       expect(transport.spawnCalls.filter((s) => s.role === 'planner').length).toBe(1);
     });
 

@@ -64,13 +64,16 @@ describe("Q-12 usage gateway: no crew agent-usage.sh shell", () => {
     expect(await gw.isDepleted("codex", "gpt-5.5")).toBeNull();
   });
 
-  it("mapToRung covers product codex/spark only", () => {
+  it("mapToRung covers codex55/spark + house ladder (grok45/haiku); unrelated stay null", () => {
     const gw = new UsageGatewayService({
       fetcher: async () => ({ ts: 0, rungs: {}, errors: [], ok: 0 }),
     });
     expect(gw.mapToRung("codex", "gpt-5.5")).toBe("codex55");
     expect(gw.mapToRung("codex", "gpt-5.4")).toBe("codex55");
     expect(gw.mapToRung("codex", "gpt-5.3-codex-spark")).toBe("spark");
+    // S17 house ladder
+    expect(gw.mapToRung("grok", "grok-4.5")).toBe("grok45");
+    expect(gw.mapToRung("claude", "claude-haiku-4-5")).toBe("haiku");
     expect(gw.mapToRung("claude", "sonnet")).toBeNull();
     expect(gw.mapToRung("codex", "gpt-5.3-codex")).toBeNull();
   });

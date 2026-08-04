@@ -1,0 +1,14 @@
+
+ RUN  v2.1.9 /home/agjrom/websites/Helm
+
+stdout | src/services/planning-phase-signature-path.test.ts > runPlanningPhase — production non-adaptive path never requires brain PLAN-READY (P3) > real (!USE_FAKE_TMUX) planning run agrees from partner CLEAN plan=<sha12> alone — brain PLAN-READY is never posted
+[planning-phase] consensus policy for batch batch-P3-signature-only (mode=planner): unanimous=true maxRounds=3 (source: teams.consensus_rule; settle-role clause not wired)
+
+ ✓ src/services/planning-phase-signature-path.test.ts (5 tests) 662ms
+ ✓ src/services/planning-phase-current-plan-sha-b5.test.ts (4 tests) 476ms
+
+ Test Files  2 passed (2)
+      Tests  9 passed (9)
+   Start at  03:52:58
+   Duration  1.72s (transform 277ms, setup 15ms, collect 372ms, tests 1.14s, environment 0ms, prepare 59ms)
+

@@ -1,0 +1,22 @@
+
+ RUN  v2.1.9 /home/agjrom/websites/Helm
+
+ ✓ src/services/seat-draft-store-isolation.test.ts > composeSeatDraftReadAllow — seat-private fence composition (R2.6) > includes own draft dir + context; excludes peer draft dirs
+ ✓ src/services/seat-draft-store-isolation.test.ts > composeSeatDraftReadAllow — seat-private fence composition (R2.6) > typed-BLOCKs when contextInputs includes a peer seat draft dir
+ ✓ src/services/seat-draft-store-isolation.test.ts > composeSeatDraftReadAllow — seat-private fence composition (R2.6) > typed-BLOCKs widening allowlist to runDir (covers all peer dirs via PATH_BENEATH)
+ ✓ src/services/seat-draft-store-isolation.test.ts > composeSeatDraftReadAllow — seat-private fence composition (R2.6) > typed-BLOCKs widening to planning-drafts/ parent of all seats
+ ✓ src/services/seat-draft-store-isolation.test.ts > composeSeatDraftReadAllow — seat-private fence composition (R2.6) > typed-BLOCKs relative context paths (absolute required)
+ ✓ src/services/seat-draft-store-isolation.test.ts > composeSeatDraftReadAllow — seat-private fence composition (R2.6) > assertNoPeerDraftAccess rejects ad-hoc allowlist that includes peer dir
+ ✓ src/services/seat-draft-store-isolation.test.ts > composeSeatDraftReadAllow — seat-private fence composition (R2.6) > compose result is accepted by makeStrictReadProfileEnv (transport env seam)
+ ✓ src/services/seat-draft-store-isolation.test.ts > transport: overlapping/widening allowlist typed-BLOCK before tmux (R2.6) > RealTransport: compose throws on peer overlap → no createSession / no sendCommand
+ ✓ src/services/seat-draft-store-isolation.test.ts > transport: overlapping/widening allowlist typed-BLOCK before tmux (R2.6) > RealTransport: valid seat allowlist lands in fenced launch (own dir yes, peer no) 3912ms
+ ✓ src/services/seat-draft-store-isolation.test.ts > transport: overlapping/widening allowlist typed-BLOCK before tmux (R2.6) > FakeTransport: records strictReadAllow; compose-fail never reaches spawn
+ ✓ src/services/seat-draft-store-isolation.test.ts > binary sandbox: seat A cannot cat/ls seat B draft (R2.6 kernel) > seat A process can read own draft + context; cannot cat or ls seat B draft dir
+ ✓ src/services/seat-draft-store-isolation.test.ts > binary sandbox: seat A cannot cat/ls seat B draft (R2.6 kernel) > seat B symmetric: cannot read seat A
+ ✓ src/services/seat-draft-store-isolation.test.ts > publishDraft — engine rehash after commit (R2.6 / R2.7) > engine reads both seats via publishDraft after atomic commit
+
+ Test Files  1 passed (1)
+      Tests  13 passed (13)
+   Start at  00:37:23
+   Duration  4.18s (transform 101ms, setup 11ms, collect 118ms, tests 3.95s, environment 0ms, prepare 28ms)
+

@@ -1,0 +1,129 @@
+contract_version: 1
+run_id: planning-agreement-restructure
+project: helm
+north_star_ref: /home/agjrom/websites/Helm/plan/planning-agreement-restructure/north-star.md
+stamped_by: helm-97
+stamped_at: 2026-07-30T06:45:00+08:00   # PHT — JROM works in PHT; servers log UTC
+revision: 1
+
+# ROSTER — JROM-SPECIFIED VERBATIM, 2026-07-30 06:4x PHT:
+#   "we have grok45, opus5, sol (all xhigh effort) to properly plan the work needed -> handover to
+#    codex55 (projcore) and implementers L1=spark,L2=grok45,L3=sonnet5, validator=L1/2=codex55,
+#    opus5 (l3) and defaults for delib and red teams"
+#
+# [north] raised ONE objection and JROM overruled it: "its fine i like my topology".
+#   Objection, recorded so it is not silently re-litigated: codex55 holds BOTH the coordinator seat and
+#   validator L1/L2, so the seat that dispatches work also renders the verdict on most of it. [north]
+#   recommended moving validator L1/L2 to sol. JROM declined. This is his call and it is LOCKED.
+#   Mitigation actually in place: the red-team panel is cross-family by construction and gates the diff
+#   independently of the coordinator, and validator L3 is opus5 (neither coordinator nor implementer).
+#
+# Live headroom at stamp (agent-usage.sh): opus 71%, sonnet 71%, spark 90%, codex55 90%.
+# Claude weekly reset was 00:00 PHT today, so claude is fresh — no pacing rule needed this run.
+
+# THE THREE-vs-TWO RECONCILIATION — read before "fixing" either block.
+# JROM asked for THREE planners (grok45 + opus5 + sol). topology-validate.sh RULE 2 enforces
+# `co_planners` == EXACTLY 2 (locked D1, cross-family). Both are satisfied because they describe
+# DIFFERENT phases, and nothing was dropped:
+#
+#   effort_planning_team (below)  -> [north]'s OWN phase. All THREE author plan.md from
+#                                    og-requirements.md, before any handoff. Not projcore's contract.
+#   co_planners (below)           -> the pair projcore may convene for IN-RUN co-planning during
+#                                    execution. Contract-governed, must be 2, must be cross-family.
+#
+# grok45 is deliberately NOT in co_planners: it already holds implementer L2 and coordinator-backup, so
+# seating it as an in-run co-planner would put one model on both sides of an in-run gate. It plans the
+# effort with the other two in [north]'s phase, where no gate is involved.
+
+effort_planning_team:                        # JROM's three. Authors plan.md in [north]'s phase.
+  - { id: A, model: grok45,  launch: "grok --always-approve -m grok-4.5" }
+  - { id: B, model: opus5,   launch: "claude --dangerously-skip-permissions --model claude-opus-5" }
+  - { id: C, model: sol,     launch: "codex -m gpt-5.6-sol -c model_reasoning_effort=\"xhigh\" --dangerously-bypass-approvals-and-sandbox" }
+  # EFFORT: JROM asked for xhigh on all three.
+  #   - sol: PINNED xhigh above. It silently defaults to `low` and has planned at the bottom of its
+  #     range before when left unpinned — the single most common stamping mistake on this project.
+  #   - opus5: xhigh set at session level.
+  #   - grok45: its CLI reports a `high` ceiling ("Grok 4.5 (high)"), so it runs at ITS MAX, not xhigh.
+  #     Recorded as a deviation rather than written as xhigh and left untrue.
+
+co_planners:                                 # contract-governed pair for projcore's in-run co-planning
+  - { id: A, model: opus5,   launch: "claude --dangerously-skip-permissions --model claude-opus-5" }
+  - { id: B, model: sol,     launch: "codex -m gpt-5.6-sol -c model_reasoning_effort=\"xhigh\" --dangerously-bypass-approvals-and-sandbox" }
+  # Proven cross-family pair from helm-ux-remediation and janitor-consent-redesign. sol PINNED xhigh.
+
+coordinator:
+  primary: { model: codex55, launch: "codex -m gpt-5.5 --dangerously-bypass-approvals-and-sandbox" }
+  backup:  { model: grok45,  launch: "grok --always-approve -m grok-4.5" }
+  # Backup is grok45 (also implementer L2). A coordinator that dies mid-run costs the whole effort, and
+  # the backup only ever takes over on primary failure — it never dispatches AND implements concurrently.
+
+implementer:
+  L1: { model: spark,   launch: "codex -m gpt-5.3-codex-spark --dangerously-bypass-approvals-and-sandbox" }
+  L2: { model: grok45,  launch: "grok --always-approve -m grok-4.5" }
+  L3: { model: sonnet5, launch: "claude --dangerously-skip-permissions --model claude-sonnet-5" }
+  # `sol` and `opus5` NEVER implement (standing project rule) — honoured.
+
+validator:
+  L1: { model: codex55, launch: "codex -m gpt-5.5 --dangerously-bypass-approvals-and-sandbox" }
+  L2: { model: codex55, launch: "codex -m gpt-5.5 --dangerously-bypass-approvals-and-sandbox" }
+  L3: { model: opus5,   launch: "claude --dangerously-skip-permissions --model claude-opus-5" }
+  # verifier != fixer at MODEL level: implementers {spark, grok45, sonnet5} vs validators {codex55, opus5}
+  # -> intersection EMPTY. Holds at every tier.
+
+deliberation_panel:                          # "defaults"
+  convergence: strict-unanimous
+  max_rounds: 3
+  settle: [opus5, sol]
+  panelists:
+    - { model: codex55, profile: agj-panelist }
+    - { model: sol,     profile: agj-panelist }
+    - { model: grok45,  profile: agj-panelist }
+    - { model: sonnet5, profile: agj-panelist }
+
+redteam_panel:                               # "defaults" — cross-family by construction
+  convergence: N-consecutive-clean
+  N: 2
+  tiers:
+    budget:   { count: 3, models: [codex55, grok45, sonnet5] }
+    standard: { count: 4, models: [codex55, sol, grok45, sonnet5] }
+    elite:    { count: 4, models: [codex55, sol, grok45, sonnet5] }
+
+routing_notes:
+  default_impl_tier: L2
+  default_validator_tier: L1
+
+  tier_guidance: >
+    P0 and P1 slices are SAFETY-CRITICAL and must not run at L1. P0 touches teardown and the global
+    session registry (the E5-class path that already marked a live session reapable); P1 rewrites the
+    agreement gate from fail-OPEN to fail-CLOSED. Route P0/P1 at implementer L2/L3 with validator L2
+    minimum and an ELITE red-team pass. P2 is the engine round machine — L2/L3, elite red-team. P3 and
+    the AC23 token-free tests may take L1.
+
+  safety_note: >
+    Ordering is NON-NEGOTIABLE: P0 -> P1 -> P2 -> P3. P1 makes the system safe while still broken; P2
+    makes it work. Never build convergence on a fail-open gate.
+    HARD RULES for every batch:
+      1. HELM_SESSION_JANITOR stays 0. No batch may set it to 1. P0.3 is a precondition for ever
+         reconsidering it, and re-enable additionally needs a fresh independent audit + JROM's approval.
+      2. Commit 8024452 (convene-race fix) MUST SURVIVE — proven on run 32.
+         `grep -c planMdPathForRaceGuard src/services/planning-phase-service.ts` must stay 3.
+      3. Cycle 13 (memory_mcp "UI Upgrade") is JROM's live test cycle. Do not mutate its data or its
+         canonical folder.
+      4. No merge to main (SD10) — main is at 680b6ca and promote is JROM's call.
+      5. app.js is hand-written browser ESM, 560KB, no build step: `node --check` after ANY edit, then
+         `npm run build` (the tree ships two copies).
+      6. UI proof targets :3110 via playwright.cap.config.ts. The default config (:3111, fake tmux,
+         scratch DB) is NOT evidence.
+      7. Run vitest FILE-BY-FILE. A bare full-suite run with extra pool flags hangs.
+      8. NEVER weaken the AC28 provenance guard to make stale pre-AC28 fixtures pass.
+         Known pre-existing failures, leave unless your change touches them: pause-after-planning-gate (3),
+         finish-planning-production (1), b25-fix1-orphan-model (1), model-service (1), smoke (1).
+
+  regression_gate: >
+    AC23 is the anti-recurrence mechanism and is NOT optional. Every historical failure mode gets a
+    token-free test: convene-before-artifacts; BROKEN->revise->CLEAN; partner1 CLEAN + partner2 BROKEN;
+    partner-2 silent until timeout; legacy path refuses when north-star exists; ibrain row count
+    unchanged on a planning block; stale-CLEAN rejected across revisions. This effort is attempt 3+ —
+    the tests are what stop failure N+1 from being a repeat of failure N.
+
+  base_commit: 0a0c883                       # branch fix/planning-convergence-panes; main untouched

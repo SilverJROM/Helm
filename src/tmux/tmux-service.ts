@@ -37,24 +37,144 @@ export type TextSubmissionState = "held" | "submitted" | "indeterminate";
 // registry keep working, and TmuxService never hard-depends on the DB.
 // A2 (R4.16): onCreate may carry projectId/runId/kind so helm_sessions rows land linked at create
 // time (planning seats via RealTransport; workers may still enrich later for late-known context).
+// S04 / AC1: owner (helm|human|legacy:unknown) threaded on stored rows / CAS tokens.
+// S05 / AC2: owner REQUIRED pre-spawn — createSession refuses missing/invalid before any tmux mutation.
+// B15b / AC21: legacy:unknown is migration-only — create accepts only helm|human (stored set unchanged).
+export type TmuxSessionOwner = 'helm' | 'human' | 'legacy:unknown';
+/** Create-time authority only — closed migration sentinel is not creatable. */
+export type TmuxSessionCreateOwner = 'helm' | 'human';
+
+/** B02: CAS token shape carried from create/register through terminate. */
+export type TmuxSessionStatusToken = {
+  id: number;
+  name: string;
+  owner: 'helm' | 'human' | 'legacy:unknown';
+  expectedStatus: 'active' | 'idle' | 'reaped';
+  generation: number;
+  /**
+   * B05 / B08 fix1 C2: when true, markReaped requires CURRENT status === expectedStatus
+   * (idle snapshot cannot claim a same-gen flip to active during staging).
+   */
+  exactStatusOnly?: boolean;
+};
+
+/**
+ * B02 C1: termination registry policy.
+ * - `sessionToken`: decision-boundary CAS token — only path that may mutate helm_sessions.
+ * - `noRegistryWrite: true`: explicit kill-only (tmux destroy, no markReaped).
+ * Passing neither is treated as kill-only (fail-safe); never re-read by name to invent a token.
+ */
+export interface TmuxTerminateOpts {
+  /**
+   * Captured at create/register (or other authoritative acquire) and retained by the caller.
+   * Required for any registry markReaped on terminate. Must not be rebuilt from get(name) at cleanup.
+   */
+  sessionToken?: TmuxSessionStatusToken;
+  /**
+   * Explicit: kill tmux only — do not mutate helm_sessions.
+   * Use when no decision-boundary token exists (unregistered / already reaped / probe cleanup).
+   */
+  noRegistryWrite?: boolean;
+}
+
 export interface TmuxSessionCreateOpts {
   projectId?: number | null;
   runId?: number | null;
   kind?: string;
+  /**
+   * Decision authority. Required at create (S05 pre-spawn refusal).
+   * B15b / AC21: helm|human only — legacy:unknown is closed (migration-only).
+   */
+  owner: TmuxSessionCreateOwner;
+  /**
+   * B02 C1 fix cycle 2: when set, createSession fills `token` with the register() CAS identity
+   * returned by onCreate. Callers MUST retain that token for later terminate/markReaped — never
+   * re-capture by name at cleanup.
+   */
+  sessionTokenOut?: { token?: TmuxSessionStatusToken };
 }
 
+/** Stored contract (3 members) — existing rows, CAS tokens, migration backfill. Not used at create. */
+export const VALID_STORED_SESSION_OWNERS = new Set<string>(['helm', 'human', 'legacy:unknown']);
+/** B15b / AC21: new create accepts only binary authority. */
+export const VALID_CREATE_SESSION_OWNERS = new Set<string>(['helm', 'human']);
+
+/**
+ * S05 + B15b / AC21: fail-closed create-time owner check (pre-spawn).
+ * Accepts helm|human only; legacy:unknown is refused (closed migration-only sentinel).
+ * Stored 3-member set remains VALID_STORED_SESSION_OWNERS (read/CAS/migration).
+ */
+export function assertValidSessionOwner(owner: unknown): asserts owner is TmuxSessionCreateOwner {
+  if (typeof owner !== 'string' || !VALID_CREATE_SESSION_OWNERS.has(owner)) {
+    throw new Error(
+      `session owner required (helm|human); got ${owner === undefined || owner === null ? String(owner) : JSON.stringify(owner)}`
+    );
+  }
+}
+
+/** B08: registry row shape needed for same-name replace eligibility (subset of helm_sessions). */
+export type TmuxSessionLookupRow = {
+  id: number;
+  name: string;
+  owner: string | null | undefined;
+  status: string;
+  generation: number;
+};
+
 export interface TmuxSessionRegistryHook {
-  onCreate(name: string, opts?: TmuxSessionCreateOpts): void;
-  onTerminate(name: string): void;
+  /**
+   * B02 C1: may return the register() SessionStatusToken so createSession can fill sessionTokenOut.
+   */
+  onCreate(name: string, opts?: TmuxSessionCreateOpts): TmuxSessionStatusToken | void;
+  /**
+   * B02 C1 R4: CAS registry claim for this token. Must return true only when markReaped applied.
+   * terminateSession kills tmux ONLY after a true return — stale false aborts kill (protects B).
+   */
+  onTerminate(name: string, token?: TmuxSessionStatusToken): boolean;
   // SL-R2/R4: fired on ACTIVE INPUT to a session (sendKeys). Refreshes last_used_at so the janitor's
   // TTL means "idle for TTL" not "alive for TTL" — keeps actively-used standalone sessions alive.
   onUse(name: string): void;
+  /**
+   * B08 / AC9: read-only lookup of the existing same-name registry row at create-time eligibility.
+   * Optional — missing hook or missing row is treated as unknown ownership (refuse live replace).
+   */
+  onLookup?(name: string): TmuxSessionLookupRow | null | undefined;
+}
+
+/** B08 / AC9–12: typed refusal when createSession will not destroy an existing same-name lifecycle. */
+export type SessionCollisionReason =
+  | 'human'
+  | 'unknown_owner'
+  | 'legacy_unknown'
+  | 'unasserted'
+  | 'untagged'
+  | 'exists_unknown'
+  | 'replace_refused';
+
+export class SessionNameCollisionError extends Error {
+  readonly code = 'SESSION_NAME_COLLISION' as const;
+  constructor(
+    public readonly sessionName: string,
+    public readonly reason: SessionCollisionReason,
+    message?: string
+  ) {
+    super(message ?? `session name collision refused (${reason}): ${sessionName}`);
+    this.name = 'SessionNameCollisionError';
+  }
 }
 
 const NOOP_REGISTRY_HOOK: TmuxSessionRegistryHook = {
+  // fix1 / AC19: a void return is no longer proof of owner persistence — publishCreatedSession now
+  // requires a truthy onCreate token, so an unhooked TmuxService can never report a successful create.
   onCreate() {},
-  onTerminate() {},
-  onUse() {}
+  // No registry: never claim success (token-bearing terminate will refuse kill without a real CAS).
+  onTerminate() {
+    return false;
+  },
+  onUse() {},
+  onLookup() {
+    return undefined;
+  },
 };
 
 export class TmuxService {
@@ -63,6 +183,10 @@ export class TmuxService {
 
   // SL-R1: no-op by default; the real registry is injected in src/index.ts on the shared instance.
   private registryHook: TmuxSessionRegistryHook;
+
+  // S09 / AC19: last ANSI-stripped pane snapshot per bare session name. Used so capturePane can
+  // refresh last_used_at only on real agent-output deltas — identical high-freq polls must not touch.
+  private lastPaneSnapshots = new Map<string, string>();
 
   constructor(registryHook?: TmuxSessionRegistryHook) {
     this.registryHook = registryHook ?? NOOP_REGISTRY_HOOK;
@@ -75,11 +199,36 @@ export class TmuxService {
 
   // SL-R2/R4: active-input signal. Fired from EVERY method by which Helm actively drives a session
   // (sendAndSubmit — the chat/message path, sendCommand, sendEnter, sendKeys) so last_used_at is
-  // refreshed and the janitor's TTL means "idle for TTL", not "alive for TTL". NOT fired from
-  // capturePane (that's high-freq polling — an idle-but-monitored session must still be reapable).
-  // Bare session name (target may be session:window.pane). Best-effort — never break a send.
+  // refreshed and the janitor's TTL means "idle for TTL", not "alive for TTL".
+  // S09 / AC19: also fired from capturePane ONLY when newly observed agent output differs from the
+  // prior pane snapshot — repeated capture polling with identical content must NOT manufacture activity
+  // (idle-but-monitored sessions must stay reapable). Bare session name (target may be session:window.pane).
+  // Best-effort — never break a send/capture.
   private touchSession(target: string): void {
     try { this.registryHook.onUse((target ?? "").split(":")[0]); } catch (err) { console.warn('[tmux] registry onUse failed', { target, err: String(err) }); }
+  }
+
+  /**
+   * S09 / AC19: observe agent output from a capture result.
+   * - First non-empty snapshot for a session = baseline only (no touch).
+   * - Identical subsequent content = no touch (no polling inflation).
+   * - Real content delta = touchSession once (last_used_at refresh via onUse).
+   * - Empty/failed captures invent no activity and do not reset the baseline.
+   * Compare on ANSI-stripped text so TUI colour flicker is not treated as output.
+   */
+  private observeAgentOutput(target: string, paneContent: string): void {
+    const name = (target ?? "").split(":")[0];
+    if (!name) return;
+    const stripped = stripAnsiForMatch(paneContent);
+    if (!stripped) return;
+    const prior = this.lastPaneSnapshots.get(name);
+    if (prior === undefined) {
+      this.lastPaneSnapshots.set(name, stripped);
+      return;
+    }
+    if (prior === stripped) return;
+    this.lastPaneSnapshots.set(name, stripped);
+    this.touchSession(name);
   }
 
   async listPanes(): Promise<TmuxPane[]> {
@@ -142,6 +291,37 @@ export class TmuxService {
     } catch (err) {
       console.warn('[tmux] sessionExists/sendAndSubmit failed', { target, err: String(err) });
       return false;
+    }
+  }
+
+  /**
+   * S12: fail-safe existence for the reconciler decision (true | false | null).
+   * true = live, false = provably gone, null = unknown (KEEP — never over-CONVERGE).
+   * Boolean sessionExists collapses error→false and must not feed decideSessionReconcile alone.
+   */
+  async sessionExistsTriState(name: string): Promise<boolean | null> {
+    try {
+      this.ensureValidSessionName(name);
+    } catch {
+      return null;
+    }
+    try {
+      await execFileAsync('tmux', ['has-session', '-t', name]);
+      return true;
+    } catch (err: any) {
+      const msg = String(err?.stderr ?? err?.message ?? err);
+      // S12-V3: ONLY explicit missing-session / no-server evidence → provably gone.
+      // Generic exit code 1 (socket/permission/unrecognized) is unknown → null, never false.
+      if (
+        /no server running/i.test(msg) ||
+        /can'?t find session/i.test(msg) ||
+        /no such session/i.test(msg) ||
+        /session not found/i.test(msg)
+      ) {
+        return false;
+      }
+      console.warn('[tmux] sessionExistsTriState probe unknown → null', { name, err: String(err) });
+      return null;
     }
   }
 
@@ -406,33 +586,289 @@ export class TmuxService {
     }
   }
 
+  /**
+   * B08 / F-03 AC9–11: create (or fail-closed replace) a named session.
+   * - Provably gone → new-session under final name (no kill).
+   * - Existence unknown → refuse (zero kill).
+   * - Live same-name → eligibility gate, then stage-before-close replace:
+   *   new-session under staging name → terminateSession(old) → rename → register(final).
+   * Never raw kill-if-exists. Staging failure leaves the old lifecycle untouched (AC11 structural).
+   */
   async createSession(name: string, cwd?: string, opts?: TmuxSessionCreateOpts): Promise<string> {
     this.ensureValidSessionName(name);
-    // POCFIX4: idempotent for fixed per-project session names (e.g. 'helm_cards' leftover from prior run).
-    // Best-effort kill-if-exists (has-session then kill-session) before new-session so duplicate never throws.
-    try {
-      await execFileAsync("tmux", ["has-session", "-t", name]);
-      // exists -> kill (ignore errors, best-effort)
-      await execFileAsync("tmux", ["kill-session", "-t", name]).catch(() => {});
-    } catch {
-      // does not exist: proceed to create
+    // S05 / AC2 (F2): owner refusal MUST be pre-spawn. register()/onCreate runs AFTER new-session and is
+    // try/caught — refusing there would leave a live untracked unreapable session. Check before ANY tmux cmd.
+    assertValidSessionOwner(opts?.owner);
+
+    const exists = await this.sessionExistsTriState(name);
+    if (exists === null) {
+      throw new SessionNameCollisionError(
+        name,
+        'exists_unknown',
+        `session name collision refused (exists_unknown): cannot prove ${name} is gone`
+      );
     }
-    const args = ["new-session", "-d", "-s", name];
-    if (cwd) {
-      args.push("-c", cwd);
+    if (exists === true) {
+      await this.createSessionReplacingLive(name, cwd, opts!);
+      return `${name}:0.0`;
     }
-    await execFileAsync("tmux", args);
-    // ST-R1: positive, name-independent Helm ownership tag. Set a tmux session user-option `@helm_child 1`
-    // on EVERY session Helm creates (single choke point). This is the marker the janitor (ST-R2) REQUIRES
-    // before it will ever terminate a session — nothing untagged is ever killed. Best-effort: a set-option
-    // failure must never break/throw the create (swallowed + logged, exactly like the registry hook below).
-    await execFileAsync('tmux', ['set-option', '-t', name, '@helm_child', '1'])
-      .catch((err) => { console.warn('[tmux] set @helm_child failed (best-effort)', { name, err: String(err) }); });
-    // SL-R1 / A2: register EVERY created session centrally (single choke point), carrying optional
-    // projectId/runId/kind so helm_sessions rows are linked at create time. Best-effort — a registry
-    // failure must never break session creation.
-    try { this.registryHook.onCreate(name, opts); } catch (err) { console.warn('[tmux] registry onCreate failed', { name, err: String(err) }); }
+
+    // Provably absent: create under the final name directly (no prior kill).
+    await this.spawnTaggedSession(name, cwd);
+    await this.publishCreatedSession(name, opts);
     return `${name}:0.0`;
+  }
+
+  /**
+   * B08: live same-name replace — eligibility first (zero kill on refuse), then stage-before-close.
+   * Eligible completed Helm: owner=helm + status=idle + @helm_child, closed via terminateSession CAS.
+   * Reaped+live orphan (row already converged): physical close via noRegistryWrite after successful stage.
+   */
+  private async createSessionReplacingLive(
+    name: string,
+    cwd: string | undefined,
+    opts: TmuxSessionCreateOpts
+  ): Promise<void> {
+    const row = this.lookupExistingSession(name);
+    if (!row) {
+      throw new SessionNameCollisionError(
+        name,
+        'unknown_owner',
+        `session name collision refused (unknown_owner): no registry row for live ${name}`
+      );
+    }
+
+    const owner = row.owner;
+    if (owner === 'human') {
+      throw new SessionNameCollisionError(
+        name,
+        'human',
+        `session name collision refused (human): will not replace live human session ${name}`
+      );
+    }
+    if (owner === 'legacy:unknown') {
+      throw new SessionNameCollisionError(
+        name,
+        'legacy_unknown',
+        `session name collision refused (legacy_unknown): will not replace live legacy session ${name}`
+      );
+    }
+    if (owner !== 'helm') {
+      throw new SessionNameCollisionError(
+        name,
+        'unknown_owner',
+        `session name collision refused (unknown_owner): live ${name} has owner ${JSON.stringify(owner)}`
+      );
+    }
+
+    const status = String(row.status || '');
+    // AC9: live replace requires completion assertion (idle) or already-converged reaped orphan.
+    // Active-without-completion is never eligible.
+    if (status === 'active') {
+      throw new SessionNameCollisionError(
+        name,
+        'unasserted',
+        `session name collision refused (unasserted): live ${name} is active without completion`
+      );
+    }
+    if (status !== 'idle' && status !== 'reaped') {
+      throw new SessionNameCollisionError(
+        name,
+        'unasserted',
+        `session name collision refused (unasserted): live ${name} has status ${JSON.stringify(status)}`
+      );
+    }
+
+    // AC9: any live old target must carry positive @helm_child (untagged never killed via replace).
+    const tagged = await this.sessionHasHelmChildTag(name);
+    if (!tagged) {
+      throw new SessionNameCollisionError(
+        name,
+        'untagged',
+        `session name collision refused (untagged): live ${name} lacks @helm_child`
+      );
+    }
+
+    // Capture old CAS token at decision boundary before any mutation (idle path only).
+    // B08 fix1 C2: exactStatusOnly fences idle completion at the destructive CAS — an idle→active
+    // flip during staging must not still claim/kill the old lifecycle.
+    let oldToken: TmuxSessionStatusToken | undefined;
+    if (status === 'idle') {
+      try {
+        oldToken = {
+          id: row.id,
+          name: row.name,
+          owner: 'helm',
+          expectedStatus: 'idle',
+          generation: row.generation,
+          exactStatusOnly: true,
+        };
+      } catch {
+        throw new SessionNameCollisionError(
+          name,
+          'unasserted',
+          `session name collision refused (unasserted): cannot build token for ${name}`
+        );
+      }
+    }
+
+    // Stage under a unique name FIRST so a create failure never touches the old lifecycle (AC11).
+    // B08 fix1 C1 / AC19: staging (like every create path) requires a successful @helm_child tag —
+    // incomplete stage must not close old.
+    const stagingName = this.makeStagingSessionName(name);
+    try {
+      await this.spawnTaggedSession(stagingName, cwd);
+    } catch (err) {
+      // Staging failed (new-session or strict tag) — old session and registry must remain untouched.
+      // Orphan staging teardown (if new-session succeeded) is handled inside spawnTaggedSession.
+      throw err;
+    }
+
+    // Authorized close of the old lifecycle through terminateSession (AC10), not raw kill-session.
+    // fix2 (AC19 / F-07 R2): every branch below that must tear down the (already tagged) staging
+    // session on failure routes through rollbackOrphanSession — never a bare killSessionRaw(...).catch
+    // (() => {}) — so a staging kill failure surfaces instead of leaving a live, tagged, unregistered
+    // orphan invisible to both the caller and any registry-driven sweep. Always targets stagingName;
+    // the final (old) name is never touched here.
+    let closed = false;
+    try {
+      if (status === 'idle' && oldToken) {
+        closed = await this.terminateSession(name, { sessionToken: oldToken });
+      } else {
+        // reaped row already converged — physical cleanup only.
+        closed = await this.terminateSession(name, { noRegistryWrite: true });
+      }
+    } catch (err) {
+      await this.rollbackOrphanSession(stagingName, err);
+    }
+    if (!closed) {
+      await this.rollbackOrphanSession(
+        stagingName,
+        new SessionNameCollisionError(
+          name,
+          'replace_refused',
+          `session name collision refused (replace_refused): terminateSession did not close ${name}`
+        )
+      );
+    }
+
+    // Publish under the FINAL name (registry row must not name the staging session).
+    try {
+      await execFileAsync('tmux', ['rename-session', '-t', stagingName, name]);
+    } catch (err) {
+      // Old is gone; staging may still exist — roll back (fail-closed), then surface the failure.
+      await this.rollbackOrphanSession(stagingName, err);
+    }
+
+    await this.publishCreatedSession(name, opts);
+  }
+
+  /** B08: lookup existing same-name registry row for replace eligibility (fail-closed if absent). */
+  private lookupExistingSession(name: string): TmuxSessionLookupRow | null {
+    const lookup = this.registryHook.onLookup;
+    if (typeof lookup !== 'function') return null;
+    try {
+      const row = lookup.call(this.registryHook, name);
+      if (!row || typeof row.id !== 'number' || !row.name) return null;
+      return row;
+    } catch (err) {
+      console.warn('[tmux] registry onLookup failed → treating as unknown', { name, err: String(err) });
+      return null;
+    }
+  }
+
+  /** Unique staging name under ensureValidSessionName charset (no second session under final name). */
+  private makeStagingSessionName(finalName: string): string {
+    const suffix = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+    const staging = `${finalName}-stg-${suffix}`;
+    this.ensureValidSessionName(staging);
+    return staging;
+  }
+
+  /**
+   * ST-R1: new-session + @helm_child tag. No registry write (caller publishes under the final name).
+   *
+   * AC19 / F-07: @helm_child is mandatory on EVERY create path (fresh-create and staging replace
+   * alike) — the janitor's ownership probe (sessionHasHelmChildTag) fail-safes untagged sessions to
+   * "not ours, never reap", so a swallowed tag failure would leave a permanent unreapable orphan.
+   * Any set-option failure tears down the just-created session and rethrows; callers must never
+   * treat an incompletely-tagged session as a successful create.
+   */
+  private async spawnTaggedSession(sessionName: string, cwd?: string): Promise<void> {
+    const args = ['new-session', '-d', '-s', sessionName];
+    if (cwd) {
+      args.push('-c', cwd);
+    }
+    await execFileAsync('tmux', args);
+
+    try {
+      await execFileAsync('tmux', ['set-option', '-t', sessionName, '@helm_child', '1']);
+    } catch (err) {
+      // Remove the orphan (tag incomplete); rollback failure must surface, never vanish (fix1).
+      await this.rollbackOrphanSession(sessionName, err);
+    }
+  }
+
+  /**
+   * SL-R1 / A2 / S05 / B02: register under the FINAL session name and optionally fill sessionTokenOut.
+   *
+   * AC19 / F-07: registry/owner persistence is mandatory, not best-effort — a durable unowned active
+   * row is exactly the state AC19 forbids. A throwing onCreate rejects the create: the just-created
+   * tmux session (published under `name`) is torn down and the failure is rethrown so the caller never
+   * treats this as a success.
+   *
+   * fix1: absence-of-throw is not proof of persistence either. `onCreate` is typed `token | void`, and
+   * a hook (or the NOOP default on an unhooked TmuxService) that returns void without throwing produced
+   * exactly the same fail-open result the redteam flagged — a live tagged session with no registry row.
+   * A falsy return is now treated identically to a thrown error: reject + roll back.
+   */
+  private async publishCreatedSession(name: string, opts?: TmuxSessionCreateOpts): Promise<void> {
+    let createdToken: TmuxSessionStatusToken | void = undefined;
+    try {
+      createdToken = this.registryHook.onCreate(name, opts);
+    } catch (err) {
+      console.warn('[tmux] registry onCreate failed — rejecting create (AC19 fail-closed)', { name, err: String(err) });
+      await this.rollbackOrphanSession(name, err);
+    }
+    if (!createdToken) {
+      console.warn('[tmux] registry onCreate returned no durable token — rejecting create (AC19 fail-closed)', { name });
+      await this.rollbackOrphanSession(
+        name,
+        new Error(`registry onCreate returned no durable token for ${name} — owner persistence not acknowledged (AC19 fail-closed)`)
+      );
+    }
+    if (opts?.sessionTokenOut) {
+      opts.sessionTokenOut.token = createdToken as TmuxSessionStatusToken;
+    }
+  }
+
+  /**
+   * fix1 (AC19 / F-07): shared rollback for a failed post-create step (tag or registry persist). The
+   * prior implementation swallowed a `kill-session` rollback failure (`.catch(() => {})`), which meant
+   * a session that survived BOTH the original failure and the cleanup kill was reported only as the
+   * original error — the live, untagged/unowned orphan itself was invisible to the caller.
+   *
+   * Kill success (or a kill failure where a follow-up tri-state probe PROVES the session is already
+   * gone — e.g. a race where it died between the failed call and this check) rethrows only the
+   * original cause. Any other outcome (kill failed AND the session is still live or unknown) throws an
+   * AggregateError carrying both failures, so the rejection itself makes the surviving orphan visible
+   * instead of reading as an ordinary create failure.
+   */
+  private async rollbackOrphanSession(sessionName: string, cause: unknown): Promise<never> {
+    const causeErr = cause instanceof Error ? cause : new Error(String(cause));
+    try {
+      await this.killSessionRaw(sessionName);
+    } catch (killErr) {
+      const stillThere = await this.sessionExistsTriState(sessionName);
+      if (stillThere === false) {
+        throw causeErr;
+      }
+      throw new AggregateError(
+        [causeErr, killErr instanceof Error ? killErr : new Error(String(killErr))],
+        `rollback kill failed for ${sessionName} after create failure — session may still be LIVE and untagged/unowned (orig: ${causeErr.message})`
+      );
+    }
+    throw causeErr;
   }
 
   // ST-R2: positive Helm-ownership probe. Returns true ONLY if the live session carries the
@@ -447,6 +883,45 @@ export class TmuxService {
     } catch (err) {
       console.warn('[tmux] sessionHasHelmChildTag probe failed → treating as NOT-Helm (fail-safe)', { name, err: String(err) });
       return false;
+    }
+  }
+
+  /**
+   * S08: fail-safe read of tmux `#{session_activity}`.
+   * Returns null (unknown) on any error, missing session, or malformed output.
+   * Unknown is intentionally safe-fail for the janitor (conservative over-reap behavior).
+   */
+  async sessionActivity(name: string): Promise<number | null> {
+    try {
+      this.ensureValidSessionName(name);
+      const { stdout } = await execFileAsync('tmux', ['display-message', '-p', '-t', name, '#{session_activity}']);
+      const raw = (stdout ?? '').trim();
+      if (!raw) return null;
+      const parsed = Number(raw);
+      if (!Number.isFinite(parsed) || parsed < 0 || Number.isNaN(parsed)) return null;
+      return parsed;
+    } catch (err) {
+      console.warn('[tmux] sessionActivity probe failed → treating as unknown', { name, err: String(err) });
+      return null;
+    }
+  }
+
+  /**
+   * S08: fail-safe read of tmux `#{session_attached}`.
+   * Returns null (unknown) on any error, missing session, or malformed output.
+   * Unknown is intentionally safe-fail for the janitor (attached status avoids unsafe idle evidence).
+   */
+  async sessionAttached(name: string): Promise<boolean | null> {
+    try {
+      this.ensureValidSessionName(name);
+      const { stdout } = await execFileAsync('tmux', ['display-message', '-p', '-t', name, '#{session_attached}']);
+      const raw = (stdout ?? '').trim();
+      if (raw === '1') return true;
+      if (raw === '0') return false;
+      return null;
+    } catch (err) {
+      console.warn('[tmux] sessionAttached probe failed → treating as unknown', { name, err: String(err) });
+      return null;
     }
   }
 
@@ -466,11 +941,49 @@ export class TmuxService {
     return last?.target || sessionTarget;
   }
 
-  async terminateSession(sessionName: string): Promise<void> {
+  /**
+   * Destroy a tmux session, optionally gated by a decision-boundary CAS token.
+   *
+   * B02 C1 R4 ordering (CRITICAL):
+   * - With `sessionToken`: registry claim (`onTerminate` / markReaped) runs **first**.
+   *   Only if the claim applies (`true`) is `kill-session` issued. Stale token → **no kill**
+   *   (same-name replacement B must not be physically destroyed by stale A cleanup).
+   * - With `noRegistryWrite` or missing token: kill-only (no registry mutation).
+   *
+   * @returns true if kill-session was performed; false if aborted (stale CAS / refused).
+   */
+  async terminateSession(sessionName: string, opts?: TmuxTerminateOpts): Promise<boolean> {
     this.ensureValidSessionName(sessionName);
+    const token = opts?.sessionToken;
+    const killOnly = !!opts?.noRegistryWrite || !token;
+
+    if (!killOnly && token) {
+      // CAS claim before any destructive tmux action.
+      let applied = false;
+      try {
+        applied = this.registryHook.onTerminate(sessionName, token) === true;
+      } catch (err) {
+        console.warn('[tmux] registry onTerminate failed — refusing kill', {
+          sessionName,
+          err: String(err),
+        });
+        return false;
+      }
+      if (!applied) {
+        // Stale lifecycle token: do not kill the name (may now be replacement B).
+        return false;
+      }
+    }
+
+    await this.killSessionRaw(sessionName);
+    // S09: drop prior pane snapshot so a recreated same-name session re-baselines (no stale delta).
+    this.lastPaneSnapshots.delete(sessionName);
+    return true;
+  }
+
+  /** Overridable for tests — production runs `tmux kill-session -t <name>`. */
+  protected async killSessionRaw(sessionName: string): Promise<void> {
     await execFileAsync("tmux", ["kill-session", "-t", sessionName]);
-    // SL-R1/R2: mark reaped centrally on terminate. Best-effort — never mask a real kill.
-    try { this.registryHook.onTerminate(sessionName); } catch (err) { console.warn('[tmux] registry onTerminate failed', { sessionName, err: String(err) }); }
   }
 
   async terminatePane(target: string): Promise<void> {
@@ -492,7 +1005,13 @@ export class TmuxService {
         `-${safeLines}`
       ]);
       // Convert \n to \r\n for xterm.js
-      return stdout.replace(/\n/g, "\r\n");
+      const content = stdout.replace(/\n/g, "\r\n");
+      // S09 / AC19: bump last_used_at only when agent output differs from prior snapshot.
+      // Best-effort — never mask a successful capture if the registry hook throws.
+      try { this.observeAgentOutput(target, content); } catch (err) {
+        console.warn('[tmux] observeAgentOutput failed', { target, err: String(err) });
+      }
+      return content;
     } catch (err) {
       console.warn('[tmux] capturePane failed', { err: String(err) });
       return "";
