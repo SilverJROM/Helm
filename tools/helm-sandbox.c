@@ -24,6 +24,45 @@
  *   narrow, additive — NOT project-write). Exists so a durable HELM_RUN_ROOT outside /tmp still
  *   lets a worker append to <run>/callbacks.md under the fence. Absent/empty -> no-op, byte-identical
  *   to every existing deployment/test. Set but malformed (relative path, empty entry) -> fail-closed.
+ *
+ * B7 (2026-08-04, R4.1/R4.3): cycle-scoped git capability, FOUR distinct classes threaded by a later
+ * slice (B8's makeCycleGitAllowEnv) through HELM_SANDBOX_GIT_RO / _ADMIN / _REF_RW / _OBJ. A worktree's
+ * commit machinery writes OUTSIDE the worktree fence, into the repo's git common dir (`<common>` —
+ * `<project>/.git` for a normal checkout), so this is a second, narrower fence layered on top of the
+ * project write fence, scoped to exactly the paths one cycle's commits touch:
+ *   - GIT_RO      (one abs path)  — `<common>` itself, read+exec. Every other class must already exist
+ *     as a strict descendant of this path; it is both a real grant (config/HEAD/packed-refs/index
+ *     reads) and the validation anchor for the other three.
+ *   - GIT_ADMIN   (one abs path)  — exactly `<common>/worktrees/<git_worktree_id>`, this cycle's
+ *     private worktree admin dir (`index`, `index.lock`, `HEAD`, `ORIG_HEAD`, `COMMIT_EDITMSG`,
+ *     `logs/HEAD`). `git add` creates `index.lock` here and renames it over `index`, so without this
+ *     class no commit is possible at all. Full write class. Refuses `<common>/worktrees` itself and
+ *     any path that is not a DIRECT child of it — the whole point is ONE cycle's admin state, never
+ *     every peer cycle's.
+ *   - GIT_REF_RW  (colon-separated abs paths) — the namespaced ref dir (`refs/heads/helm/cycle/<id>`)
+ *     and its reflog mirror (`logs/refs/heads/helm/cycle/<id>`). `git commit` creates `<branch>.lock`
+ *     inside the ref's directory, so the grant must be the directory, not the ref file. `refs/heads/
+ *     main` and every peer cycle's namespace sit outside this subtree.
+ *   - GIT_OBJ     (one abs path)  — `<common>/objects`, under a NARROWER mask than the other three:
+ *     create only (MAKE_REG|MAKE_DIR|WRITE_FILE), with REFER, TRUNCATE, REMOVE_FILE, REMOVE_DIR
+ *     and MAKE_SYM all omitted — empirically the minimum that lets `git add`+`git commit` write new
+ *     loose objects (probed by adding one bit at a time from zero against a real repo, fixtures
+ *     deliberately OUTSIDE /tmp and the $HOME tooling exceptions so no other grant could mask the
+ *     result under test; REFER's omission is itself a checked finding — 5/5 stable passes without
+ *     it — not an oversight; see
+ *     plan/cycle-branch-lifecycle/validation/B7-impl-a1/obj-mask-derivation.md). This means a
+ *     pre-existing object reachable from base or a peer branch can be neither truncated nor unlinked
+ *     by this seat. Reads of the object store come from the GIT_RO ancestor grant, not from this class.
+ * Every entry: must already exist (no ensure_dir — B6 pre-creates the reflog dir; git itself creates
+ * the rest at worktree-add time), must be absolute + canonical (the raw value must equal its own
+ * realpath() — this single check rejects relative components, a trailing slash, and any symlink
+ * anywhere on the path in one move) and free of control characters. A directory target gets the full
+ * class mask; a regular-file target gets the file-safe subset (no directory-only rights, which would
+ * EINVAL on a non-dir fd) pinned to the file's own O_NOFOLLOW fd — never widened to its parent (same
+ * discipline as FIX1/B22b-fix1 above). Absent HELM_SANDBOX_GIT_RO is a byte-identical no-op for every
+ * existing caller (B9 threads this to cycle seats only); once set, GIT_ADMIN/GIT_REF_RW/GIT_OBJ are
+ * ALL mandatory — the four classes travel together, so a partial set is a caller bug and fails closed
+ * rather than silently granting less than intended.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -492,6 +531,234 @@ static void add_write_allow_rules(int rs, const char *list, uint64_t access, con
   }
 }
 
+static bool has_control_chars(const char *s) {
+  for (const unsigned char *p = (const unsigned char *)s; *p; ++p) {
+    if (*p < 0x20 || *p == 0x7f) return true;
+  }
+  return false;
+}
+
+/* B7: fail-closed canonicalization for one GIT_* path entry. Absolute, control-char-free, must
+ * already exist (no ensure_dir), and exactly canonical — the raw value must equal its own
+ * realpath(): this single comparison rejects relative components ('.'/'..'), a trailing slash,
+ * repeated slashes, AND any symlink anywhere on the path (a symlinked entry's realpath()
+ * necessarily differs from the raw string, since the target path is never textually identical to
+ * a path that names it via a link). `what` names the offending source (env var or list entry) in
+ * the failure message; the canonical form is copied into `resolved`. */
+static void resolve_git_entry(const char *raw, const char *what, char *resolved, size_t resolved_sz, const char *proj) {
+  char op[PATH_MAX + 160];
+  if (raw == NULL || raw[0] == '\0') {
+    snprintf(op, sizeof(op), "%s must not be empty", what);
+    fail(op, proj, 0);
+  }
+  if (raw[0] != '/') {
+    snprintf(op, sizeof(op), "%s must be an absolute path (got '%s')", what, raw);
+    fail(op, proj, 0);
+  }
+  if (has_control_chars(raw)) {
+    snprintf(op, sizeof(op), "%s contains control characters", what);
+    fail(op, proj, 0);
+  }
+  if (strlen(raw) >= resolved_sz) {
+    snprintf(op, sizeof(op), "%s exceeds PATH_MAX", what);
+    fail(op, proj, 0);
+  }
+  char rp[PATH_MAX];
+  if (realpath(raw, rp) == NULL) {
+    snprintf(op, sizeof(op), "%s does not resolve (must already exist; no ensure_dir): realpath('%s')", what, raw);
+    fail(op, proj, errno);
+  }
+  if (strcmp(raw, rp) != 0) {
+    snprintf(op, sizeof(op),
+             "%s is not canonical (relative components, a trailing slash, or a symlink): '%s' != realpath '%s'",
+             what, raw, rp);
+    fail(op, proj, 0);
+  }
+  if (is_too_shallow(rp)) {
+    snprintf(op, sizeof(op), "%s resolves to a forbidden shallow path: '%s'", what, rp);
+    fail(op, proj, 0);
+  }
+  strncpy(resolved, rp, resolved_sz - 1);
+  resolved[resolved_sz - 1] = '\0';
+}
+
+/* True iff `candidate` is a STRICT descendant of `anchor` (never equal — an entry naming the
+ * common-dir root itself is refused this way): candidate begins with anchor + '/'. Both must
+ * already be canonical absolute paths (post resolve_git_entry). Comparing on "anchor + '/'"
+ * rather than a bare prefix avoids the classic sibling bug (anchor `/a/b` must not match
+ * candidate `/a/bc`). */
+static bool is_strict_descendant(const char *anchor, const char *candidate) {
+  size_t alen = strlen(anchor);
+  if (strncmp(candidate, anchor, alen) != 0) return false;
+  return candidate[alen] == '/';
+}
+
+/* B7: adds one PATH_BENEATH rule for a GIT_* entry, fd-pinned via O_NOFOLLOW (never widened to the
+ * parent — no ensure_dir, no POCFIX10 parent-widen). A directory target gets `dir_access`; a
+ * regular-file target gets the file-safe `file_access` subset (directory-only rights such as
+ * MAKE_REG/MAKE_DIR/REMOVE_FILE/REMOVE_DIR/MAKE_SYM/REFER/READ_DIR would EINVAL on a non-dir fd).
+ * Any other inode type (symlink already excluded by resolve_git_entry's canonical check; a device,
+ * fifo, or socket left over from something else) refuses fail-closed rather than guessing which
+ * mask applies. */
+static void add_git_rule(int rs, const char *resolved, uint64_t dir_access, uint64_t file_access, const char *what, const char *proj) {
+  char op[PATH_MAX + 128];
+  int fd = open(resolved, O_PATH | O_CLOEXEC | O_NOFOLLOW);
+  if (fd < 0) {
+    snprintf(op, sizeof(op), "open %s '%s'", what, resolved);
+    fail(op, proj, errno);
+  }
+  struct stat st;
+  if (fstat(fd, &st) != 0) {
+    int e = errno;
+    snprintf(op, sizeof(op), "fstat %s '%s'", what, resolved);
+    close(fd);
+    fail(op, proj, e);
+  }
+  uint64_t access;
+  if (S_ISDIR(st.st_mode)) {
+    access = dir_access;
+  } else if (S_ISREG(st.st_mode)) {
+    access = file_access;
+  } else {
+    close(fd);
+    snprintf(op, sizeof(op), "%s '%s' is neither a directory nor a regular file", what, resolved);
+    fail(op, proj, 0);
+  }
+  struct landlock_path_beneath_attr rule = { .allowed_access = access, .parent_fd = fd };
+  if (landlock_add_rule(rs, LANDLOCK_RULE_PATH_BENEATH, &rule, 0)) {
+    int e = errno;
+    close(fd);
+    snprintf(op, sizeof(op), "landlock_add_rule(%s '%s')", what, resolved);
+    fail(op, proj, e);
+  }
+  close(fd);
+}
+
+/* B7 (R4.1/R4.3): wires the cycle-scoped git capability — see the file-header doc comment for the
+ * four classes. `rw` is the caller's full read+write class (same variable used for the project
+ * grant); this function derives its own file-safe and OBJ-narrowed variants locally so it stays
+ * fully self-contained, mirroring grant_project_rw_excluding_root_governed above. */
+static void add_cycle_git_rules(int rs, uint64_t rw, const char *proj) {
+  const char *ro_raw = getenv("HELM_SANDBOX_GIT_RO");
+  if (ro_raw == NULL || ro_raw[0] == '\0') {
+    /* Absent GIT_RO must mean NO git capability at all — a lone ADMIN/REF_RW/OBJ with no anchor
+     * to validate against is a caller bug, never silently ignored (the four classes travel
+     * together; see B8's "1 RO + 1 ADMIN + 2 REF_RW + 1 OBJ, never a subset" contract). */
+    const char *others[] = { "HELM_SANDBOX_GIT_ADMIN", "HELM_SANDBOX_GIT_REF_RW", "HELM_SANDBOX_GIT_OBJ" };
+    for (size_t i = 0; i < sizeof(others) / sizeof(others[0]); i++) {
+      const char *v = getenv(others[i]);
+      if (v != NULL && v[0] != '\0') {
+        char op[192];
+        snprintf(op, sizeof(op), "%s set without HELM_SANDBOX_GIT_RO — the git capability classes must travel together", others[i]);
+        fail(op, proj, 0);
+      }
+    }
+    return;
+  }
+
+  uint64_t ro = LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR | LANDLOCK_ACCESS_FS_EXECUTE;
+  uint64_t file_rw_full = LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_WRITE_FILE | LANDLOCK_ACCESS_FS_TRUNCATE;
+
+  char git_ro[PATH_MAX];
+  resolve_git_entry(ro_raw, "HELM_SANDBOX_GIT_RO", git_ro, sizeof(git_ro), proj);
+  add_git_rule(rs, git_ro, ro, LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_EXECUTE, "HELM_SANDBOX_GIT_RO", proj);
+
+  const char *admin_raw = getenv("HELM_SANDBOX_GIT_ADMIN");
+  const char *refrw_raw = getenv("HELM_SANDBOX_GIT_REF_RW");
+  const char *obj_raw = getenv("HELM_SANDBOX_GIT_OBJ");
+  if (admin_raw == NULL || admin_raw[0] == '\0') fail("HELM_SANDBOX_GIT_ADMIN is required once HELM_SANDBOX_GIT_RO is set", proj, 0);
+  if (refrw_raw == NULL || refrw_raw[0] == '\0') fail("HELM_SANDBOX_GIT_REF_RW is required once HELM_SANDBOX_GIT_RO is set", proj, 0);
+  if (obj_raw == NULL || obj_raw[0] == '\0') fail("HELM_SANDBOX_GIT_OBJ is required once HELM_SANDBOX_GIT_RO is set", proj, 0);
+
+  /* GIT_ADMIN: exactly <GIT_RO>/worktrees/<id> — a strict descendant of GIT_RO, refusing
+   * <GIT_RO>/worktrees itself and anything that is not a DIRECT child of it (a peer cycle's admin
+   * dir, or a nested path underneath one). */
+  char admin[PATH_MAX];
+  resolve_git_entry(admin_raw, "HELM_SANDBOX_GIT_ADMIN", admin, sizeof(admin), proj);
+  if (!is_strict_descendant(git_ro, admin)) {
+    fail("HELM_SANDBOX_GIT_ADMIN must be a strict descendant of HELM_SANDBOX_GIT_RO", proj, 0);
+  }
+  char worktrees_dir[PATH_MAX];
+  int wn = snprintf(worktrees_dir, sizeof(worktrees_dir), "%s/worktrees", git_ro);
+  if (wn < 0 || (size_t)wn >= sizeof(worktrees_dir)) {
+    fail("HELM_SANDBOX_GIT_RO path too long to derive its worktrees dir", proj, 0);
+  }
+  if (strcmp(admin, worktrees_dir) == 0) {
+    fail("HELM_SANDBOX_GIT_ADMIN must not name <common>/worktrees itself", proj, 0);
+  }
+  const char *admin_slash = strrchr(admin, '/');
+  size_t admin_parent_len = admin_slash ? (size_t)(admin_slash - admin) : 0;
+  if (admin_parent_len != strlen(worktrees_dir) || strncmp(admin, worktrees_dir, admin_parent_len) != 0) {
+    fail("HELM_SANDBOX_GIT_ADMIN must be a DIRECT child of <common>/worktrees", proj, 0);
+  }
+  add_git_rule(rs, admin, rw, file_rw_full, "HELM_SANDBOX_GIT_ADMIN", proj);
+
+  /* GIT_REF_RW: colon-separated list (B8 emits exactly 2 — the namespaced ref dir + its reflog
+   * mirror), each a strict descendant of GIT_RO. Mirrors add_write_allow_rules' fail-closed
+   * empty-entry detection (leading/trailing/repeated ':' never silently collapsed by strtok_r). */
+  {
+    size_t rlen = strlen(refrw_raw);
+    bool has_empty_entry = (rlen == 0) || (refrw_raw[0] == ':') || (refrw_raw[rlen - 1] == ':') || (strstr(refrw_raw, "::") != NULL);
+    if (has_empty_entry) {
+      char op[PATH_MAX + 96];
+      snprintf(op, sizeof(op), "HELM_SANDBOX_GIT_REF_RW contains an empty entry (leading/trailing/repeated ':'): '%s'", refrw_raw);
+      fail(op, proj, 0);
+    }
+    char *copy = strdup(refrw_raw);
+    if (copy == NULL) fail("strdup(HELM_SANDBOX_GIT_REF_RW)", proj, errno);
+    int granted = 0;
+    char *saveptr = NULL;
+    for (char *tok = strtok_r(copy, ":", &saveptr); tok != NULL; tok = strtok_r(NULL, ":", &saveptr)) {
+      char resolved[PATH_MAX];
+      resolve_git_entry(tok, "HELM_SANDBOX_GIT_REF_RW entry", resolved, sizeof(resolved), proj);
+      if (!is_strict_descendant(git_ro, resolved)) {
+        free(copy);
+        fail("HELM_SANDBOX_GIT_REF_RW entry must be a strict descendant of HELM_SANDBOX_GIT_RO", proj, 0);
+      }
+      add_git_rule(rs, resolved, rw, file_rw_full, "HELM_SANDBOX_GIT_REF_RW", proj);
+      granted++;
+    }
+    free(copy);
+    if (granted == 0) fail("HELM_SANDBOX_GIT_REF_RW has zero entries (contains only separators)", proj, 0);
+  }
+
+  /* GIT_OBJ: <common>/objects, NARROWER mask than the other three classes — create-only.
+   * Empirically derived minimum, starting from zero and adding one candidate bit at a time
+   * against a real repo with fixtures deliberately placed OUTSIDE /tmp and every $HOME
+   * tooling-exception dir (those get their own blanket write grants that would mask the very
+   * enforcement under test): plan/cycle-branch-lifecycle/validation/B7-impl-a1/obj-mask-derivation.md.
+   * The true minimum is MAKE_REG | MAKE_DIR | WRITE_FILE:
+   *   - MAKE_REG: create the new loose-object file itself (both the temp file git writes and its
+   *     final `objects/<2-hex>/<38-hex>` name — confirmed necessary: MAKE_DIR+WRITE_FILE alone
+   *     fails with "adding files failed").
+   *   - MAKE_DIR: create a new 2-hex-prefix subdirectory when an object's prefix hasn't been seen
+   *     before (confirmed necessary: MAKE_REG+WRITE_FILE alone fails the same way; a passing run's
+   *     prefix-dir count rises by exactly the number of new objects written).
+   *   - WRITE_FILE: write the temp file's content before it is renamed into place (confirmed
+   *     necessary: MAKE_REG+MAKE_DIR alone fails — creating-for-write is NOT covered by MAKE_REG
+   *     alone on this kernel).
+   * REFER is DELIBERATELY OMITTED — empirically proven unnecessary, not merely untried: 5/5 stable
+   * passes on MAKE_REG|MAKE_DIR|WRITE_FILE alone, and adding REFER on top changes nothing. This
+   * matches Landlock's own rename semantics — the temp file and its final name are both reparented
+   * within the exact same granted `objects/` hierarchy (no rule boundary is crossed), so the
+   * kernel's REFER escalation check never triggers for this rename. Any FUTURE git behavior that
+   * needs REFER here (e.g. a temp dir outside `objects/`) would surface as an immediate, obvious
+   * EACCES on a real commit — not a silent gap — so it is left out per the "never defaulted in"
+   * instruction. TRUNCATE, REMOVE_FILE, REMOVE_DIR and MAKE_SYM are likewise OMITTED (not tested
+   * for necessity — they are the deliberate negative: a pre-existing object reachable from base or
+   * a peer branch must be neither truncatable nor unlinkable by this seat). Reads of the object
+   * store (loose objects, pack files) are covered by the GIT_RO ancestor grant, not by this class. */
+  char obj[PATH_MAX];
+  resolve_git_entry(obj_raw, "HELM_SANDBOX_GIT_OBJ", obj, sizeof(obj), proj);
+  if (!is_strict_descendant(git_ro, obj)) {
+    fail("HELM_SANDBOX_GIT_OBJ must be a strict descendant of HELM_SANDBOX_GIT_RO", proj, 0);
+  }
+  uint64_t obj_dir_access = LANDLOCK_ACCESS_FS_MAKE_REG | LANDLOCK_ACCESS_FS_MAKE_DIR |
+                             LANDLOCK_ACCESS_FS_WRITE_FILE;
+  uint64_t obj_file_access = LANDLOCK_ACCESS_FS_WRITE_FILE;
+  add_git_rule(rs, obj, obj_dir_access, obj_file_access, "HELM_SANDBOX_GIT_OBJ", proj);
+}
+
 int main(int argc, char **argv) {
   if (argc < 3) {
     fprintf(stderr, "usage: %s <project_dir> <cmd> [args...]\n", argv[0]);
@@ -687,6 +954,11 @@ int main(int argc, char **argv) {
   if (access("/dev/tty", F_OK) == 0) {
     add_rule_ex(rs, "/dev/tty", file_rw, resolved, "dev-tty", dev_widen);
   }
+
+  /* B7 (R4.1/R4.3): cycle-scoped git capability (GIT_RO/GIT_ADMIN/GIT_REF_RW/GIT_OBJ) — see the
+   * file-header doc comment. Absent HELM_SANDBOX_GIT_RO is a no-op, byte-identical to every
+   * existing caller and profile. */
+  add_cycle_git_rules(rs, rw, resolved);
 
   if (landlock_restrict_self(rs, 0)) {
     close(rs);
