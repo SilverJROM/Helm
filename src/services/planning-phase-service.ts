@@ -513,6 +513,12 @@ export class PlanningPhaseService {
       roundCap,
       agreementFenceOffset,
       isFake,
+      // R2 (R2.5-R2.7): round 1 is always dual blind draft, never the legacy plancore-authored
+      // diff-review path — plancore no longer authors plan.md/og-requirements.md (P1/R1.2 above), so
+      // the legacy path's precondition can never be satisfied. Missing here left both co-planner
+      // seats fail-closed waiting on canonical artifacts that would never be written (found live,
+      // cycle 13 run 33/34, 2026-08-03 07:2x PHT — confirmed via runtime callback text, not guessed).
+      blindDraftRound1: true,
       panelSize: inputs.panelSize,
       coPlannerSeats: inputs.coPlannerSeats,
       partnerModel: inputs.partnerModel,

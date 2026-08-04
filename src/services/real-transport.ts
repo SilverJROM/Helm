@@ -528,7 +528,12 @@ export class RealTransport implements ITransport {
           await new Promise((r) => setTimeout(r, 500));
           continue; // re-capture before the ready check (the menu itself can contain › glyphs)
         }
-        const hasStable = /gpt-5/i.test(pane) || /›/.test(pane);
+        // gpt-5.6-sol review (2026-08-03 08:2x PHT, consulted per JROM): the model NAME can appear
+        // in codex's startup banner before the composer actually exists, so accepting /gpt-5/i alone
+        // let this report "genuine ready" prematurely — DispatchService's own, stricter › poll then
+        // times out on a seat this check already (wrongly) waved through. Require the real composer
+        // glyph only, matching the second gate.
+        const hasStable = /›/.test(pane);
         const noLoading = !/Starting|loading|spinner/i.test(pane);
         if (hasStable && noLoading) {
           return true;

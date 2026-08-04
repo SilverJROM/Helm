@@ -59,6 +59,21 @@ Implementation uses. Suspect the Planning tab has a competing scroll owner or th
    seats should collapse/hide by default, or group under a "previous attempts" disclosure — otherwise
    the live seats are buried and `≠ preview` badges from a dead run read as current problems.
 
+**Reiterated by JROM, 2026-08-03 08:5x PHT** (verbatim, from a screenshot mid a live run 43 — cycle 13
+had accumulated ~30+ historical seats across a night of test runs by `[north]`):
+> "add this to the next batch when we fix the helm, why is there so much agents windows here i only
+> want to see the active agents here, right now there are two, just show those two and if there are 3
+> only 3 are shown, i dont know why there are multiple agent windows here i dont want to see them fix
+> this on the next batch"
+
+This is the same defect (#2 above) surfacing again, now with a much larger historical pile (a heavy
+test night compounds it, but it would eventually happen in normal use too — every cycle accumulates
+seats across every attempt, forever). **Sharper ask this time: default view = ONLY the live seats,
+count matching reality (2 live → show 2, 3 live → show 3).** Historical seats belong behind an
+explicit disclosure (the existing "Show N previous-attempt seats" button already does this — the bug
+is that the grid was rendering un-collapsed/inline instead of behind that toggle, or the toggle state
+wasn't defaulting to collapsed). **Still parked — do not fix mid this live test; batch it.**
+
 ## Constraints when this is built
 
 - `app.js` is hand-written browser ESM, **560KB, no build step** — `node --check` after ANY edit, then

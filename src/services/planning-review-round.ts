@@ -6,6 +6,7 @@ import type { BriefWriterService } from './brief-writer-service.js';
 import { validateExecutionPlan } from './execution-plan-parser.js';
 import { readPlanRevision, type PlanRevision } from './plan-revision.js';
 import { roleMatches } from './role-alias.js';
+import { resolveAgentExecBaselineAllow } from '../security/landlock-sandbox.js';
 import {
   composeSeatDraftReadAllow,
   publishDraft,
@@ -13,6 +14,7 @@ import {
   atomicWriteFile,
   candidatePlanPath,
   candidateReqPath,
+  seatDraftDir,
 } from './seat-draft-store.js';
 import { designateRound2Proposer, formatProposerLog, rolesForRound, type RoundRoles } from './proposer-role.js';
 
@@ -1655,6 +1657,13 @@ export async function runReviewRound(options: RunReviewRoundOptions): Promise<Re
         // / conversation-log.md / decisions/, matching that call's own root-relative defaults); every
         // peer seat's dir is refused fail-closed (SeatDraftIsolationError) BEFORE this seat ever
         // spawns — not merely "the brief omits it."
+        // R2.6 fix (found live, cycle 13 run 35, 2026-08-03 07:40 PHT): the Landlock sandbox
+        // realpath()-resolves every strictReadAllow entry BEFORE the seat process starts, so this
+        // seat's own draft dir must exist on disk before spawn — atomicWriteFile's mkdir (below, at
+        // actual draft-publish time) runs far too late. Without this the sandbox fails closed with
+        // "ro-allowlist entry does not resolve ... No such file or directory" and the seat never
+        // launches at all.
+        fsSync.mkdirSync(seatDraftDir(runDir, seatLabel), { recursive: true });
         seatStrictReadAllow = composeSeatDraftReadAllow({
           runDir,
           seatId: seatLabel,
@@ -1663,8 +1672,23 @@ export async function runReviewRound(options: RunReviewRoundOptions): Promise<Re
             path.resolve(runDir, 'north-star.md'),
             path.resolve(runDir, 'conversation-log.md'),
             path.resolve(runDir, 'decisions'),
+            // gpt-5.6-sol review (2026-08-03 08:2x PHT): the dispatch payload literally says "Read
+            // <briefPath> and follow its instructions" (briefPath lives under runDir/prompts/), and
+            // the brief separately tells the seat to grep callbacks.md for Helm's ACK — the strict
+            // write exception on runDir does not imply read. Both read-only; never all of runDir
+            // (the isolation guard correctly refuses that, since it would expose peer drafts).
+            path.resolve(runDir, 'prompts'),
+            path.resolve(cbPath),
           ],
-          deploymentAllow: strictReadAllow,
+          // R2.6 fix (found live, cycle 13 run 36, 2026-08-03 07:45 PHT): strict mode grants READ+EXEC
+          // on ONLY the enumerated entries, nothing implicit — without the CLI's own binary + shared
+          // libraries also allowlisted, execvp() fails closed the instant the sandbox restricts itself
+          // ("Permission denied"), before the seat ever runs. `strictReadAllow` (this round's OUTER
+          // opt-in B-ISO1 param) is empty for a normal deployment, since blind-draft is the first
+          // caller that forces strict mode unconditionally — merge in the real exec baseline too.
+          // Scoped to THIS seat's own provider (sol review) — a claude seat never needs read on
+          // ~/.codex/auth.json or vice versa.
+          deploymentAllow: [...resolveAgentExecBaselineAllow(seatProvider), ...(strictReadAllow ?? [])],
         });
       } else {
         // B1: ROUND temporarily uses diff-review (empty implementedDiff) so current verdict

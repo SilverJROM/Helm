@@ -7,3 +7,12 @@
 [2026-08-01T14:41:46+08:00] facts: effort=plancore-orchestrator-redesign (co-planners author + debate; plancore is coordinator-only, no plan content) scope=24 slices (P0+P1+P2+D12); D1-D11 deferred by JROM verified=0/24 verified_ids= none remaining=1 in_flight=P0 in_flight_running_min=0 next_up=none current_phase=P0 stop-corruption worker_seats_live=0 blocked_count=0 raceguard_pin=3 (must be 3) janitor=0 (must be 0) latest_heartbeat=none time_now_pht=2026-08-01 14:41 PHT 
 [2026-08-01T14:42:49+08:00] TG -> HTTP 200 (try 1)
 [2026-08-01T14:42:49+08:00] reported verified=0/24 inflight=P0
+[2026-08-01T16:12:49+08:00] facts: effort=plancore-orchestrator-redesign (co-planners author + debate; plancore is coordinator-only, no plan content) scope=24 slices (P0+P1+P2+D12); D1-D11 deferred by JROM verified=0/24 verified_ids= none remaining=1 in_flight=P0 in_flight_running_min=0 next_up=none current_phase=P0 stop-corruption worker_seats_live=0 blocked_count=0 raceguard_pin=3 (must be 3) janitor=0 (must be 0) latest_heartbeat=none time_now_pht=2026-08-01 16:12 PHT 
+[2026-08-01T16:13:03+08:00] TG -> HTTP 200 (try 1)
+[2026-08-01T16:13:03+08:00] reported verified=0/24 inflight=P0
+[2026-08-01T17:43:03+08:00] facts: effort=plancore-orchestrator-redesign (co-planners author + debate; plancore is coordinator-only, no plan content) scope=24 slices (P0+P1+P2+D12); D1-D11 deferred by JROM verified=0/24 verified_ids= none remaining=1 in_flight=P0 in_flight_running_min=0 next_up=none current_phase=P0 stop-corruption worker_seats_live=0 blocked_count=0 raceguard_pin=3 (must be 3) janitor=0 (must be 0) latest_heartbeat=none time_now_pht=2026-08-01 17:43 PHT 
+[2026-08-01T17:43:37+08:00] TG -> HTTP 200 (try 1)
+[2026-08-01T17:43:37+08:00] reported verified=0/24 inflight=P0
+[2026-08-01T19:13:38+08:00] facts: effort=plancore-orchestrator-redesign (co-planners author + debate; plancore is coordinator-only, no plan content) scope=24 slices (P0+P1+P2+D12); D1-D11 deferred by JROM verified=0/24 verified_ids= none remaining=1 in_flight=P0 in_flight_running_min=0 next_up=none current_phase=P0 stop-corruption worker_seats_live=0 blocked_count=0 raceguard_pin=3 (must be 3) janitor=0 (must be 0) latest_heartbeat=none time_now_pht=2026-08-01 19:13 PHT 
+[2026-08-01T19:13:56+08:00] TG -> HTTP 200 (try 1)
+[2026-08-01T19:13:56+08:00] reported verified=0/24 inflight=P0

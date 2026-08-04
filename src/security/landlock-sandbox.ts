@@ -134,6 +134,104 @@ export function resolveDeploymentStrictReadAllow(
   return list;
 }
 
+/**
+ * R2.6 fix (found live, cycle 13 run 36, 2026-08-03 07:45 PHT): strict mode (add_strict_allow_rules
+ * in tools/helm-sandbox.c) grants READ+EXEC on ONLY the caller-supplied HELM_SANDBOX_RO_ALLOW entries
+ * plus the project subtree — no blanket root-ro rule, and nothing about the agent CLI's own binary or
+ * shared libraries is implied. Every strict-mode launch this deployment had exercised before tonight
+ * was the B-ISO1 opt-in path with an UNSET HELM_STRICT_READ_ALLOW (this env is empty in .env), so it
+ * always fell back to read-all and this gap was never hit. Round-1 blind-draft seats (R2/D2) are the
+ * first caller that forces strict mode unconditionally — without this baseline, `execvp(claude)`
+ * (or codex/grok) fails closed with "Permission denied" the instant the sandbox restricts itself,
+ * before the seat ever gets a chance to run.
+ *
+ * Returns the subset of {standard shared-library dirs, this user's known CLI install trees} that
+ * actually exist on THIS machine — the C binary realpath()s every entry and fails closed on any that
+ * don't resolve, so a hardcoded-but-absent path would break the launch worse than omitting it.
+ *
+ * `/proc`, `/etc`, `/run`, and each provider's own credential dir were added after direct manual
+ * repro (bypassing the seat-spawn machinery entirely, running the sandboxed launch command by hand
+ * with a REAL `--print`/`exec` prompt, not just `--version`):
+ *   - without `/proc`: claude's compiled Node/V8 binary hits a fatal internal error during its own
+ *     startup and SIGABRTs ("Aborted (core dumped)") rather than a catchable error;
+ *   - without `/etc`: codex's Node runtime fails cleanly (exit 13) on `fopen(/etc/ssl/openssl.cnf)`;
+ *   - without `/run`: both hang/ETIMEOUT reaching their API — `/etc/resolv.conf` on this box is a
+ *     symlink to `/run/systemd/resolve/stub-resolv.conf` (systemd-resolved), so DNS resolution needs
+ *     `/run` readable too;
+ *   - without `~/.claude` / `~/.codex`: each CLI reports "not logged in" — that's where its OAuth/API
+ *     credentials live (`~/.claude/.credentials.json`, `~/.codex/auth.json`).
+ * `claude --print "..."` and `codex exec "..."` both confirmed a genuine round-trip (real model
+ * reply) through the strict sandbox with exactly this baseline before wiring it in here.
+ *
+ * gpt-5.6-sol review (consulted live, 2026-08-03 08:1x PHT, per JROM's ask to bring in a second
+ * opinion on this sandbox work): the FIRST version of this function granted every seat all three
+ * providers' credential dirs regardless of which provider it actually runs — broader than "strict"
+ * should mean, and unnecessary (a claude seat never needs to read `~/.codex/auth.json`). Fixed:
+ * `provider` scopes the credential grant to only the one this seat actually launches as. Sol also
+ * caught the real remaining gap: `~/.claude.json` (a FILE, sibling to the `~/.claude/` directory —
+ * NOT inside it, so the directory grant above never covered it) is where claude keeps
+ * `hasCompletedOnboarding` / `theme`; without READ on the exact file the sandboxed TUI can't see
+ * that onboarding was already completed and shows the first-run theme-picker wizard instead of the
+ * ready composer. `RealTransport.ensureClaudeTrust()` already writes the prepared trust/onboarding
+ * state into that file OUTSIDE the sandbox before launch — the seat only needs to read it back, so
+ * this is READ-only, not added to the write-fence.
+ *
+ * `~/.cache/helm-agent-homes/<codex|grok>` (found live, run 41, 2026-08-03 08:2x PHT): per
+ * `agent-home-isolation.ts` (JROM directive 2026-07-06), Helm-dispatched codex/grok launches do NOT
+ * use the real `~/.codex` / `~/.grok` as their working home — `envelope-isolation.ts` points
+ * `CODEX_HOME` (codex) / `HOME` (grok) at an isolated blank-slate dir under `~/.cache/helm-agent-
+ * homes/` that read-only-symlinks in just auth+config (never the operator's skills/agents), so the
+ * CLI writes its session/sqlite state there instead of polluting the real home. Granting only
+ * `~/.codex` (as the first version of this function did) misses this entirely: codex reported a
+ * generic "local database appears to be damaged" — actually a Landlock EACCES on
+ * `~/.cache/helm-agent-homes/codex/state_N.sqlite` misreported by codex's own error handling. WRITE
+ * is already covered (the C sandbox's hardcoded `$HOME/.cache` tooling exception survives strict
+ * mode per `helm-sandbox.c`'s own comment); only READ was missing. Confirmed via manual repro with
+ * the exact real dispatch env (`CODEX_HOME` set, full RO allowlist) before wiring in.
+ */
+export function resolveAgentExecBaselineAllow(provider?: string): string[] {
+  const home = os.homedir();
+  const agentHomesBase = path.join(home, ".cache", "helm-agent-homes");
+  const candidates = [
+    "/lib",
+    "/lib64",
+    "/usr/lib",
+    "/usr/bin",
+    "/proc",
+    "/etc",
+    "/run",
+    path.join(home, ".local"), // claude + grok native launchers (~/.local/bin, ~/.local/share/claude/...)
+    path.join(home, ".npm-global"), // codex (npm -g install prefix)
+  ];
+  if (provider === "claude") {
+    candidates.push(path.join(home, ".claude")); // OAuth/API credentials + config
+    candidates.push(path.join(home, ".claude.json")); // hasCompletedOnboarding/theme (sibling FILE, not under ~/.claude/)
+  } else if (provider === "codex") {
+    candidates.push(path.join(home, ".codex")); // auth.json + config.toml (symlink targets for the isolated home below)
+    candidates.push(path.join(agentHomesBase, "codex")); // isolated CODEX_HOME — actual working dir + sqlite state
+  } else if (provider === "grok") {
+    candidates.push(path.join(home, ".grok")); // config/credentials (symlink targets for the isolated home below)
+    candidates.push(path.join(agentHomesBase, "grok")); // ensureBlankGrokHome() overrides grok's entire $HOME to here
+    // grok's shell tools may read the operator's git identity (ensureBlankGrokHome symlinks it in).
+    if (fs.existsSync(path.join(home, ".gitconfig"))) candidates.push(path.join(home, ".gitconfig"));
+    // Not itself live-verified tonight — grok isn't in this project's round-1 co-planner roster.
+  } else {
+    // Unknown/absent provider: keep the pre-scoping behavior (grant all three) rather than guess wrong.
+    candidates.push(
+      path.join(home, ".claude"), path.join(home, ".claude.json"),
+      path.join(home, ".codex"), path.join(agentHomesBase, "codex"),
+      path.join(home, ".grok"), path.join(agentHomesBase, "grok")
+    );
+  }
+  return candidates.filter((p) => {
+    try {
+      return fs.existsSync(p);
+    } catch {
+      return false;
+    }
+  });
+}
+
 // B-ISO1: optional strictReadAllow swaps ONLY the read line of the behavioral policy — a strict
 // seat told "you MAY read anywhere" would fight the kernel fence (confused retries + misleading
 // self-reports during the harness negative probes). Absent (every existing caller) the output is
