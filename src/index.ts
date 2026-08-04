@@ -2004,6 +2004,32 @@ async function main(): Promise<void> {
     }
   });
 
+  // B22 / R1.2–R1.3: POST /api/cycles/:id/archive — status-only completed→archived (409 unless completed).
+  app.post('/api/cycles/:id/archive', { preHandler: [authMiddleware, requireOwnerPre] }, async (request: any, reply: any) => {
+    const id = Number(request.params.id);
+    try {
+      const c = cycleService.archiveCycle(id);
+      return { cycle: c };
+    } catch (e: any) {
+      if (e.code === 'NOT_FOUND') return reply.code(404).send({ error: e.message });
+      if (e.code === 'CONFLICT') return reply.code(409).send({ error: e.message });
+      return reply.code(400).send({ error: e.message });
+    }
+  });
+
+  // B22 / R1.3: POST /api/cycles/:id/unarchive — status-only archived→completed (409 unless archived).
+  app.post('/api/cycles/:id/unarchive', { preHandler: [authMiddleware, requireOwnerPre] }, async (request: any, reply: any) => {
+    const id = Number(request.params.id);
+    try {
+      const c = cycleService.unarchiveCycle(id);
+      return { cycle: c };
+    } catch (e: any) {
+      if (e.code === 'NOT_FOUND') return reply.code(404).send({ error: e.message });
+      if (e.code === 'CONFLICT') return reply.code(409).send({ error: e.message });
+      return reply.code(400).send({ error: e.message });
+    }
+  });
+
   app.get('/api/projects/:id/status', { preHandler: [authMiddleware, requireOwnerPre] }, async (request: any, reply: any) => {
     const id = Number(request.params.id);
     const status = await projectStatusService.getProjectStatus(id);

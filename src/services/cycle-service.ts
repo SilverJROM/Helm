@@ -82,10 +82,12 @@ export interface CycleOverviewRow {
 }
 
 export interface CyclesOverview {
-  counts: { pending: number; active: number; completed: number };
+  counts: { pending: number; active: number; completed: number; archived: number };
   pending: CycleOverviewRow[];
   active: CycleOverviewRow[];
   completed: CycleOverviewRow[];
+  // B22 (cycle-branch-lifecycle R1.1): fourth overview bucket — status-only archive, no disk move.
+  archived: CycleOverviewRow[];
 }
 
 function rowToCycleOverviewRow(row: any, progressByCycle: Map<number, { done: number; total: number; blocked: boolean }>): CycleOverviewRow {
@@ -254,7 +256,10 @@ export class CycleService {
       throw err;
     }
     const cycleRoot = path.join(project.directory, 'cycle');
-    if (String(cycle.status) === 'completed') {
+    // completed AND archived both live under cycle/completed/ — archive is status-only (B22/R1.3),
+    // so there is never a second folder move into an archived/ path.
+    const status = String(cycle.status);
+    if (status === 'completed' || status === 'archived') {
       return path.join(cycleRoot, 'completed', String(cycle.folder_name));
     }
     return path.join(cycleRoot, String(cycle.folder_name));
@@ -328,7 +333,8 @@ export class CycleService {
     return result;
   }
 
-  /** B2-T02: cross-project cycle listing grouped by status for Overview board (R-A2). */
+  /** B2-T02: cross-project cycle listing grouped by status for Overview board (R-A2).
+   * B22 / R1.1: fourth bucket `archived` (status-only; docs stay under cycle/completed/). */
   listCyclesOverview(): CyclesOverview {
     const rows = this.db.prepare(
       `SELECT c.id, c.project_id, p.name AS project_name, c.name, c.phase, c.autonomy,
@@ -342,6 +348,7 @@ export class CycleService {
     const pending: CycleOverviewRow[] = [];
     const active: CycleOverviewRow[] = [];
     const completed: CycleOverviewRow[] = [];
+    const archived: CycleOverviewRow[] = [];
 
     for (const row of rows) {
       const item = rowToCycleOverviewRow(row, progressByCycle);
@@ -351,6 +358,9 @@ export class CycleService {
           break;
         case 'completed':
           completed.push(item);
+          break;
+        case 'archived':
+          archived.push(item);
           break;
         case 'active':
         default:
@@ -363,11 +373,13 @@ export class CycleService {
       counts: {
         pending: pending.length,
         active: active.length,
-        completed: completed.length
+        completed: completed.length,
+        archived: archived.length
       },
       pending,
       active,
-      completed
+      completed,
+      archived
     };
   }
 
@@ -646,6 +658,71 @@ export class CycleService {
     return {
       ...result,
       folder_path: target
+    };
+  }
+
+  /**
+   * B22 / R1.2–R1.3: archive a completed cycle (status-only).
+   * Allowed only from status='completed' (409 otherwise). Does NOT move the on-disk folder,
+   * delete docs, or touch DB history (runs/run_tasks stay). Folder remains under cycle/completed/.
+   */
+  archiveCycle(cycleId: number): Cycle {
+    const cycleRow = this.db.prepare('SELECT * FROM cycles WHERE id = ?').get(cycleId) as any;
+    if (!cycleRow) {
+      const err: any = new Error('unknown cycle');
+      err.code = 'NOT_FOUND';
+      throw err;
+    }
+
+    const status = String(cycleRow.status);
+    if (status !== 'completed') {
+      const err: any = new Error(
+        `cannot archive: cycle ${cycleId} status is '${status}' (only completed cycles may be archived)`
+      );
+      err.code = 'CONFLICT';
+      throw err;
+    }
+
+    const updated = this.db.prepare(
+      `UPDATE cycles SET status = 'archived' WHERE id = ? RETURNING *`
+    ).get(cycleId) as any;
+
+    const result = rowToCycle(updated);
+    return {
+      ...result,
+      folder_path: this.getCycleDocDir(cycleId)
+    };
+  }
+
+  /**
+   * B22 / R1.3: un-archive — restore an archived cycle to status='completed'.
+   * Status-only: no folder move, nothing deleted. 409 unless currently archived.
+   */
+  unarchiveCycle(cycleId: number): Cycle {
+    const cycleRow = this.db.prepare('SELECT * FROM cycles WHERE id = ?').get(cycleId) as any;
+    if (!cycleRow) {
+      const err: any = new Error('unknown cycle');
+      err.code = 'NOT_FOUND';
+      throw err;
+    }
+
+    const status = String(cycleRow.status);
+    if (status !== 'archived') {
+      const err: any = new Error(
+        `cannot unarchive: cycle ${cycleId} status is '${status}' (only archived cycles may be unarchived)`
+      );
+      err.code = 'CONFLICT';
+      throw err;
+    }
+
+    const updated = this.db.prepare(
+      `UPDATE cycles SET status = 'completed' WHERE id = ? RETURNING *`
+    ).get(cycleId) as any;
+
+    const result = rowToCycle(updated);
+    return {
+      ...result,
+      folder_path: this.getCycleDocDir(cycleId)
     };
   }
 }

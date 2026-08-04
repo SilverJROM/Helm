@@ -84,10 +84,11 @@ describe.sequential('B2-T02 cycle overview listing (grouped by status)', () => {
 
     const overview = cycleService.listCyclesOverview();
 
-    expect(overview.counts).toEqual({ pending: 1, active: 1, completed: 1 });
+    expect(overview.counts).toEqual({ pending: 1, active: 1, completed: 1, archived: 0 });
     expect(overview.pending).toHaveLength(1);
     expect(overview.active).toHaveLength(1);
     expect(overview.completed).toHaveLength(1);
+    expect(overview.archived).toHaveLength(0);
 
     expect(overview.pending[0].name).toBe('Pending Cycle');
     expect(overview.pending[0].status).toBe('pending');
@@ -104,10 +105,11 @@ describe.sequential('B2-T02 cycle overview listing (grouped by status)', () => {
   it('project with zero cycles yields empty buckets (first-class empty state)', () => {
     const overview = cycleService.listCyclesOverview();
 
-    expect(overview.counts).toEqual({ pending: 0, active: 0, completed: 0 });
+    expect(overview.counts).toEqual({ pending: 0, active: 0, completed: 0, archived: 0 });
     expect(overview.pending).toEqual([]);
     expect(overview.active).toEqual([]);
     expect(overview.completed).toEqual([]);
+    expect(overview.archived).toEqual([]);
     expect(projEmpty.id).toBeTruthy();
   });
 
@@ -130,10 +132,11 @@ describe.sequential('B2-T02 cycle overview listing (grouped by status)', () => {
 
     expect(res.statusCode).toBe(200);
     const body = res.json();
-    expect(body.counts).toEqual({ pending: 1, active: 1, completed: 1 });
+    expect(body.counts).toEqual({ pending: 1, active: 1, completed: 1, archived: 0 });
     expect(body.pending.map((c: any) => c.name)).toContain('Route Pending');
     expect(body.active.map((c: any) => c.name)).toContain('Route Active');
     expect(body.completed.map((c: any) => c.name)).toContain('Route Done');
+    expect(body.archived).toEqual([]);
 
     for (const bucket of ['pending', 'active', 'completed'] as const) {
       const row = body[bucket][0];
