@@ -2,7 +2,7 @@ import type Database from "better-sqlite3";
 import { assertAllRoleTiersInvariants } from "./role-tier-invariants.js";
 import { PROVIDERS } from "../config/providers.js";
 
-export const SCHEMA_VERSION = 112;
+export const SCHEMA_VERSION = 113;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -172,6 +172,10 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_one_active_owner
   ON users(role) WHERE role = 'owner' AND active = 1;
 
+-- B1 (cycle-branch-lifecycle) / v113: 'archived' added to status CHECK (R1.1) + nullable
+-- server-owned git identity (R4.2) + awaiting_merge/git_cleanup_pending flags (R6.1). SQLite
+-- cannot ALTER a CHECK, so this is the canonical post-rebuild shape; see database.ts v113 for the
+-- live-DB table rebuild. awaiting_merge is distinct from awaiting_approval (planning-gate only).
 CREATE TABLE IF NOT EXISTS cycles (
   id INTEGER PRIMARY KEY,
   project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -179,9 +183,16 @@ CREATE TABLE IF NOT EXISTS cycles (
   folder_name TEXT NOT NULL,
   phase TEXT NOT NULL DEFAULT 'discovery' CHECK(phase IN ('discovery', 'planning', 'implementation', 'final_tests', 'complete')),
   autonomy TEXT NOT NULL CHECK(autonomy IN ('autonomous_after_discovery', 'pause_after_planning')),
-  status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('pending', 'active', 'completed')),
+  status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('pending', 'active', 'completed', 'archived')),
   awaiting_approval INTEGER NOT NULL DEFAULT 0,
   final_tests_enabled INTEGER NOT NULL DEFAULT 1 CHECK(final_tests_enabled IN (0, 1)),
+  git_base_branch TEXT,
+  git_branch TEXT,
+  git_worktree_path TEXT,
+  git_worktree_id TEXT,
+  git_merged_at TEXT,
+  awaiting_merge INTEGER NOT NULL DEFAULT 0,
+  git_cleanup_pending INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   UNIQUE(project_id, folder_name)
 );

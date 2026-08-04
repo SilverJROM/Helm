@@ -3747,6 +3747,77 @@ CREATE INDEX IF NOT EXISTS idx_planning_provenance_run ON planning_provenance(pl
 `);
         this.db.prepare('UPDATE schema_version SET version = 112').run();
       }
+
+      // v113 (cycle-branch-lifecycle B1): widen cycles.status CHECK to include 'archived' (R1.1)
+      // and add nullable server-owned git identity (git_base_branch, git_branch,
+      // git_worktree_path, git_worktree_id, git_merged_at) plus awaiting_merge and
+      // git_cleanup_pending flags (R4.2, R6.1). SQLite cannot ALTER a CHECK, so this is a table
+      // rebuild. cycles is an FK *target* (runs.cycle_id, discovery_handoffs.cycle_id,
+      // planning_provenance.cycle_id, cycle_topology_freezes.cycle_id, cycle_team_deltas.cycle_id,
+      // …) — mirrors the v91 runs / v108 helm_sessions rebuild precedent: toggle foreign_keys OFF
+      // before BEGIN, re-validate with foreign_key_check after, restore the pragma on both paths.
+      // awaiting_merge is a NEW column and never overloads awaiting_approval (planning-gate only).
+      if (current && current.version < 113) {
+        if (hasTable('cycles')) {
+          const before = (this.db.prepare('SELECT COUNT(*) AS c FROM cycles').get() as { c: number }).c;
+          const fkWasOn = this.db.pragma('foreign_keys', { simple: true }) === 1;
+          this.db.pragma('foreign_keys = OFF');
+          this.db.exec('BEGIN IMMEDIATE;');
+          try {
+            this.db.exec(`
+CREATE TABLE cycles_new (
+  id INTEGER PRIMARY KEY,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  folder_name TEXT NOT NULL,
+  phase TEXT NOT NULL DEFAULT 'discovery' CHECK(phase IN ('discovery', 'planning', 'implementation', 'final_tests', 'complete')),
+  autonomy TEXT NOT NULL CHECK(autonomy IN ('autonomous_after_discovery', 'pause_after_planning')),
+  status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('pending', 'active', 'completed', 'archived')),
+  awaiting_approval INTEGER NOT NULL DEFAULT 0,
+  final_tests_enabled INTEGER NOT NULL DEFAULT 1 CHECK(final_tests_enabled IN (0, 1)),
+  git_base_branch TEXT,
+  git_branch TEXT,
+  git_worktree_path TEXT,
+  git_worktree_id TEXT,
+  git_merged_at TEXT,
+  awaiting_merge INTEGER NOT NULL DEFAULT 0,
+  git_cleanup_pending INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(project_id, folder_name)
+);
+INSERT INTO cycles_new (
+  id, project_id, name, folder_name, phase, autonomy, status, awaiting_approval,
+  final_tests_enabled, created_at
+)
+SELECT id, project_id, name, folder_name, phase, autonomy, status, awaiting_approval,
+  final_tests_enabled, created_at
+FROM cycles;
+DROP TABLE cycles;
+ALTER TABLE cycles_new RENAME TO cycles;
+`);
+            const after = (this.db.prepare('SELECT COUNT(*) AS c FROM cycles').get() as { c: number }).c;
+            if (after !== before) {
+              throw new Error(`v113 cycles rebuild row-count mismatch: before=${before} after=${after}`);
+            }
+            this.db.pragma('foreign_keys = ON');
+            const fkProblems = (this.db.prepare('PRAGMA foreign_key_check').all() as any[]).filter(
+              (p: any) => p.table === 'cycles' || p.parent === 'cycles'
+            );
+            if (fkProblems.length > 0) {
+              throw new Error(`foreign_key_check failed during v113 cycles rebuild: ${JSON.stringify(fkProblems.slice(0, 5))}`);
+            }
+            this.db.prepare('UPDATE schema_version SET version = 113').run();
+            this.db.exec('COMMIT;');
+          } catch (e) {
+            try { this.db.exec('ROLLBACK;'); } catch {}
+            this.db.pragma(`foreign_keys = ${fkWasOn ? 'ON' : 'OFF'}`);
+            throw e;
+          }
+          this.db.pragma('foreign_keys = ON');
+        } else {
+          this.db.prepare('UPDATE schema_version SET version = 113').run();
+        }
+      }
     }
   }
 

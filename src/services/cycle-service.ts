@@ -12,7 +12,7 @@ import { TopologyFreezeService } from './topology-freeze-service.js';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
-export type CycleStatus = 'pending' | 'active' | 'completed';
+export type CycleStatus = 'pending' | 'active' | 'completed' | 'archived';
 
 const CYCLE_PHASES = ['discovery', 'planning', 'implementation', 'final_tests', 'complete'] as const;
 
@@ -31,6 +31,17 @@ export interface Cycle {
   status: CycleStatus | string;
   awaiting_approval: boolean;
   final_tests_enabled: boolean;
+  // B1 (cycle-branch-lifecycle) / v113: nullable server-owned git identity (R4.2). Null on
+  // legacy cycles created before this model existed — never inferred or backfilled (R4.4).
+  git_base_branch: string | null;
+  git_branch: string | null;
+  git_worktree_path: string | null;
+  git_worktree_id: string | null;
+  git_merged_at: string | null;
+  // R6.1: parked post-implementation, awaiting the explicit merge action. Distinct from
+  // awaiting_approval (the planning-only gate) — never overloaded.
+  awaiting_merge: boolean;
+  git_cleanup_pending: boolean;
   created_at: string;
   // augmented at creation for callers (not stored in DB row)
   folder_path?: string;
@@ -120,6 +131,13 @@ function rowToCycle(row: any): Cycle {
     status: String(row.status),
     awaiting_approval: Boolean(Number(row.awaiting_approval)),
     final_tests_enabled: normalizeFinalTestsEnabled(row.final_tests_enabled),
+    git_base_branch: row.git_base_branch != null ? String(row.git_base_branch) : null,
+    git_branch: row.git_branch != null ? String(row.git_branch) : null,
+    git_worktree_path: row.git_worktree_path != null ? String(row.git_worktree_path) : null,
+    git_worktree_id: row.git_worktree_id != null ? String(row.git_worktree_id) : null,
+    git_merged_at: row.git_merged_at != null ? String(row.git_merged_at) : null,
+    awaiting_merge: Boolean(Number(row.awaiting_merge)),
+    git_cleanup_pending: Boolean(Number(row.git_cleanup_pending)),
     created_at: String(row.created_at)
   };
 }
@@ -216,16 +234,7 @@ export class CycleService {
     await fs.mkdir(folderPath, { recursive: true });
 
     return {
-      id: Number(row.id),
-      project_id: Number(row.project_id),
-      name: String(row.name),
-      folder_name: String(row.folder_name),
-      phase: String(row.phase),
-      autonomy: normalizeAutonomyDefault(row.autonomy),
-      status: String(row.status),
-      awaiting_approval: Boolean(Number(row.awaiting_approval)),
-      final_tests_enabled: normalizeFinalTestsEnabled(row.final_tests_enabled),
-      created_at: String(row.created_at),
+      ...rowToCycle(row),
       folder_path: folderPath
     };
   }
