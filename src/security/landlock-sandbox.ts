@@ -296,6 +296,334 @@ export function makeRunRootWriteAllowEnv(
 }
 
 /**
+ * B8 (R4.1/R4.3): compose the four cycle-scoped git capability env vars that B7's C binary
+ * enforces (`HELM_SANDBOX_GIT_RO` / `_ADMIN` / `_REF_RW` / `_OBJ`). Paths come ONLY from the
+ * persisted, revalidated cycle identity — never a brief field, task field, free-floating caller
+ * path, or ambient env. The admin path is derived as
+ * `<common>/worktrees/<persisted git_worktree_id>` (never scanned or guessed from the worktrees
+ * directory). Objects go in the OBJ class only, never REF_RW or ADMIN. Returns '' when the cycle
+ * has no worktree (byte-identical no-op for legacy / pre-B6 cycles). Node-side validation mirrors
+ * the C fail-closed checks: absolute, no ':', no control chars, strict-descendant-of-RO, ADMIN is
+ * a DIRECT child of `<common>/worktrees` (not worktrees itself), and the identity belongs to the
+ * registered project.
+ *
+ * `projectDir` is the project's registered directory (ownership boundary for revalidation) — it is
+ * not itself emitted as a grant.
+ */
+export type CycleGitAllowCycle = {
+  id: number;
+  git_worktree_path: string | null;
+  git_worktree_id: string | null;
+  /** Absolute registered project.directory — revalidation boundary only, never a grant source. */
+  projectDir: string;
+};
+
+function isStrictPathDescendant(anchor: string, candidate: string): boolean {
+  const a = path.resolve(anchor);
+  const c = path.resolve(candidate);
+  if (a === c) return false;
+  const rel = path.relative(a, c);
+  return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
+}
+
+/** Fail-closed path shape for a GIT_* entry (mirrors resolve_git_entry in tools/helm-sandbox.c). */
+function assertGitAllowPath(label: string, raw: string): string {
+  if (typeof raw !== "string" || raw === "") {
+    throw new Error(`cycle git allow: ${label} must be a non-empty string`);
+  }
+  // Deliberately no trim — C compares the raw value to realpath(); whitespace is invalid.
+  if (!path.isAbsolute(raw)) {
+    throw new Error(`cycle git allow: ${label} must be an absolute path (got '${raw}')`);
+  }
+  if (raw.includes(":")) {
+    throw new Error(
+      `cycle git allow: ${label} must not contain ':' (the HELM_SANDBOX_GIT_REF_RW separator): '${raw}'`
+    );
+  }
+  // eslint-disable-next-line no-control-regex
+  if (/[\x00-\x1f\x7f]/.test(raw)) {
+    throw new Error(`cycle git allow: ${label} must not contain control characters`);
+  }
+  let rp: string;
+  try {
+    rp = fs.realpathSync(raw);
+  } catch (e: any) {
+    throw new Error(
+      `cycle git allow: ${label} does not resolve (must already exist; no ensure_dir): '${raw}' (${e?.message || e})`
+    );
+  }
+  // Canonical: raw must equal its own realpath (rejects trailing slash, relative components, symlinks).
+  if (raw !== rp) {
+    throw new Error(
+      `cycle git allow: ${label} is not canonical (relative components, trailing slash, or symlink): '${raw}' != realpath '${rp}'`
+    );
+  }
+  return rp;
+}
+
+function shellSingleQuote(value: string): string {
+  return value.replace(/'/g, `'\\''`);
+}
+
+/**
+ * Resolve the git common dir and the worktree admin dir from the worktree's `.git` pointer file
+ * and its `commondir` sibling — no ambient env, no directory scan of `worktrees/`.
+ */
+function resolveCommonAndAdminFromWorktree(
+  worktreePath: string,
+  persistedWorktreeId: string
+): { common: string; admin: string } {
+  const gitFile = path.join(worktreePath, ".git");
+  let content: string;
+  try {
+    content = fs.readFileSync(gitFile, "utf8");
+  } catch (e: any) {
+    throw new Error(
+      `cycle git allow: cannot read worktree gitdir pointer at '${gitFile}': ${e?.message || e}`
+    );
+  }
+  const m = content.match(/^gitdir:\s*(.+?)\s*$/m);
+  if (!m) {
+    throw new Error(
+      `cycle git allow: worktree '${worktreePath}' .git is not a gitdir pointer (linked worktree required)`
+    );
+  }
+  const gitdirRaw = m[1];
+  if (!path.isAbsolute(gitdirRaw)) {
+    throw new Error(`cycle git allow: worktree gitdir must be absolute (got '${gitdirRaw}')`);
+  }
+  if (gitdirRaw.includes(":")) {
+    throw new Error(`cycle git allow: worktree gitdir must not contain ':': '${gitdirRaw}'`);
+  }
+  const admin = assertGitAllowPath("GIT_ADMIN (from worktree gitdir)", gitdirRaw);
+
+  // Admin path must be exactly <common>/worktrees/<persisted id> — refuse worktrees itself and
+  // any peer id. Derived from the persisted id for the grant; the gitdir must agree.
+  if (path.basename(admin) !== persistedWorktreeId) {
+    throw new Error(
+      `cycle git allow: GIT_ADMIN resolves to another cycle's id (gitdir basename '${path.basename(admin)}' != persisted git_worktree_id '${persistedWorktreeId}')`
+    );
+  }
+  if (path.basename(path.dirname(admin)) !== "worktrees") {
+    throw new Error(
+      `cycle git allow: GIT_ADMIN must be a DIRECT child of <common>/worktrees (got '${admin}')`
+    );
+  }
+
+  const commondirFile = path.join(admin, "commondir");
+  let common: string;
+  try {
+    const rel = fs.readFileSync(commondirFile, "utf8").trim();
+    if (!rel) throw new Error("empty commondir");
+    // commondir is typically relative ("../.."); resolve against the admin dir.
+    const candidate = path.isAbsolute(rel) ? rel : path.resolve(admin, rel);
+    common = assertGitAllowPath("GIT_RO (git common dir)", candidate);
+  } catch (e: any) {
+    throw new Error(
+      `cycle git allow: cannot resolve git common dir from '${commondirFile}': ${e?.message || e}`
+    );
+  }
+
+  // Fail-closed: the worktree's gitdir admin must already sit under the resolved common (RO).
+  // Checked before the derived-equality gate so a gitdir planted outside common is refused with
+  // an explicit "not under RO" (mirrors C is_strict_descendant), not a secondary mismatch message.
+  if (!isStrictPathDescendant(common, admin)) {
+    throw new Error(
+      `cycle git allow: GIT_ADMIN path is not under RO ('${admin}' not under '${common}')`
+    );
+  }
+
+  // Re-derive admin from common + persisted id (never scan worktrees/) and demand equality.
+  const derivedAdmin = path.join(common, "worktrees", persistedWorktreeId);
+  if (derivedAdmin.includes(":")) {
+    throw new Error(`cycle git allow: derived GIT_ADMIN contains ':': '${derivedAdmin}'`);
+  }
+  if (derivedAdmin === path.join(common, "worktrees")) {
+    throw new Error("cycle git allow: GIT_ADMIN must not name <common>/worktrees itself");
+  }
+  if (derivedAdmin !== admin) {
+    throw new Error(
+      `cycle git allow: derived GIT_ADMIN '${derivedAdmin}' != worktree gitdir '${admin}'`
+    );
+  }
+
+  return { common, admin };
+}
+
+export function makeCycleGitAllowEnv(cycle: CycleGitAllowCycle): string {
+  if (!cycle || typeof cycle !== "object") {
+    throw new Error("cycle git allow: cycle is required");
+  }
+
+  const wtPath = cycle.git_worktree_path;
+  const wtId = cycle.git_worktree_id;
+
+  // No worktree → byte-identical no-op (legacy null-identity cycles).
+  if ((wtPath == null || wtPath === "") && (wtId == null || wtId === "")) {
+    return "";
+  }
+  // Partial identity is a caller/persist bug — fail closed, never half-grant.
+  if (wtPath == null || wtPath === "" || wtId == null || wtId === "") {
+    throw new Error(
+      "cycle git allow: partial git identity (both git_worktree_path and git_worktree_id are required once either is set)"
+    );
+  }
+
+  if (typeof cycle.id !== "number" || !Number.isInteger(cycle.id) || cycle.id <= 0) {
+    throw new Error(`cycle git allow: invalid cycle id: ${String(cycle.id)}`);
+  }
+
+  if (typeof cycle.projectDir !== "string" || cycle.projectDir === "") {
+    throw new Error("cycle git allow: registered projectDir is required");
+  }
+  if (!path.isAbsolute(cycle.projectDir)) {
+    throw new Error(
+      `cycle git allow: registered projectDir must be an absolute path (got '${cycle.projectDir}')`
+    );
+  }
+  if (cycle.projectDir.includes(":")) {
+    throw new Error(
+      `cycle git allow: registered projectDir must not contain ':': '${cycle.projectDir}'`
+    );
+  }
+
+  // Persisted worktree id is a single path segment — never a scanned/guessed path, never '../x'.
+  if (typeof wtId !== "string" || wtId === "") {
+    throw new Error("cycle git allow: git_worktree_id must be a non-empty string");
+  }
+  if (wtId.includes("/") || wtId.includes("\\") || wtId.includes("\0")) {
+    throw new Error(
+      `cycle git allow: git_worktree_id must be a single path segment (got '${wtId}')`
+    );
+  }
+  if (wtId.includes(":")) {
+    throw new Error(
+      `cycle git allow: git_worktree_id must not contain ':' (got '${wtId}')`
+    );
+  }
+  if (wtId === "." || wtId === ".." || wtId.includes("..")) {
+    // Empty segment after join would collapse ADMIN onto <common>/worktrees itself.
+    throw new Error(
+      `cycle git allow: GIT_ADMIN would resolve to <common>/worktrees itself or escape (git_worktree_id='${wtId}')`
+    );
+  }
+
+  // Worktree path shape (absolute / no colon) before existence — so relative/colon tests throw
+  // cleanly without a realpath ENOENT masking the cause.
+  if (typeof wtPath !== "string" || wtPath === "") {
+    throw new Error("cycle git allow: git_worktree_path must be a non-empty string");
+  }
+  if (!path.isAbsolute(wtPath)) {
+    throw new Error(
+      `cycle git allow: git_worktree_path must be an absolute path (got '${wtPath}')`
+    );
+  }
+  if (wtPath.includes(":")) {
+    throw new Error(
+      `cycle git allow: git_worktree_path must not contain ':' (got '${wtPath}')`
+    );
+  }
+  // eslint-disable-next-line no-control-regex
+  if (/[\x00-\x1f\x7f]/.test(wtPath)) {
+    throw new Error("cycle git allow: git_worktree_path must not contain control characters");
+  }
+
+  let worktreePath: string;
+  try {
+    worktreePath = fs.realpathSync(wtPath);
+  } catch (e: any) {
+    throw new Error(
+      `cycle git allow: git_worktree_path does not resolve: '${wtPath}' (${e?.message || e})`
+    );
+  }
+  if (wtPath !== worktreePath) {
+    throw new Error(
+      `cycle git allow: git_worktree_path is not canonical: '${wtPath}' != realpath '${worktreePath}'`
+    );
+  }
+
+  // Identity must belong to the registered project (strict descendant of projectDir).
+  let projectReal: string;
+  try {
+    projectReal = fs.realpathSync(cycle.projectDir);
+  } catch (e: any) {
+    throw new Error(
+      `cycle git allow: registered projectDir does not resolve: '${cycle.projectDir}' (${e?.message || e})`
+    );
+  }
+  if (!isStrictPathDescendant(projectReal, worktreePath)) {
+    throw new Error(
+      `cycle git allow: identity does not belong to the registered project (worktree '${worktreePath}' is not under '${projectReal}')`
+    );
+  }
+
+  const { common, admin } = resolveCommonAndAdminFromWorktree(worktreePath, wtId);
+
+  // REF_RW: namespaced ref dir + reflog mirror for THIS cycle id only.
+  const refDir = path.join(common, "refs", "heads", "helm", "cycle", String(cycle.id));
+  const logDir = path.join(common, "logs", "refs", "heads", "helm", "cycle", String(cycle.id));
+  // OBJ: object store — its own class, never REF_RW or ADMIN.
+  const objDir = path.join(common, "objects");
+
+  const ro = assertGitAllowPath("GIT_RO", common);
+  const adminPath = assertGitAllowPath("GIT_ADMIN", admin);
+  const refPath = assertGitAllowPath("GIT_REF_RW refs", refDir);
+  const logPath = assertGitAllowPath("GIT_REF_RW logs", logDir);
+  const objPath = assertGitAllowPath("GIT_OBJ", objDir);
+
+  for (const [label, p] of [
+    ["GIT_ADMIN", adminPath],
+    ["GIT_REF_RW refs", refPath],
+    ["GIT_REF_RW logs", logPath],
+    ["GIT_OBJ", objPath],
+  ] as const) {
+    if (!isStrictPathDescendant(ro, p)) {
+      throw new Error(`cycle git allow: ${label} path is not under RO ('${p}' not under '${ro}')`);
+    }
+  }
+
+  // Refuse bare common-dir root on any write class (C also refuses common-dir ROOT grants).
+  for (const [label, p] of [
+    ["GIT_ADMIN", adminPath],
+    ["GIT_REF_RW refs", refPath],
+    ["GIT_REF_RW logs", logPath],
+    ["GIT_OBJ", objPath],
+  ] as const) {
+    if (p === ro) {
+      throw new Error(`cycle git allow: ${label} must not name the bare git common dir ('${ro}')`);
+    }
+  }
+
+  // ADMIN must remain a direct child of <common>/worktrees and end with the persisted id.
+  const worktreesDir = path.join(ro, "worktrees");
+  if (adminPath === worktreesDir) {
+    throw new Error("cycle git allow: GIT_ADMIN must not name <common>/worktrees itself");
+  }
+  if (path.dirname(adminPath) !== worktreesDir || path.basename(adminPath) !== wtId) {
+    throw new Error(
+      `cycle git allow: GIT_ADMIN must be <common>/worktrees/<persisted git_worktree_id> (got '${adminPath}')`
+    );
+  }
+
+  // Structural class separation: objects go in OBJ only — never as a REF_RW or ADMIN entry.
+  if (objPath === adminPath || objPath === refPath || objPath === logPath) {
+    throw new Error("cycle git allow: objects must go in the OBJ class only");
+  }
+  if (path.basename(objPath) !== "objects") {
+    throw new Error(`cycle git allow: GIT_OBJ must be the objects dir (got '${objPath}')`);
+  }
+
+  // REF_RW is a colon-separated list; each entry was already validated free of ':'.
+  const refRw = `${refPath}:${logPath}`;
+  return (
+    `HELM_SANDBOX_GIT_RO='${shellSingleQuote(ro)}' ` +
+    `HELM_SANDBOX_GIT_ADMIN='${shellSingleQuote(adminPath)}' ` +
+    `HELM_SANDBOX_GIT_REF_RW='${shellSingleQuote(refRw)}' ` +
+    `HELM_SANDBOX_GIT_OBJ='${shellSingleQuote(objPath)}' `
+  );
+}
+
+/**
  * Startup self-check (honest): verifies the binary exists + is executable, then runs a quick landlock probe
  * (temp project dir + /bin/true). Returns 'active' only on full success. Never lies about enforcement.
  */
