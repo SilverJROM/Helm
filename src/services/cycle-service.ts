@@ -382,6 +382,26 @@ export class CycleService {
   }
 
   /**
+   * B19 (R4/R6 coupling, plan.md §3.3): shared guard for completeCycle/archiveCycle. A
+   * persisted-identity cycle (`git_worktree_path` set) may not have its docs moved or its status
+   * flipped until merge+cleanup has reached its durable terminal state — merged
+   * (`git_merged_at` set, never cleared once landed) AND cleaned (`git_cleanup_pending` cleared).
+   * Legacy null-identity cycles (`git_worktree_path IS NULL`, R4.4) have no merge/cleanup to wait
+   * on — no repair or migration path exists for them, so they pass through unconditionally and
+   * this issues zero git commands, exactly as before this slice.
+   */
+  private assertMergeCleanupTerminal(cycleId: number, cycleRow: any, action: string): void {
+    if (cycleRow.git_worktree_path == null) return;
+    if (cycleRow.git_merged_at == null || Number(cycleRow.git_cleanup_pending) === 1) {
+      const err: any = new Error(
+        `cannot ${action}: cycle ${cycleId} merge/cleanup has not reached its durable terminal state`
+      );
+      err.code = 'CONFLICT';
+      throw err;
+    }
+  }
+
+  /**
    * B13-T01b: latest-run task progress per cycle (R-B5), 2 grouped queries (no N+1) — latest run
    * id per cycle_id, then task counts per run_id. Cycles with no run are simply absent from the map.
    */
@@ -669,6 +689,11 @@ export class CycleService {
       throw err;
     }
 
+    // B19 (R4/R6 coupling, plan.md §3.3): today's only guard against moving the docs out from
+    // under a not-yet-merged cycle is UI-only (app.js:5735's own comment: "The server has no such
+    // guard, so it is enforced here at the only caller"). Refuse server-side too.
+    this.assertMergeCleanupTerminal(cycleId, cycleRow, 'complete');
+
     const cycleRoot = path.join(project.directory, 'cycle');
     const source = path.join(cycleRoot, cycleRow.folder_name);
     const completedRoot = path.join(cycleRoot, 'completed');
@@ -766,6 +791,11 @@ export class CycleService {
       err.code = 'CONFLICT';
       throw err;
     }
+
+    // B19 (R4/R6 coupling): defense-in-depth — only completeCycle can set status='completed', and
+    // it now refuses that transition until merge/cleanup is durably terminal, so this should
+    // already hold. Re-checked directly rather than trusting the status column alone.
+    this.assertMergeCleanupTerminal(cycleId, cycleRow, 'archive');
 
     const updated = this.db.prepare(
       `UPDATE cycles SET status = 'archived' WHERE id = ? RETURNING *`
