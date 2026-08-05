@@ -66,7 +66,7 @@ describe('S15 housekeeper seed (AC28/AC31)', () => {
     expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(103);
     expect(B09A_HOUSE_NAMES).toContain('housekeeper');
     expect(B09A_CANONICAL_NAMES).toContain('housekeeper');
-    expect(B09A_CANONICAL_NAMES).toHaveLength(11);
+    expect(B09A_CANONICAL_NAMES).toHaveLength(12);
 
     const rows = dbs.raw.prepare("SELECT * FROM agents WHERE name = 'housekeeper'").all() as any[];
     expect(rows).toHaveLength(1);

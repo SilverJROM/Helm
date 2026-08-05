@@ -297,12 +297,13 @@ describe('B1 ModelService (S1) + B2 agent bindings + delete ref-guard + v10 mig 
     const cs = new RoleCapabilityService(dbs);
 
     const agents = as.listAgents();
-    // B09b (R2.11) + v89 + S15: canonical set including ibrain + housekeeper.
-    expect(agents.length).toBe(11);
+    // B09b (R2.11) + v89 + S15 + B3: canonical set including ibrain + housekeeper + branch-safety.
+    expect(agents.length).toBe(12);
     const agentNames = agents.map(a => a.name).sort();
     // NAME-LAYER rename: north→discovery, projcore→plancore (agents.name only; roles unchanged).
     expect(agentNames).toEqual([
       'agent-master',
+      'branch-safety',
       'discovery',
       'housekeeper',
       'ibrain',
@@ -338,9 +339,10 @@ describe('B1 ModelService (S1) + B2 agent bindings + delete ref-guard + v10 mig 
     // B11 / AC-3: panelist retired as live seat owner — still a seeded agent (hidden), but not role_defaults
     const roleNames = ['discovery', 'ibrain', 'implementer', 'plancore', 'planner', 'validator'].sort();
     const roleDefs = as.listRoleDefaults();
-    expect(roleDefs.length).toBe(6);
+    // B3: branch-safety house role is bound to its canonical agent (in addition to the 6 project seats).
+    expect(roleDefs.length).toBe(7);
     const defRoles = roleDefs.map(r => r.role).sort();
-    expect(defRoles).toEqual(roleNames);
+    expect(defRoles).toEqual([...roleNames, 'branch-safety'].sort());
     expect(defRoles).not.toContain('panelist');
 
     // Final v90 role defaults resolve directly to their backing agents.
@@ -351,9 +353,9 @@ describe('B1 ModelService (S1) + B2 agent bindings + delete ref-guard + v10 mig 
       expect(resolved!.agent.name).toBe(roleToAgentName[r] ?? r);
     }
 
-    // role caps (AG2) contain only the final role keys.
+    // role caps (AG2) contain the final role keys + B2 branch-safety facts-only row.
     const caps = cs.listRoleCapabilities();
-    expect(caps.length).toBe(11);
+    expect(caps.length).toBe(12);
     const implCap = cs.getRoleCapability('implementer')!;
     expect(implCap.can_write_code).toBe(true);
     expect(implCap.can_escalate).toBe(true);
@@ -625,8 +627,8 @@ describe('D2 R-02A: model-named stub agents removed (schema v32)', () => {
       "SELECT name FROM agents WHERE name IN ('grok-4.5','grok-composer','spark','codex-5.4')"
     ).all();
     expect(stubs).toHaveLength(0);
-    // B09b + v89 + S15: fresh DB includes ibrain + housekeeper (11 canonical).
-    expect(dbs.raw.prepare('SELECT COUNT(*) AS c FROM agents').get()).toEqual({ c: 11 });
+    // B09b + v89 + S15 + B3: fresh DB includes ibrain + housekeeper + branch-safety (12 canonical).
+    expect(dbs.raw.prepare('SELECT COUNT(*) AS c FROM agents').get()).toEqual({ c: 12 });
     t.cleanup();
   });
 
@@ -634,7 +636,7 @@ describe('D2 R-02A: model-named stub agents removed (schema v32)', () => {
     const t = makeTempDb();
     const seedDbs = new DatabaseService(t.dbPath); // fresh (all tables, B09b canonical roster)
     const realAgentsBefore = (seedDbs.raw.prepare('SELECT name FROM agents').all() as any[]).map(a => a.name).sort();
-    expect(realAgentsBefore).toHaveLength(11);
+    expect(realAgentsBefore).toHaveLength(12);
     const stubIds = seedStubsThenDowngrade(seedDbs.raw, 31);
     seedDbs.close();
 
@@ -651,7 +653,8 @@ describe('D2 R-02A: model-named stub agents removed (schema v32)', () => {
     ).get() as { c: number };
     expect(bindCount.c).toBe(0);
     // B09b + B11: role_defaults only for surviving same-named agents; panelist unbound (AC-3)
-    expect((migDbs.raw.prepare('SELECT COUNT(*) AS c FROM role_defaults').get() as { c: number }).c).toBe(6);
+    // B11 unbound panelist; B3 adds branch-safety → 6 project seats + branch-safety = 7
+    expect((migDbs.raw.prepare('SELECT COUNT(*) AS c FROM role_defaults').get() as { c: number }).c).toBe(7);
     // canonical roster stable
     const realAfter = (migDbs.raw.prepare('SELECT name FROM agents').all() as any[]).map(a => a.name).sort();
     expect(realAfter).toEqual(realAgentsBefore);

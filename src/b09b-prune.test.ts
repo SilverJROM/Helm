@@ -39,7 +39,7 @@ describe('B09b prune + FK cleanup (R2.11)', () => {
     while (cleanups.length) cleanups.pop()!();
   });
 
-  it('fresh DB: SCHEMA_VERSION ≥65; exactly the 11 canonical agents; no legacy house stubs', () => {
+  it('fresh DB: SCHEMA_VERSION ≥65; exactly the 12 canonical agents; no legacy house stubs', () => {
     const t = tempDbPath('helm-b09b-fresh-');
     cleanups.push(t.cleanup);
     process.env.HELM_DB_PATH = t.dbPath;
@@ -54,7 +54,7 @@ describe('B09b prune + FK cleanup (R2.11)', () => {
       dbs.raw.prepare('SELECT name FROM agents ORDER BY name').all() as Array<{ name: string }>
     ).map((r) => r.name);
     expect(names).toEqual([...B09A_CANONICAL_NAMES].sort());
-    expect(names).toHaveLength(11);
+    expect(names).toHaveLength(12);
     expect(names).not.toContain('master_agent');
     expect(names).not.toContain('jkagebunshin');
     expect(names).not.toContain('coord');
@@ -98,14 +98,14 @@ describe('B09b prune + FK cleanup (R2.11)', () => {
 
     const dbs = new DatabaseService(t.dbPath);
     const before = (dbs.raw.prepare('SELECT COUNT(*) AS c FROM agents').get() as { c: number }).c;
-    expect(before).toBe(11);
+    expect(before).toBe(12);
 
     const c1 = applyB09bPruneNonCanonicalAgents(dbs.raw);
     const c2 = applyB09bPruneNonCanonicalAgents(dbs.raw);
     expect(c1.pruned_names).toEqual([]);
     expect(c2.pruned_names).toEqual([]);
-    expect(c1.agents_after).toBe(11);
-    expect(c2.agents_after).toBe(11);
+    expect(c1.agents_after).toBe(12);
+    expect(c2.agents_after).toBe(12);
 
     const after = (dbs.raw.prepare('SELECT COUNT(*) AS c FROM agents').get() as { c: number }).c;
     expect(after).toBe(before);
@@ -117,7 +117,7 @@ describe('B09b prune + FK cleanup (R2.11)', () => {
         )
         .get(...B09A_CANONICAL_NAMES) as { c: number }
     ).c;
-    expect(nameCount).toBe(11);
+    expect(nameCount).toBe(12);
 
     dbs.close();
   });
@@ -251,7 +251,7 @@ describe('B09b prune + FK cleanup (R2.11)', () => {
     const names = (
       dbs.raw.prepare('SELECT name FROM agents ORDER BY name').all() as Array<{ name: string }>
     ).map((r) => r.name);
-    // All 11 canonical agents are present (B09a + S15 housekeeper).
+    // All 12 canonical agents are present (B09a + S15 housekeeper + B3 branch-safety).
     for (const n of B09A_CANONICAL_NAMES) {
       expect(names).toContain(n);
     }
@@ -335,7 +335,7 @@ describe('B09b prune + FK cleanup (R2.11)', () => {
     const counts = applyB09bPruneNonCanonicalAgents(dbs.raw);
     expect(counts.pruned_names).toEqual(['accidental-extra']);
     expect(counts.role_bindings_deleted).toBe(1);
-    expect(counts.agents_after).toBe(11);
+    expect(counts.agents_after).toBe(12);
 
     applyB09aCanonicalRosterSeeds(dbs.raw);
     applyB09bPruneNonCanonicalAgents(dbs.raw);

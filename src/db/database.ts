@@ -2,7 +2,7 @@ import Database from "better-sqlite3";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import fs from "node:fs";
-import { SCHEMA_VERSION, SCHEMA_SQL, V89_IBRAIN_DEFINITION_MD, V89_KNOWN_CANONICAL_PLANCORE_HASHES, V89_PLANCORE_DEFINITION_MD, V110_DISCOVERY_ALLOWED_STATUSES, V110_DISCOVERY_DEFINITION_MD, V110_DISCOVERY_REQUIRED_ARTIFACTS, V110_DISCOVERY_TERMINAL_STATUSES, V110_KNOWN_STALE_DISCOVERY_HASHES, applyFreshDbExtras, applyB04CanonicalModelSeeds, applyB12bRoleTierSeeds, applyB17TeamTierSeeds, applyB1TeamsSeeds, applyB3AgentRoleCapabilitySeeds, applyB2BranchSafetyCapabilitySeed, applyB2HelmAgentSeeds, applyB09aCanonicalRosterSeeds, applyB09bPruneNonCanonicalAgents, applyB25OrphanModelHygiene, applyB25dDeleteUnknownProviderMasterRuntimes, applyB6AgentMemorySeeds, applyB11PanelistRetirement, applyHousekeeperSeed, seedRoutingRules } from "./schema.js";
+import { SCHEMA_VERSION, SCHEMA_SQL, V89_IBRAIN_DEFINITION_MD, V89_KNOWN_CANONICAL_PLANCORE_HASHES, V89_PLANCORE_DEFINITION_MD, V110_DISCOVERY_ALLOWED_STATUSES, V110_DISCOVERY_DEFINITION_MD, V110_DISCOVERY_REQUIRED_ARTIFACTS, V110_DISCOVERY_TERMINAL_STATUSES, V110_KNOWN_STALE_DISCOVERY_HASHES, applyFreshDbExtras, applyB04CanonicalModelSeeds, applyB12bRoleTierSeeds, applyB17TeamTierSeeds, applyB1TeamsSeeds, applyB3AgentRoleCapabilitySeeds, applyB2BranchSafetyCapabilitySeed, applyB2HelmAgentSeeds, applyB09aCanonicalRosterSeeds, applyB09bPruneNonCanonicalAgents, applyB25OrphanModelHygiene, applyB25dDeleteUnknownProviderMasterRuntimes, applyB6AgentMemorySeeds, applyB11PanelistRetirement, applyHousekeeperSeed, applyBranchSafetyAgentSeed, seedRoutingRules } from "./schema.js";
 import { deriveSessionOwner } from "../services/session-registry-service.js";
 import { allocateLifecycleGeneration } from "../services/lifecycle-cas.js";
 
@@ -70,6 +70,7 @@ export class DatabaseService {
       applyB2BranchSafetyCapabilitySeed(this.db);  // v114 (B2): facts-only branch-safety role_capabilities row
       applyB09bPruneNonCanonicalAgents(this.db);  // B09b: R2.11 prune non-canonical + FK cleanup (after B09a seeds)
       applyHousekeeperSeed(this.db);  // S15: housekeeper house+tiered main+2 (after models + B09a so prune allowlist holds)
+      applyBranchSafetyAgentSeed(this.db);  // B3 v115: house branch-safety agent + model bind + role_defaults
       applyB25OrphanModelHygiene(this.db);  // B25 fix1: remap orphan agents.model + prune unreferenced orphan models
       applyB25dDeleteUnknownProviderMasterRuntimes(this.db);  // B25d: no unknown-provider master_runtimes
       applyB1TeamsSeeds(this.db);  // B1: after full SCHEMA_SQL (teams present)
@@ -3899,6 +3900,18 @@ ALTER TABLE role_capabilities_v114 RENAME TO role_capabilities;
           this.db.prepare('UPDATE schema_version SET version = 114').run();
         });
         migrateV114();
+      }
+
+      // v115 (cycle-branch-lifecycle B3 / R3.1, R3.3): seed house branch-safety agent into the
+      // canonical roster with topology model binding (grok45) + role_defaults bind. Idempotent;
+      // definition_md + default_model_id only when empty/NULL. Requires v114 role CHECK that
+      // already accepts role='branch-safety'.
+      if (current && current.version < 115) {
+        if (hasTable('agents')) {
+          applyB09aCanonicalRosterSeeds(this.db);
+          applyBranchSafetyAgentSeed(this.db);
+        }
+        this.db.prepare('UPDATE schema_version SET version = 115').run();
       }
     }
   }

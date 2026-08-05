@@ -42,7 +42,7 @@ async function captureRepoState(dir: string, refs: string[]) {
   return { shas, status };
 }
 
-function assertFactsShape(facts: Record<string, unknown>) {
+function assertFactsShape(facts: object) {
   expect(Object.keys(facts).sort()).toEqual(EXPECTED_KEYS);
   for (const key of FORBIDDEN_KEYS) {
     expect(facts).not.toHaveProperty(key);

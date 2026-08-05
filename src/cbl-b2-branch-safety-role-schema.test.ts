@@ -99,11 +99,13 @@ function makeV113RoleShapeDb(dbPath: string): { agentId: number } {
 }
 
 describe('cycle-branch-lifecycle B2: branch-safety role schema v114 (fresh DB)', () => {
-  it('SCHEMA_VERSION is 114', () => {
+  it('SCHEMA_VERSION is ≥114 (B2 floor; later slices may bump further)', () => {
     withTempDb((dbPath) => {
       const dbs = new DatabaseService(dbPath);
-      expect(SCHEMA_VERSION).toBe(114);
-      expect((dbs.raw.prepare('SELECT version FROM schema_version').get() as any).version).toBe(114);
+      expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(114);
+      expect((dbs.raw.prepare('SELECT version FROM schema_version').get() as any).version).toBe(
+        SCHEMA_VERSION
+      );
       dbs.close();
     });
   });
@@ -121,6 +123,8 @@ describe('cycle-branch-lifecycle B2: branch-safety role schema v114 (fresh DB)',
           .prepare(`INSERT INTO role_bindings (project_id, role, agent_id) VALUES (1, 'branch-safety', ?)`)
           .run(agentId)
       ).not.toThrow();
+      // B3 seeds role_defaults.branch-safety; vacate so this insert exercises the CHECK itself.
+      dbs.raw.prepare(`DELETE FROM role_defaults WHERE role = 'branch-safety'`).run();
       expect(() =>
         dbs.raw.prepare(`INSERT INTO role_defaults (role, agent_id) VALUES ('branch-safety', ?)`).run(agentId)
       ).not.toThrow();
@@ -192,7 +196,7 @@ describe('cycle-branch-lifecycle B2: branch-safety role schema v114 (v113 upgrad
 
       const dbs = new DatabaseService(dbPath);
       expect((dbs.raw.prepare('SELECT version FROM schema_version').get() as any).version).toBe(SCHEMA_VERSION);
-      expect((dbs.raw.prepare('SELECT version FROM schema_version').get() as any).version).toBe(114);
+      expect((dbs.raw.prepare('SELECT version FROM schema_version').get() as any).version).toBeGreaterThanOrEqual(114);
 
       // Pre-existing rows preserved by the rebuild (id + values untouched).
       const existingBinding = dbs.raw
@@ -206,8 +210,9 @@ describe('cycle-branch-lifecycle B2: branch-safety role schema v114 (v113 upgrad
       expect(existingCap.can_write_code).toBe(1);
       expect(existingCap.can_escalate).toBe(1);
 
-      // Row counts: +0 for role_bindings/role_defaults (branch-safety not auto-bound to any agent —
-      // that is B3's job), +1 for role_capabilities (the new facts-only seed row).
+      // Row counts: +0 role_bindings/role_defaults on this minimal fixture (no agent_type column,
+      // so B3's applyBranchSafetyAgentSeed is a deliberate no-op here); +1 role_capabilities (B2 seed).
+      // Full agent-row + role_defaults bind is covered by cbl-b3-branch-safety-agent-seed.test.ts.
       expect((dbs.raw.prepare('SELECT COUNT(*) AS c FROM role_bindings').get() as any).c).toBe(
         countsBefore.role_bindings
       );
@@ -243,7 +248,9 @@ describe('cycle-branch-lifecycle B2: branch-safety role schema v114 (v113 upgrad
 
       // Idempotent re-open: no duplicate rows, no CHECK regression.
       const again = new DatabaseService(dbPath);
-      expect((again.raw.prepare('SELECT version FROM schema_version').get() as any).version).toBe(114);
+      expect((again.raw.prepare('SELECT version FROM schema_version').get() as any).version).toBe(
+        SCHEMA_VERSION
+      );
       expect((again.raw.prepare('SELECT COUNT(*) AS c FROM role_capabilities').get() as any).c).toBe(
         countsBefore.role_capabilities + 1
       );
@@ -253,7 +260,7 @@ describe('cycle-branch-lifecycle B2: branch-safety role schema v114 (v113 upgrad
 });
 
 describe('cycle-branch-lifecycle B2: live data/helm.db (read-only assertion, never mutated)', () => {
-  it('already reports v114 with a facts-only branch-safety role_capabilities row', () => {
+  it('already reports ≥v114 with a facts-only branch-safety role_capabilities row', () => {
     const liveDbPath = path.resolve('data/helm.db');
     if (!fs.existsSync(liveDbPath)) {
       // No live DB present in this environment (e.g. a clean CI checkout) — nothing to assert.

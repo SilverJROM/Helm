@@ -2,7 +2,7 @@ import type Database from "better-sqlite3";
 import { assertAllRoleTiersInvariants } from "./role-tier-invariants.js";
 import { PROVIDERS } from "../config/providers.js";
 
-export const SCHEMA_VERSION = 114;
+export const SCHEMA_VERSION = 115;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -1784,7 +1784,7 @@ export const V110_DISCOVERY_REQUIRED_ARTIFACTS =
 /**
  * B09a / c01 R2.8–R2.9: canonical project + house roster seed set.
  * Project: discovery, plancore, ibrain, planner, implementer, validator, panelist.
- * House: agent-master, overseer, jkage, housekeeper (S15).
+ * House: agent-master, overseer, jkage, housekeeper (S15), branch-safety (cycle-branch-lifecycle B3).
  * Additive + idempotent (INSERT OR IGNORE by name). MIG1: never overwrite non-empty definition_md.
  * Forces kind (agent_type) for each seed. Does NOT prune extras (B09b).
  * Legacy house stubs (master_agent, jkagebunshin) remain until B09b prune.
@@ -1850,6 +1850,43 @@ You investigate from a **bounded diagnosis envelope only** — not open-ended ju
 
 Do not invent extra sources. Do not improvise outside this envelope. Verdicts are only
 **done** (status repair toward idle via markIdle path) or **needs-human**. Never reap.
+`;
+
+/**
+ * cycle-branch-lifecycle B3 / R3.1+R3.3: house branch-safety agent — facts-only contract.
+ * Reports branch/git facts; never decides, blocks, or deletes. Model binding: topology default
+ * (grok45 / grok-4.5, same preferred house/implementer L2 tier). Seeded empty-only (MIG1).
+ */
+export const BRANCH_SAFETY_DEFINITION_MD = `---
+role: branch-safety
+kind: house
+agent_type: house
+lifecycle: on-demand
+default_provider: grok
+default_model: grok-4.5
+default_effort: medium
+spawn_pref: tmux
+main_model_slug: grok45
+callback_contract: "[helm callback] branch-safety <session> STATUS: DONE"
+---
+# branch-safety — house facts-only branch reporter
+
+You are the Helm **branch-safety** house agent. Given a branch (and project context), you
+**report facts only**: whether the branch is merged anywhere, whether it is tied to any
+currently-active cycle, how stale it is, and related git state (ahead/behind, dirty worktree).
+
+## Facts-only contract (non-negotiable)
+
+1. **Report facts. Never decides, blocks, or deletes.** You never merge, delete, force-push,
+   or mutate git state. You never autonomously gate a human action.
+2. **No decision field.** Your output is a factual report only — never a decision, verdict,
+   allow, deny, or recommendation-to-act as an authority. JROM (or the human-in-the-loop
+   moment) always makes the actual call.
+3. **House-level, reusable.** One role serves pre-delete safety, merge-conflict context, and
+   discovery-time repo-hygiene survey — never three separate roles that re-litigate the same
+   facts.
+4. **Bounded input.** Work from the facts envelope handed to you (project dir, branch name,
+   cycle linkage, git porcelain). Do not invent extra sources or improvise outside it.
 `;
 
 export const B09A_CANONICAL_AGENT_SEEDS: readonly B09aCanonicalAgentSeed[] = [
@@ -2020,6 +2057,15 @@ project run.
     spawn_pref: 'tmux',
     definition_md: HOUSEKEEPER_DEFINITION_MD,
   },
+  {
+    name: 'branch-safety',
+    kind: 'house',
+    provider: 'grok',
+    model: 'grok-4.5',
+    default_effort: 'medium',
+    spawn_pref: 'tmux',
+    definition_md: BRANCH_SAFETY_DEFINITION_MD,
+  },
 ] as const;
 
 export const B09A_PROJECT_NAMES: readonly string[] = B09A_CANONICAL_AGENT_SEEDS.filter(
@@ -2158,6 +2204,97 @@ export function applyHousekeeperSeed(db: Database.Database): void {
     db.prepare(
       `INSERT OR IGNORE INTO agent_escalations (agent_id, position, model_id, trigger) VALUES (?,?,?, 'on-fail')`
     ).run(agent.id, rung.position, mid);
+  }
+}
+
+/**
+ * cycle-branch-lifecycle B3 / R3.1+R3.3: house branch-safety agent seed (idempotent, Studio-edit safe).
+ * - Row + agent_type via B09a-style INSERT OR IGNORE + force house.
+ * - definition_md: MIG1 empty-only (facts-only / never-decides contract).
+ * - default_model_id: topology default grok45 only when NULL.
+ * - role_defaults: bind role='branch-safety' → this agent (B2 deferred this bind to B3).
+ * No escalations (solo facts reporter). No-op when agents table missing.
+ */
+export function applyBranchSafetyAgentSeed(db: Database.Database): void {
+  const hasAgents = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agents'").get();
+  if (!hasAgents) return;
+  const cols = (db.prepare('PRAGMA table_info(agents)').all() as Array<{ name: string }>).map((c) => c.name);
+  if (!cols.includes('agent_type')) return;
+
+  const sql = (db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='agents'`).get() as
+    | { sql?: string }
+    | undefined)?.sql;
+  const houseValue = sql && sql.includes("'helm'") && !sql.includes("'house'") ? 'helm' : 'house';
+
+  db.prepare(
+    `INSERT OR IGNORE INTO agents (name, provider, model, default_effort, spawn_pref, definition_md, agent_type)
+     VALUES (?,?,?,?,?,NULL,?)`
+  ).run('branch-safety', 'grok', 'grok-4.5', 'medium', 'tmux', houseValue);
+
+  db.prepare(
+    `UPDATE agents SET definition_md = ?, updated_at = datetime('now')
+     WHERE name = 'branch-safety' AND (definition_md IS NULL OR TRIM(IFNULL(definition_md, '')) = '')`
+  ).run(BRANCH_SAFETY_DEFINITION_MD);
+
+  db.prepare(
+    `UPDATE agents SET agent_type = ?, updated_at = datetime('now') WHERE name = 'branch-safety'`
+  ).run(houseValue);
+
+  if (cols.includes('classification')) {
+    db.prepare(
+      `UPDATE agents SET classification = 'solo', updated_at = datetime('now')
+       WHERE name = 'branch-safety' AND (classification IS NULL OR TRIM(IFNULL(classification, '')) = '')`
+    ).run();
+  }
+
+  const resolveModelId = (slug: string, modelId: string, nameHint?: string): number | undefined => {
+    const hasModels = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='models'").get();
+    if (!hasModels) return undefined;
+    const mcols = new Set((db.prepare('PRAGMA table_info(models)').all() as Array<{ name: string }>).map((c) => c.name));
+    if (mcols.has('slug')) {
+      const bySlug = db.prepare('SELECT id FROM models WHERE slug = ? LIMIT 1').get(slug) as { id: number } | undefined;
+      if (bySlug) return bySlug.id;
+    }
+    const byModelId = db
+      .prepare('SELECT id FROM models WHERE model_id = ? LIMIT 1')
+      .get(modelId) as { id: number } | undefined;
+    if (byModelId) return byModelId.id;
+    if (nameHint) {
+      const byName = db.prepare('SELECT id FROM models WHERE name = ? LIMIT 1').get(nameHint) as
+        | { id: number }
+        | undefined;
+      if (byName) return byName.id;
+    }
+    return undefined;
+  };
+
+  if (cols.includes('default_model_id')) {
+    const mainId = resolveModelId('grok45', 'grok-4.5', 'grok-4.5');
+    if (mainId != null) {
+      db.prepare(
+        `UPDATE agents SET default_model_id = ?, updated_at = datetime('now')
+         WHERE name = 'branch-safety' AND default_model_id IS NULL`
+      ).run(mainId);
+    }
+  }
+
+  // role_defaults bind (role CHECK must already accept branch-safety — v114+).
+  const hasRoleDefaults = !!db
+    .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='role_defaults'")
+    .get();
+  if (hasRoleDefaults) {
+    const agent = db.prepare("SELECT id FROM agents WHERE name = 'branch-safety'").get() as
+      | { id: number }
+      | undefined;
+    if (agent) {
+      try {
+        db.prepare(`INSERT OR IGNORE INTO role_defaults (role, agent_id) VALUES ('branch-safety', ?)`).run(
+          agent.id
+        );
+      } catch {
+        // Older role_defaults CHECK without branch-safety: skip bind (pre-v114 upgrade path).
+      }
+    }
   }
 }
 
