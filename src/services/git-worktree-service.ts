@@ -499,7 +499,26 @@ export class GitWorktreeService {
 
   private async writeExcludeEntry(repoRoot: string, gitCommonDir: string, worktreePath: string): Promise<void> {
     const rel = path.relative(repoRoot, worktreePath).split(path.sep).join('/');
-    const line = `/${rel}/`;
+    await this.appendExcludeLine(gitCommonDir, `/${rel}/`);
+  }
+
+  /**
+   * B17 (R6.3): same idempotent repository-local exclude B6 writes for the runtime root, for a
+   * Helm-OWNED artifact that Helm itself drops inside the base checkout. Untracked files count as
+   * dirt in `git status --porcelain`, and `mergeCycleIntoBase` refuses to merge into a dirty base —
+   * so any artifact Helm writes there without this would wedge the next merge. Caller supplies the
+   * pattern because the artifact belongs to the caller, not to this primitive; a blank or
+   * multi-line pattern is refused rather than appended (one call must never inject a second rule).
+   */
+  async ensureRepoLocalExclude(projectDir: string, pattern: string): Promise<void> {
+    const line = pattern.trim();
+    if (!line || line.includes('\n')) {
+      throw new Error(`invalid repo-local exclude pattern: ${JSON.stringify(pattern)}`);
+    }
+    await this.appendExcludeLine(await this.resolveGitCommonDir(projectDir), line);
+  }
+
+  private async appendExcludeLine(gitCommonDir: string, line: string): Promise<void> {
     const excludePath = path.join(gitCommonDir, 'info', 'exclude');
 
     await fs.mkdir(path.dirname(excludePath), { recursive: true });

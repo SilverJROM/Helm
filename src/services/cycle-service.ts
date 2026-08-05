@@ -23,6 +23,14 @@ const CYCLE_PHASES = ['discovery', 'planning', 'implementation', 'final_tests', 
 // the stamp.
 const FREEZE_ON_OR_AFTER: readonly string[] = ['implementation', 'final_tests', 'complete'];
 
+// B17 / R6.3: the conflict report's filename, and the repo-local exclude that keeps it from
+// counting as base-checkout dirt. Matched by pattern, not by one resolved path, because the docs
+// folder MOVES (`cycle/<folder>/` -> `cycle/completed/<folder>/` on completion) — a path-exact
+// entry would go stale the moment the cycle it describes is completed. Still scoped to Helm's own
+// directory and Helm's own filename: nothing of the project's is hidden by it.
+const MERGE_CONFLICT_REPORT_FILE = 'merge-conflict-report.json';
+const MERGE_CONFLICT_REPORT_EXCLUDE = `/cycle/**/${MERGE_CONFLICT_REPORT_FILE}`;
+
 export interface Cycle {
   id: number;
   project_id: number;
@@ -941,7 +949,7 @@ export class CycleService {
       if (e instanceof MergeConflictError) {
         // R6.3: GitWorktreeService has already aborted the merge (base restored) — this only
         // records what happened. Never auto-resolves; the cycle stays parked either way.
-        await this.recordMergeConflict(cycleId, branch, baseBranch, e);
+        await this.recordMergeConflict(project.directory, cycleId, branch, baseBranch, e);
       }
       throw e;
     }
@@ -966,13 +974,22 @@ export class CycleService {
    * house-agent entry point (`branchSafetyReport` — R3.2's exact call-site pattern) exactly once
    * for its facts + optional narrative. Reports only, decides nothing — resolving the conflict
    * stays JROM's call.
+   *
+   * The report lands next to the cycle's docs, which sit INSIDE the base checkout, and an untracked
+   * file there is dirt to `git status --porcelain` — the exact signal `mergeCycleIntoBase` refuses
+   * on. Unexcluded, this report would wedge the merge it exists to enable: conflict → JROM resolves
+   * → retry dies with a bare `not clean` that names neither the conflict nor the file causing it,
+   * and only a manual `rm` escapes. So the exclude goes in FIRST: if it fails, the report is never
+   * written and the base stays exactly as clean as the abort left it.
    */
   private async recordMergeConflict(
+    projectDir: string,
     cycleId: number,
     branch: string,
     baseBranch: string,
     conflict: MergeConflictError
   ): Promise<void> {
+    await this.gitWorktreeService!.ensureRepoLocalExclude(projectDir, MERGE_CONFLICT_REPORT_EXCLUDE);
     const safety = await branchSafetyReport(cycleId, this.db);
     const report = {
       cycleId,
@@ -984,7 +1001,7 @@ export class CycleService {
       detectedAt: new Date().toISOString(),
       safety
     };
-    const reportPath = path.join(this.getCycleDocDir(cycleId), 'merge-conflict-report.json');
+    const reportPath = path.join(this.getCycleDocDir(cycleId), MERGE_CONFLICT_REPORT_FILE);
     await fs.writeFile(reportPath, JSON.stringify(report, null, 2), 'utf8');
   }
 

@@ -101,17 +101,18 @@ describe('B17 mergeCycleBranch — conflict path (R6.3)', () => {
 
       const safetySpy = vi.spyOn(BranchSafetyReportService, 'branchSafetyReport');
       const baseShaBefore = (await git(repoDir, ['rev-parse', 'HEAD'])).trim();
+      const statusBefore = await git(repoDir, ['status', '--porcelain']);
+      expect(statusBefore.trim()).toBe('');
 
       await expect(cycles.mergeCycleBranch(cycle.id)).rejects.toThrow(/conflict/i);
 
-      // base HEAD, index and worktree restored — no half-merged state, no MERGE_HEAD. Scoped to the
-      // conflicted path itself: the base repo's docs folder (project.directory/cycle/<name>) is
-      // intentionally untracked (that's where the conflict report below just got written), so a
-      // repo-wide `git status --porcelain` is not the right signal here.
+      // base HEAD, index and worktree restored — no half-merged state, no MERGE_HEAD. Repo-wide,
+      // NOT scoped to the conflicted path: "restores the base" has to mean the whole checkout is
+      // as the attempt found it, including the report the attempt itself just wrote next to the
+      // cycle's docs (see the retry test below for what a leftover costs).
       const baseShaAfter = (await git(repoDir, ['rev-parse', 'HEAD'])).trim();
       expect(baseShaAfter).toBe(baseShaBefore);
-      const statusOfConflictedPath = await git(repoDir, ['status', '--porcelain', '--', 'feature.txt']);
-      expect(statusOfConflictedPath.trim()).toBe('');
+      expect(await git(repoDir, ['status', '--porcelain'])).toBe(statusBefore);
       const unmergedEntries = await git(repoDir, ['ls-files', '-u']);
       expect(unmergedEntries.trim()).toBe('');
       expect(fs.existsSync(path.join(repoDir, '.git', 'MERGE_HEAD'))).toBe(false);
@@ -141,6 +142,63 @@ describe('B17 mergeCycleBranch — conflict path (R6.3)', () => {
 
       // exactly ONE R3 (single B5 house-agent entry point) invocation.
       expect(safetySpy).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  it(
+    'the report leaves the base checkout clean, so the retry AFTER the conflict is resolved merges',
+    async () => {
+      const { repoDir, dbs, cycles, project } = await setup('retry-after-resolve');
+
+      const cycle = await cycles.createCycle(project.id, 'Feature Retry');
+      const worktreePath = cycle.git_worktree_path!;
+
+      fs.writeFileSync(path.join(worktreePath, 'feature.txt'), 'cycle version\n');
+      await git(worktreePath, ['add', 'feature.txt']);
+      await git(worktreePath, ['commit', '-m', 'cycle: add feature.txt']);
+      fs.writeFileSync(path.join(repoDir, 'feature.txt'), 'base version\n');
+      await git(repoDir, ['add', 'feature.txt']);
+      await git(repoDir, ['commit', '-m', 'base: add feature.txt']);
+
+      dbs.prepare('UPDATE cycles SET awaiting_merge = 1 WHERE id = ?').run(cycle.id);
+
+      const statusBefore = await git(repoDir, ['status', '--porcelain']);
+      expect(statusBefore.trim()).toBe('');
+
+      await expect(cycles.mergeCycleBranch(cycle.id)).rejects.toThrow(/conflict/i);
+
+      // the report IS on disk, inside the base checkout, next to the cycle's docs...
+      const reportPath = path.join(cycles.getCycleDocDir(cycle.id), 'merge-conflict-report.json');
+      expect(fs.existsSync(reportPath)).toBe(true);
+      expect(reportPath.startsWith(repoDir + path.sep)).toBe(true);
+      // ...and the base checkout is still byte-for-byte as clean as before the attempt.
+      expect(await git(repoDir, ['status', '--porcelain'])).toBe(statusBefore);
+      // ...because git is excluding it, not because status happened to miss it: git names the rule.
+      const rel = path.relative(repoDir, reportPath).split(path.sep).join('/');
+      const ignoredBy = await git(repoDir, ['check-ignore', '-v', rel]);
+      expect(ignoredBy).toContain('info/exclude');
+      expect(ignoredBy).toContain('merge-conflict-report.json');
+
+      // JROM does what the park exists for: resolves the conflict himself, on the cycle branch.
+      await expect(git(worktreePath, ['merge', 'main'])).rejects.toThrow();
+      fs.writeFileSync(path.join(worktreePath, 'feature.txt'), 'resolved by hand\n');
+      await git(worktreePath, ['add', 'feature.txt']);
+      await git(worktreePath, ['commit', '--no-edit']);
+
+      // the retry then merges — it is not wedged on a bare 'not clean' by B17's own report.
+      const result = await cycles.mergeCycleBranch(cycle.id);
+      expect(result.merged).toBe(true);
+      expect(result.cleaned).toBe(true);
+      expect(fs.readFileSync(path.join(repoDir, 'feature.txt'), 'utf8')).toBe('resolved by hand\n');
+
+      const row = dbs.prepare('SELECT * FROM cycles WHERE id = ?').get(cycle.id) as any;
+      expect(row.git_merged_at).not.toBeNull();
+      expect(row.awaiting_merge).toBe(0);
+      expect(row.git_cleanup_pending).toBe(0);
+
+      // the report survives the merge for the record, and still isn't dirt.
+      expect(fs.existsSync(reportPath)).toBe(true);
+      expect((await git(repoDir, ['status', '--porcelain'])).trim()).toBe('');
     }
   );
 
