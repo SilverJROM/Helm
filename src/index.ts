@@ -47,6 +47,7 @@ import { HouseUsageSelector } from "./services/house-usage-selector.js";
 import { registerHousekeeperRoutes } from "./api/routes/housekeeper-routes.js";
 import { registerCycleBranchOnboardingRoutes } from "./api/routes/cycle-branch-onboarding-routes.js";
 import { registerCycleDeleteRoutes } from "./api/routes/cycle-delete-routes.js";
+import { registerCycleMergeRoutes } from "./api/routes/cycle-merge-routes.js";
 import {
   startCycleWithBranchOnboarding,
   surveyCycleBranches,
@@ -1132,6 +1133,12 @@ async function main(): Promise<void> {
   // B13 / R2.1,R2.4,R3.2: DELETE /api/cycles/:id (completed|archived only) + GET delete-preflight (B5 report).
   registerCycleDeleteRoutes(app, {
     db,
+    cycleService,
+    authMiddleware,
+    requireOwnerPre,
+  });
+  // B18 / R6 UI: POST /api/cycles/:id/merge (owner-gated B16) + GET merge-conflict-report (B17 panel).
+  registerCycleMergeRoutes(app, {
     cycleService,
     authMiddleware,
     requireOwnerPre,

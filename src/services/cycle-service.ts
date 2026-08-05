@@ -102,6 +102,12 @@ export interface CycleOverviewRow {
   // B10b (R4.4): true when this cycle has no persisted git identity — legacy workspace, drives the
   // UI's "legacy workspace — no branch" marker. Never inferred/repaired; a straight read of the column.
   legacyWorkspace: boolean;
+  // B18 (R6 UI): post-implementation merge gate fields — never overload awaiting_approval.
+  awaiting_merge: boolean;
+  git_cleanup_pending: boolean;
+  git_merged_at: string | null;
+  git_branch: string | null;
+  git_base_branch: string | null;
 }
 
 export interface CyclesOverview {
@@ -128,7 +134,13 @@ function rowToCycleOverviewRow(row: any, progressByCycle: Map<number, { done: nu
     created_at: String(row.created_at),
     progress: prog ? { done: prog.done, total: prog.total } : null,
     blocked: Boolean(prog?.blocked),
-    legacyWorkspace: row.git_worktree_path == null
+    legacyWorkspace: row.git_worktree_path == null,
+    // B18 (R6 UI): merge-gate fields for the parked post-implementation banner / action.
+    awaiting_merge: Boolean(Number(row.awaiting_merge)),
+    git_cleanup_pending: Boolean(Number(row.git_cleanup_pending)),
+    git_merged_at: row.git_merged_at != null ? String(row.git_merged_at) : null,
+    git_branch: row.git_branch != null ? String(row.git_branch) : null,
+    git_base_branch: row.git_base_branch != null ? String(row.git_base_branch) : null
   };
 }
 
@@ -409,7 +421,8 @@ export class CycleService {
   listCyclesOverview(): CyclesOverview {
     const rows = this.db.prepare(
       `SELECT c.id, c.project_id, p.name AS project_name, c.name, c.phase, c.autonomy,
-              c.status, c.awaiting_approval, c.folder_name, c.created_at, c.git_worktree_path
+              c.status, c.awaiting_approval, c.folder_name, c.created_at, c.git_worktree_path,
+              c.awaiting_merge, c.git_cleanup_pending, c.git_merged_at, c.git_branch, c.git_base_branch
        FROM cycles c
        JOIN projects p ON p.id = c.project_id
        ORDER BY c.created_at DESC`
@@ -1003,6 +1016,29 @@ export class CycleService {
     };
     const reportPath = path.join(this.getCycleDocDir(cycleId), MERGE_CONFLICT_REPORT_FILE);
     await fs.writeFile(reportPath, JSON.stringify(report, null, 2), 'utf8');
+  }
+
+  /**
+   * B18 (R6.3 UI): read the B17 merge-conflict report next to the cycle's docs, if present.
+   * Returns null when no report file exists (404 at the route layer). Never invents a report.
+   */
+  async getMergeConflictReport(cycleId: number): Promise<Record<string, unknown> | null> {
+    const cycleRow = this.db.prepare('SELECT id FROM cycles WHERE id = ?').get(cycleId) as
+      | { id: number }
+      | undefined;
+    if (!cycleRow) {
+      const err: any = new Error('unknown cycle');
+      err.code = 'NOT_FOUND';
+      throw err;
+    }
+    const reportPath = path.join(this.getCycleDocDir(cycleId), MERGE_CONFLICT_REPORT_FILE);
+    try {
+      const raw = await fs.readFile(reportPath, 'utf8');
+      return JSON.parse(raw) as Record<string, unknown>;
+    } catch (e: any) {
+      if (e && (e.code === 'ENOENT' || e.code === 'ENOTDIR')) return null;
+      throw e;
+    }
   }
 
   /** B16: cleanup-only retry path for a cycle whose merge already landed but cleanup failed. */

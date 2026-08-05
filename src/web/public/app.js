@@ -888,6 +888,15 @@ function App() {
   const [ccDeleteDialog, setCcDeleteDialog] = useState(null);
   const [ccDeleting, setCcDeleting] = useState({});
   const [ccDeleteNote, setCcDeleteNote] = useState({});
+  // B18 / R6 UI: post-implementation merge gate — same visual pattern as awaiting_approval.
+  // Explicit confirmed "tested — merge it" action; never auto-fired. Disabled while a run is
+  // active or the cycle is ineligible (not awaiting_merge / not cleanup-retryable).
+  // ccMergeDialog: null | { cycleId, label, baseBranch, branch, cleanupPending }
+  const [ccMergeDialog, setCcMergeDialog] = useState(null);
+  const [ccMerging, setCcMerging] = useState({});
+  const [ccMergeNote, setCcMergeNote] = useState({}); // cycleId -> outcome / cleanup result text
+  // cycleId -> undefined(loading) | 'absent' | report object from GET merge-conflict-report
+  const [ccMergeConflictReport, setCcMergeConflictReport] = useState({});
   // IS-R2 (impl-start): Start Implementation button. cycleId -> busy flag / inline notice for the
   // POST /start-implementation outcome. The button is enabled purely on (valid plan.md
   // exists AND no active run) — never gated behind Approve-Planning. Clicking it starts the run.
@@ -1173,6 +1182,11 @@ function App() {
     if (ccWsTab !== 'implementation' || !ccWsCycleId || !token) return;
     if (!ccRunState[ccWsCycleId]) loadRunState(ccWsCycleId);
   }, [ccWsTab, ccWsCycleId, token]);
+  // B18: conflict report for the merge-gate panel — load when workspace cycle is open.
+  useEffect(() => {
+    if (!ccWsCycleId || !token) return;
+    if (ccMergeConflictReport[ccWsCycleId] === undefined) loadMergeConflictReport(ccWsCycleId);
+  }, [ccWsCycleId, token]);
   // LIVE workspace (same fix as Discovery's living docs): og-requirements.md/plan.md (Planning),
   // per-task run-state (Implementation), and final-tests status are written/updated by the agents
   // DURING a phase — a once-cached load goes stale. Poll each while its tab is open so they stay live
@@ -5847,6 +5861,198 @@ function App() {
       setCcArchiving(p => ({ ...p, [cycleId]: false }));
     }
   };
+  // B18 / R6.3: load B17 conflict report for the merge-gate panel (best-effort; 404 = absent).
+  const loadMergeConflictReport = async (cycleId) => {
+    if (!cycleId) return;
+    try {
+      const r = await authedFetch(`/api/cycles/${cycleId}/merge-conflict-report`, { allowStatuses: [404, 400] });
+      if (!r.ok) {
+        setCcMergeConflictReport(p => ({ ...p, [cycleId]: 'absent' }));
+        return;
+      }
+      const d = await r.json().catch(() => ({}));
+      setCcMergeConflictReport(p => ({ ...p, [cycleId]: d.report || 'absent' }));
+    } catch {
+      setCcMergeConflictReport(p => ({ ...p, [cycleId]: 'absent' }));
+    }
+  };
+  // B18 / R6.2: open explicit confirm for "tested — merge it". Never auto-fires merge.
+  const openCycleMergeDialog = (cycleId) => {
+    if (ccMerging[cycleId] || (ccMergeDialog && ccMergeDialog.cycleId === cycleId)) return;
+    const c = ccFindOverviewCycle(cycleId);
+    const label = c ? c.name : `cycle ${cycleId}`;
+    setCcMergeNote(p => ({ ...p, [cycleId]: '' }));
+    setCcMergeDialog({
+      cycleId,
+      label,
+      baseBranch: c && c.git_base_branch ? String(c.git_base_branch) : 'base',
+      branch: c && c.git_branch ? String(c.git_branch) : 'cycle branch',
+      cleanupPending: !!(c && c.git_cleanup_pending),
+    });
+  };
+  const closeCycleMergeDialog = () => {
+    if (ccMergeDialog && ccMerging[ccMergeDialog.cycleId]) return;
+    setCcMergeDialog(null);
+  };
+  // B18: only fires from the confirm button in the dialog — never from the banner alone.
+  const confirmCycleMerge = async () => {
+    const dlg = ccMergeDialog;
+    if (!dlg || !dlg.cycleId || ccMerging[dlg.cycleId]) return;
+    const cycleId = dlg.cycleId;
+    setCcMerging(p => ({ ...p, [cycleId]: true }));
+    try {
+      const r = await authedFetch(`/api/cycles/${cycleId}/merge`, {
+        method: 'POST',
+        allowStatuses: [400, 403, 404, 409],
+      });
+      const d = await r.json().catch(() => ({}));
+      if (r.ok && d.result) {
+        const res = d.result;
+        let note = res.alreadyMerged
+          ? 'Already merged and cleaned — nothing more to do.'
+          : (res.cleaned
+            ? `Merged into base and cleaned up worktree/branch${res.mergedAt ? ` at ${res.mergedAt}` : ''}.`
+            : `Merged${res.mergedAt ? ` at ${res.mergedAt}` : ''}; cleanup still pending — retry merge to finish cleanup.`);
+        setCcMergeNote(p => ({ ...p, [cycleId]: note }));
+        setCcMergeDialog(null);
+        await loadCcOverview();
+        await loadMergeConflictReport(cycleId);
+        return;
+      }
+      if (r.status === 409 && (d.code === 'MERGE_CONFLICT' || /conflict/i.test(String(d.error || '')))) {
+        const paths = Array.isArray(d.conflictedPaths) ? d.conflictedPaths.join(', ') : '';
+        setCcMergeNote(p => ({
+          ...p,
+          [cycleId]: `Merge conflict — base restored. Report for JROM${paths ? `: ${paths}` : ''}. Cycle stays parked.`,
+        }));
+        if (d.report) setCcMergeConflictReport(p => ({ ...p, [cycleId]: d.report }));
+        else await loadMergeConflictReport(cycleId);
+        setCcMergeDialog(null);
+        await loadCcOverview();
+        return;
+      }
+      let msg = d.error || `Merge failed (${r.status}).`;
+      if (r.status === 409) msg = d.error || 'Merge refused — cycle ineligible or a run is still active.';
+      setCcMergeDialog(p => p ? { ...p, error: msg } : p);
+      await loadCcOverview();
+    } catch (e) {
+      setCcMergeDialog(p => p ? { ...p, error: 'Merge request failed to send — retry.' } : p);
+    } finally {
+      setCcMerging(p => ({ ...p, [cycleId]: false }));
+    }
+  };
+  const renderCycleMergeDialog = () => {
+    if (!ccMergeDialog) return null;
+    const dlg = ccMergeDialog;
+    const busy = !!ccMerging[dlg.cycleId];
+    const actionLabel = dlg.cleanupPending ? 'Retry cleanup' : 'Tested — merge it';
+    return html`<div class="cc-del-scrim" data-testid="cycle-merge-scrim" onclick=${closeCycleMergeDialog}>
+      <div class="cc-del-dialog" data-testid="cycle-merge-dialog" role="dialog" aria-modal="true" aria-labelledby="cycle-merge-title" onclick=${(e) => e.stopPropagation()}>
+        <div class="cc-nc-head">
+          <div class="cc-nc-title" id="cycle-merge-title">${dlg.cleanupPending ? 'Retry git cleanup' : 'Merge cycle branch'}</div>
+          <span class="chip chip-orange">owner confirm</span>
+        </div>
+        <div class="text-sec" style="font-size:12px" data-testid="cycle-merge-label">
+          ${dlg.cleanupPending
+            ? html`Merge already landed for <strong style="color:var(--text)">${dlg.label}</strong>. This retries worktree/branch cleanup only — it will not re-merge.`
+            : html`You tested <strong style="color:var(--text)">${dlg.label}</strong>. Merge <code data-testid="cycle-merge-branch">${dlg.branch}</code> into <code data-testid="cycle-merge-base">${dlg.baseBranch}</code> with --no-ff, then remove the cycle worktree and branch. Docs stay for Completed.`}
+        </div>
+        ${dlg.error ? html`<div data-testid="cycle-merge-error" style="font-size:12px;color:var(--danger);padding:4px 0">${dlg.error}</div>` : null}
+        <div class="cc-nc-actions">
+          <button type="button" class="btn btn-sm" data-testid="cycle-merge-cancel" disabled=${busy} onclick=${closeCycleMergeDialog}>Cancel</button>
+          <button type="button" class="btn btn-sm btn-primary" data-testid="cycle-merge-confirm"
+            disabled=${busy}
+            title=${dlg.cleanupPending ? 'Retry cleanup only' : 'Merge into base then clean up'}
+            onclick=${confirmCycleMerge}>${busy ? 'Working…' : actionLabel}</button>
+        </div>
+      </div>
+    </div>`;
+  };
+  // B18: parked merge-gate banner (awaiting_approval visual pattern) + conflict panel + cleanup note.
+  const renderMergeGateBanner = (cycle, runActive) => {
+    if (!cycle) return null;
+    const cycleId = cycle.id;
+    const legacy = !!cycle.legacyWorkspace;
+    const awaitingMerge = !!cycle.awaiting_merge;
+    const cleanupPending = !!cycle.git_cleanup_pending;
+    const mergedAt = cycle.git_merged_at || null;
+    const conflictRaw = ccMergeConflictReport[cycleId];
+    const conflictReport = conflictRaw && conflictRaw !== 'absent' ? conflictRaw : null;
+    // Show for git-backed cycles when parked / cleanup pending / conflict / result, or any active
+    // non-legacy cycle (so the action can render disabled while ineligible — B18 AC).
+    const phaseOk = ['implementation', 'final_tests', 'complete'].includes(String(cycle.phase || ''));
+    const show = !legacy && (
+      awaitingMerge || cleanupPending || conflictReport || mergedAt || phaseOk || String(cycle.status) === 'active'
+    );
+    if (!show) return null;
+    const eligible = awaitingMerge || cleanupPending;
+    const busy = !!ccMerging[cycleId];
+    const disabled = !eligible || !!runActive || busy || legacy;
+    const disableReason = legacy
+      ? 'Legacy workspace — no branch to merge'
+      : runActive
+        ? 'Disabled while a run is active'
+        : !eligible
+          ? (mergedAt ? 'Already merged' : 'Cycle is not awaiting merge')
+          : '';
+    const btnLabel = busy
+      ? 'Working…'
+      : cleanupPending
+        ? 'Retry cleanup'
+        : 'Tested — merge it';
+    const title = cleanupPending
+      ? 'Merge landed — cleanup still pending'
+      : awaitingMerge
+        ? 'Awaiting your merge approval'
+        : conflictReport
+          ? 'Merge conflict reported'
+          : mergedAt
+            ? 'Branch merged'
+            : 'Merge gate';
+    const body = cleanupPending
+      ? 'The merge commit is durable. Retry cleans up the worktree and branch only — it never re-merges.'
+      : awaitingMerge
+        ? `Implementation finished. Test the result yourself, then confirm merge of ${cycle.git_branch || 'the cycle branch'} into ${cycle.git_base_branch || 'base'}. No autonomy — you decide when.`
+        : conflictReport
+          ? 'A prior merge attempt conflicted; the base was restored. Resolve on the cycle branch, then retry.'
+          : mergedAt
+            ? `Merged${mergedAt ? ` at ${mergedAt}` : ''}. Cleanup is complete.`
+            : 'Merge becomes available when this cycle parks after implementation (awaiting_merge).';
+    const paths = conflictReport && Array.isArray(conflictReport.conflictedPaths)
+      ? conflictReport.conflictedPaths
+      : [];
+    const narrative = conflictReport && conflictReport.safety && conflictReport.safety.narrative
+      ? String(conflictReport.safety.narrative)
+      : null;
+    const note = ccMergeNote[cycleId] || '';
+    return html`<div class="cc-merge-gate" data-testid="ws-merge-gate">
+      <div class="cc-plan-approve-banner" data-testid="ws-merge-banner"
+        data-awaiting-merge=${awaitingMerge ? '1' : '0'}
+        data-eligible=${eligible ? '1' : '0'}
+        data-run-active=${runActive ? '1' : '0'}>
+        <div class="cc-plan-approve-banner-text">
+          <div class="cc-plan-approve-banner-title" data-testid="ws-merge-banner-title">${title}</div>
+          <div class="cc-plan-approve-banner-body" data-testid="ws-merge-banner-body">${body}</div>
+          ${disableReason && disabled ? html`<div class="cc-plan-approve-notice" data-testid="ws-merge-disabled-reason">${disableReason}</div>` : null}
+          ${note ? html`<div class="cc-plan-approve-notice" data-testid="ws-merge-result-note">${note}</div>` : null}
+        </div>
+        <button type="button" class="btn btn-primary btn-sm" data-testid="ws-merge-action"
+          disabled=${disabled}
+          title=${disabled ? (disableReason || 'Not eligible') : 'Open confirm to merge after you tested'}
+          onclick=${() => openCycleMergeDialog(cycleId)}>${btnLabel}</button>
+      </div>
+      ${conflictReport ? html`<div class="cc-del-report" data-testid="ws-merge-conflict-report" style="margin-top:8px">
+        <div class="cc-del-report-title">Merge conflict report</div>
+        <dl class="cc-del-facts" data-testid="ws-merge-conflict-facts">
+          <div class="cc-del-fact"><dt>Branch</dt><dd data-testid="ws-merge-conflict-branch">${conflictReport.branch || cycle.git_branch || '—'}</dd></div>
+          <div class="cc-del-fact"><dt>Base</dt><dd data-testid="ws-merge-conflict-base">${conflictReport.baseBranch || cycle.git_base_branch || '—'}</dd></div>
+          <div class="cc-del-fact"><dt>Conflicted paths</dt><dd data-testid="ws-merge-conflict-paths">${paths.length ? paths.join(', ') : '—'}</dd></div>
+          <div class="cc-del-fact"><dt>Detected</dt><dd data-testid="ws-merge-conflict-at">${conflictReport.detectedAt || '—'}</dd></div>
+        </dl>
+        ${narrative ? html`<div class="cc-del-narrative text-sec" data-testid="ws-merge-conflict-narrative">${narrative}</div>` : null}
+      </div>` : null}
+    </div>`;
+  };
   // B14 / R2.1+R2.3+R2.4: open delete confirm. Always fetches B13 delete-preflight first and
   // renders the safety report in the dialog. No autonomous path calls this — only explicit UI.
   const openCycleDeleteDialog = async (cycleId) => {
@@ -7359,8 +7565,12 @@ function App() {
             </div>
           </div>`;
 
+      // B18 / R6: parked post-implementation merge gate (awaiting_approval visual pattern).
+      const mergeGate = renderMergeGateBanner(cycle, runActive);
+
       return html`<div class="cc-impl-split" data-testid="ws-impl-wrap">
         <div class="cc-impl-main">
+          ${mergeGate}
           ${startImplRow}
           ${metricsRow}
           ${termRow()}
@@ -7577,6 +7787,7 @@ function App() {
           : html`${activeTabDef.label} — lands in ${activeTabDef.lands}.`}
       </div>
       ${renderCycleDeleteDialog()}
+      ${renderCycleMergeDialog()}
     </div>`;
   };
 
