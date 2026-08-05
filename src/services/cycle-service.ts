@@ -344,6 +344,23 @@ export class CycleService {
   }
 
   /**
+   * B16 (R6.2): true when the cycle has a run row in a NON-TERMINAL status. The worker-level guard
+   * above is not sufficient on its own: worker rows finalize to done|failed|reaped between tasks
+   * (worker-runtime-finalize.ts), and a run still in interview/planning has not spawned one yet —
+   * so a genuinely live run presents ZERO launching/running workers for whole stretches of its
+   * life. Terminal statuses (`complete`, `failed`) are the only ones this lets through; `paused` is
+   * an operator-recoverable halt (schema v91) and therefore blocks exactly like `active`.
+   */
+  hasNonTerminalRunsForCycle(cycleId: number): boolean {
+    const row = this.db.prepare(
+      `SELECT COUNT(*) AS c
+       FROM runs
+       WHERE cycle_id = ? AND status IN ('pending', 'active', 'paused')`
+    ).get(cycleId) as { c: number };
+    return Number(row?.c ?? 0) > 0;
+  }
+
+  /**
    * B13-T01b: latest-run task progress per cycle (R-B5), 2 grouped queries (no N+1) — latest run
    * id per cycle_id, then task counts per run_id. Cycles with no run are simply absent from the map.
    */
@@ -882,6 +899,16 @@ export class CycleService {
       throw err;
     }
 
+    // R6.2 "no active run OR workers": the run-level half. A parked cycle can be run again (park →
+    // owner tests it → fixes what he found → merges), and `createRunForCycle` does not consult
+    // awaiting_merge — so without this a merge fired while that run sits between tasks lands
+    // mid-flight work on the base and then deletes the running cycle's worktree underneath it.
+    if (this.hasNonTerminalRunsForCycle(cycleId)) {
+      const err: any = new Error(`cannot merge: cycle ${cycleId} has a run that is not terminal`);
+      err.code = 'CONFLICT';
+      throw err;
+    }
+
     // R6.2: trust nothing — revalidate the persisted identity against live git state before any
     // mutation, same fail-closed posture as B10b's verifyPersistedWorktree callers.
     await this.gitWorktreeService.verifyPersistedWorktree(project.directory, { worktreePath, branch });
@@ -936,6 +963,14 @@ export class CycleService {
   ): Promise<MergeCycleBranchResult> {
     if (this.hasActiveWorkersForCycle(cycleId)) {
       const err: any = new Error(`cannot retry cleanup: active agents or open handles for cycle ${cycleId}`);
+      err.code = 'CONFLICT';
+      throw err;
+    }
+    // Same run-level clause: the landed merge is durable either way, but cleanup still removes the
+    // worktree — never do that under a non-terminal run. Refusing here leaves git_cleanup_pending
+    // set, so the retry stays available once the run reaches a terminal status.
+    if (this.hasNonTerminalRunsForCycle(cycleId)) {
+      const err: any = new Error(`cannot retry cleanup: cycle ${cycleId} has a run that is not terminal`);
       err.code = 'CONFLICT';
       throw err;
     }

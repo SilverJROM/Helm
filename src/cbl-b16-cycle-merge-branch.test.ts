@@ -160,6 +160,102 @@ describe('B16 mergeCycleBranch — owner-gated merge (R6.2)', () => {
     expect(row.git_merged_at).toBeNull();
   });
 
+  /** Opens a run on the cycle in `status`, with ZERO worker_runtimes rows (between-tasks shape). */
+  function openRun(dbs: DatabaseService, projectId: number, cycleId: number, status: string): number {
+    const row = dbs
+      .prepare(`INSERT INTO runs (project_id, cycle_id, status, phase) VALUES (?, ?, ?, 'executing') RETURNING id`)
+      .get(projectId, cycleId, status) as { id: number };
+    const live = dbs
+      .prepare(
+        `SELECT COUNT(*) AS c FROM worker_runtimes wr INNER JOIN runs r ON r.id = wr.run_id
+         WHERE r.cycle_id = ? AND wr.state IN ('launching','running')`
+      )
+      .get(cycleId) as { c: number };
+    // the whole point of these cases: the worker-level guard sees nothing to block on
+    expect(live.c).toBe(0);
+    return row.id;
+  }
+
+  // R6.2 revalidates "no active run OR workers". Worker rows finalize to done|failed|reaped between
+  // tasks, so a live run presents zero launching/running workers — the run row is the only signal.
+  it.each(['pending', 'active', 'paused'])(
+    'a %s run with zero live workers refuses the merge (no commits land, worktree survives)',
+    async (status) => {
+      const { repoDir, dbs, cycles, project } = await setup(`run-${status}`);
+      const cycle = await makeParkedCycle(dbs, cycles, project.id, `Feature Run ${status}`);
+      openRun(dbs, project.id, cycle.id, status);
+
+      const logBefore = await git(repoDir, ['log', '--oneline', 'main']);
+
+      await expect(cycles.mergeCycleBranch(cycle.id)).rejects.toThrow(/run that is not terminal/);
+
+      const logAfter = await git(repoDir, ['log', '--oneline', 'main']);
+      expect(logAfter).toBe(logBefore);
+      expect(logAfter).not.toContain('Merge cycle');
+
+      // the running cycle's working directory must still be there
+      expect(fs.existsSync(cycle.git_worktree_path!)).toBe(true);
+      const porcelain = await git(repoDir, ['worktree', 'list', '--porcelain']);
+      expect(porcelain).toContain(cycle.git_branch!);
+      const branches = await git(repoDir, ['branch', '--list', `helm/cycle/${cycle.id}/*`]);
+      expect(branches.trim()).not.toBe('');
+
+      // refusal happens before the CAS claim — the cycle stays parked and retryable
+      const row = dbs.prepare('SELECT * FROM cycles WHERE id = ?').get(cycle.id) as any;
+      expect(row.awaiting_merge).toBe(1);
+      expect(row.git_merged_at).toBeNull();
+      expect(row.git_cleanup_pending).toBe(0);
+    }
+  );
+
+  it.each(['complete', 'failed'])(
+    'a %s run does not block the merge (terminal runs are exactly what park-then-merge leaves behind)',
+    async (status) => {
+      const { repoDir, dbs, cycles, project } = await setup(`run-${status}`);
+      const cycle = await makeParkedCycle(dbs, cycles, project.id, `Feature Run ${status}`);
+      openRun(dbs, project.id, cycle.id, status);
+
+      const result = await cycles.mergeCycleBranch(cycle.id);
+      expect(result.merged).toBe(true);
+      expect(result.cleaned).toBe(true);
+
+      const log = await git(repoDir, ['log', '--oneline', 'main']);
+      expect(log).toContain(`feature work: Feature Run ${status}`);
+      expect(fs.existsSync(cycle.git_worktree_path!)).toBe(false);
+    }
+  );
+
+  it('the cleanup-only retry also refuses under a non-terminal run, and succeeds once it is terminal', async () => {
+    const { repoDir, dbs, gws, cycles, project } = await setup('retry-active-run');
+    const cycle = await makeParkedCycle(dbs, cycles, project.id, 'Feature Epsilon');
+
+    vi.spyOn(gws, 'cleanupCycleGit').mockImplementationOnce(async () => {
+      throw new Error('injected cleanup failure');
+    });
+    await expect(cycles.mergeCycleBranch(cycle.id)).rejects.toThrow(/injected cleanup failure/);
+    let row = dbs.prepare('SELECT * FROM cycles WHERE id = ?').get(cycle.id) as any;
+    expect(row.git_merged_at).toBeTruthy();
+    expect(row.git_cleanup_pending).toBe(1);
+    const mergedAt = row.git_merged_at;
+
+    // a new run opens on the cycle before the operator retries cleanup
+    const runId = openRun(dbs, project.id, cycle.id, 'active');
+    await expect(cycles.mergeCycleBranch(cycle.id)).rejects.toThrow(/run that is not terminal/);
+    expect(fs.existsSync(cycle.git_worktree_path!)).toBe(true);
+    row = dbs.prepare('SELECT * FROM cycles WHERE id = ?').get(cycle.id) as any;
+    expect(row.git_cleanup_pending).toBe(1); // still retryable, merge untouched
+    expect(row.git_merged_at).toBe(mergedAt);
+
+    dbs.prepare(`UPDATE runs SET status = 'complete' WHERE id = ?`).run(runId);
+    const retry = await cycles.mergeCycleBranch(cycle.id);
+    expect(retry.cleaned).toBe(true);
+    expect(retry.mergedAt).toBe(mergedAt);
+    expect(fs.existsSync(cycle.git_worktree_path!)).toBe(false);
+
+    const log = await git(repoDir, ['log', '--oneline', 'main']);
+    expect(log.split('\n').filter((l) => l.includes('Merge cycle')).length).toBe(1);
+  });
+
   it('an injected post-merge cleanup failure sets git_cleanup_pending, and the retry produces no second merge commit', async () => {
     const { repoDir, dbs, gws, cycles, project } = await setup('cleanup-retry');
     const cycle = await makeParkedCycle(dbs, cycles, project.id, 'Feature Delta');
