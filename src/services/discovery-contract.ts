@@ -136,3 +136,139 @@ export function isPlanningPhase(phase?: string | null): boolean {
     .toLowerCase();
   return p === 'planning' || p === 'plan';
 }
+
+// ─── B21 / R7.2+R7.3 — discovery-time branch hygiene as FIRST exchange ────────
+
+/**
+ * Stable heading for the hygiene block. Used by formatActiveCycleBlock (sidecar) and
+ * generateInterviewBrief; tests assert this block precedes the interview mandate and contains
+ * no discovery-side judgement verbs (D5 / R7.2).
+ */
+export const DISCOVERY_HYGIENE_HEADING =
+  '## Discovery opening exchange — repo branch hygiene (FIRST topic)';
+
+/**
+ * Structural survey facts shape (matches cycle-branch-onboarding CycleBranchSurvey / B4+B5
+ * BranchSafetyReport). Kept structural here so discovery-contract stays free of service imports.
+ */
+export interface DiscoveryHygieneSurveyFacts {
+  exists: boolean;
+  mergedInto: string[];
+  tiedToActiveCycleId: number | null;
+  lastCommitAt: string | null;
+  ageDays: number | null;
+  aheadBehind: { ahead: number; behind: number } | null;
+  uncommittedInWorktree: boolean;
+  worktreePath: string | null;
+}
+
+export interface DiscoveryHygieneSurveyEntry {
+  cycleId: number;
+  cycleName: string;
+  branch: string;
+  report: { facts: DiscoveryHygieneSurveyFacts; narrative?: string | null };
+}
+
+export interface DiscoveryHygieneSurvey {
+  branches: DiscoveryHygieneSurveyEntry[];
+  degraded: boolean;
+}
+
+/**
+ * Discovery-side judgement verbs / phrases that MUST NOT appear in the hygiene block.
+ * The operator alone chooses keep / delete / ignore (R7.2, D5). Case-insensitive match.
+ * Note: the words "delete" / "keep" / "ignore" as *operator options* are allowed; these
+ * entries are discovery-side *judgment* language.
+ */
+export const DISCOVERY_HYGIENE_FORBIDDEN_JUDGEMENT_VERBS = [
+  'recommend',
+  'recommended',
+  'should delete',
+  'must delete',
+  'ought to',
+  'advisable',
+  'i suggest',
+  'suggest deleting',
+  'prefer deleting',
+  'safe to delete',
+  'unsafe to keep',
+  'cleanup needed',
+  'you should',
+  'verdict',
+  'decision: delete',
+  'decision: keep',
+  'allow delete',
+  'deny delete',
+] as const;
+
+/**
+ * R7.2 / R7.3 / D5 — format the branch-hygiene survey as Discovery's FIRST conversational
+ * exchange. Facts only: discovery presents, never judges. Operator chooses keep/delete/ignore
+ * (and the new cycle's base); after their reply the normal requirements interview continues in
+ * the SAME session. Never blocks: degraded/empty surveys still yield a presentable block.
+ */
+export function formatDiscoveryHygieneExchange(
+  survey?: DiscoveryHygieneSurvey | null,
+  opts?: { defaultBase?: string | null }
+): string {
+  const defaultBase = String(opts?.defaultBase || '').trim() || 'main';
+  const lines: string[] = [
+    DISCOVERY_HYGIENE_HEADING,
+    '',
+    'This is the FIRST topic of the Discovery conversation (R7.2 / D5). Open with it before any new-task requirements questions.',
+    'Present FACTS only. You do NOT decide, act on, or judge cleanup. The operator alone chooses **keep** / **delete** / **ignore** for each listed branch, and confirms the base for this new cycle.',
+    'After the operator replies (including "nothing to do, proceed"), continue in THIS SAME session into the normal requirements interview (R7.3). Do not open a separate flow.',
+    '',
+    '### Survey facts (structured; no narrative judgment)',
+  ];
+
+  if (!survey || survey.degraded) {
+    lines.push(
+      '- Survey status: degraded or unavailable — no sibling branch facts to list. Still ask the operator to confirm the base branch for this cycle, then proceed to the interview.'
+    );
+  } else if (!survey.branches.length) {
+    lines.push('- No other Helm cycle branches found on this project.');
+  } else {
+    for (const entry of survey.branches) {
+      const f = entry.report?.facts;
+      if (!f) {
+        lines.push(
+          `- Branch \`${entry.branch}\` (cycle #${entry.cycleId} "${entry.cycleName}"): facts unavailable.`
+        );
+        continue;
+      }
+      const merged = f.mergedInto?.length ? f.mergedInto.join(', ') : 'none';
+      const tied =
+        f.tiedToActiveCycleId == null ? 'none' : String(f.tiedToActiveCycleId);
+      const age = f.ageDays == null ? 'n/a' : String(f.ageDays);
+      const aheadBehind = f.aheadBehind
+        ? `ahead=${f.aheadBehind.ahead} behind=${f.aheadBehind.behind}`
+        : 'n/a';
+      const wt = f.worktreePath || 'none';
+      lines.push(
+        `- Branch \`${entry.branch}\` (cycle #${entry.cycleId} "${entry.cycleName}"): ` +
+          `exists=${Boolean(f.exists)}; mergedInto=[${merged}]; tiedToActiveCycleId=${tied}; ` +
+          `lastCommitAt=${f.lastCommitAt ?? 'n/a'}; ageDays=${age}; aheadBehind=${aheadBehind}; ` +
+          `uncommittedInWorktree=${Boolean(f.uncommittedInWorktree)}; worktreePath=${wt}`
+      );
+    }
+  }
+
+  lines.push(
+    '',
+    `### Base for this new cycle`,
+    `- Offered default base: \`${defaultBase}\` (operator may override; discovery does not pick).`,
+    '',
+    '### Operator decision (explicitly theirs — never discovery\'s)',
+    'Ask the operator, for each relevant branch: **keep** / **delete** / **ignore**. Record their choice only; do not execute deletes from this survey step.',
+    'Record their base-branch choice for the new cycle (or acceptance of the default), then continue the requirements interview in this same session.'
+  );
+
+  return lines.join('\n');
+}
+
+/** True when `text` contains any forbidden discovery-side judgement verb (case-insensitive). */
+export function discoveryHygieneContainsJudgementVerb(text: string): boolean {
+  const lower = String(text || '').toLowerCase();
+  return DISCOVERY_HYGIENE_FORBIDDEN_JUDGEMENT_VERBS.some((v) => lower.includes(v));
+}

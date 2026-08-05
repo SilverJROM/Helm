@@ -46,7 +46,11 @@ import { HousekeeperService } from "./services/housekeeper-service.js";
 import { HouseUsageSelector } from "./services/house-usage-selector.js";
 import { registerHousekeeperRoutes } from "./api/routes/housekeeper-routes.js";
 import { registerCycleBranchOnboardingRoutes } from "./api/routes/cycle-branch-onboarding-routes.js";
-import { startCycleWithBranchOnboarding } from "./services/cycle-branch-onboarding-service.js";
+import {
+  startCycleWithBranchOnboarding,
+  surveyCycleBranches,
+} from "./services/cycle-branch-onboarding-service.js";
+import { isDiscoveryPhase } from "./services/discovery-contract.js";
 import { configureWorkerRuntimeFinalize } from "./services/worker-runtime-finalize.js";
 import { UsageGatewayService } from "./services/usage-gateway-service.js";
 import { ModelService } from "./services/model-service.js";
@@ -1360,6 +1364,16 @@ async function main(): Promise<void> {
         phase: String(row.phase || ''),
         autonomy: String(row.autonomy || '')
       };
+      // B21 / R7.2: discovery chats get the branch-hygiene survey as the FIRST sidecar exchange
+      // (formatActiveCycleBlock). Survey failure degrades — never blocks chat spawn (R7.3).
+      if (isDiscoveryPhase(activeCycle.phase)) {
+        try {
+          activeCycle.branchSurvey = await surveyCycleBranches(cycleId, db);
+        } catch {
+          activeCycle.branchSurvey = { branches: [], degraded: true };
+        }
+        activeCycle.defaultBase = 'main';
+      }
     }
     try {
       const result = await chatSessionService.create(agentId, body.model_id, pid, { projectFenceDir: project.directory, activeCycle });

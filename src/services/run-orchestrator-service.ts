@@ -1610,6 +1610,17 @@ export class RunOrchestratorService {
 
       // Interview brief: projcore interviews for north-star (incl. per-task model/effort policy per D-b2),
       // writes north-star.md + decisions/ from answers, signals NORTH-STAR-READY. Planning follows.
+      // B21 / R7.2: prepend hygiene survey as FIRST exchange (facts-only); survey never blocks (R7.3).
+      let branchSurvey: import('./discovery-contract.js').DiscoveryHygieneSurvey | null = null;
+      if (input.cycleId != null && Number.isFinite(Number(input.cycleId))) {
+        try {
+          const { surveyCycleBranches } = await import('./cycle-branch-onboarding-service.js');
+          const db = this.deps.artifacts['db'] as DatabaseService;
+          branchSurvey = await surveyCycleBranches(Number(input.cycleId), db);
+        } catch {
+          branchSurvey = { branches: [], degraded: true };
+        }
+      }
       const briefWriter = new BriefWriterService();
       const interviewBrief = briefWriter.generateInterviewBrief({
         batchId,
@@ -1618,6 +1629,8 @@ export class RunOrchestratorService {
         callbacksFile: path.join(runDir, 'callbacks.md'),
         runDir,
         canonicalArtifactRoot,
+        branchSurvey,
+        defaultBase: 'main',
       });
 
       // Resolve at the phase boundary so a binding change before dispatch is honored.

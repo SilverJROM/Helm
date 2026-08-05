@@ -23,6 +23,7 @@ import {
   type ChatIdentityKey,
 } from './chat-session-identity.js';
 import {
+  formatDiscoveryHygieneExchange,
   formatDiscoveryPhaseContract,
   formatPlanningPhaseContract,
   isDiscoveryPhase,
@@ -129,6 +130,13 @@ export interface ActiveCycleContext {
   folder_path: string;
   phase?: string | null;
   autonomy?: string | null;
+  /**
+   * B21 / R7.2: optional branch-hygiene survey (from surveyCycleBranches at cycle start / chat
+   * spawn). When phase is discovery, formatActiveCycleBlock injects it as the FIRST exchange.
+   */
+  branchSurvey?: import('./discovery-contract.js').DiscoveryHygieneSurvey | null;
+  /** R4.2 offered default base (usually `main`) shown alongside the hygiene survey. */
+  defaultBase?: string | null;
 }
 
 export function bootstrapEndMarker(sessionId: string): string {
@@ -311,10 +319,14 @@ export function formatActiveCycleBlock(activeCycle?: ActiveCycleContext | null):
   // S01: phase-scoped artifact contract. Discovery omits Planning schema/writes.
   // Planning keeps its schema. Unknown/empty phase: cycle facts only (fail-closed — no Planning leak).
   if (isDiscoveryPhase(activeCycle.phase)) {
-    // Phase contract body is appended last by composeAgentSidecar (last-authority wins).
-    // Here we only keep cycle identity + folder rules; Discovery artifact/ASK live in
+    // B21 / R7.2: inject the branch-hygiene survey as the FIRST discovery exchange (facts-only;
+    // keep/delete/ignore is the operator's). Phase contract body is still appended last by
+    // composeAgentSidecar (last-authority wins). Discovery artifact/ASK live in
     // formatDiscoveryPhaseContract so they appear last in the sidecar.
-    return lines.join('\n');
+    const hygiene = formatDiscoveryHygieneExchange(activeCycle.branchSurvey ?? null, {
+      defaultBase: activeCycle.defaultBase,
+    });
+    return [lines.join('\n'), hygiene].filter(Boolean).join('\n\n');
   }
   if (isPlanningPhase(activeCycle.phase)) {
     lines.push('', formatPlanningPhaseContract());

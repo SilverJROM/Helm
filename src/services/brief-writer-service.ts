@@ -6,6 +6,8 @@ import { readPlanRevision } from './plan-revision.js';
 import {
   DISCOVERY_READY_ASK,
   DISCOVERY_ROLE,
+  formatDiscoveryHygieneExchange,
+  type DiscoveryHygieneSurvey,
   discoveryStatesEnumLine,
   discoveryTerminalEnumLine,
   PLANNING_FORBIDDEN_FOR_DISCOVERY,
@@ -309,6 +311,9 @@ End your reply with \`STATUS: <STATE> — <same short note>\`. The callbacks.md 
     callbacksFile?: string;
     runDir?: string;
     canonicalArtifactRoot?: string;
+    /** B21 / R7.2: survey facts for the FIRST discovery exchange (hygiene before interview). */
+    branchSurvey?: DiscoveryHygieneSurvey | null;
+    defaultBase?: string | null;
   }): string {
     const canonicalArtifactRoot = params.canonicalArtifactRoot || params.runDir || '.';
     const base = this.generateBrief({
@@ -327,8 +332,14 @@ End your reply with \`STATUS: <STATE> — <same short note>\`. The callbacks.md 
       taskType: 'feature',
     });
     const forbidden = PLANNING_FORBIDDEN_FOR_DISCOVERY.map((f) => `\`${f}\``).join(', ');
+    // B21 / R7.2+R7.3: hygiene exchange is FIRST; interview mandate follows in the same brief.
+    const hygieneBlock = formatDiscoveryHygieneExchange(params.branchSurvey ?? null, {
+      defaultBase: params.defaultBase,
+    });
     const instructions = `
-You are **${DISCOVERY_ROLE}** conducting the Command Center **Discovery INTERVIEW** before any planning or autonomous execution. You are the **sole CC-chat interlocutor** for Discovery (R-H3) — the operator talks only to you in this phase.
+${hygieneBlock}
+
+You are **${DISCOVERY_ROLE}** conducting the Command Center **Discovery INTERVIEW** before any planning or autonomous execution. You are the **sole CC-chat interlocutor** for Discovery (R-H3) — the operator talks only to you in this phase. Complete the opening hygiene exchange above first; after the operator replies, continue the requirements interview in this same session.
 Initial prompt: ${params.prompt}
 
 ## Shared Discovery contract (S01 — authoritative)
