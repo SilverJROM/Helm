@@ -45,6 +45,8 @@ import { registerSessionCloseRoutes } from "./api/routes/session-close-routes.js
 import { HousekeeperService } from "./services/housekeeper-service.js";
 import { HouseUsageSelector } from "./services/house-usage-selector.js";
 import { registerHousekeeperRoutes } from "./api/routes/housekeeper-routes.js";
+import { registerCycleBranchOnboardingRoutes } from "./api/routes/cycle-branch-onboarding-routes.js";
+import { startCycleWithBranchOnboarding } from "./services/cycle-branch-onboarding-service.js";
 import { configureWorkerRuntimeFinalize } from "./services/worker-runtime-finalize.js";
 import { UsageGatewayService } from "./services/usage-gateway-service.js";
 import { ModelService } from "./services/model-service.js";
@@ -1105,6 +1107,14 @@ async function main(): Promise<void> {
     requireOwnerPre,
     requireLocalLaunchPre,
   });
+  // B20 / R7.1: GET /api/cycles/:id/branch-survey + POST /api/cycles/:id/branch-base — the rest of
+  // the cycle-start sequence whose first step lives in POST /api/projects/:id/cycles below.
+  registerCycleBranchOnboardingRoutes(app, {
+    db,
+    authMiddleware,
+    requireOwnerPre,
+    requireLocalLaunchPre,
+  });
 
   app.post('/api/agents/:agentId/chat-session', { preHandler: [authMiddleware, requireOwnerPre, requireLocalLaunchPre] }, async (request: any, reply: any) => {
     const agentId = Number(request.params.agentId);
@@ -1446,13 +1456,29 @@ async function main(): Promise<void> {
   // B2-T01: POST /api/projects/:id/cycles — creates cycle row (autonomy inherit or override) + on-disk folder
   // <project.directory>/cycle/<slug>_<MMDD>/ . Returns cycle incl. folder_path. 409 on dup folder_name.
   // Clock derived at boundary (service default); folder always fenced under project.directory.
+  // B20 / R7.1: cycle start goes through startCycleWithBranchOnboarding — create, then IMMEDIATELY
+  // survey the project's other cycle branches (B4/B5 facts) so discovery presents them before the
+  // interview. NO branch/worktree yet: that waits for JROM's live base choice on
+  // POST /api/cycles/:id/branch-base (R4.2). Survey failure never blocks the create (R7.3).
   app.post('/api/projects/:id/cycles', { preHandler: [authMiddleware, requireOwnerPre, requireLocalLaunchPre] }, async (request: any, reply: any) => {
     const id = Number(request.params.id);
     if (!projectService.getProject(id)) return reply.code(404).send({ error: 'unknown project' });
     try {
       const body = request.body || {};
-      const c = await cycleService.createCycle(id, body.name, body.autonomy, body.final_tests_enabled);
-      return { cycle: c };
+      const started = await startCycleWithBranchOnboarding({
+        cycleService,
+        db,
+        projectId: id,
+        name: body.name,
+        autonomy: body.autonomy,
+        finalTests: body.final_tests_enabled,
+      });
+      return {
+        cycle: started.cycle,
+        branch_survey: started.survey,
+        awaiting_base_choice: started.awaitingBaseChoice,
+        default_base: started.defaultBase,
+      };
     } catch (e: any) {
       if (e.code === 'CONFLICT' || /already exists/.test(String(e.message || e))) {
         return reply.code(409).send({ error: e.message });

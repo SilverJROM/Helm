@@ -1,6 +1,7 @@
 import { DatabaseService } from '../db/database.js';
 import { branchSafetyReport, type BranchSafetyReport } from './branch-safety-report-service.js';
 import { GitWorktreeService, type CycleGitIdentity } from './git-worktree-service.js';
+import type { Cycle } from './cycle-service.js';
 
 const DEFAULT_BASE_BRANCH = 'main';
 
@@ -109,4 +110,79 @@ export async function establishCycleBranch(params: EstablishCycleBranchParams): 
     slug,
     baseRef
   });
+}
+
+/** Structural subset of CycleService used at cycle start — keeps this module free of a service cycle. */
+export interface CycleCreator {
+  createCycle(
+    projectId: number,
+    name: string,
+    autonomyInput?: unknown,
+    finalTestsInput?: unknown
+  ): Promise<Cycle>;
+}
+
+export interface CycleStartOnboarding {
+  cycle: Cycle;
+  survey: CycleBranchSurvey;
+  /** Always true here: cycle start deliberately stops before B6 until JROM's choice is recorded. */
+  awaitingBaseChoice: boolean;
+  /** What `recordCycleBaseChoice` will use if JROM does not override it (R4.2). */
+  defaultBase: string;
+}
+
+/**
+ * R7.1 — THE production cycle-start entry (`POST /api/projects/:id/cycles` calls this, not
+ * `cycleService.createCycle` directly): create the cycle, then IMMEDIATELY — before the task
+ * interview — run the B4/B5 branch survey so discovery has it to present (B21 injects it as the
+ * first discovery exchange). Deliberately does NOT create the branch or worktree: that waits for
+ * JROM's live base choice via `recordCycleBaseChoice` (R4.2). The survey is non-blocking (R7.3):
+ * a survey failure degrades to an empty/degraded result and the cycle is still created.
+ */
+export async function startCycleWithBranchOnboarding(params: {
+  cycleService: CycleCreator;
+  db: DatabaseService;
+  projectId: number;
+  name: string;
+  autonomy?: unknown;
+  finalTests?: unknown;
+}): Promise<CycleStartOnboarding> {
+  const { cycleService, db, projectId, name } = params;
+
+  const cycle = await cycleService.createCycle(projectId, name, params.autonomy, params.finalTests);
+
+  let survey: CycleBranchSurvey;
+  try {
+    survey = await surveyCycleBranches(cycle.id, db);
+  } catch {
+    // surveyCycleBranches already swallows its own failures; this is the belt-and-suspenders half
+    // of R7.3 — nothing about the hygiene survey may fail a cycle start.
+    survey = { branches: [], degraded: true };
+  }
+
+  return { cycle, survey, awaitingBaseChoice: true, defaultBase: DEFAULT_BASE_BRANCH };
+}
+
+export interface CycleBaseChoiceResult {
+  cycle: any;
+  identity: CycleGitIdentity;
+  /** The base actually used — JROM's override, or `main` when he took the default. */
+  base: string;
+}
+
+/**
+ * R7.1/R4.2 — JROM's live base choice, recorded. This is the production step that finally invokes
+ * B6 (`POST /api/cycles/:id/branch-base` calls this): it runs ONLY after cycle start has presented
+ * the survey, and it never picks the base itself — an absent/blank choice means he took the
+ * offered default (`main`), not that this code decided.
+ */
+export async function recordCycleBaseChoice(params: {
+  cycleId: number;
+  db: DatabaseService;
+  chosenBase?: string | null;
+}): Promise<CycleBaseChoiceResult> {
+  const { cycleId, db } = params;
+  const identity = await establishCycleBranch({ cycleId, db, chosenBase: params.chosenBase });
+  const cycle = db.prepare('SELECT * FROM cycles WHERE id = ?').get(cycleId) as any;
+  return { cycle, identity, base: identity.baseBranch };
 }
