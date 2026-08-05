@@ -63,7 +63,8 @@ export const AGENT_ROLES = [
   'red-team',
   'planner',
   'routine-implementer',
-  'panelist'
+  'panelist',
+  'branch-safety'
 ] as const;
 
 export type AgentRole = (typeof AGENT_ROLES)[number];

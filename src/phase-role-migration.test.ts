@@ -32,6 +32,7 @@ const V90_ROLES = [
   'planner',
   'routine-implementer',
   'panelist',
+  'branch-safety',
 ] as const;
 
 const tempDirs: string[] = [];

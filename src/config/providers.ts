@@ -12,7 +12,8 @@ export const PROVIDER_ROLES = [
   "red-team",
   "planner",
   "routine-implementer",
-  "panelist"
+  "panelist",
+  "branch-safety"
 ] as const;
 export type ProviderRole = (typeof PROVIDER_ROLES)[number];
 

@@ -47,12 +47,14 @@ async function withTempDbAsync<T>(fn: (dbPath: string) => Promise<T>): Promise<T
 }
 
 describe('cycle-branch-lifecycle B1: cycles schema v113 (fresh DB)', () => {
-  it('SCHEMA_VERSION is 113 and cycles carries all 7 new columns', () => {
+  it('SCHEMA_VERSION is >=113 and cycles carries all 7 new columns', () => {
     withTempDb((dbPath) => {
       const dbs = new DatabaseService(dbPath);
-      expect(SCHEMA_VERSION).toBe(113);
+      // SCHEMA_VERSION tracks the live tip (v114+); do not pin a stale integer (see
+      // phase-role-migration.test.ts). This test proves the v113 cycles rebuild, not the tip.
+      expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(113);
       const ver = (dbs.raw.prepare('SELECT version FROM schema_version').get() as any).version;
-      expect(ver).toBe(113);
+      expect(ver).toBe(SCHEMA_VERSION);
 
       const cols = (dbs.raw.prepare('PRAGMA table_info(cycles)').all() as any[]).map((c) => c.name);
       for (const col of NEW_CYCLE_COLUMNS) {
@@ -170,7 +172,7 @@ describe('cycle-branch-lifecycle B1: cycles schema v113 (v112 upgrade fixture)',
       const migrated = new DatabaseService(dbPath);
       const ver = (migrated.raw.prepare('SELECT version FROM schema_version').get() as any).version;
       expect(ver).toBe(SCHEMA_VERSION);
-      expect(ver).toBe(113);
+      expect(ver).toBeGreaterThanOrEqual(113);
 
       const countAfter = (migrated.raw.prepare('SELECT COUNT(*) AS c FROM cycles').get() as any).c;
       expect(countAfter).toBe(countBefore);

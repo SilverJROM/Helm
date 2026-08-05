@@ -2,7 +2,7 @@ import type Database from "better-sqlite3";
 import { assertAllRoleTiersInvariants } from "./role-tier-invariants.js";
 import { PROVIDERS } from "../config/providers.js";
 
-export const SCHEMA_VERSION = 113;
+export const SCHEMA_VERSION = 114;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -243,10 +243,15 @@ CREATE TABLE IF NOT EXISTS project_agent_escalations (
 );
 CREATE INDEX IF NOT EXISTS idx_project_agent_escalations_agent ON project_agent_escalations(project_id, agent_id);
 
+-- v114 (cycle-branch-lifecycle B2 / R3.1, R3.3): 'branch-safety' added to the role CHECK on
+-- role_bindings, role_defaults, and role_capabilities — a facts-only house role that reports
+-- branch/git safety facts and never decides, writes code, panels, or escalates (see
+-- applyB2BranchSafetyCapabilitySeed). SQLite cannot ALTER a CHECK, so database.ts v114 rebuilds
+-- all three live tables; this is the canonical post-rebuild shape for fresh DBs.
 CREATE TABLE IF NOT EXISTS role_bindings (
   id INTEGER PRIMARY KEY,
   project_id INTEGER NOT NULL,
-  role TEXT NOT NULL CHECK(role IN ('discovery', 'plancore', 'ibrain', 'coord', 'implementer', 'validator', 'deliberation', 'red-team', 'planner', 'routine-implementer', 'panelist')),
+  role TEXT NOT NULL CHECK(role IN ('discovery', 'plancore', 'ibrain', 'coord', 'implementer', 'validator', 'deliberation', 'red-team', 'planner', 'routine-implementer', 'panelist', 'branch-safety')),
   agent_id INTEGER NOT NULL REFERENCES agents(id) ON DELETE RESTRICT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -254,7 +259,7 @@ CREATE TABLE IF NOT EXISTS role_bindings (
 );
 
 CREATE TABLE IF NOT EXISTS role_defaults (
-  role TEXT PRIMARY KEY CHECK(role IN ('discovery', 'plancore', 'ibrain', 'coord', 'implementer', 'validator', 'deliberation', 'red-team', 'planner', 'routine-implementer', 'panelist')),
+  role TEXT PRIMARY KEY CHECK(role IN ('discovery', 'plancore', 'ibrain', 'coord', 'implementer', 'validator', 'deliberation', 'red-team', 'planner', 'routine-implementer', 'panelist', 'branch-safety')),
   agent_id INTEGER NOT NULL REFERENCES agents(id),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -263,7 +268,7 @@ CREATE TABLE IF NOT EXISTS role_defaults (
 -- Capabilities derived from the authoritative agents/*.md frontmatter + body (source of truth per brief).
 -- JSON for list fields (allowed/terminal/required_artifacts) for simplicity + query via json_extract if needed later.
 CREATE TABLE IF NOT EXISTS role_capabilities (
-  role TEXT PRIMARY KEY CHECK(role IN ('discovery', 'plancore', 'ibrain', 'coord', 'implementer', 'validator', 'deliberation', 'red-team', 'planner', 'routine-implementer', 'panelist')),
+  role TEXT PRIMARY KEY CHECK(role IN ('discovery', 'plancore', 'ibrain', 'coord', 'implementer', 'validator', 'deliberation', 'red-team', 'planner', 'routine-implementer', 'panelist', 'branch-safety')),
   allowed_statuses TEXT NOT NULL,      -- JSON array e.g. ["PROPOSED","WORKING","DONE","BLOCKED"]
   terminal_statuses TEXT NOT NULL,
   can_write_code INTEGER NOT NULL DEFAULT 0,
@@ -3608,6 +3613,26 @@ When invoked for a project, you will:
       db.prepare(`INSERT OR IGNORE INTO agent_escalations (agent_id, position, model_id, trigger) VALUES (?,?,?, 'on-fail')`).run(agentRow.id, l.position, modelRow.id);
     }
   }
+}
+
+/**
+ * v114 (cycle-branch-lifecycle B2 / R3.1, R3.3): seed the facts-only role_capabilities row for
+ * the house role 'branch-safety' — reports branch/git facts, never decides, blocks, panels, or
+ * escalates. Deliberately NOT folded into applyB3AgentRoleCapabilitySeeds's capSeeds: that
+ * function also runs from several pre-v114 migration blocks (older role_capabilities CHECK), and
+ * an INSERT of a role the CHECK doesn't accept yet would abort those upgrades.
+ */
+export function applyB2BranchSafetyCapabilitySeed(db: Database.Database): void {
+  const hasRoleCapabilities = !!db.prepare(
+    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='role_capabilities'"
+  ).get();
+  if (!hasRoleCapabilities) return;
+  db.prepare(`
+INSERT OR IGNORE INTO role_capabilities (
+  role, allowed_statuses, terminal_statuses, can_write_code, requires_repro_first,
+  panel_participant, can_escalate, session_policy, required_artifacts, timeout_ms, checkin_ms
+) VALUES ('branch-safety', '["DONE"]', '["DONE"]', 0, 0, 0, 0, 'fresh', '[]', NULL, NULL)
+`).run();
 }
 
 /**

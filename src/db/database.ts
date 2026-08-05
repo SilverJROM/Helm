@@ -2,7 +2,7 @@ import Database from "better-sqlite3";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import fs from "node:fs";
-import { SCHEMA_VERSION, SCHEMA_SQL, V89_IBRAIN_DEFINITION_MD, V89_KNOWN_CANONICAL_PLANCORE_HASHES, V89_PLANCORE_DEFINITION_MD, V110_DISCOVERY_ALLOWED_STATUSES, V110_DISCOVERY_DEFINITION_MD, V110_DISCOVERY_REQUIRED_ARTIFACTS, V110_DISCOVERY_TERMINAL_STATUSES, V110_KNOWN_STALE_DISCOVERY_HASHES, applyFreshDbExtras, applyB04CanonicalModelSeeds, applyB12bRoleTierSeeds, applyB17TeamTierSeeds, applyB1TeamsSeeds, applyB3AgentRoleCapabilitySeeds, applyB2HelmAgentSeeds, applyB09aCanonicalRosterSeeds, applyB09bPruneNonCanonicalAgents, applyB25OrphanModelHygiene, applyB25dDeleteUnknownProviderMasterRuntimes, applyB6AgentMemorySeeds, applyB11PanelistRetirement, applyHousekeeperSeed, seedRoutingRules } from "./schema.js";
+import { SCHEMA_VERSION, SCHEMA_SQL, V89_IBRAIN_DEFINITION_MD, V89_KNOWN_CANONICAL_PLANCORE_HASHES, V89_PLANCORE_DEFINITION_MD, V110_DISCOVERY_ALLOWED_STATUSES, V110_DISCOVERY_DEFINITION_MD, V110_DISCOVERY_REQUIRED_ARTIFACTS, V110_DISCOVERY_TERMINAL_STATUSES, V110_KNOWN_STALE_DISCOVERY_HASHES, applyFreshDbExtras, applyB04CanonicalModelSeeds, applyB12bRoleTierSeeds, applyB17TeamTierSeeds, applyB1TeamsSeeds, applyB3AgentRoleCapabilitySeeds, applyB2BranchSafetyCapabilitySeed, applyB2HelmAgentSeeds, applyB09aCanonicalRosterSeeds, applyB09bPruneNonCanonicalAgents, applyB25OrphanModelHygiene, applyB25dDeleteUnknownProviderMasterRuntimes, applyB6AgentMemorySeeds, applyB11PanelistRetirement, applyHousekeeperSeed, seedRoutingRules } from "./schema.js";
 import { deriveSessionOwner } from "../services/session-registry-service.js";
 import { allocateLifecycleGeneration } from "../services/lifecycle-cas.js";
 
@@ -67,6 +67,7 @@ export class DatabaseService {
       applyB2HelmAgentSeeds(this.db);  // B2: SCHEMA_SQL agents includes agent_type; not inside applyFreshDbExtras (v18 mig safety)
       applyB09aCanonicalRosterSeeds(this.db);  // B09a: R2.8–R2.9 project+house canonical roster (after agent_type exists)
       applyB3AgentRoleCapabilitySeeds(this.db);  // v89: discovery exists after B09a, so bind its role default
+      applyB2BranchSafetyCapabilitySeed(this.db);  // v114 (B2): facts-only branch-safety role_capabilities row
       applyB09bPruneNonCanonicalAgents(this.db);  // B09b: R2.11 prune non-canonical + FK cleanup (after B09a seeds)
       applyHousekeeperSeed(this.db);  // S15: housekeeper house+tiered main+2 (after models + B09a so prune allowlist holds)
       applyB25OrphanModelHygiene(this.db);  // B25 fix1: remap orphan agents.model + prune unreferenced orphan models
@@ -3817,6 +3818,87 @@ ALTER TABLE cycles_new RENAME TO cycles;
         } else {
           this.db.prepare('UPDATE schema_version SET version = 113').run();
         }
+      }
+
+      // v114 (cycle-branch-lifecycle B2 / R3.1, R3.3): widen role_bindings, role_defaults, and
+      // role_capabilities CHECK lists to add the house role 'branch-safety', then seed its
+      // role_capabilities row facts-only (can_write_code=0, panel_participant=0, can_escalate=0,
+      // session_policy='fresh'). SQLite cannot ALTER a CHECK, so this rebuilds all three tables —
+      // same shape as the v89 role-table rebuild precedent. Unlike v113's cycles rebuild, none of
+      // these three tables is an FK *target* elsewhere, so no foreign_keys pragma toggling is
+      // needed; this.db.transaction() alone gives atomicity (rollback on any failure).
+      if (current && current.version < 114) {
+        const migrateV114 = this.db.transaction(() => {
+          if (hasTable('role_bindings')) {
+            this.db.exec(`
+DROP TABLE IF EXISTS role_bindings_v114;
+CREATE TABLE role_bindings_v114 (
+  id INTEGER PRIMARY KEY,
+  project_id INTEGER NOT NULL,
+  role TEXT NOT NULL CHECK(role IN ('discovery', 'plancore', 'ibrain', 'coord', 'implementer', 'validator', 'deliberation', 'red-team', 'planner', 'routine-implementer', 'panelist', 'branch-safety')),
+  agent_id INTEGER NOT NULL REFERENCES agents(id) ON DELETE RESTRICT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(project_id, role, agent_id)
+);
+INSERT INTO role_bindings_v114 (id, project_id, role, agent_id, created_at, updated_at)
+SELECT id, project_id, role, agent_id, created_at, updated_at FROM role_bindings;
+DROP TABLE role_bindings;
+ALTER TABLE role_bindings_v114 RENAME TO role_bindings;
+`);
+          }
+
+          if (hasTable('role_defaults')) {
+            this.db.exec(`
+DROP TABLE IF EXISTS role_defaults_v114;
+CREATE TABLE role_defaults_v114 (
+  role TEXT PRIMARY KEY CHECK(role IN ('discovery', 'plancore', 'ibrain', 'coord', 'implementer', 'validator', 'deliberation', 'red-team', 'planner', 'routine-implementer', 'panelist', 'branch-safety')),
+  agent_id INTEGER NOT NULL REFERENCES agents(id),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+INSERT INTO role_defaults_v114 (role, agent_id, updated_at)
+SELECT role, agent_id, updated_at FROM role_defaults;
+DROP TABLE role_defaults;
+ALTER TABLE role_defaults_v114 RENAME TO role_defaults;
+`);
+          }
+
+          if (hasTable('role_capabilities')) {
+            this.db.exec(`
+DROP TABLE IF EXISTS role_capabilities_v114;
+CREATE TABLE role_capabilities_v114 (
+  role TEXT PRIMARY KEY CHECK(role IN ('discovery', 'plancore', 'ibrain', 'coord', 'implementer', 'validator', 'deliberation', 'red-team', 'planner', 'routine-implementer', 'panelist', 'branch-safety')),
+  allowed_statuses TEXT NOT NULL,
+  terminal_statuses TEXT NOT NULL,
+  can_write_code INTEGER NOT NULL DEFAULT 0,
+  requires_repro_first INTEGER NOT NULL DEFAULT 0,
+  panel_participant INTEGER NOT NULL DEFAULT 0,
+  can_escalate INTEGER NOT NULL DEFAULT 0,
+  session_policy TEXT NOT NULL DEFAULT 'fresh',
+  required_artifacts TEXT,
+  timeout_ms INTEGER,
+  checkin_ms INTEGER,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+INSERT INTO role_capabilities_v114 (
+  role, allowed_statuses, terminal_statuses, can_write_code, requires_repro_first,
+  panel_participant, can_escalate, session_policy, required_artifacts, timeout_ms,
+  checkin_ms, created_at, updated_at
+)
+SELECT role, allowed_statuses, terminal_statuses, can_write_code, requires_repro_first,
+       panel_participant, can_escalate, session_policy, required_artifacts, timeout_ms,
+       checkin_ms, created_at, updated_at
+FROM role_capabilities;
+DROP TABLE role_capabilities;
+ALTER TABLE role_capabilities_v114 RENAME TO role_capabilities;
+`);
+          }
+
+          applyB2BranchSafetyCapabilitySeed(this.db);
+          this.db.prepare('UPDATE schema_version SET version = 114').run();
+        });
+        migrateV114();
       }
     }
   }
