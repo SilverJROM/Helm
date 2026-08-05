@@ -679,6 +679,9 @@ export class RunOrchestratorService {
    * cycle board to the sole terminal cycle phase `complete`. Does NOT call completeCycle (no
    * folder archive). Operator-pause paths must never call this (A6 park stays non-terminal).
    * Resolves cycle_id from the run row when only runId is known. N7: board write is non-fatal.
+   * R6.1: a cycle with a PERSISTED git identity never reaches `complete` here — it parks instead
+   * (awaiting_merge=1) until the explicit B16 merge action runs. Legacy null-identity cycles are
+   * untouched — same setCyclePhase('complete') as before this slice.
    */
   private terminalizeCycleAtRunEnd(opts: { runId?: number | null; cycleId?: number | null }): void {
     let cycleId =
@@ -692,6 +695,27 @@ export class RunOrchestratorService {
       } catch { /* leave null */ }
     }
     if (cycleId == null || !Number.isFinite(cycleId)) return;
+
+    // R6.1: persisted-identity cycles park (awaiting_merge=1) instead of terminalizing — a pure
+    // DB flag flip, zero git calls. awaiting_merge is a distinct durable state, never a reuse of
+    // awaiting_approval (that gate is planning-only, R3.14). Recoverable failure/stop semantics
+    // are preserved because this whole function is best-effort/non-fatal, same as before.
+    try {
+      const row: any = this.deps.artifacts['db'].raw
+        .prepare('SELECT git_worktree_path, git_worktree_id FROM cycles WHERE id = ?')
+        .get(cycleId);
+      if (row && (row.git_worktree_path != null || row.git_worktree_id != null)) {
+        this.deps.artifacts['db'].raw
+          .prepare('UPDATE cycles SET awaiting_merge = 1 WHERE id = ?')
+          .run(cycleId);
+        return;
+      }
+    } catch (e: any) {
+      console.warn(
+        `[RunOrchestrator] terminalizeCycleAtRunEnd(${cycleId}) identity check non-fatal: ${e?.message || e}`
+      );
+    }
+
     const setPhase = this.deps.cycleService?.setCyclePhase;
     if (typeof setPhase !== 'function') return;
     try {
