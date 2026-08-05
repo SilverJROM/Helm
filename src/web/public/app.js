@@ -882,6 +882,12 @@ function App() {
   // same busy/note shape as completeCycleAction. cycleId -> busy flag / inline outcome note.
   const [ccArchiving, setCcArchiving] = useState({});
   const [ccArchiveNote, setCcArchiveNote] = useState({});
+  // B14 / R2.1,R2.3,R2.4: Delete UI — offered only on completed|archived; confirm dialog ALWAYS
+  // shows B13 delete-preflight safety report above the destructive button; never auto-fired.
+  // ccDeleteDialog: null | { cycleId, label, loading, error, report }
+  const [ccDeleteDialog, setCcDeleteDialog] = useState(null);
+  const [ccDeleting, setCcDeleting] = useState({});
+  const [ccDeleteNote, setCcDeleteNote] = useState({});
   // IS-R2 (impl-start): Start Implementation button. cycleId -> busy flag / inline notice for the
   // POST /start-implementation outcome. The button is enabled purely on (valid plan.md
   // exists AND no active run) — never gated behind Approve-Planning. Clicking it starts the run.
@@ -5841,6 +5847,127 @@ function App() {
       setCcArchiving(p => ({ ...p, [cycleId]: false }));
     }
   };
+  // B14 / R2.1+R2.3+R2.4: open delete confirm. Always fetches B13 delete-preflight first and
+  // renders the safety report in the dialog. No autonomous path calls this — only explicit UI.
+  const openCycleDeleteDialog = async (cycleId) => {
+    if (ccDeleting[cycleId] || (ccDeleteDialog && ccDeleteDialog.loading)) return;
+    const c = ccFindOverviewCycle(cycleId);
+    const status = c ? String(c.status || '') : '';
+    if (status !== 'completed' && status !== 'archived') {
+      setCcDeleteNote(p => ({ ...p, [cycleId]: 'Delete is only available for Completed or Archived cycles.' }));
+      return;
+    }
+    const label = c ? c.name : `cycle ${cycleId}`;
+    setCcDeleteNote(p => ({ ...p, [cycleId]: '' }));
+    setCcDeleteDialog({ cycleId, label, loading: true, error: '', report: null });
+    try {
+      const r = await authedFetch(`/api/cycles/${cycleId}/delete-preflight`, { allowStatuses: [400, 403, 404] });
+      if (!r.ok) {
+        let msg = `Safety report failed (${r.status}).`;
+        try { const d = await r.json(); if (d && d.error) msg = d.error; } catch {}
+        setCcDeleteDialog(p => (p && p.cycleId === cycleId) ? { ...p, loading: false, error: msg, report: null } : p);
+        return;
+      }
+      const d = await r.json();
+      setCcDeleteDialog(p => (p && p.cycleId === cycleId)
+        ? { ...p, loading: false, error: '', report: d.report || null }
+        : p);
+    } catch (e) {
+      setCcDeleteDialog(p => (p && p.cycleId === cycleId)
+        ? { ...p, loading: false, error: 'Could not load safety report — delete blocked until it loads.', report: null }
+        : p);
+    }
+  };
+  const closeCycleDeleteDialog = () => {
+    if (ccDeleteDialog && ccDeleting[ccDeleteDialog.cycleId]) return;
+    setCcDeleteDialog(null);
+  };
+  // R2.3: only fires from the confirm button after the report has been rendered (report != null).
+  const confirmCycleDelete = async () => {
+    const dlg = ccDeleteDialog;
+    if (!dlg || !dlg.cycleId || dlg.loading || !dlg.report || ccDeleting[dlg.cycleId]) return;
+    const cycleId = dlg.cycleId;
+    setCcDeleting(p => ({ ...p, [cycleId]: true }));
+    try {
+      const r = await authedFetch(`/api/cycles/${cycleId}`, { method: 'DELETE', allowStatuses: [400, 403, 404, 409] });
+      if (r.ok) {
+        setCcDeleteNote(p => ({ ...p, [cycleId]: 'Cycle deleted — worktree, branch, and docs removed. DB history kept.' }));
+        setCcDeleteDialog(null);
+        loadCcOverview();
+        if (ccWsCycleId === cycleId) {
+          setCcWsProjectId(null);
+          setCcWsCycleId(null);
+          setCcOvBucket('completed');
+        }
+      } else {
+        let msg = 'Delete failed.';
+        try { const d = await r.json(); if (d && d.error) msg = d.error; } catch {}
+        if (r.status === 409) msg = 'Only Completed or Archived cycles can be deleted.';
+        setCcDeleteDialog(p => p ? { ...p, error: msg } : p);
+      }
+    } catch (e) {
+      setCcDeleteDialog(p => p ? { ...p, error: 'Delete request failed to send — retry.' } : p);
+    } finally {
+      setCcDeleting(p => ({ ...p, [cycleId]: false }));
+    }
+  };
+  const renderCycleDeleteDialog = () => {
+    if (!ccDeleteDialog) return null;
+    const dlg = ccDeleteDialog;
+    const busy = !!ccDeleting[dlg.cycleId];
+    const facts = dlg.report && dlg.report.facts ? dlg.report.facts : null;
+    const narrative = dlg.report && dlg.report.narrative ? String(dlg.report.narrative) : null;
+    const mergedText = facts
+      ? ((facts.mergedInto && facts.mergedInto.length)
+          ? `yes — ${facts.mergedInto.join(', ')}`
+          : (facts.exists === false ? 'branch missing / no git identity' : 'no — not merged into any local branch'))
+      : '—';
+    const uncommittedText = facts
+      ? (facts.uncommittedInWorktree ? 'yes — uncommitted work in worktree' : 'no')
+      : '—';
+    const tiedText = facts
+      ? (facts.tiedToActiveCycleId != null
+          ? `yes — active cycle #${facts.tiedToActiveCycleId}`
+          : 'no')
+      : '—';
+    const ageText = facts
+      ? (facts.ageDays != null
+          ? `${facts.ageDays} day(s)`
+          : (facts.lastCommitAt ? String(facts.lastCommitAt) : 'unknown'))
+      : '—';
+    return html`<div class="cc-del-scrim" data-testid="cycle-delete-scrim" onclick=${closeCycleDeleteDialog}>
+      <div class="cc-del-dialog" data-testid="cycle-delete-dialog" role="dialog" aria-modal="true" aria-labelledby="cycle-delete-title" onclick=${(e) => e.stopPropagation()}>
+        <div class="cc-nc-head">
+          <div class="cc-nc-title" id="cycle-delete-title">Delete cycle</div>
+          <span class="chip chip-orange">destructive</span>
+        </div>
+        <div class="text-sec" style="font-size:12px" data-testid="cycle-delete-label">
+          Permanently remove worktree, branch, and Helm cycle docs for <strong style="color:var(--text)">${dlg.label}</strong>.
+          DB history (runs / tasks) is kept. Never touches main or other cycles.
+        </div>
+        <div class="cc-del-report" data-testid="cycle-delete-safety-report">
+          <div class="cc-del-report-title">Safety report (always shown before confirm)</div>
+          ${dlg.loading ? html`<div class="text-sec" data-testid="cycle-delete-report-loading" style="font-size:12px;padding:6px 0">Loading branch safety report…</div>` : null}
+          ${!dlg.loading && facts ? html`<dl class="cc-del-facts" data-testid="cycle-delete-report-facts">
+            <div class="cc-del-fact"><dt>Merged?</dt><dd data-testid="cycle-delete-fact-merged">${mergedText}</dd></div>
+            <div class="cc-del-fact"><dt>Uncommitted?</dt><dd data-testid="cycle-delete-fact-uncommitted">${uncommittedText}</dd></div>
+            <div class="cc-del-fact"><dt>Tied to an active cycle?</dt><dd data-testid="cycle-delete-fact-tied">${tiedText}</dd></div>
+            <div class="cc-del-fact"><dt>Age</dt><dd data-testid="cycle-delete-fact-age">${ageText}</dd></div>
+          </dl>` : null}
+          ${!dlg.loading && !facts && !dlg.error ? html`<div class="text-sec" style="font-size:12px">No safety facts returned.</div>` : null}
+          ${narrative ? html`<div class="cc-del-narrative text-sec" data-testid="cycle-delete-report-narrative">${narrative}</div>` : null}
+        </div>
+        ${dlg.error ? html`<div data-testid="cycle-delete-error" style="font-size:12px;color:var(--danger);padding:4px 0">${dlg.error}</div>` : null}
+        <div class="cc-nc-actions">
+          <button type="button" class="btn btn-sm" data-testid="cycle-delete-cancel" disabled=${busy} onclick=${closeCycleDeleteDialog}>Cancel</button>
+          <button type="button" class="btn btn-sm btn-danger" data-testid="cycle-delete-confirm"
+            disabled=${busy || dlg.loading || !dlg.report}
+            title=${!dlg.report ? 'Safety report must load before delete can proceed' : 'Permanently delete this cycle'}
+            onclick=${confirmCycleDelete}>${busy ? 'Deleting…' : 'Delete permanently'}</button>
+        </div>
+      </div>
+    </div>`;
+  };
   // IS-R2 (impl-start): manual Start Implementation. POST /api/cycles/:id/start-implementation with
   // an empty body — the server uses the project's role bindings + ingests the cycle's own
   // plan.md (no seedPlan). On success, refresh run-state so the 4s Impl poll shows progress.
@@ -7411,6 +7538,10 @@ function App() {
             disabled=${!!ccArchiving[cycle.id]}
             title="Return this cycle to the Completed list"
             onclick=${() => unarchiveCycleAction(cycle.id)}>${ccArchiving[cycle.id] ? 'Un-archiving…' : 'Un-archive'}</button>` : null}
+          ${(cycle.status === 'completed' || cycle.status === 'archived') ? html`<button type="button" class="btn btn-sm btn-danger" data-testid="ws-delete-cycle"
+            disabled=${!!ccDeleting[cycle.id] || !!(ccDeleteDialog && ccDeleteDialog.loading)}
+            title="Delete worktree, branch, and cycle docs — safety report shown before confirm"
+            onclick=${() => openCycleDeleteDialog(cycle.id)}>${ccDeleting[cycle.id] ? 'Deleting…' : 'Delete'}</button>` : null}
           <div class="cc-ws-switcher-wrap">
             <button class="btn btn-sm" data-testid="ws-cycle-switcher-btn" onclick=${() => setCcWsSwitcherOpen(!ccWsSwitcherOpen)}>Cycle switcher</button>
             ${ccWsSwitcherOpen ? html`<div class="cc-ws-switcher-menu" data-testid="ws-cycle-switcher-menu">
@@ -7430,6 +7561,7 @@ function App() {
         ${ccWsTab === 'implementation' && ccGracefulStopNote[cycle.id] ? html`<div class="cc-ws-impl-subtitle text-sec" data-testid="ws-graceful-stop-note">${ccGracefulStopNote[cycle.id]}</div>` : null}
         ${ccCompleteNote[cycle.id] ? html`<div class="cc-ws-impl-subtitle text-sec" data-testid="ws-complete-cycle-note">${ccCompleteNote[cycle.id]}</div>` : null}
         ${ccArchiveNote[cycle.id] ? html`<div class="cc-ws-impl-subtitle text-sec" data-testid="ws-archive-cycle-note">${ccArchiveNote[cycle.id]}</div>` : null}
+        ${ccDeleteNote[cycle.id] ? html`<div class="cc-ws-impl-subtitle text-sec" data-testid="ws-delete-cycle-note">${ccDeleteNote[cycle.id]}</div>` : null}
       </div>
 
       <div class="tab-strip" data-testid="ws-phase-tabs">
@@ -7444,6 +7576,7 @@ function App() {
           : activeTabDef.key === 'final_tests' ? renderFinalTestsBody()
           : html`${activeTabDef.label} — lands in ${activeTabDef.lands}.`}
       </div>
+      ${renderCycleDeleteDialog()}
     </div>`;
   };
 
@@ -7563,6 +7696,10 @@ function App() {
                       disabled=${!!ccArchiving[row.id]}
                       title="Return to Completed"
                       onclick=${(e) => { e.stopPropagation(); unarchiveCycleAction(row.id); }}>${ccArchiving[row.id] ? 'Un-archiving…' : 'Un-archive'}</button>` : null}
+                    ${(ccOvBucket === 'completed' || ccOvBucket === 'archived') ? html`<button type="button" class="btn btn-sm btn-danger" data-testid=${`ov-delete-${row.id}`}
+                      disabled=${!!ccDeleting[row.id] || !!(ccDeleteDialog && ccDeleteDialog.loading)}
+                      title="Delete worktree, branch, and cycle docs — safety report shown before confirm"
+                      onclick=${(e) => { e.stopPropagation(); openCycleDeleteDialog(row.id); }}>${ccDeleting[row.id] ? 'Deleting…' : 'Delete'}</button>` : null}
                   </div>`)}
                 </div>`
               : html`<div class="cc-cards-grid" data-testid="ov-cards-grid">
@@ -7603,6 +7740,7 @@ function App() {
                 </div>`
         ) : null}
       </div>
+      ${renderCycleDeleteDialog()}
     </div>`;
   };
 

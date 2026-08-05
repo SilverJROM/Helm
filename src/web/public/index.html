@@ -281,6 +281,17 @@ select option{background:var(--surface)}
 .cc-nc-radio-sub { font-size: 11px; margin-top: 2px; }
 .cc-nc-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 6px; }
 
+/* B14 / R2.4: Delete confirm dialog — centered scrim; safety report ALWAYS above destructive confirm. */
+.cc-del-scrim { position: fixed; inset: 0; z-index: 120; background: rgba(0,0,0,.45); display: flex; align-items: center; justify-content: center; padding: 16px; }
+.cc-del-dialog { width: 440px; max-width: calc(100vw - 32px); display: flex; flex-direction: column; gap: 10px; padding: 16px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); box-shadow: 0 12px 32px rgba(0,0,0,0.4); }
+.cc-del-report { border: 1px solid var(--border); border-radius: 8px; background: var(--surface-2); padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
+.cc-del-report-title { font-size: 11px; font-weight: 700; color: var(--text); text-transform: uppercase; letter-spacing: .03em; }
+.cc-del-facts { margin: 0; display: flex; flex-direction: column; gap: 6px; }
+.cc-del-fact { display: grid; grid-template-columns: 150px 1fr; gap: 8px; font-size: 12px; }
+.cc-del-fact dt { margin: 0; color: var(--text-sec); font-weight: 600; }
+.cc-del-fact dd { margin: 0; color: var(--text); }
+.cc-del-narrative { font-size: 11px; white-space: pre-wrap; border-top: 1px solid var(--border); padding-top: 8px; }
+
 /* B6-T01: project cycle workspace shell (header + cycle switcher + phase tabs). Scoped to cc-ws-*.
    Parity ref: v2.1-02-discovery.png / v2.1-03-planning.png header region. */
 /* B5 / R6.26: header chrome ≤2 rows — avoid flex-wrap accident that parks Minimize alone on row 3. */
