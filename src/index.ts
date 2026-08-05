@@ -72,6 +72,7 @@ import { ProjectDocsService } from "./services/project-docs-service.js";
 import { ProjectStatusService } from "./services/project-status-service.js";
 import { TaskService } from "./services/task-service.js";
 import { CycleService } from "./services/cycle-service.js";
+import { GitWorktreeService } from "./services/git-worktree-service.js";
 import { CycleDocsService } from "./services/cycle-docs-service.js";
 import { CycleChatFileService } from "./services/cycle-chat-file-service.js";
 import { CANONICAL_CYCLE_ARTIFACTS } from "./services/cycle-artifact-paths.js";
@@ -397,8 +398,15 @@ async function main(): Promise<void> {
   // C4/B13: ProjectDocsService (P4). Read .md review surface + B13 helm_docs write/delete (owner-guarded PUT/DELETE).
   const projectDocsService = new ProjectDocsService(projectService);
 
+  // B10a (R4.1/R4.2): shared cycle-scoped git worktree service — injected into CycleService so a
+  // direct createCycle can provisionally cut helm/cycle/<id>/<slug> from main. Production cycle
+  // start (POST /api/projects/:id/cycles) goes through startCycleWithBranchOnboarding, which
+  // passes skipGitWorktree so B20's survey→live-base→establishCycleBranch remains the single
+  // live B6 call path (R7.1). B10b will also revalidate via this service.
+  const gitWorktreeService = new GitWorktreeService(db);
+
   // B2-T01: CycleService (create only for this slice). Folder creation fenced to project.directory.
-  const cycleService = new CycleService(db, projectService);
+  const cycleService = new CycleService(db, projectService, gitWorktreeService);
   const cycleDocsService = new CycleDocsService(cycleService);
   // B8 / R6.27: thin HTTP over B7 CycleChatFileService (project tmp/<cycle-folder>/ chat-files).
   const cycleChatFileService = new CycleChatFileService(cycleService);

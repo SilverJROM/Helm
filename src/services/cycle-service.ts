@@ -9,6 +9,7 @@ import {
   type EffectiveTopology,
 } from './inheritance-service.js';
 import { TopologyFreezeService } from './topology-freeze-service.js';
+import type { GitWorktreeService } from './git-worktree-service.js';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
@@ -150,7 +151,12 @@ export class CycleService {
 
   constructor(
     private readonly db: DatabaseService,
-    private readonly projectService: ProjectService
+    private readonly projectService: ProjectService,
+    // B10a (R4.1/R4.2): optional — when wired, a freshly created cycle immediately gets its own
+    // branch + worktree (default base `main`). Absent (most unit tests) => cycles stay
+    // null-identity (R4.4 legacy), zero git commands. B20's survey→live-base path passes
+    // skipGitWorktree so create stays null until recordCycleBaseChoice (R7.1).
+    private readonly gitWorktreeService?: GitWorktreeService
   ) {
     this.inheritance = new InheritanceService(db);
     this.topologyFreeze = new TopologyFreezeService(db);
@@ -182,13 +188,17 @@ export class CycleService {
    * autonomy: omitted -> inherit project.autonomy_default (R-E2); provided -> use override.
    * finalTestsInput: omitted -> inherit project.final_tests_default (R-G1); provided -> use override.
    * clock/getNow: injectable at API boundary for test determinism (no Date.now() deep in impl).
+   * options.skipGitWorktree: B20 onboarding sets this so survey→live base choice remains the sole
+   * production B6 path (R7.1); B10a's provisional create→B6 only runs when the service is wired
+   * and this flag is absent.
    */
   async createCycle(
     projectId: number,
     name: string,
     autonomyInput?: unknown,
     finalTestsInput?: unknown,
-    getNow: () => Date = () => new Date()
+    getNow: () => Date = () => new Date(),
+    options?: { skipGitWorktree?: boolean }
   ): Promise<Cycle> {
     const project = this.projectService.getProject(projectId);
     if (!project) {
@@ -225,7 +235,7 @@ export class CycleService {
       throw err;
     }
 
-    const row = this.db.prepare(
+    let row = this.db.prepare(
       `INSERT INTO cycles (project_id, name, folder_name, phase, autonomy, status, final_tests_enabled)
        VALUES (?, ?, ?, 'discovery', ?, 'active', ?) RETURNING *`
     ).get(projectId, trimmed, folder_name, autonomy, final_tests_enabled ? 1 : 0) as any;
@@ -234,6 +244,27 @@ export class CycleService {
     const folderPath = path.join(cycleRoot, folder_name);
     // fence: always under project.directory
     await fs.mkdir(folderPath, { recursive: true });
+
+    // B10a (R4.1/R4.2): provisional cycle-start call to B6 with default base `main`. B6 itself
+    // verifies then persists git_* and compensates (removes worktree + branch) if persist fails —
+    // no half-built identity. Soft-skip on failure: R4.4 forbids inferring/repairing an identity,
+    // so a refused create is indistinguishable from a pre-existing null-identity legacy cycle.
+    // B20 passes skipGitWorktree so production survey→choice remains the single live B6 path.
+    if (this.gitWorktreeService && !options?.skipGitWorktree) {
+      try {
+        await this.gitWorktreeService.createCycleWorktree({
+          projectDir: project.directory,
+          cycleId: Number(row.id),
+          slug,
+          baseRef: 'main'
+        });
+        row = this.db.prepare('SELECT * FROM cycles WHERE id = ?').get(row.id) as any;
+      } catch (e: any) {
+        console.warn(
+          `[CycleService] cycle ${row.id} worktree-at-start skipped (legacy null-identity path): ${e?.message || e}`
+        );
+      }
+    }
 
     return {
       ...rowToCycle(row),

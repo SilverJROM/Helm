@@ -118,7 +118,9 @@ export interface CycleCreator {
     projectId: number,
     name: string,
     autonomyInput?: unknown,
-    finalTestsInput?: unknown
+    finalTestsInput?: unknown,
+    getNow?: () => Date,
+    options?: { skipGitWorktree?: boolean }
   ): Promise<Cycle>;
 }
 
@@ -149,7 +151,16 @@ export async function startCycleWithBranchOnboarding(params: {
 }): Promise<CycleStartOnboarding> {
   const { cycleService, db, projectId, name } = params;
 
-  const cycle = await cycleService.createCycle(projectId, name, params.autonomy, params.finalTests);
+  // R7.1: deliberately skip B10a's provisional create→B6 wire — branch/worktree wait for
+  // JROM's live base choice via recordCycleBaseChoice (establishCycleBranch is the sole live B6 path).
+  const cycle = await cycleService.createCycle(
+    projectId,
+    name,
+    params.autonomy,
+    params.finalTests,
+    () => new Date(),
+    { skipGitWorktree: true }
+  );
 
   let survey: CycleBranchSurvey;
   try {

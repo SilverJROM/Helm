@@ -405,7 +405,7 @@ describe('cycle-branch-lifecycle B20: survey -> JROM live choice -> ONLY THEN B6
     }
   });
 
-  it('grep proves exactly one cycle-start call site to B6 (`.createCycleWorktree(`)', () => {
+  it('grep proves cycle-start B6 call sites are only onboarding + B10a provisional create', () => {
     const files: string[] = [];
     const walk = (dir: string) => {
       for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -421,17 +421,26 @@ describe('cycle-branch-lifecycle B20: survey -> JROM live choice -> ONLY THEN B6
     walk(SRC_DIR);
 
     const callPattern = /\.createCycleWorktree\s*\(/;
-    const callSites = files.filter((f) => callPattern.test(fs.readFileSync(f, 'utf8')));
+    const callSites = files
+      .filter((f) => callPattern.test(fs.readFileSync(f, 'utf8')))
+      .map((f) => path.relative(SRC_DIR, f))
+      .sort();
 
-    expect(callSites).toHaveLength(1);
-    expect(callSites[0]).toBe(path.join(SRC_DIR, 'services', 'cycle-branch-onboarding-service.ts'));
+    // B10a: CycleService.createCycle (provisional default main; skipped by onboarding via
+    // skipGitWorktree). B20: establishCycleBranch after live base choice (the live production path).
+    expect(callSites).toEqual([
+      'services/cycle-branch-onboarding-service.ts',
+      'services/cycle-service.ts',
+    ]);
   });
 
   it('src/index.ts wires production cycle start into survey -> choice -> B6 (no bypass call site)', () => {
     const index = fs.readFileSync(INDEX_TS, 'utf8');
 
     // the cycle-start route and the two follow-on routes are both registered from production code
-    expect(index).toContain("import { startCycleWithBranchOnboarding } from \"./services/cycle-branch-onboarding-service.js\"");
+    expect(index).toMatch(
+      /import\s*\{[^}]*\bstartCycleWithBranchOnboarding\b[^}]*\}\s*from\s*"\.\/services\/cycle-branch-onboarding-service\.js"/
+    );
     expect(index).toContain('registerCycleBranchOnboardingRoutes(app, {');
 
     // POST /api/projects/:id/cycles goes through the onboarding entry, and no longer creates a
