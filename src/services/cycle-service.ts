@@ -48,6 +48,16 @@ export interface Cycle {
   folder_path?: string;
 }
 
+/** B16 (R6.2): result of an owner-gated merge attempt / cleanup retry / idempotent no-op. */
+export interface MergeCycleBranchResult {
+  cycleId: number;
+  merged: boolean;
+  cleaned: boolean;
+  mergedAt: string | null;
+  /** true when this call was a no-op because the cycle was already merged+cleaned before it ran. */
+  alreadyMerged?: boolean;
+}
+
 export function normalizeFinalTestsEnabled(value: unknown, fallback = true): boolean {
   if (value == null || value === '') return fallback;
   if (typeof value === 'boolean') return value;
@@ -808,6 +818,134 @@ export class CycleService {
     return {
       ...rowToCycle(cycleRow),
       folder_path: docDir
+    };
+  }
+
+  /**
+   * B16 (R6.2): owner-gated merge — CAS/idempotent. Revalidates (no active workers, persisted
+   * identity matches `git worktree list`, cycle branch clean, base ref exists and its checkout is
+   * clean and unambiguous), merges `--no-ff` into the persisted base, then calls the GIT-ONLY
+   * `cleanupCycleGit` primitive so the cycle's docs survive for the Completed bucket (B19). A
+   * cleanup failure AFTER the merge has landed sets `git_cleanup_pending`; a later call retries
+   * ONLY the cleanup — the landed merge is never replayed or rolled back. A failure BEFORE the
+   * merge lands (dirty base, lost CAS race) restores `awaiting_merge=1` so the cycle stays
+   * retryable and no merge ever ran. A repeat call after a full merge+cleanup is a no-op.
+   */
+  async mergeCycleBranch(cycleId: number): Promise<MergeCycleBranchResult> {
+    const cycleRow = this.db.prepare('SELECT * FROM cycles WHERE id = ?').get(cycleId) as any;
+    if (!cycleRow) {
+      const err: any = new Error('unknown cycle');
+      err.code = 'NOT_FOUND';
+      throw err;
+    }
+    const project = this.projectService.getProject(Number(cycleRow.project_id));
+    if (!project) {
+      const err: any = new Error('unknown project');
+      err.code = 'NOT_FOUND';
+      throw err;
+    }
+    if (!this.gitWorktreeService) {
+      throw new Error('git worktree service not wired — cannot merge');
+    }
+
+    if (Number(cycleRow.git_cleanup_pending) === 1) {
+      return this.retryMergeCleanup(project.directory, cycleId, cycleRow);
+    }
+
+    if (cycleRow.git_merged_at != null) {
+      return {
+        cycleId,
+        merged: true,
+        cleaned: true,
+        mergedAt: String(cycleRow.git_merged_at),
+        alreadyMerged: true
+      };
+    }
+
+    if (!Number(cycleRow.awaiting_merge)) {
+      const err: any = new Error(`cycle ${cycleId} is not awaiting merge`);
+      err.code = 'CONFLICT';
+      throw err;
+    }
+
+    const branch = cycleRow.git_branch as string | null;
+    const baseBranch = cycleRow.git_base_branch as string | null;
+    const worktreePath = cycleRow.git_worktree_path as string | null;
+    const worktreeId = cycleRow.git_worktree_id as string | null;
+    if (!branch || !baseBranch || !worktreePath || !worktreeId) {
+      throw new Error(`cycle ${cycleId} has no persisted git identity to merge`);
+    }
+
+    if (this.hasActiveWorkersForCycle(cycleId)) {
+      const err: any = new Error(`cannot merge: active agents or open handles for cycle ${cycleId}`);
+      err.code = 'CONFLICT';
+      throw err;
+    }
+
+    // R6.2: trust nothing — revalidate the persisted identity against live git state before any
+    // mutation, same fail-closed posture as B10b's verifyPersistedWorktree callers.
+    await this.gitWorktreeService.verifyPersistedWorktree(project.directory, { worktreePath, branch });
+
+    // CAS claim: the sole gate between revalidation and the actual merge. A concurrent second call
+    // that reaches this UPDATE after the first has already flipped awaiting_merge loses the race
+    // (changes !== 1) and refuses here — no merge, no double submit.
+    const claim = this.db.prepare(
+      `UPDATE cycles SET awaiting_merge = 0
+       WHERE id = ? AND awaiting_merge = 1 AND git_merged_at IS NULL AND git_cleanup_pending = 0`
+    ).run(cycleId);
+    if (claim.changes !== 1) {
+      const err: any = new Error(`cycle ${cycleId} merge already claimed by a concurrent call`);
+      err.code = 'CONFLICT';
+      throw err;
+    }
+
+    try {
+      await this.gitWorktreeService.mergeCycleIntoBase(project.directory, {
+        cycleId,
+        cycleBranch: branch,
+        baseBranch,
+        cycleWorktreePath: worktreePath
+      });
+    } catch (e) {
+      // No merge landed — release the claim so the cycle stays retryable (e.g. after the base
+      // checkout is cleaned up).
+      this.db.prepare('UPDATE cycles SET awaiting_merge = 1 WHERE id = ?').run(cycleId);
+      throw e;
+    }
+
+    // The merge is durable from here on — git_merged_at is never cleared or replayed by this
+    // method again, regardless of what happens to cleanup below.
+    const mergedAt = new Date().toISOString();
+    this.db.prepare('UPDATE cycles SET git_merged_at = ? WHERE id = ?').run(mergedAt, cycleId);
+
+    try {
+      await this.gitWorktreeService.cleanupCycleGit(project.directory, cycleId);
+    } catch (e) {
+      this.db.prepare('UPDATE cycles SET git_cleanup_pending = 1 WHERE id = ?').run(cycleId);
+      throw e;
+    }
+
+    return { cycleId, merged: true, cleaned: true, mergedAt };
+  }
+
+  /** B16: cleanup-only retry path for a cycle whose merge already landed but cleanup failed. */
+  private async retryMergeCleanup(
+    projectDir: string,
+    cycleId: number,
+    cycleRow: any
+  ): Promise<MergeCycleBranchResult> {
+    if (this.hasActiveWorkersForCycle(cycleId)) {
+      const err: any = new Error(`cannot retry cleanup: active agents or open handles for cycle ${cycleId}`);
+      err.code = 'CONFLICT';
+      throw err;
+    }
+    await this.gitWorktreeService!.cleanupCycleGit(projectDir, cycleId);
+    this.db.prepare('UPDATE cycles SET git_cleanup_pending = 0 WHERE id = ?').run(cycleId);
+    return {
+      cycleId,
+      merged: true,
+      cleaned: true,
+      mergedAt: cycleRow.git_merged_at != null ? String(cycleRow.git_merged_at) : null
     };
   }
 }

@@ -160,15 +160,17 @@ describe('cycle-branch-lifecycle B15: terminalizeCycleAtRunEnd parks persisted-i
     };
     walk(SRC_DIR);
 
-    const callPattern = /\bmergeCycleBranch\s*\(/;
+    // B16 landed `CycleService.mergeCycleBranch` as the owner-gated entry point (definition site:
+    // services/cycle-service.ts). A bare `\bmergeCycleBranch\s*\(` pattern would match that
+    // definition too, so this greps for INVOCATIONS specifically — always dot-prefixed member
+    // calls (`x.mergeCycleBranch(...)`) — which the definition itself never is. Zero invocations
+    // must remain anywhere until B18 wires the explicit, human-confirmed UI action.
+    const callPattern = /\.mergeCycleBranch\s*\(/;
     const callSites = files
       .filter((f) => callPattern.test(fs.readFileSync(f, 'utf8')))
       .map((f) => path.relative(SRC_DIR, f))
       .sort();
 
-    // B16 (R6.2) has not landed yet — terminalizeCycleAtRunEnd (this slice) parks instead of
-    // merging, so there must be zero call sites anywhere in src/ until B16's owner-gated entry
-    // point exists. Re-run after B16 lands to prove it stays out of every autonomous path.
     expect(callSites).toEqual([]);
   });
 });

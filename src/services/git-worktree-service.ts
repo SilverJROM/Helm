@@ -238,6 +238,52 @@ export class GitWorktreeService {
     return { cycleId, branch, worktreePath, cleaned: true };
   }
 
+  /**
+   * B16 (R6.2): GIT-ONLY merge primitive. Refuses (no mutation) unless the cycle's own worktree is
+   * clean, the persisted base ref exists, AND that base branch is checked out in EXACTLY one
+   * worktree (unambiguous) whose status is clean — only then merges `--no-ff` into that checkout.
+   * Writes nothing to the DB and never touches docs; the caller (CycleService.mergeCycleBranch)
+   * owns the CAS claim, the `git_merged_at`/`git_cleanup_pending` flags, and the call into
+   * `cleanupCycleGit`.
+   */
+  async mergeCycleIntoBase(
+    projectDir: string,
+    params: { cycleId: number; cycleBranch: string; baseBranch: string; cycleWorktreePath: string }
+  ): Promise<{ baseWorktreePath: string }> {
+    const { cycleId, cycleBranch, baseBranch, cycleWorktreePath } = params;
+
+    await this.assertWorktreeClean(cycleWorktreePath, `cycle ${cycleId} branch '${cycleBranch}'`);
+
+    if (!(await this.refExists(projectDir, `refs/heads/${baseBranch}`))) {
+      throw new Error(`base ref does not exist: ${baseBranch}`);
+    }
+    const baseMatches = (await this.listWorktrees(projectDir)).filter(
+      (w) => w.branch === `refs/heads/${baseBranch}`
+    );
+    if (baseMatches.length === 0) {
+      throw new Error(`base branch '${baseBranch}' is not checked out in any worktree — refusing merge`);
+    }
+    if (baseMatches.length > 1) {
+      throw new Error(`base branch '${baseBranch}' is checked out in ${baseMatches.length} worktrees — ambiguous`);
+    }
+    const baseWorktreePath = baseMatches[0].worktree;
+    await this.assertWorktreeClean(baseWorktreePath, `base branch '${baseBranch}' checkout`);
+
+    await this.git(baseWorktreePath, [
+      'merge', '--no-ff', cycleBranch,
+      '-m', `Merge cycle ${cycleId} (${cycleBranch}) into ${baseBranch}`
+    ]);
+
+    return { baseWorktreePath };
+  }
+
+  private async assertWorktreeClean(worktreePath: string, label: string): Promise<void> {
+    const { stdout } = await this.git(worktreePath, ['status', '--porcelain']);
+    if (stdout.trim() !== '') {
+      throw new Error(`${label} is not clean — refusing merge`);
+    }
+  }
+
   private readCycleGitIdentity(
     cycleId: number
   ): { git_branch: string | null; git_base_branch: string | null; git_worktree_path: string | null } | undefined {
