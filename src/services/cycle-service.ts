@@ -760,4 +760,54 @@ export class CycleService {
       folder_path: this.getCycleDocDir(cycleId)
     };
   }
+
+  /**
+   * B12 (R2.2/R2.3): deletes a cycle's on-disk artifacts — composes the GIT-ONLY
+   * `cleanupCycleGit` primitive (worktree + branch, refuses on base/wrong-namespace) with removal
+   * of the cycle's docs folder. Per R2.2(d) this is artifact retirement, not a DB purge: the
+   * `cycles` row and all DB history (`runs`, `run_tasks`, `planning_provenance`,
+   * `worker_runtimes`) are left completely untouched. Refuses (409) while agents/workers are still
+   * open on this cycle — checked here directly so the refusal holds even in the (test-only)
+   * unwired-GitWorktreeService path. Confirm-step / autonomy gating (R2.3) is a caller concern
+   * (B13/B14), not this primitive's.
+   */
+  async deleteCycle(cycleId: number): Promise<Cycle> {
+    const cycleRow = this.db.prepare('SELECT * FROM cycles WHERE id = ?').get(cycleId) as any;
+    if (!cycleRow) {
+      const err: any = new Error('unknown cycle');
+      err.code = 'NOT_FOUND';
+      throw err;
+    }
+
+    const project = this.projectService.getProject(Number(cycleRow.project_id));
+    if (!project) {
+      const err: any = new Error('unknown project');
+      err.code = 'NOT_FOUND';
+      throw err;
+    }
+
+    if (this.hasActiveWorkersForCycle(cycleId)) {
+      const err: any = new Error('cannot delete: active agents or open handles for this cycle');
+      err.code = 'CONFLICT';
+      throw err;
+    }
+
+    if (this.gitWorktreeService) {
+      await this.gitWorktreeService.cleanupCycleGit(project.directory, cycleId);
+    }
+
+    const docDir = this.getCycleDocDir(cycleId);
+    const base = path.resolve(project.directory);
+    if (!path.resolve(docDir).startsWith(base)) {
+      const err: any = new Error('path escape detected');
+      err.code = 'FORBIDDEN';
+      throw err;
+    }
+    await fs.rm(docDir, { recursive: true, force: true });
+
+    return {
+      ...rowToCycle(cycleRow),
+      folder_path: docDir
+    };
+  }
 }

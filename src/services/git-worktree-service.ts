@@ -31,9 +31,22 @@ export interface CreateCycleWorktreeParams {
   baseRef: string;
 }
 
-/** Structural subset of DatabaseService used here — lets tests inject a failing persister. */
+/** Structural subset of DatabaseService used here — lets tests inject a failing persister.
+ * `get` is optional so pre-B12 test doubles (which only ever exercised `run`) keep compiling —
+ * `cleanupCycleGit` is the only method that reads via `get`. */
 export interface DbLike {
-  prepare(sql: string): { run(...params: unknown[]): { changes: number } };
+  prepare(sql: string): {
+    run(...params: unknown[]): { changes: number };
+    get?(...params: unknown[]): any;
+  };
+}
+
+export interface CleanupCycleGitResult {
+  cycleId: number;
+  branch: string | null;
+  worktreePath: string | null;
+  /** false when the cycle had no persisted git identity (R4.4 legacy/never-provisioned) — no-op. */
+  cleaned: boolean;
 }
 
 /**
@@ -161,6 +174,92 @@ export class GitWorktreeService {
       return canonWorktree;
     }
     throw new Error(`persisted worktree not found in 'git worktree list --porcelain': ${canonWorktree}`);
+  }
+
+  /**
+   * B12 (R2.2/R4.1): GIT-ONLY cleanup primitive shared by delete (B12's `deleteCycle`) and merge
+   * (B16) — `git worktree remove --force` + `git worktree prune` + `git branch -D`. Touches no
+   * filesystem docs and writes nothing to the DB; the only DB use is the read needed to resolve
+   * the persisted identity and to refuse while agents/workers are still open on this cycle.
+   * Refuses (fails closed, no git mutation) unless the persisted branch is namespaced under
+   * `helm/cycle/<cycleId>/` and differs from the cycle's own base branch — a corrupted or
+   * mismatched persisted branch must never reach `branch -D`. A cycle with no persisted git
+   * identity (R4.4 legacy/never-provisioned) is a no-op, not a refusal.
+   */
+  async cleanupCycleGit(projectDir: string, cycleId: number): Promise<CleanupCycleGitResult> {
+    if (!Number.isInteger(cycleId) || cycleId <= 0) {
+      throw new Error(`invalid cycleId: ${String(cycleId)}`);
+    }
+
+    const cycleRow = this.readCycleGitIdentity(cycleId);
+    if (!cycleRow) {
+      throw new Error(`unknown cycle: ${cycleId}`);
+    }
+
+    if (this.hasActiveWorkers(cycleId)) {
+      const err: any = new Error(
+        `refusing git cleanup for cycle ${cycleId}: active agents or open handles for this cycle`
+      );
+      err.code = 'CONFLICT';
+      throw err;
+    }
+
+    const { git_branch: branch, git_base_branch: baseBranch, git_worktree_path: worktreePath } = cycleRow;
+
+    if (!branch && !worktreePath) {
+      return { cycleId, branch: null, worktreePath: null, cleaned: false };
+    }
+    if (!branch || !worktreePath) {
+      throw new Error(
+        `cycle ${cycleId} has a partial git identity (branch=${branch ?? 'null'}, worktreePath=${worktreePath ?? 'null'}) — refusing cleanup`
+      );
+    }
+
+    const expectedPrefix = `helm/cycle/${cycleId}/`;
+    if (!branch.startsWith(expectedPrefix)) {
+      const err: any = new Error(
+        `refusing cleanup: persisted branch '${branch}' for cycle ${cycleId} is outside the ${expectedPrefix} namespace`
+      );
+      err.code = 'FORBIDDEN';
+      throw err;
+    }
+    if (branch === baseBranch) {
+      const err: any = new Error(
+        `refusing cleanup: persisted branch for cycle ${cycleId} equals its own base branch (${branch})`
+      );
+      err.code = 'FORBIDDEN';
+      throw err;
+    }
+
+    await this.git(projectDir, ['worktree', 'remove', '--force', worktreePath]);
+    await this.git(projectDir, ['worktree', 'prune']);
+    await this.git(projectDir, ['branch', '-D', branch]);
+
+    return { cycleId, branch, worktreePath, cleaned: true };
+  }
+
+  private readCycleGitIdentity(
+    cycleId: number
+  ): { git_branch: string | null; git_base_branch: string | null; git_worktree_path: string | null } | undefined {
+    const stmt = this.db.prepare('SELECT git_branch, git_base_branch, git_worktree_path FROM cycles WHERE id = ?');
+    if (typeof stmt.get !== 'function') {
+      throw new Error('DbLike.get is required for cleanupCycleGit');
+    }
+    return stmt.get(cycleId);
+  }
+
+  private hasActiveWorkers(cycleId: number): boolean {
+    const stmt = this.db.prepare(
+      `SELECT COUNT(*) AS c
+       FROM worker_runtimes wr
+       INNER JOIN runs r ON r.id = wr.run_id
+       WHERE r.cycle_id = ? AND wr.state IN ('launching', 'running')`
+    );
+    if (typeof stmt.get !== 'function') {
+      throw new Error('DbLike.get is required for cleanupCycleGit');
+    }
+    const row = stmt.get(cycleId) as { c: number } | undefined;
+    return Number(row?.c ?? 0) > 0;
   }
 
   private async resolveRepoRoot(projectDir: string): Promise<string> {
