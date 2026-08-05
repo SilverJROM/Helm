@@ -173,6 +173,14 @@ export class RunOrchestratorService {
       finishPlanning?(cycleId: number): unknown;
       setCyclePhase?(cycleId: number, phase: string): unknown;
     };
+    // B10b (R4.1/R4.2): revalidates a cycle's PERSISTED worktree identity (strict canonical
+    // containment under the registered root + live membership/branch match in `git worktree
+    // list`) before a cyclePlan dispatch trusts it as the build root. Absent => every cyclePlan
+    // run takes the legacy `<cycle-docs>/repo` path, byte-identical to before this slice.
+    // Typed structurally to avoid a service import cycle.
+    gitWorktreeService?: {
+      verifyPersistedWorktree(projectDir: string, identity: { worktreePath: string; branch: string }): Promise<string>;
+    };
     // A1a (seat-binary pre-flight): when provided, the run refuses to start if any rostered model's
     // launch CLI is not on the seat's PATH (the "binary vanished" bug) — instead of discovering it as a
     // per-seat generic timeout mid-run. Optional (like the other injected runners): absent => skipped.
@@ -1353,6 +1361,11 @@ export class RunOrchestratorService {
     let effectiveProjectDir = project.directory;
     let resolvedCycleWorkspace: string | null = null;
     let canonicalArtifactRoot = runDir;
+    // B10b (R4.1/R4.3): persisted, revalidated cycle git identity — threaded to OrchestratorLoop so
+    // the implementer/validator/final-validation seats get the cycle-scoped git Landlock grant
+    // (B7/B8/B9). Absent for every legacy (null-identity) cycle and every non-cyclePlan run —
+    // byte-identical no-op.
+    let cycleGitIdentity: { id: number; git_worktree_path: string | null; git_worktree_id: string | null; projectDir: string } | undefined;
     if (input.cyclePlan && input.cycleId != null && !input.seedPlan) {
       // Mark the (pre-created) run blocked + drop a reason artifact, then hand back the Error to throw.
       const invalid = async (reason: string): Promise<Error> => {
@@ -1366,14 +1379,16 @@ export class RunOrchestratorService {
         return new Error(`cycle-plan run refused: ${reason}`);
       };
       if (!this.deps.cycleService) throw await invalid('cycleService not wired (cannot resolve the cycle workspace)');
-      // Establish the cycle status and FAIL CLOSED on unknown (no row / query failure) — never build on a
+      // Establish the cycle row and FAIL CLOSED on unknown (no row / query failure) — never build on a
       // cycle whose lifecycle can't be confirmed. Reject completed archives (getCycleDocDir maps
       // status='completed' → cycle/completed/<name>, a reviewable archive, never a writable build).
-      let cycleStatus: string | null = null;
+      // B10b: the full row (not just status) is fetched once here — its git_* columns are the ONLY
+      // source for effectiveProjectDir's split below (never a brief field or a fresh git probe).
+      let cycleRow: any = null;
       try {
-        const cr = this.deps.artifacts['db'].raw.prepare('SELECT status FROM cycles WHERE id=?').get(input.cycleId) as any;
-        cycleStatus = cr ? String(cr.status) : null;
-      } catch { cycleStatus = null; }
+        cycleRow = this.deps.artifacts['db'].raw.prepare('SELECT * FROM cycles WHERE id=?').get(input.cycleId) as any;
+      } catch { cycleRow = null; }
+      const cycleStatus: string | null = cycleRow ? String(cycleRow.status) : null;
       if (cycleStatus === null) throw await invalid(`cannot establish status for cycle ${input.cycleId} (no cycle row / query failed) — refusing to build on an unknown-state cycle`);
       if (cycleStatus === 'completed') throw await invalid(`cycle ${input.cycleId} is completed — its archive must not be reopened as a writable build`);
       let ws: string;
@@ -1399,27 +1414,57 @@ export class RunOrchestratorService {
       }
       resolvedCycleWorkspace = canonWs;
       canonicalArtifactRoot = canonWs;
-      // helm-sandbox (Landlock) enters PROTECTED-ROOT mode whenever `north-star.md` exists at the fence
-      // root — and it DOES at the cycle-workspace root (a cycle doc). That mode issues no MAKE_REG/MAKE_DIR
-      // on the root (denial-by-omission to keep north-star.md non-writable), so a from-scratch scaffold
-      // CANNOT create new top-level files there (package.json, tsconfig, ...) → EPERM. Build in a dedicated
-      // subdir of the workspace instead: it holds no north-star.md → SCAFFOLD mode → the implementer writes
-      // freely, while the cycle's north-star/plan/decisions stay protected at the workspace root. Plan
-      // ingest still reads plan.md from resolvedCycleWorkspace (the workspace), not this build dir. The
-      // build dir is created here (server-side, unfenced) so the fence has an existing dir to lock onto.
-      const buildDir = path.join(canonWs, CYCLE_BUILD_SUBDIR);
-      let canonBuild: string;
-      try {
-        await fs.mkdir(buildDir, { recursive: true });
-        canonBuild = await fs.realpath(buildDir);
-      } catch (e: any) {
-        throw await invalid(`cannot create/resolve cycle build dir ${buildDir}: ${e?.message || e}`);
+
+      // B10b (R4.1/R4.2/R4.4): docs root (above) never changes — the BUILD root now splits on the
+      // cycle's PERSISTED git identity. An R4 (worktree-backed) cycle's build root is its worktree,
+      // revalidated once; it never falls back to <ws>/repo. A null-identity legacy cycle keeps
+      // EXACTLY today's path below and issues zero git commands — never inferred, never repaired.
+      const gitWorktreePath = cycleRow.git_worktree_path != null ? String(cycleRow.git_worktree_path) : null;
+      const gitWorktreeId = cycleRow.git_worktree_id != null ? String(cycleRow.git_worktree_id) : null;
+      const gitBranch = cycleRow.git_branch != null ? String(cycleRow.git_branch) : null;
+
+      if (gitWorktreePath != null || gitWorktreeId != null) {
+        // Partial identity is a caller/persist bug — fail closed, never half-trust it.
+        if (gitWorktreePath == null || gitWorktreeId == null || gitBranch == null) {
+          throw await invalid(`cycle ${input.cycleId} has a partial git identity (worktree_path/worktree_id/branch must all be persisted together)`);
+        }
+        if (!this.deps.gitWorktreeService) {
+          throw await invalid(`cycle ${input.cycleId} has a persisted git identity but gitWorktreeService is not wired (cannot revalidate)`);
+        }
+        let canonWorktree: string;
+        try {
+          canonWorktree = await this.deps.gitWorktreeService.verifyPersistedWorktree(canonRoot, { worktreePath: gitWorktreePath, branch: gitBranch });
+        } catch (e: any) {
+          throw await invalid(`cycle ${input.cycleId} git identity failed revalidation: ${e?.message || e}`);
+        }
+        effectiveProjectDir = canonWorktree;
+        project = { ...project, directory: canonWorktree };
+        cycleGitIdentity = { id: Number(input.cycleId), git_worktree_path: canonWorktree, git_worktree_id: gitWorktreeId, projectDir: canonRoot };
+      } else {
+        // R4.4 legacy path (today's behavior, unchanged): helm-sandbox (Landlock) enters
+        // PROTECTED-ROOT mode whenever `north-star.md` exists at the fence root — and it DOES at the
+        // cycle-workspace root (a cycle doc). That mode issues no MAKE_REG/MAKE_DIR on the root
+        // (denial-by-omission to keep north-star.md non-writable), so a from-scratch scaffold CANNOT
+        // create new top-level files there (package.json, tsconfig, ...) → EPERM. Build in a
+        // dedicated subdir of the workspace instead: it holds no north-star.md → SCAFFOLD mode → the
+        // implementer writes freely, while the cycle's north-star/plan/decisions stay protected at
+        // the workspace root. Plan ingest still reads plan.md from resolvedCycleWorkspace (the
+        // workspace), not this build dir. The build dir is created here (server-side, unfenced) so
+        // the fence has an existing dir to lock onto.
+        const buildDir = path.join(canonWs, CYCLE_BUILD_SUBDIR);
+        let canonBuild: string;
+        try {
+          await fs.mkdir(buildDir, { recursive: true });
+          canonBuild = await fs.realpath(buildDir);
+        } catch (e: any) {
+          throw await invalid(`cannot create/resolve cycle build dir ${buildDir}: ${e?.message || e}`);
+        }
+        if (canonBuild !== canonWs && !canonBuild.startsWith(canonWs + path.sep)) {
+          throw await invalid(`cycle build dir ${canonBuild} escaped the workspace ${canonWs} (fence-escape guard)`);
+        }
+        effectiveProjectDir = canonBuild;
+        project = { ...project, directory: canonBuild };
       }
-      if (canonBuild !== canonWs && !canonBuild.startsWith(canonWs + path.sep)) {
-        throw await invalid(`cycle build dir ${canonBuild} escaped the workspace ${canonWs} (fence-escape guard)`);
-      }
-      effectiveProjectDir = canonBuild;
-      project = { ...project, directory: canonBuild };
 
       // One canonical handoff replaces FIX #42b's partial og-requirements/decisions copy. Snapshot the
       // complete hyphen-canonical document set for runDir-relative implementation consumers.
@@ -1817,7 +1862,10 @@ export class RunOrchestratorService {
       // no masterRuntime injected (fake-transport tests) → no-op, same as the preflight.
       verifySeatBinary: (this.deps.masterRuntime && process.env.HELM_DISABLE_SEAT_PREFLIGHT !== '1')
         ? this.deps.masterRuntime.makeSeatBinaryVerifier(project.directory)
-        : undefined
+        : undefined,
+      // B10b (R4.1/R4.3): the persisted, revalidated cycle git identity — absent for legacy
+      // (null-identity) cycles and every non-cyclePlan run, so those spawns carry no git env.
+      ...(cycleGitIdentity ? { cycleGitIdentity } : {}),
     });
 
     // helm-algo owns execution from here — reap the planning-brain session so it CANNOT keep working past

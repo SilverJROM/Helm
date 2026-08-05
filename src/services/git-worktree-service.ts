@@ -119,6 +119,50 @@ export class GitWorktreeService {
     return identity;
   }
 
+  /**
+   * B10b (R4.1/R4.2): revalidate a PERSISTED cycle git identity before any caller trusts it as the
+   * effective build root — strict canonical containment under the registered root AND live
+   * membership + branch match in `git worktree list --porcelain`. Never repairs and never infers a
+   * substitute — throws with a precise, distinct reason on any mismatch (removed/stale worktree,
+   * branch drift, fence-escape) so the caller can fail closed with that reason recorded.
+   */
+  async verifyPersistedWorktree(
+    projectDir: string,
+    identity: { worktreePath: string; branch: string }
+  ): Promise<string> {
+    const canonRoot = await fs.realpath(projectDir);
+    let canonWorktree: string;
+    try {
+      canonWorktree = await fs.realpath(identity.worktreePath);
+    } catch (e: any) {
+      throw new Error(`persisted worktree does not resolve: ${identity.worktreePath} (${e?.message || e})`);
+    }
+    const rel = path.relative(canonRoot, canonWorktree);
+    if (canonWorktree === canonRoot || rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) {
+      throw new Error(`persisted worktree ${canonWorktree} is not a strict descendant of registered root ${canonRoot} (fence-escape guard)`);
+    }
+    const st = await fs.stat(canonWorktree);
+    if (!st.isDirectory()) {
+      throw new Error(`persisted worktree path is not a directory: ${canonWorktree}`);
+    }
+
+    const targetRef = `refs/heads/${identity.branch}`;
+    for (const block of await this.listWorktrees(projectDir)) {
+      let blockPath: string;
+      try {
+        blockPath = await fs.realpath(block.worktree);
+      } catch {
+        continue;
+      }
+      if (blockPath !== canonWorktree) continue;
+      if (block.branch !== targetRef) {
+        throw new Error(`persisted worktree is registered on unexpected branch: ${block.branch ?? '(detached)'} (expected ${targetRef})`);
+      }
+      return canonWorktree;
+    }
+    throw new Error(`persisted worktree not found in 'git worktree list --porcelain': ${canonWorktree}`);
+  }
+
   private async resolveRepoRoot(projectDir: string): Promise<string> {
     try {
       const { stdout } = await this.git(projectDir, ['rev-parse', '--show-toplevel']);

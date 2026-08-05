@@ -7361,6 +7361,8 @@ function App() {
       <div class="cc-ws-header">
         <button class="btn btn-sm" data-testid="ws-back" onclick=${ccCloseWorkspace}>← Back</button>
         <div class="cc-ws-title" data-testid="ws-title">${(proj && proj.name) || cycle.project_name} / ${cycle.name}</div>
+        ${cycle.legacyWorkspace ? html`<span class="chip chip-gray" data-testid="ws-legacy-workspace-badge"
+            title="No persisted git identity — this cycle builds in its cycle-docs folder, never inferred or repaired">legacy workspace — no branch</span>` : null}
         <div class="cc-ws-actions">
           <div class="cc-ws-autonomy-wrap">
             <button type="button" class="chip ${autonomyBadge.chip} cc-ws-autonomy-badge" data-testid="ws-autonomy-badge"

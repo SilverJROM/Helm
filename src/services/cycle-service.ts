@@ -80,6 +80,9 @@ export interface CycleOverviewRow {
   progress: { done: number; total: number } | null;
   // B13-T01b: true when the latest run has any failed/deferred run_tasks (R-B5).
   blocked: boolean;
+  // B10b (R4.4): true when this cycle has no persisted git identity — legacy workspace, drives the
+  // UI's "legacy workspace — no branch" marker. Never inferred/repaired; a straight read of the column.
+  legacyWorkspace: boolean;
 }
 
 export interface CyclesOverview {
@@ -105,7 +108,8 @@ function rowToCycleOverviewRow(row: any, progressByCycle: Map<number, { done: nu
     folder_name: String(row.folder_name),
     created_at: String(row.created_at),
     progress: prog ? { done: prog.done, total: prog.total } : null,
-    blocked: Boolean(prog?.blocked)
+    blocked: Boolean(prog?.blocked),
+    legacyWorkspace: row.git_worktree_path == null
   };
 }
 
@@ -369,7 +373,7 @@ export class CycleService {
   listCyclesOverview(): CyclesOverview {
     const rows = this.db.prepare(
       `SELECT c.id, c.project_id, p.name AS project_name, c.name, c.phase, c.autonomy,
-              c.status, c.awaiting_approval, c.folder_name, c.created_at
+              c.status, c.awaiting_approval, c.folder_name, c.created_at, c.git_worktree_path
        FROM cycles c
        JOIN projects p ON p.id = c.project_id
        ORDER BY c.created_at DESC`

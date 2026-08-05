@@ -457,6 +457,7 @@ async function main(): Promise<void> {
     routingConfig: routingConfigService,
     events: eventsService,  // CC-CHAT-2 R3: startRunDetached persists the run prompt as an owner chat bubble
     cycleService,  // IS-R1 (impl-start): cycle-plan implementation-only path resolves <cycle folder>/execution_plan.md
+    gitWorktreeService,  // B10b (R4.1/R4.2): revalidates the persisted worktree identity for cyclePlan dispatch
     masterRuntime: runtimeService,  // A1a: seat-binary pre-flight refuses a run whose rostered CLI is missing on the seat PATH
     plannerPanelService,  // v93: adaptive planner panel config when adaptive_planning ON
   });
