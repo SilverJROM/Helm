@@ -46,6 +46,7 @@ import { HousekeeperService } from "./services/housekeeper-service.js";
 import { HouseUsageSelector } from "./services/house-usage-selector.js";
 import { registerHousekeeperRoutes } from "./api/routes/housekeeper-routes.js";
 import { registerCycleBranchOnboardingRoutes } from "./api/routes/cycle-branch-onboarding-routes.js";
+import { registerCycleDeleteRoutes } from "./api/routes/cycle-delete-routes.js";
 import {
   startCycleWithBranchOnboarding,
   surveyCycleBranches,
@@ -1127,6 +1128,13 @@ async function main(): Promise<void> {
     authMiddleware,
     requireOwnerPre,
     requireLocalLaunchPre,
+  });
+  // B13 / R2.1,R2.4,R3.2: DELETE /api/cycles/:id (completed|archived only) + GET delete-preflight (B5 report).
+  registerCycleDeleteRoutes(app, {
+    db,
+    cycleService,
+    authMiddleware,
+    requireOwnerPre,
   });
 
   app.post('/api/agents/:agentId/chat-session', { preHandler: [authMiddleware, requireOwnerPre, requireLocalLaunchPre] }, async (request: any, reply: any) => {
