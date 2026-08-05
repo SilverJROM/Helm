@@ -50,6 +50,27 @@ export interface CleanupCycleGitResult {
 }
 
 /**
+ * B17 (R6.3): thrown by `mergeCycleIntoBase` for a REAL conflict only — one or more paths git
+ * itself could not merge mechanically. By the time this is thrown, `git merge --abort` has already
+ * restored the base worktree's HEAD/index/files to exactly what they were before the attempt; no
+ * MERGE_HEAD, no partial merge commit. Carries what a caller needs to report the conflict without
+ * re-deriving it (never re-inspects git state itself). A merge failure with zero conflicted paths
+ * (lock contention, hook rejection, etc.) is not this — the caller sees the original error instead.
+ */
+export class MergeConflictError extends Error {
+  readonly code = 'MERGE_CONFLICT' as const;
+  constructor(
+    message: string,
+    readonly conflictedPaths: string[],
+    readonly baseShaBefore: string,
+    readonly cycleBranchSha: string
+  ) {
+    super(message);
+    this.name = 'MergeConflictError';
+  }
+}
+
+/**
  * R4.1/R4.2 (D3): creates the per-cycle branch + `git worktree add`, at a STABLE path
  * (`<project>/cycle/.worktrees/<id>`) that never moves when the docs folder does. Verifies the
  * worktree via `git worktree list --porcelain` before persisting identity, and compensates
@@ -269,12 +290,59 @@ export class GitWorktreeService {
     const baseWorktreePath = baseMatches[0].worktree;
     await this.assertWorktreeClean(baseWorktreePath, `base branch '${baseBranch}' checkout`);
 
-    await this.git(baseWorktreePath, [
-      'merge', '--no-ff', cycleBranch,
-      '-m', `Merge cycle ${cycleId} (${cycleBranch}) into ${baseBranch}`
-    ]);
+    try {
+      await this.git(baseWorktreePath, [
+        'merge', '--no-ff', cycleBranch,
+        '-m', `Merge cycle ${cycleId} (${cycleBranch}) into ${baseBranch}`
+      ]);
+    } catch (e) {
+      throw await this.toConflictErrorOrRethrow(baseWorktreePath, projectDir, cycleBranch, e);
+    }
 
     return { baseWorktreePath };
+  }
+
+  /**
+   * B17 (R6.3): git's own unambiguous mechanical merges never reach here (they just succeed above)
+   * — this only runs on merge failure, and it distinguishes a REAL conflict (unmerged paths exist)
+   * from anything else (lock contention, hook rejection). A real conflict aborts immediately,
+   * restoring the base exactly as it was, and returns a `MergeConflictError` for the caller to
+   * report. Never resolves a conflict itself — that judgment call belongs to the R3 house agent /
+   * JROM, never this primitive.
+   */
+  private async toConflictErrorOrRethrow(
+    baseWorktreePath: string,
+    projectDir: string,
+    cycleBranch: string,
+    cause: unknown
+  ): Promise<Error> {
+    const conflictedPaths = await this.listConflictedPaths(baseWorktreePath);
+    if (conflictedPaths.length === 0) {
+      return cause instanceof Error ? cause : new Error(String(cause));
+    }
+
+    // HEAD still points at the pre-merge base commit during a conflict (only MERGE_HEAD names the
+    // other parent) — no merge commit exists yet, so this IS the base's unmoved sha.
+    const baseShaBefore = (await this.git(baseWorktreePath, ['rev-parse', 'HEAD'])).stdout.trim();
+    const cycleBranchSha = (await this.git(projectDir, ['rev-parse', cycleBranch])).stdout.trim();
+
+    await this.git(baseWorktreePath, ['merge', '--abort']);
+
+    return new MergeConflictError(
+      `merge conflict on ${conflictedPaths.length} path(s): ${conflictedPaths.join(', ')}`,
+      conflictedPaths,
+      baseShaBefore,
+      cycleBranchSha
+    );
+  }
+
+  private async listConflictedPaths(worktreePath: string): Promise<string[]> {
+    try {
+      const { stdout } = await this.git(worktreePath, ['diff', '--name-only', '--diff-filter=U']);
+      return stdout.split('\n').map((l) => l.trim()).filter(Boolean);
+    } catch {
+      return [];
+    }
   }
 
   private async assertWorktreeClean(worktreePath: string, label: string): Promise<void> {

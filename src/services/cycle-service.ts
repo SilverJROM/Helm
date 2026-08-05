@@ -9,7 +9,8 @@ import {
   type EffectiveTopology,
 } from './inheritance-service.js';
 import { TopologyFreezeService } from './topology-freeze-service.js';
-import type { GitWorktreeService } from './git-worktree-service.js';
+import { MergeConflictError, type GitWorktreeService } from './git-worktree-service.js';
+import { branchSafetyReport } from './branch-safety-report-service.js';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
@@ -937,6 +938,11 @@ export class CycleService {
       // No merge landed — release the claim so the cycle stays retryable (e.g. after the base
       // checkout is cleaned up).
       this.db.prepare('UPDATE cycles SET awaiting_merge = 1 WHERE id = ?').run(cycleId);
+      if (e instanceof MergeConflictError) {
+        // R6.3: GitWorktreeService has already aborted the merge (base restored) — this only
+        // records what happened. Never auto-resolves; the cycle stays parked either way.
+        await this.recordMergeConflict(cycleId, branch, baseBranch, e);
+      }
       throw e;
     }
 
@@ -953,6 +959,33 @@ export class CycleService {
     }
 
     return { cycleId, merged: true, cleaned: true, mergedAt };
+  }
+
+  /**
+   * B17 (R6.3): persists the conflict report next to the cycle's docs and calls the single B5
+   * house-agent entry point (`branchSafetyReport` — R3.2's exact call-site pattern) exactly once
+   * for its facts + optional narrative. Reports only, decides nothing — resolving the conflict
+   * stays JROM's call.
+   */
+  private async recordMergeConflict(
+    cycleId: number,
+    branch: string,
+    baseBranch: string,
+    conflict: MergeConflictError
+  ): Promise<void> {
+    const safety = await branchSafetyReport(cycleId, this.db);
+    const report = {
+      cycleId,
+      branch,
+      baseBranch,
+      conflictedPaths: conflict.conflictedPaths,
+      baseShaBefore: conflict.baseShaBefore,
+      cycleBranchSha: conflict.cycleBranchSha,
+      detectedAt: new Date().toISOString(),
+      safety
+    };
+    const reportPath = path.join(this.getCycleDocDir(cycleId), 'merge-conflict-report.json');
+    await fs.writeFile(reportPath, JSON.stringify(report, null, 2), 'utf8');
   }
 
   /** B16: cleanup-only retry path for a cycle whose merge already landed but cleanup failed. */
