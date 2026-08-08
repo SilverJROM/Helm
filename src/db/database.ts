@@ -4052,19 +4052,35 @@ BEGIN
   SELECT RAISE(ABORT, 'fence repair units are append-only');
 END;
 `);
-        const rtCols = new Set(
-          (this.db.prepare('PRAGMA table_info(run_tasks)').all() as any[]).map((c) => c.name)
-        );
-        if (!rtCols.has('reopen_reason')) {
-          this.db.exec("ALTER TABLE run_tasks ADD COLUMN reopen_reason TEXT CHECK(reopen_reason IS NULL OR reopen_reason = 'repair')");
+        // Guard run_tasks ALTERs: many synthetic migration fixtures predate run_tasks.
+        // PRAGMA table_info on a missing table returns [] without error; bare ALTER then
+        // throws "no such table: run_tasks" and leaves SCHEMA_VERSION short of 118.
+        const hasRunTasks = !!this.db
+          .prepare("SELECT 1 AS o FROM sqlite_master WHERE type='table' AND name='run_tasks'")
+          .get();
+        if (hasRunTasks) {
+          const rtCols = new Set(
+            (this.db.prepare('PRAGMA table_info(run_tasks)').all() as any[]).map((c) => c.name)
+          );
+          if (!rtCols.has('reopen_reason')) {
+            this.db.exec(
+              "ALTER TABLE run_tasks ADD COLUMN reopen_reason TEXT CHECK(reopen_reason IS NULL OR reopen_reason = 'repair')"
+            );
+          }
+          if (!rtCols.has('repair_generation')) {
+            this.db.exec(
+              'ALTER TABLE run_tasks ADD COLUMN repair_generation INTEGER NOT NULL DEFAULT 0 CHECK(repair_generation >= 0)'
+            );
+          }
+          if (!rtCols.has('repair_round_id')) {
+            this.db.exec(
+              'ALTER TABLE run_tasks ADD COLUMN repair_round_id INTEGER REFERENCES fence_repair_rounds(id) ON DELETE SET NULL'
+            );
+          }
+          this.db.exec(
+            'CREATE INDEX IF NOT EXISTS idx_run_tasks_repair ON run_tasks(run_id, reopen_reason, repair_generation)'
+          );
         }
-        if (!rtCols.has('repair_generation')) {
-          this.db.exec("ALTER TABLE run_tasks ADD COLUMN repair_generation INTEGER NOT NULL DEFAULT 0 CHECK(repair_generation >= 0)");
-        }
-        if (!rtCols.has('repair_round_id')) {
-          this.db.exec("ALTER TABLE run_tasks ADD COLUMN repair_round_id INTEGER REFERENCES fence_repair_rounds(id) ON DELETE SET NULL");
-        }
-        this.db.exec('CREATE INDEX IF NOT EXISTS idx_run_tasks_repair ON run_tasks(run_id, reopen_reason, repair_generation)');
         this.db.prepare('UPDATE schema_version SET version = 118').run();
       }
     }
