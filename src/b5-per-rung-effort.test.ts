@@ -132,7 +132,7 @@ describe('B5 per-rung effort (schema v95 + API + AC-10 spawn)', () => {
 
     const dbs = new DatabaseService(t.dbPath);
     const ver = (dbs.raw.prepare('SELECT version FROM schema_version').get() as any).version;
-    expect(ver).toBe(98);
+    expect(ver).toBe(SCHEMA_VERSION);
 
     for (const table of ['agent_escalations', 'project_agent_escalations'] as const) {
       const cols = (dbs.raw.prepare(`PRAGMA table_info(${table})`).all() as any[]).map((c) => c.name);
@@ -145,7 +145,7 @@ describe('B5 per-rung effort (schema v95 + API + AC-10 spawn)', () => {
     // Idempotent re-open
     dbs.close();
     const dbs2 = new DatabaseService(t.dbPath);
-    expect((dbs2.raw.prepare('SELECT version FROM schema_version').get() as any).version).toBe(98);
+    expect((dbs2.raw.prepare('SELECT version FROM schema_version').get() as any).version).toBe(SCHEMA_VERSION);
     dbs2.close();
   });
 

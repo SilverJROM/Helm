@@ -197,7 +197,7 @@ describe('Leg D: schema fresh + guarded-upgrade persistence of run_tasks.batch',
     const cols = (upg.raw.prepare('PRAGMA table_info(run_tasks)').all() as any[]).map((c) => c.name);
     expect(cols).toContain('batch');
     const v = upg.raw.prepare('SELECT version FROM schema_version').get() as any;
-    expect(Number(v.version)).toBe(98);
+    expect(Number(v.version)).toBe(SCHEMA_VERSION);
     // The legacy row carries NULL batch (resolved to the synthetic 'default' at read time).
     const row = upg.raw.prepare("SELECT batch FROM run_tasks WHERE task_key = 'LEG'").get() as any;
     expect(row.batch).toBeNull();

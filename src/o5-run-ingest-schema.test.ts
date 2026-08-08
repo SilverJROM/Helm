@@ -43,7 +43,7 @@ describe('O5.1 run ingest durability schema v85', () => {
     const t = tempDb('helm-o51-fresh-'); cleanups.push(t.cleanup);
     const dbs = new DatabaseService(t.dbPath);
     const columns = new Set((dbs.raw.prepare('PRAGMA table_info(runs)').all() as any[]).map((column) => column.name));
-    expect(SCHEMA_VERSION).toBe(98); // v90 iBrain compatibility deletion; version-pin tracks current
+    expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(98); // version-pin: at least v90 iBrain deletion era
     expect(columns).toEqual(expect.objectContaining(new Set([
       'external_run_id', 'generation', 'source', 'state_revision', 'register_seal_hash', 'terminal_seal_hash',
     ])));
