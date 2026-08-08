@@ -60,6 +60,11 @@ import {
 } from './planning-provenance-service.js';
 import { openFence } from './fence-open-service.js';
 import { selectNextWork } from './fence-selector-admission.js';
+import {
+  FENCE_REPAIR_UNIT_CEILING,
+  loadActiveRepairUnits,
+  type ActiveRepairUnit,
+} from './fence-repair-resume-adapter.js';
 
 // CYCLE-BUILDDIR: a cycle-plan run builds the deliverable in this subdir OF the cycle workspace (never the
 // workspace root — that holds north-star.md, which puts helm-sandbox in PROTECTED-ROOT mode and blocks
@@ -2364,26 +2369,58 @@ export class RunOrchestratorService {
         queue.enqueue(runId, Number(row.id), depIds, false, row.batch == null ? 'default' : String(row.batch));
       }
       for (const row of taskRows) {
-        queue.rehydrateTaskStatus(Number(row.id), row.status as 'pending' | 'complete' | 'failed' | 'deferred');
+        const status = row.status as 'pending' | 'complete' | 'failed' | 'deferred' | 'working';
+        // working is refused earlier; treat any residual as pending for claim readiness
+        if (status === 'working') queue.rehydrateTaskStatus(Number(row.id), 'pending');
+        else queue.rehydrateTaskStatus(Number(row.id), status as 'pending' | 'complete' | 'failed' | 'deferred');
       }
 
-      // Reactivate exactly one parked task: the one that becomes the deterministic first ready task while
-      // all other durable statuses remain seeded. A resume can therefore never jump a batch barrier.
+      // R6 / R5.5: repair resume takes precedence over deferred unpark.
+      // Never overload deferred for repair — active generation-matched fence_repair_units
+      // (1–2) drive redispatch; deferred rows stay deferred.
+      const repairUnits: ActiveRepairUnit[] = loadActiveRepairUnits(db, runId);
+      if (repairUnits.length > FENCE_REPAIR_UNIT_CEILING) {
+        throw new Error(
+          `run ${runId} has ${repairUnits.length} active repair units (ceiling ${FENCE_REPAIR_UNIT_CEILING})`
+        );
+      }
+
+      let resumeKind: 'repair' | 'deferred' = 'deferred';
       let parked: any = null;
-      for (const candidate of taskRows.filter((row) => row.status === 'deferred')) {
-        queue.rehydrateTaskStatus(Number(candidate.id), 'pending');
-        if (queue.peekNextReady(runId) === Number(candidate.id)) {
-          parked = candidate;
-          break;
+
+      if (repairUnits.length >= 1) {
+        resumeKind = 'repair';
+        for (const unit of repairUnits) {
+          // Durable reopen is already pending; re-assert claimability on the live queue.
+          queue.rehydrateTaskStatus(Number(unit.run_task_id), 'pending');
+          queue.enqueueTask(runId, Number(unit.run_task_id), false);
+          queue.requeueForRedirect(runId, Number(unit.run_task_id));
         }
-        queue.rehydrateTaskStatus(Number(candidate.id), 'deferred');
-      }
-      if (!parked) {
-        throw new Error(`run ${runId} has no deferred task that can be resumed as the first ready task`);
-      }
-      const firstReady = queue.peekNextReady(runId);
-      if (firstReady !== Number(parked.id)) {
-        throw new Error(`run ${runId} recovery queue invariant failed: expected first-ready ${parked.id}, got ${firstReady ?? 'none'}`);
+        const firstReady = queue.peekNextReady(runId);
+        const repairIds = new Set(repairUnits.map((u) => Number(u.run_task_id)));
+        if (firstReady == null || !repairIds.has(Number(firstReady))) {
+          throw new Error(
+            `run ${runId} repair resume: expected a generation-matched repair unit first-ready, got ${firstReady ?? 'none'}`
+          );
+        }
+      } else {
+        // Reactivate exactly one parked deferred task: the one that becomes the deterministic first
+        // ready task while all other durable statuses remain seeded. Never jumps a batch barrier.
+        for (const candidate of taskRows.filter((row) => row.status === 'deferred')) {
+          queue.rehydrateTaskStatus(Number(candidate.id), 'pending');
+          if (queue.peekNextReady(runId) === Number(candidate.id)) {
+            parked = candidate;
+            break;
+          }
+          queue.rehydrateTaskStatus(Number(candidate.id), 'deferred');
+        }
+        if (!parked) {
+          throw new Error(`run ${runId} has no deferred task that can be resumed as the first ready task`);
+        }
+        const firstReady = queue.peekNextReady(runId);
+        if (firstReady !== Number(parked.id)) {
+          throw new Error(`run ${runId} recovery queue invariant failed: expected first-ready ${parked.id}, got ${firstReady ?? 'none'}`);
+        }
       }
 
       const batchId = String(run.batch_id || `run-${runId}`);
@@ -2431,13 +2468,36 @@ export class RunOrchestratorService {
         .resolvePhaseAgents(projectId, 'implementation').brain;
       if (!implementationBrain) throw new Error('required brain unavailable for phase implementation');
 
-      // Last setup action before dispatch: atomically re-open the parked task and the independently-terminal
-      // run status. Historical attempts/dispatches/validations/callbacks/artifacts remain untouched.
+      // Last setup action before dispatch: re-open the run (and deferred park when not repair).
+      // Repair: leave reopen markers intact; never force-complete; never unpark deferred for repair.
       const unblock = db.transaction(() => {
-        const taskChange = db.prepare(
-          "UPDATE run_tasks SET status='pending', attempts_count=0, current_attempt_id=NULL, updated_at=datetime('now') WHERE id=? AND run_id=? AND status='deferred'"
-        ).run(parked.id, runId);
-        if (taskChange.changes !== 1) throw new Error(`run ${runId} parked task ${parked.id} changed before resume`);
+        if (resumeKind === 'deferred') {
+          const taskChange = db.prepare(
+            "UPDATE run_tasks SET status='pending', attempts_count=0, current_attempt_id=NULL, updated_at=datetime('now') WHERE id=? AND run_id=? AND status='deferred'"
+          ).run(parked.id, runId);
+          if (taskChange.changes !== 1) throw new Error(`run ${runId} parked task ${parked.id} changed before resume`);
+        } else {
+          for (const unit of repairUnits) {
+            const row: any = db.prepare(
+              "SELECT status, reopen_reason, repair_generation FROM run_tasks WHERE id=? AND run_id=?"
+            ).get(unit.run_task_id, runId);
+            if (!row || row.reopen_reason !== 'repair') {
+              throw new Error(
+                `run ${runId} repair unit ${unit.task_key} lost reopen admission before resume`
+              );
+            }
+            if (row.status !== 'pending' && row.status !== 'working') {
+              throw new Error(
+                `run ${runId} repair unit ${unit.task_key} status '${row.status}' is not resume-ready (need pending|working)`
+              );
+            }
+            if (Number(row.repair_generation) !== Number(unit.repair_generation)) {
+              throw new Error(
+                `run ${runId} repair unit ${unit.task_key} generation drift before resume`
+              );
+            }
+          }
+        }
         const runChange = db.prepare(
           "UPDATE runs SET phase='executing', status='active', ended_at=NULL WHERE id=? AND phase='blocked' AND status IN ('failed','paused')"
         ).run(runId);

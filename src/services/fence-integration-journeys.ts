@@ -1064,10 +1064,16 @@ import {
 import {
   loadActiveRepairUnits,
   loadActiveRepairUnitsForFreshProcess,
+  prepareFreshProcessRepairResume,
   reconstructRepairResumeQueue,
 } from './fence-repair-resume-adapter.js';
 import { TaskQueueService } from './task-queue-service.js';
 import { RunArtifactService } from './run-artifact-service.js';
+import { AgentAssignmentService } from './agent-assignment-service.js';
+import { FakeTransport } from './fake-transport.js';
+import { PlanParserService } from './plan-parser-service.js';
+import { ProjectService } from './project-service.js';
+import { RunOrchestratorService } from './run-orchestrator-service.js';
 
 /**
  * F4/I4: repair localization → hash-lock → requeue → routing → resume adapter.
@@ -1079,6 +1085,15 @@ export async function runF4RepairJourney(input: {
   dbPath?: string;
   contractPath?: string;
 }): Promise<Partial<Record<string, boolean | AssertionResult>>> {
+  // R5.5 fresh-process resume uses FakeTransport — force the batch-B0 gate before any spawn graph.
+  process.env.USE_FAKE_TMUX = '1';
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('runF4RepairJourney refuses production NODE_ENV (FakeTransport gate)');
+  }
+  process.env.NODE_ENV = process.env.NODE_ENV || 'test';
+  process.env.HELM_SKIP_BATCH_DEPLOY = process.env.HELM_SKIP_BATCH_DEPLOY || '1';
+  process.env.HELM_SKIP_REDTEAM = process.env.HELM_SKIP_REDTEAM || '1';
+
   const stub = input.stub || process.env.FENCE_STUB || '';
   const productFiles = [
     'src/services/fence-repair-schema.ts',
@@ -1126,7 +1141,53 @@ export async function runF4RepairJourney(input: {
 
   const os = await import('node:os');
   const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'helm-f4-journey-'));
-  const db = new DatabaseService(dbPath);
+  // north-star + plan.json required for real resumeExistingRun (R5.5).
+  const northStarPath = path.join(repoRoot, 'north-star.md');
+  fs.writeFileSync(northStarPath, 'F4/I4 repair journey north-star\n', 'utf8');
+  fs.writeFileSync(
+    path.join(repoRoot, 'plan.json'),
+    JSON.stringify(
+      {
+        tasks: [
+          {
+            task_key: 'R1-unit',
+            atomic_work: 'Repair unit R1',
+            complexity: 'low',
+            effort: 'low',
+            needs_more_info: false,
+            task_type: 'feature',
+            validation_criteria: 'R1-unit passes',
+            deps: [],
+            batch: 'R',
+          },
+          {
+            task_key: 'R2-unit',
+            atomic_work: 'Repair unit R2',
+            complexity: 'low',
+            effort: 'low',
+            needs_more_info: false,
+            task_type: 'feature',
+            validation_criteria: 'R2-unit passes',
+            deps: [],
+            batch: 'R',
+          },
+        ],
+        meta: { source: 'fence-f4-journey' },
+      },
+      null,
+      2
+    ),
+    'utf8'
+  );
+  fs.writeFileSync(
+    path.join(repoRoot, 'callbacks.md'),
+    '[helm callback] implementer I4-journey STATUS: DONE — repaired\n' +
+      '[helm callback] validator I4-journey STATUS: PASS — verified\n',
+    'utf8'
+  );
+
+  let db: DatabaseService | null = new DatabaseService(dbPath);
+  let freshDb: DatabaseService | null = null;
 
   try {
     const artifacts = new RunArtifactService(db);
@@ -1137,7 +1198,7 @@ export async function runF4RepairJourney(input: {
         .prepare('INSERT INTO projects (name, directory) VALUES (?, ?) RETURNING id')
         .get(`fence-f4-${Date.now()}`, repoRoot) as { id: number }
     ).id;
-    const runId = artifacts.createRun(projectId, 'I4-journey', path.join(repoRoot, 'north-star.md'));
+    const runId = artifacts.createRun(projectId, 'I4-journey', northStarPath);
     db.raw
       .prepare("UPDATE runs SET status = 'active', phase = 'implementation' WHERE id = ?")
       .run(runId);
@@ -1260,6 +1321,7 @@ export async function runF4RepairJourney(input: {
       const reopened = reopenAndEnqueueRepairRound(db, {
         repairRoundId: round.repair_round_id,
         queue,
+        repoRoot,
       });
       r53dispatch =
         reopened.units.length >= 1 &&
@@ -1335,30 +1397,75 @@ export async function runF4RepairJourney(input: {
       FENCE_REPAIR_MAX_ROUNDS === 3 &&
       barePlanSound.ok === false;
 
-    // R5.5 / R8.1 — resume adapter reconstructs; fresh-process has intentional first-pass gap
+    // R5.5 — real fresh-process resume (generation join + resumeExistingRun). Must be capable of failing.
+    // R8.1 — product seams composed through the journey (localization + lock + reconstruct).
     let r55 = false;
     let r81 = false;
     try {
       const inProc = loadActiveRepairUnits(db, runId);
-      const fresh = loadActiveRepairUnitsForFreshProcess(db, runId);
-      // Dogfood: real seams compose in-process (R8.1); fresh-process may differ by design
+      const freshLoader = loadActiveRepairUnitsForFreshProcess(db, runId);
+      // Correct signature: (db, queue, runId) — wrong args must not be papered over.
+      const recon = reconstructRepairResumeQueue(db, queue, runId);
+      r81 =
+        haveProduct &&
+        r51 &&
+        r52 &&
+        recon.ok === true &&
+        inProc.length >= 1 &&
+        freshLoader.length >= 1 &&
+        inProc.map((u) => u.task_key).sort().join(',') ===
+          freshLoader.map((u) => u.task_key).sort().join(',');
+
+      // OPEN baseline so fence members are claimable after resume (R3.1).
+      db.raw
+        .prepare(
+          `UPDATE fences
+           SET lifecycle_state = 'draining',
+               open_failed_ids = ?,
+               open_test_hash = 'f4-journey-open',
+               open_at = datetime('now')
+           WHERE id = ?`
+        )
+        .run(JSON.stringify(['R5.2']), fenceId);
+
+      // Park for real resumeExistingRun.
+      db.raw
+        .prepare(
+          "UPDATE runs SET phase='blocked', status='failed', ended_at=datetime('now') WHERE id=?"
+        )
+        .run(runId);
+
+      const liveDb = db;
+      db = null; // ownership transfers into prepareFreshProcess (closes liveDb)
+      const prep = await prepareFreshProcessRepairResume({
+        dbPath,
+        runId,
+        closeDb: liveDb,
+        createOrchestrator: ({ db: fresh, queue: freshQueue, artifacts: freshArtifacts }) =>
+          new RunOrchestratorService({
+            artifacts: freshArtifacts,
+            planning: {} as any,
+            parser: new PlanParserService(freshArtifacts),
+            queue: freshQueue,
+            transport: new FakeTransport(),
+            projectService: new ProjectService(fresh),
+            assignmentService: new AgentAssignmentService(fresh),
+          }),
+      });
+      freshDb = prep.db;
+
       r55 =
-        typeof reconstructRepairResumeQueue === 'function' &&
-        (inProc.length >= 0 || fresh.length >= 0);
-      // R8.1: product files exist and repair round + lock path ran (journey through seams)
-      r81 = haveProduct && r51 && r52;
-      // Prefer stronger: reconstruct succeeds when units active
-      try {
-        const recon = reconstructRepairResumeQueue(db, { runId, queue });
-        r55 = recon.ok === true;
-        r81 = r81 && recon.ok === true;
-      } catch {
-        // if no active units after reopen quirks, still count product surface + prior steps
-        r55 = r55 || r51;
-      }
+        prep.ok === true &&
+        prep.generation_join === true &&
+        prep.units.length >= 1 &&
+        prep.redispatched_task_ids.length >= 1 &&
+        prep.run_after_resume.phase === 'executing' &&
+        prep.run_after_resume.status === 'active';
+      r81 = r81 && r55;
     } catch {
+      // Capable of failing: no tautology fallback to r51 / array.length >= 0.
       r55 = false;
-      r81 = haveProduct && r51;
+      r81 = haveProduct && r51 && r52;
     }
 
     return {
@@ -1370,7 +1477,17 @@ export async function runF4RepairJourney(input: {
       'R8.1': result(r81, 'dogfooded F4 repair fence cannot run through real product seams'),
     };
   } finally {
-    db.close();
+    // Yield so the async engine tail from resumeExistingRun can finish its current tick
+    // before we close the SQLite handle it still holds.
+    await new Promise((r) => setTimeout(r, 40));
+    for (const handle of [freshDb, db]) {
+      if (!handle) continue;
+      try {
+        handle.close();
+      } catch {
+        /* ignore */
+      }
+    }
     try {
       fs.rmSync(repoRoot, { recursive: true, force: true });
     } catch {

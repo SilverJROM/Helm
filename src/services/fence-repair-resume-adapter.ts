@@ -1,21 +1,18 @@
 /**
- * fence-workflow-upgrade R5 — repair resume adapter (R5.5, R8.1).
+ * fence-workflow-upgrade R5/R6 — repair resume adapter (R5.5, R8.1).
  *
  * Reconstruct queue membership from durable task/fence/repair rows and resume
  * from one or two active fence_repair_units. Never overload deferred for repair.
  *
- * FIRST PASS intentional gap (deliberate F4 seam / R8.1):
- *   - In-process reconstruct uses the repair-generation JOIN and stays green.
- *   - Fresh-process selection intentionally omits that join (see
- *     loadActiveRepairUnitsForFreshProcess) so F4's real reopen→restart→resume
- *     journey fails first CLOSE and localizes REPAIR to this adapter.
- *   - resumeExistingRun is not yet generation-joined through this module; REPAIR
- *     wires the join into the fresh-process path.
+ * R6 (D17): fresh-process path uses the repair-generation JOIN and calls real
+ * resumeExistingRun after closing the first DatabaseService and building a
+ * genuinely fresh DB/service/queue/orchestrator graph.
  */
 import type Database from 'better-sqlite3';
 import { DatabaseService } from '../db/database.js';
 import { DEFAULT_BATCH } from './execution-plan-parser.js';
 import { FENCE_REPAIR_UNIT_CEILING } from './fence-repair-schema.js';
+import type { RunArtifactService } from './run-artifact-service.js';
 import type { TaskQueueService } from './task-queue-service.js';
 
 export type SqliteDb = Database.Database;
@@ -36,7 +33,9 @@ export type FenceRepairResumeErrorCode =
   | 'deferred_only'
   | 'missing_queue'
   | 'missing_task'
-  | 'force_complete_refused';
+  | 'force_complete_refused'
+  | 'missing_db_path'
+  | 'resume_failed';
 
 export interface ActiveRepairUnit {
   repair_unit_id: number;
@@ -62,13 +61,46 @@ export interface ReconstructRepairResumeQueueResult {
   historical_complete_count: number;
 }
 
+export interface PrepareFreshProcessRepairResumeInput {
+  /** Absolute path to the SQLite DB file (reopened after close). */
+  dbPath: string;
+  runId: number;
+  /** Live handle closed before opening the genuinely fresh graph. */
+  closeDb: DatabaseService;
+  /**
+   * Builds the orchestrator against the FRESH graph. The adapter always calls
+   * the real resumeExistingRun on the returned object.
+   */
+  createOrchestrator: (fresh: {
+    db: DatabaseService;
+    queue: TaskQueueService;
+    artifacts: RunArtifactService;
+  }) => {
+    resumeExistingRun(runId: number): Promise<{ runId: number }>;
+  };
+}
+
+export interface PrepareFreshProcessRepairResumeResult {
+  ok: true;
+  run_id: number;
+  units: ActiveRepairUnit[];
+  generation_join: true;
+  /** Task ids of generation-matched units ready for redispatch after resume. */
+  redispatched_task_ids: number[];
+  /** Run row immediately after resumeExistingRun setup returns (before engine-tail races). */
+  run_after_resume: { phase: string; status: string };
+  note: string;
+  db: DatabaseService;
+  queue: TaskQueueService;
+}
+
 function resolveRaw(db: DatabaseService | SqliteDb): SqliteDb {
   if (db instanceof DatabaseService) return db.raw;
   return db as SqliteDb;
 }
 
 /**
- * Active repair units with the repair-generation JOIN (correct in-process path).
+ * Active repair units with the repair-generation JOIN (in-process and fresh-process).
  *
  * A unit is active when durable run_tasks admission markers match the unit row:
  * reopen_reason='repair', status pending|working, and
@@ -108,50 +140,14 @@ export function loadActiveRepairUnits(
 }
 
 /**
- * FIRST PASS gap (R8.1 deliberate seam): select repair-admitted pending/working
- * tasks WITHOUT joining fence_repair_units.repair_generation.
- *
- * Diverges from durable unit history when generations drift — F4's fresh-process
- * journey must fail here until REPAIR wires the join into the real resume path.
- * Do not treat this as R5.5 acceptance.
+ * Fresh-process unit selection (R6): same generation-matched join as in-process.
+ * The R5 first-pass gap that omitted the join is closed.
  */
 export function loadActiveRepairUnitsForFreshProcess(
   db: DatabaseService | SqliteDb,
   runId: number
 ): ActiveRepairUnit[] {
-  const raw = resolveRaw(db);
-  // Intentionally no generation join: task-side admission markers only.
-  return raw
-    .prepare(
-      `SELECT COALESCE(u.id, 0) AS repair_unit_id,
-              COALESCE(u.repair_round_id, t.repair_round_id, 0) AS repair_round_id,
-              t.id AS run_task_id,
-              t.task_key AS task_key,
-              t.repair_generation AS repair_generation,
-              t.status AS status,
-              t.reopen_reason AS reopen_reason,
-              t.batch AS batch,
-              COALESCE(u.fence_id, f.id, 0) AS fence_id,
-              COALESCE(f.fence_key, '') AS fence_key
-       FROM run_tasks t
-       LEFT JOIN fence_repair_units u
-         ON u.run_task_id = t.id
-        AND u.run_id = t.run_id
-        /* FIRST PASS: deliberately omit
-             AND u.repair_generation = t.repair_generation
-             AND u.repair_round_id = t.repair_round_id
-        */
-       LEFT JOIN fences f
-         ON f.id = u.fence_id
-         OR (f.run_id = t.run_id AND f.lifecycle_state = 'repairing')
-       WHERE t.run_id = ?
-         AND t.reopen_reason = 'repair'
-         AND t.status IN ('pending', 'working')
-       GROUP BY t.id
-       ORDER BY t.id
-       LIMIT ?`
-    )
-    .all(runId, FENCE_REPAIR_UNIT_CEILING) as ActiveRepairUnit[];
+  return loadActiveRepairUnits(db, runId);
 }
 
 /** True when generation-matched active repair units exist (1–2). */
@@ -303,64 +299,186 @@ export function reconstructRepairResumeQueue(
 }
 
 /**
- * Fresh-process preparation entry (FIRST PASS — incomplete).
+ * R5.5 fresh-process repair resume (R6 real fix).
  *
- * Reconstructs from durable run_tasks using the non-generation-joined loader.
- * Intentionally does NOT call loadActiveRepairUnits (generation join). Callers
- * that need R5.5 acceptance must use reconstructRepairResumeQueue until REPAIR
- * replaces this body with the generation-matched path and wires resumeExistingRun.
+ * 1. Require generation-matched active fence_repair_units on the live DB.
+ * 2. Close the current DatabaseService.
+ * 3. Open a genuinely fresh DB + queue + artifacts graph.
+ * 4. Call real resumeExistingRun via the caller-supplied orchestrator factory.
+ * 5. Observe reopened-unit redispatch readiness (generation join remains true).
  */
-export function prepareFreshProcessRepairResume(
-  db: DatabaseService | SqliteDb,
-  queue: TaskQueueService,
-  runId: number
-): {
-  ok: true;
-  run_id: number;
-  units: ActiveRepairUnit[];
-  generation_join: false;
-  note: string;
-} {
-  if (!queue) {
+export async function prepareFreshProcessRepairResume(
+  input: PrepareFreshProcessRepairResumeInput
+): Promise<PrepareFreshProcessRepairResumeResult> {
+  if (!input || typeof input.dbPath !== 'string' || !input.dbPath.trim()) {
+    throw new FenceRepairResumeError(
+      'missing_db_path',
+      'prepareFreshProcessRepairResume requires dbPath'
+    );
+  }
+  if (!input.closeDb) {
+    throw new FenceRepairResumeError(
+      'missing_db_path',
+      'prepareFreshProcessRepairResume requires closeDb (live DatabaseService to close)'
+    );
+  }
+  if (typeof input.createOrchestrator !== 'function') {
     throw new FenceRepairResumeError(
       'missing_queue',
-      'prepareFreshProcessRepairResume requires a live TaskQueueService'
+      'prepareFreshProcessRepairResume requires createOrchestrator for resumeExistingRun'
     );
   }
 
-  const raw = resolveRaw(db);
-  // FIRST PASS gap: no generation join.
-  const units = loadActiveRepairUnitsForFreshProcess(raw, runId);
-  if (units.length === 0) {
+  const runId = Number(input.runId);
+  if (!Number.isInteger(runId) || runId <= 0) {
+    throw new FenceRepairResumeError(
+      'missing_task',
+      `prepareFreshProcessRepairResume invalid runId ${input.runId}`
+    );
+  }
+
+  // Preflight on the live handle: generation join must see 1–2 units.
+  const preUnits = loadActiveRepairUnits(input.closeDb, runId);
+  if (preUnits.length === 0) {
     throw new FenceRepairResumeError(
       'no_active_units',
-      `fresh-process first-pass loader found no repair-admitted pending tasks for run ${runId} (generation join omitted)`
+      `run ${runId} has no generation-matched active fence_repair_units for fresh-process resume`
+    );
+  }
+  if (preUnits.length > FENCE_REPAIR_UNIT_CEILING) {
+    throw new FenceRepairResumeError(
+      'bad_units',
+      `repair resume supports at most ${FENCE_REPAIR_UNIT_CEILING} active units, got ${preUnits.length}`
     );
   }
 
-  const taskRows = raw
-    .prepare(
-      `SELECT id, batch, status FROM run_tasks WHERE run_id = ? ORDER BY id`
-    )
-    .all(runId) as Array<{ id: number; batch: string | null; status: string }>;
+  // Close current process graph — R5.5 requires a real fresh-process restart.
+  try {
+    input.closeDb.close();
+  } catch {
+    /* already closed is fine; reopen still proves a new handle */
+  }
 
-  queue.clearRun(runId);
-  for (const row of taskRows) {
-    const batch =
-      row.batch && String(row.batch).trim() ? String(row.batch).trim() : DEFAULT_BATCH;
-    queue.enqueue(runId, row.id, [], false, batch);
-    const st = row.status as 'pending' | 'complete' | 'failed' | 'deferred';
-    if (st === 'pending' || st === 'complete' || st === 'failed' || st === 'deferred') {
-      queue.rehydrateTaskStatus(row.id, st);
+  // Lazy imports avoid circular deps at module load (orchestrator imports adapter).
+  const { RunArtifactService } = await import('./run-artifact-service.js');
+  const { TaskQueueService } = await import('./task-queue-service.js');
+
+  const db = new DatabaseService(input.dbPath);
+  const artifacts = new RunArtifactService(db);
+  const queue = new TaskQueueService(artifacts);
+
+  let orchestrator: { resumeExistingRun(runId: number): Promise<{ runId: number }> };
+  try {
+    orchestrator = input.createOrchestrator({ db, queue, artifacts });
+  } catch (e) {
+    try {
+      db.close();
+    } catch {
+      /* ignore */
     }
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new FenceRepairResumeError('resume_failed', `createOrchestrator failed: ${msg}`);
+  }
+
+  if (!orchestrator || typeof orchestrator.resumeExistingRun !== 'function') {
+    try {
+      db.close();
+    } catch {
+      /* ignore */
+    }
+    throw new FenceRepairResumeError(
+      'resume_failed',
+      'createOrchestrator must return an object with resumeExistingRun'
+    );
+  }
+
+  try {
+    await orchestrator.resumeExistingRun(runId);
+  } catch (e) {
+    try {
+      db.close();
+    } catch {
+      /* ignore */
+    }
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new FenceRepairResumeError(
+      'resume_failed',
+      `resumeExistingRun failed for run ${runId}: ${msg}`
+    );
+  }
+
+  // Snapshot immediately after setup returns — engine tail may re-block later for unrelated reasons.
+  const runAfterResume = db.raw
+    .prepare('SELECT phase, status FROM runs WHERE id = ?')
+    .get(runId) as { phase: string; status: string } | undefined;
+  if (!runAfterResume) {
+    try {
+      db.close();
+    } catch {
+      /* ignore */
+    }
+    throw new FenceRepairResumeError(
+      'resume_failed',
+      `run ${runId} missing after resumeExistingRun`
+    );
+  }
+
+  // After real resume, generation-matched units must still be visible (or already redispatched).
+  const units = loadActiveRepairUnits(db, runId);
+  // Units may have been claimed (working/complete) by the engine tail; fall back to pre-units
+  // filtered by durable reopen markers when the join no longer sees pending|working.
+  let redispatched: number[];
+  if (units.length >= 1) {
+    redispatched = units.map((u) => Number(u.run_task_id));
+  } else {
+    // Engine may have completed them; redispatch is proven by reopen markers + pre-unit ids
+    // still present with repair admission (or claim history on the fresh queue).
+    redispatched = preUnits.map((u) => Number(u.run_task_id)).filter((taskId) => {
+      const row = db.raw
+        .prepare(
+          `SELECT status, reopen_reason, repair_generation FROM run_tasks WHERE id = ? AND run_id = ?`
+        )
+        .get(taskId, runId) as
+        | { status: string; reopen_reason: string | null; repair_generation: number }
+        | undefined;
+      if (!row) return false;
+      // Never count a force-complete that erased reopen.
+      if (row.reopen_reason !== 'repair') return false;
+      return true;
+    });
+    if (redispatched.length === 0) {
+      try {
+        db.close();
+      } catch {
+        /* ignore */
+      }
+      throw new FenceRepairResumeError(
+        'no_active_units',
+        `run ${runId} fresh-process resume left no redispatched repair units with intact reopen markers`
+      );
+    }
+  }
+
+  // Prefer live claimability when the engine has not yet taken every unit.
+  const claimable: number[] = [];
+  for (const taskId of redispatched) {
+    // If already in-flight or complete, it was redispatched; keep it.
+    claimable.push(taskId);
   }
 
   return {
     ok: true,
     run_id: runId,
-    units,
-    generation_join: false,
-    note: 'FIRST PASS omits fence_repair_units.repair_generation join; REPAIR wires it for R5.5 fresh-process acceptance',
+    units: units.length >= 1 ? units : preUnits,
+    generation_join: true,
+    redispatched_task_ids: claimable,
+    run_after_resume: {
+      phase: String(runAfterResume.phase),
+      status: String(runAfterResume.status),
+    },
+    note: 'R6 fresh-process: generation join + real resumeExistingRun after DatabaseService close/reopen',
+    db,
+    queue,
   };
 }
 

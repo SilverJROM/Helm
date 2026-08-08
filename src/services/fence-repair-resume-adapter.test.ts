@@ -1,27 +1,31 @@
 /**
- * fence-workflow-upgrade R5 — repair resume adapter (R5.5, R8.1).
+ * fence-workflow-upgrade R5/R6 — repair resume adapter (R5.5, R8.1).
  *
- * Focused in-process contract:
+ * Focused contract:
  *   - reconstruct queue from durable task/fence/repair rows
  *   - resume from 1–2 active fence_repair_units (generation join)
  *   - never deferred-only
  *   - historical completes outside active generation stay complete
  *
- * FIRST PASS: fresh-process path intentionally omits the repair-generation join
- * so F4 first CLOSE fails and localizes REPAIR here.
+ * R6 (D17): fresh-process path uses the repair-generation join and calls real
+ * resumeExistingRun after closing the first DatabaseService and building a
+ * genuinely fresh DB/service/queue/orchestrator graph.
  */
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { DatabaseService } from '../db/database.js';
 import { SCHEMA_VERSION } from '../db/schema.js';
+import { AgentAssignmentService } from './agent-assignment-service.js';
 import { beginFenceRepairRound } from './fence-repair-schema.js';
 import {
   areAllRepairRoundUnitsLocked,
-  hashTestFile,
   lockFenceRepairUnitTest,
 } from './fence-repair-hashlock.js';
+import { FakeTransport } from './fake-transport.js';
+import { PlanParserService } from './plan-parser-service.js';
+import { ProjectService } from './project-service.js';
 import { reopenAndEnqueueRepairRound } from './fence-repair-requeue.js';
 import {
   FenceRepairResumeError,
@@ -37,6 +41,8 @@ import {
   type FenceReportV1,
   type RunFenceReportCommandResult,
 } from './fence-report-v1.js';
+import { RunArtifactService } from './run-artifact-service.js';
+import { RunOrchestratorService } from './run-orchestrator-service.js';
 import { TaskQueueService } from './task-queue-service.js';
 
 function tempDir(prefix: string): { dir: string; cleanup: () => void } {
@@ -44,29 +50,39 @@ function tempDir(prefix: string): { dir: string; cleanup: () => void } {
   return { dir, cleanup: () => fs.rmSync(dir, { recursive: true, force: true }) };
 }
 
-function insertProjectRun(db: DatabaseService): { projectId: number; runId: number } {
+function insertProjectRun(
+  db: DatabaseService,
+  opts?: { projectDir?: string; northStarRef?: string; batchId?: string }
+): { projectId: number; runId: number } {
   const suffix = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const projectDir = opts?.projectDir ?? `/tmp/fence-r5-${suffix}`;
   const projectId = (
     db.raw
       .prepare('INSERT INTO projects (name, directory) VALUES (?, ?) RETURNING id')
-      .get(`fence-r5-${suffix}`, `/tmp/fence-r5-${suffix}`) as { id: number }
+      .get(`fence-r5-${suffix}`, projectDir) as { id: number }
   ).id;
   const runId = (
     db.raw
       .prepare(
         "INSERT INTO runs (project_id, batch_id, north_star_ref, status, phase) VALUES (?, ?, ?, 'active', 'implementation') RETURNING id"
       )
-      .get(projectId, 'R5', 'fence-repair-resume') as { id: number }
+      .get(projectId, opts?.batchId ?? 'R5', opts?.northStarRef ?? 'fence-repair-resume') as {
+      id: number;
+    }
   ).id;
   return { projectId, runId };
 }
 
-function insertRepairFixture(db: DatabaseService): {
+function insertRepairFixture(
+  db: DatabaseService,
+  opts?: { projectDir?: string; northStarRef?: string; batchId?: string }
+): {
   runId: number;
   fenceId: number;
   taskIds: Record<string, number>;
+  projectId: number;
 } {
-  const { runId } = insertProjectRun(db);
+  const { projectId, runId } = insertProjectRun(db, opts);
   const taskIds: Record<string, number> = {};
   for (const taskKey of ['A1', 'A2', 'A3']) {
     taskIds[taskKey] = Number(
@@ -103,7 +119,7 @@ function insertRepairFixture(db: DatabaseService): {
       .prepare('INSERT INTO fence_members (fence_id, task_key, position) VALUES (?, ?, ?)')
       .run(fenceId, taskKey, position);
   }
-  return { runId, fenceId, taskIds };
+  return { runId, fenceId, taskIds, projectId };
 }
 
 function writeRepairTest(repoRoot: string, body: string, rel: string): string {
@@ -179,15 +195,17 @@ function makeQueue(runId: number, taskIds: number[]): TaskQueueService {
 function stageLockReopen(
   db: DatabaseService,
   repoRoot: string,
-  failingUnits: readonly string[]
+  failingUnits: readonly string[],
+  opts?: { projectDir?: string; northStarRef?: string; batchId?: string }
 ): {
   runId: number;
   fenceId: number;
   taskIds: Record<string, number>;
   repairRoundId: number;
   queue: TaskQueueService;
+  projectId: number;
 } {
-  const { runId, fenceId, taskIds } = insertRepairFixture(db);
+  const { runId, fenceId, taskIds, projectId } = insertRepairFixture(db, opts);
   const staged = beginFenceRepairRound(db, {
     fenceId,
     faultClass: 'implementation',
@@ -218,7 +236,34 @@ function stageLockReopen(
     taskIds,
     repairRoundId: staged.repair_round_id,
     queue,
+    projectId,
   };
+}
+
+function writePlanForRepairRun(runDir: string, batchId: string): void {
+  fs.mkdirSync(runDir, { recursive: true });
+  const plan = {
+    tasks: (['A1', 'A2', 'A3'] as const).map((taskKey) => ({
+      task_key: taskKey,
+      atomic_work: `Repair ${taskKey}`,
+      complexity: 'low',
+      effort: 'low',
+      needs_more_info: false,
+      task_type: 'feature',
+      validation_criteria: `${taskKey} passes`,
+      deps: [],
+      batch: 'B1',
+    })),
+    meta: { source: 'fence-r6-fresh-process' },
+  };
+  fs.writeFileSync(path.join(runDir, 'north_star.md'), 'R6 fresh-process repair resume fixture\n', 'utf8');
+  fs.writeFileSync(path.join(runDir, 'plan.json'), JSON.stringify(plan, null, 2), 'utf8');
+  fs.writeFileSync(
+    path.join(runDir, 'callbacks.md'),
+    `[helm callback] implementer ${batchId} STATUS: DONE — repaired\n` +
+      `[helm callback] validator ${batchId} STATUS: PASS — verified\n`,
+    'utf8'
+  );
 }
 
 describe('R5 fence-repair-resume-adapter (R5.5, R8.1)', () => {
@@ -402,10 +447,9 @@ describe('R5 fence-repair-resume-adapter (R5.5, R8.1)', () => {
     expect(loadActiveRepairUnits(db, runId)).toHaveLength(0);
     expect(hasActiveRepairResumeUnits(db, runId)).toBe(false);
 
-    // FIRST PASS fresh-process loader omits the join → still sees the task (deliberate gap).
-    const loose = loadActiveRepairUnitsForFreshProcess(db, runId);
-    expect(loose.length).toBeGreaterThanOrEqual(1);
-    expect(loose.some((u) => u.task_key === 'A1')).toBe(true);
+    // R6: fresh-process loader uses the same generation join (gap closed).
+    const freshLoader = loadActiveRepairUnitsForFreshProcess(db, runId);
+    expect(freshLoader).toHaveLength(0);
 
     const q = new TaskQueueService();
     expect(() => reconstructRepairResumeQueue(db, q, runId)).toThrow(/no active fence_repair_units/i);
@@ -420,38 +464,158 @@ describe('R5 fence-repair-resume-adapter (R5.5, R8.1)', () => {
     db.close();
   });
 
-  it('FIRST PASS fresh-process path omits repair-generation join (R8.1 deliberate seam)', () => {
-    const t = tempDir('helm-fence-r5-fresh-gap-');
+  it('fresh-process path uses generation join and real resumeExistingRun (R5.5)', async () => {
+    process.env.USE_FAKE_TMUX = '1';
+    process.env.NODE_ENV = 'test';
+    process.env.HELM_SKIP_BATCH_DEPLOY = '1';
+    process.env.HELM_SKIP_REDTEAM = '1';
+
+    const t = tempDir('helm-fence-r6-fresh-');
     cleanups.push(t.cleanup);
-    const db = new DatabaseService(path.join(t.dir, 'helm.db'));
-    const { runId, taskIds } = stageLockReopen(db, t.dir, ['A1', 'A2']);
+    const dbPath = path.join(t.dir, 'helm.db');
+    const projectDir = path.join(t.dir, 'project');
+    const runDir = path.join(t.dir, 'run');
+    fs.mkdirSync(projectDir, { recursive: true });
+    const batchId = 'R6-fresh';
+    writePlanForRepairRun(runDir, batchId);
+    const northStarRef = path.join(runDir, 'north_star.md');
 
-    // Matched path and loose path agree when generations are consistent.
-    const matched = loadActiveRepairUnits(db, runId);
-    const loose = loadActiveRepairUnitsForFreshProcess(db, runId);
+    const firstDb = new DatabaseService(dbPath);
+    const { runId, taskIds } = stageLockReopen(firstDb, t.dir, ['A1', 'A2'], {
+      projectDir,
+      northStarRef,
+      batchId,
+    });
+
+    // OPEN baseline so fence members are claimable after resume (R3.1).
+    firstDb.raw
+      .prepare(
+        `UPDATE fences
+         SET lifecycle_state = 'draining',
+             open_failed_ids = ?,
+             open_test_hash = 'r6-open-baseline',
+             open_at = datetime('now')
+         WHERE run_id = ?`
+      )
+      .run(JSON.stringify(['unit-A1-regression']), runId);
+
+    // Park the repair run so resumeExistingRun accepts it.
+    firstDb.raw
+      .prepare(
+        "UPDATE runs SET phase='blocked', status='failed', ended_at=datetime('now') WHERE id=?"
+      )
+      .run(runId);
+
+    // Matched path and fresh-process loader agree when generations are consistent.
+    const matched = loadActiveRepairUnits(firstDb, runId);
+    const freshLoader = loadActiveRepairUnitsForFreshProcess(firstDb, runId);
     expect(matched.map((u) => u.task_key).sort()).toEqual(['A1', 'A2']);
-    expect(loose.map((u) => u.task_key).sort()).toEqual(['A1', 'A2']);
+    expect(freshLoader.map((u) => u.task_key).sort()).toEqual(['A1', 'A2']);
 
-    // After generation drift on one unit, paths diverge — the seam F4 will hit.
-    db.raw
-      .prepare('UPDATE run_tasks SET repair_generation = 99 WHERE id = ?')
-      .run(taskIds.A1);
-    expect(loadActiveRepairUnits(db, runId).map((u) => u.task_key)).toEqual(['A2']);
-    const looseAfter = loadActiveRepairUnitsForFreshProcess(db, runId);
-    expect(looseAfter.map((u) => u.task_key).sort()).toEqual(['A1', 'A2']);
+    // After generation drift on one unit, both paths exclude it (join wired).
+    firstDb.raw.prepare('UPDATE run_tasks SET repair_generation = 99 WHERE id = ?').run(taskIds.A1);
+    expect(loadActiveRepairUnits(firstDb, runId).map((u) => u.task_key)).toEqual(['A2']);
+    expect(loadActiveRepairUnitsForFreshProcess(firstDb, runId).map((u) => u.task_key)).toEqual([
+      'A2',
+    ]);
+    // Restore for the real resume path (both units active).
+    firstDb.raw.prepare('UPDATE run_tasks SET repair_generation = 1 WHERE id = ?').run(taskIds.A1);
 
-    const q = new TaskQueueService();
-    const prep = prepareFreshProcessRepairResume(db, q, runId);
-    expect(prep.generation_join).toBe(false);
-    expect(prep.note).toMatch(/FIRST PASS|generation/i);
-    // Fresh-process first-pass still surfaces drifted A1 (join omitted).
+    const resumeSpy = vi.spyOn(RunOrchestratorService.prototype, 'resumeExistingRun');
+
+    const prep = await prepareFreshProcessRepairResume({
+      dbPath,
+      runId,
+      closeDb: firstDb,
+      createOrchestrator: ({ db, queue, artifacts }) => {
+        return new RunOrchestratorService({
+          artifacts,
+          planning: {} as any,
+          parser: new PlanParserService(artifacts),
+          queue,
+          transport: new FakeTransport(),
+          projectService: new ProjectService(db),
+          assignmentService: new AgentAssignmentService(db),
+        });
+      },
+    });
+
+    expect(prep.ok).toBe(true);
+    expect(prep.generation_join).toBe(true);
     expect(prep.units.map((u) => u.task_key).sort()).toEqual(['A1', 'A2']);
+    expect(prep.redispatched_task_ids.sort()).toEqual([taskIds.A1, taskIds.A2].sort());
+    expect(resumeSpy).toHaveBeenCalledWith(runId);
+    expect(resumeSpy).toHaveBeenCalledTimes(1);
 
-    // Product surface for F4/R8.1 dogfood is present.
-    expect(fs.existsSync(path.join(process.cwd(), 'src/services/fence-repair-resume-adapter.ts'))).toBe(
-      true
-    );
-    db.close();
+    // Fresh graph is a different DatabaseService instance (first was closed).
+    expect(prep.db).not.toBe(firstDb);
+    // Snapshot taken immediately after resumeExistingRun setup (before engine-tail races).
+    expect(prep.run_after_resume).toMatchObject({ phase: 'executing', status: 'active' });
+
+    // Reopen markers survive real resumeExistingRun (never force-complete / erase).
+    for (const key of ['A1', 'A2'] as const) {
+      const row = prep.db.raw
+        .prepare(
+          'SELECT status, reopen_reason, repair_generation FROM run_tasks WHERE id = ?'
+        )
+        .get(taskIds[key]) as {
+        status: string;
+        reopen_reason: string;
+        repair_generation: number;
+      };
+      expect(row.reopen_reason).toBe('repair');
+      expect(row.repair_generation).toBe(1);
+      expect(['pending', 'working', 'complete']).toContain(row.status);
+    }
+
+    // Historical complete outside active generation stays complete.
+    const a3 = prep.db.raw
+      .prepare('SELECT status, reopen_reason, repair_generation FROM run_tasks WHERE id = ?')
+      .get(taskIds.A3) as { status: string; reopen_reason: string | null; repair_generation: number };
+    expect(a3).toEqual({ status: 'complete', reopen_reason: null, repair_generation: 0 });
+
+    resumeSpy.mockRestore();
+    // Brief yield so the async engine tail notices closed handles less noisily.
+    await new Promise((r) => setTimeout(r, 30));
+    try {
+      prep.db.close();
+    } catch {
+      /* ignore */
+    }
+  });
+
+  it('fresh-process path refuses when no generation-matched repair units remain', async () => {
+    process.env.USE_FAKE_TMUX = '1';
+    process.env.NODE_ENV = 'test';
+
+    const t = tempDir('helm-fence-r6-fresh-refuse-');
+    cleanups.push(t.cleanup);
+    const dbPath = path.join(t.dir, 'helm.db');
+    const firstDb = new DatabaseService(dbPath);
+    const { runId, taskIds } = stageLockReopen(firstDb, t.dir, ['A1']);
+
+    // Drift so join excludes the only unit.
+    firstDb.raw
+      .prepare('UPDATE run_tasks SET repair_generation = repair_generation + 1 WHERE id = ?')
+      .run(taskIds.A1);
+
+    await expect(
+      prepareFreshProcessRepairResume({
+        dbPath,
+        runId,
+        closeDb: firstDb,
+        createOrchestrator: ({ db, queue, artifacts }) =>
+          new RunOrchestratorService({
+            artifacts,
+            planning: {} as any,
+            parser: new PlanParserService(artifacts),
+            queue,
+            transport: new FakeTransport(),
+            projectService: new ProjectService(db),
+            assignmentService: new AgentAssignmentService(db),
+          }),
+      })
+    ).rejects.toThrow(/no active fence_repair_units|generation/i);
   });
 
   it('never force-completes a deliberate repair reopen on reconstruct', () => {
