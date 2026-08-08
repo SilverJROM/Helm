@@ -2637,8 +2637,12 @@ CREATE TABLE role_bindings_v89 (
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
   UNIQUE(project_id, role, agent_id)
 );
+-- Filter to v89 vocabulary only. Fresh SCHEMA_SQL may already carry post-v89 roles
+-- (e.g. branch-safety from B3); re-running this migration after a version downgrade
+-- must not fail CHECK when those rows exist — later steps (v114+) re-seed them.
 INSERT INTO role_bindings_v89 (id, project_id, role, agent_id, created_at, updated_at)
-SELECT id, project_id, role, agent_id, created_at, updated_at FROM role_bindings;
+SELECT id, project_id, role, agent_id, created_at, updated_at FROM role_bindings
+WHERE role IN ('projcore', 'discovery', 'plancore', 'ibrain', 'coord', 'implementer', 'validator', 'deliberation', 'red-team', 'planner', 'routine-implementer', 'panelist');
 DROP TABLE role_bindings;
 ALTER TABLE role_bindings_v89 RENAME TO role_bindings;
 `);
@@ -2653,7 +2657,8 @@ CREATE TABLE role_defaults_v89 (
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 INSERT INTO role_defaults_v89 (role, agent_id, updated_at)
-SELECT role, agent_id, updated_at FROM role_defaults;
+SELECT role, agent_id, updated_at FROM role_defaults
+WHERE role IN ('projcore', 'discovery', 'plancore', 'ibrain', 'coord', 'implementer', 'validator', 'deliberation', 'red-team', 'planner', 'routine-implementer', 'panelist');
 DROP TABLE role_defaults;
 ALTER TABLE role_defaults_v89 RENAME TO role_defaults;
 `);
@@ -2685,7 +2690,8 @@ INSERT INTO role_capabilities_v89 (
 SELECT role, allowed_statuses, terminal_statuses, can_write_code, requires_repro_first,
        panel_participant, can_escalate, session_policy, required_artifacts, timeout_ms,
        checkin_ms, created_at, updated_at
-FROM role_capabilities;
+FROM role_capabilities
+WHERE role IN ('projcore', 'discovery', 'plancore', 'ibrain', 'coord', 'implementer', 'validator', 'deliberation', 'red-team', 'planner', 'routine-implementer', 'panelist');
 DROP TABLE role_capabilities;
 ALTER TABLE role_capabilities_v89 RENAME TO role_capabilities;
 `);

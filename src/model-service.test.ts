@@ -264,6 +264,14 @@ describe('B1 ModelService (S1) + B2 agent bindings + delete ref-guard + v10 mig 
   it('D2 R-02A: v32 live migration PURGES model-named stub agents (grok-4.5/grok-composer/spark/codex-5.4) from COPY of live data/helm.db; stub MODELS retained; version toBe(SCHEMA_VERSION)', () => {
     const livePath = path.resolve(process.cwd(), 'data/helm.db');
     if (!fs.existsSync(livePath)) return; // env without live db; gate covered by fresh + synthetic migs
+    // Snapshot live model names BEFORE migration — this env's live registry may not still carry
+    // every historical stub model row (names drift). Only assert retention for names that exist live.
+    const liveModelNames = new Set(
+      (new Database(livePath, { readonly: true })
+        .prepare('SELECT name FROM models')
+        .all() as Array<{ name: string }>)
+        .map((m) => m.name)
+    );
     const t = makeTempDb();
     fs.copyFileSync(livePath, t.dbPath);
     const dbsCopy = new DatabaseService(t.dbPath);
@@ -281,11 +289,13 @@ describe('B1 ModelService (S1) + B2 agent bindings + delete ref-guard + v10 mig 
       "SELECT COUNT(*) AS c FROM role_bindings rb LEFT JOIN agents a ON a.id = rb.agent_id WHERE a.id IS NULL"
     ).get() as { c: number };
     expect(dangling.c).toBe(0);
-    // The stub MODELS remain (D2 removes agents only, not models).
+    // The stub MODELS remain when present live (D2 removes agents only, not models).
     const modelNames = (dbsCopy.raw.prepare("SELECT name FROM models").all() as any[]).map((m: any) => m.name);
-    expect(modelNames).toContain('grok-composer-2.5-fast');
-    expect(modelNames).toContain('spark');
-    expect(modelNames).toContain('codex-5.4');
+    for (const stubModel of ['grok-composer-2.5-fast', 'spark', 'codex-5.4'] as const) {
+      if (liveModelNames.has(stubModel)) {
+        expect(modelNames).toContain(stubModel);
+      }
+    }
     t.cleanup();
   });
 

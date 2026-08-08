@@ -2160,10 +2160,14 @@ export function applyB09aCanonicalRosterSeeds(db: Database.Database): void {
   }
 
   // agent-master team-eligible (default_model_id) — same pattern as master_agent F4.
-  db.prepare(
-    `UPDATE agents SET default_model_id = (SELECT id FROM models WHERE model_id = 'claude-sonnet-4-6' LIMIT 1)
-     WHERE name = 'agent-master' AND default_model_id IS NULL`
-  ).run();
+  // Guard: some upgrade fixtures (phase-role-migration) have agents without models yet.
+  const hasModels = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='models'").get();
+  if (hasModels) {
+    db.prepare(
+      `UPDATE agents SET default_model_id = (SELECT id FROM models WHERE model_id = 'claude-sonnet-4-6' LIMIT 1)
+       WHERE name = 'agent-master' AND default_model_id IS NULL`
+    ).run();
+  }
 }
 
 /**
