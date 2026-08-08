@@ -14,6 +14,14 @@ import {
   type CloseFenceLockedTestResult,
 } from './fence-close-locked-test.js';
 import {
+  buildCompositionJudgmentRequest,
+  persistCompositionJudgmentSession,
+  routeCompositionJudgment,
+  type CompositionJudgmentRequest,
+  type FenceAuthoringSessionRow,
+  type FenceImplementerSession,
+} from './fence-integration-agent-route.js';
+import {
   failedIds,
   fingerprint,
   isProvingKind,
@@ -72,6 +80,52 @@ export interface CloseFenceMechanicalResult {
     artifactId: number;
   };
 }
+
+export interface CloseFenceSeatRoutingParams extends CloseFenceMechanicalParams {
+  compositionJudgmentSessionId?: string | null;
+  implementerSessions?: readonly FenceImplementerSession[];
+  candidateFailingUnits?: string[];
+}
+
+export type CloseFenceSeatRoutingResult =
+  | {
+      ok: true;
+      clean: true;
+      status: 'closed';
+      fenceId: number;
+      fenceKey: string;
+      runId: number;
+      close: CloseFenceMechanicalResult;
+      seat_spend: {
+        implementer: 0;
+        validator: 0;
+        integration_test_agent: 0;
+      };
+      composition_judgment: null;
+    }
+  | {
+      ok: true;
+      clean: false;
+      status: 'composition_judgment_required';
+      fenceId: number;
+      fenceKey: string;
+      runId: number;
+      close: CloseFenceLockedTestResult;
+      non_clean_reason: {
+        open_ids_still_failing: string[];
+        close_failed_ids: string[];
+      };
+      seat_spend: {
+        implementer: 0;
+        validator: 0;
+        integration_test_agent: 1;
+      };
+      composition_judgment: {
+        route: ReturnType<typeof routeCompositionJudgment>;
+        request: CompositionJudgmentRequest;
+        session: FenceAuthoringSessionRow | null;
+      };
+    };
 
 interface FenceCloseMechanicalRow {
   id: number;
@@ -135,12 +189,17 @@ function setFenceState(raw: SqliteDb, fenceId: number, state: 'closing' | 'close
 
 function requireOpenIdsPassed(close: CloseFenceLockedTestResult): void {
   const passed = new Set(close.close_passed_ids);
-  const missing = sortedUnique(close.open_failed_ids.filter((id) => !passed.has(id)));
+  const missing = openIdsStillFailing(close);
   if (missing.length === 0) return;
   throw new FenceCloseMechanicalError(
     'open_assertions_not_passing',
     `fence '${close.fenceKey}' CLOSE refused: OPEN assertion id(s) did not pass at CLOSE: ${missing.join(', ')}`
   );
+}
+
+function openIdsStillFailing(close: CloseFenceLockedTestResult): string[] {
+  const passed = new Set(close.close_passed_ids);
+  return sortedUnique(close.open_failed_ids.filter((id) => !passed.has(id)));
 }
 
 function provingFailedIds(report: FenceReportV1): string[] {
@@ -294,5 +353,163 @@ export function closeFenceMechanical(
       exitCode: negativeRun.exitCode,
       artifactId: ncArtifactId,
     },
+  };
+}
+
+export function closeFenceWithSeatRouting(
+  db: DatabaseService | SqliteDb,
+  params: CloseFenceSeatRoutingParams
+): CloseFenceSeatRoutingResult {
+  const raw = resolveRaw(db);
+  const fence = loadFence(raw, params);
+  if (fence.lifecycle_state !== 'draining') {
+    throw new FenceCloseMechanicalError(
+      'bad_state',
+      `fence '${fence.fence_key}' lifecycle_state is '${fence.lifecycle_state}' — CLOSE starts from draining`
+    );
+  }
+
+  const negativeControlCmd = fence.negative_control_cmd?.trim();
+  if (!negativeControlCmd) {
+    throw new FenceCloseMechanicalError(
+      'missing_negative_control',
+      `fence '${fence.fence_key}' declares no negative_control_cmd`
+    );
+  }
+
+  const run =
+    params.runCommand ??
+    ((opts) =>
+      runFenceReportCommand({
+        cmd: opts.cmd,
+        cwd: opts.cwd,
+        runDir: opts.runDir,
+        reportPath: opts.reportPath,
+        env: opts.env,
+        timeoutMs: opts.timeoutMs,
+      }));
+  const cwd = params.cwd ?? process.cwd();
+
+  setFenceState(raw, fence.id, 'closing');
+
+  const close = closeFenceLockedTest(db, {
+    ...params,
+    fenceId: fence.id,
+    cwd,
+    runCommand: run,
+  });
+
+  const openIdsNotPassing = openIdsStillFailing(close);
+  const closeFailedIds = sortedUnique(close.close_failed_ids);
+  if (openIdsNotPassing.length > 0 || closeFailedIds.length > 0) {
+    const request = buildCompositionJudgmentRequest({
+      fence_key: fence.fence_key,
+      run_id: fence.run_id,
+      open_failed_ids: close.open_failed_ids,
+      close_failed_ids: closeFailedIds,
+      close_passed_ids: close.close_passed_ids,
+      seam_fingerprint: fingerprint(close.report),
+      report_path: close.reportPath,
+      candidate_failing_units: params.candidateFailingUnits,
+    });
+    const sessionId = params.compositionJudgmentSessionId?.trim();
+    const session = sessionId
+      ? persistCompositionJudgmentSession(db, {
+          fence_id: fence.id,
+          run_id: fence.run_id,
+          fence_key: fence.fence_key,
+          session_id: sessionId,
+          implementer_sessions: params.implementerSessions,
+        })
+      : null;
+
+    return {
+      ok: true,
+      clean: false,
+      status: 'composition_judgment_required',
+      fenceId: fence.id,
+      fenceKey: fence.fence_key,
+      runId: fence.run_id,
+      close,
+      non_clean_reason: {
+        open_ids_still_failing: openIdsNotPassing,
+        close_failed_ids: closeFailedIds,
+      },
+      seat_spend: {
+        implementer: 0,
+        validator: 0,
+        integration_test_agent: 1,
+      },
+      composition_judgment: {
+        route: routeCompositionJudgment(),
+        request,
+        session,
+      },
+    };
+  }
+
+  let negativeRun: RunFenceReportCommandResult;
+  try {
+    negativeRun = run({
+      cmd: negativeControlCmd,
+      cwd,
+      runDir: params.runDir,
+      reportPath: params.reportPath,
+      env: params.env,
+      timeoutMs: params.timeoutMs,
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new FenceCloseMechanicalError(
+      'negative_control_report_error',
+      `negative_control_cmd could not read a report: ${msg}`
+    );
+  }
+
+  const nc = requireNegativeControlDifferentAssertion({
+    fenceKey: fence.fence_key,
+    openFailedIds: close.open_failed_ids,
+    report: negativeRun.report,
+  });
+  const ncFingerprint = fingerprint(negativeRun.report);
+  const ncArtifactId = recordArtifact(raw, {
+    runId: fence.run_id,
+    type: 'fence-close-negative-control',
+    reportPath: negativeRun.reportPath,
+    sha: ncFingerprint,
+  });
+
+  setFenceState(raw, fence.id, 'closed');
+
+  return {
+    ok: true,
+    clean: true,
+    status: 'closed',
+    fenceId: fence.id,
+    fenceKey: fence.fence_key,
+    runId: fence.run_id,
+    close: {
+      ok: true,
+      fenceId: fence.id,
+      fenceKey: fence.fence_key,
+      runId: fence.run_id,
+      close,
+      negative_control: {
+        failed_ids: failedIds(negativeRun.report),
+        proving_failed_ids: nc.proving,
+        different_failed_ids: nc.different,
+        fingerprint: ncFingerprint,
+        report: negativeRun.report,
+        reportPath: negativeRun.reportPath,
+        exitCode: negativeRun.exitCode,
+        artifactId: ncArtifactId,
+      },
+    },
+    seat_spend: {
+      implementer: 0,
+      validator: 0,
+      integration_test_agent: 0,
+    },
+    composition_judgment: null,
   };
 }
