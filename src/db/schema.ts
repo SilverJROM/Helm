@@ -2,7 +2,7 @@ import type Database from "better-sqlite3";
 import { assertAllRoleTiersInvariants } from "./role-tier-invariants.js";
 import { PROVIDERS } from "../config/providers.js";
 
-export const SCHEMA_VERSION = 116;
+export const SCHEMA_VERSION = 117;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -1051,6 +1051,26 @@ CREATE TABLE IF NOT EXISTS fence_members (
 );
 CREATE INDEX IF NOT EXISTS idx_fence_members_fence ON fence_members(fence_id);
 CREATE INDEX IF NOT EXISTS idx_fence_members_task_key ON fence_members(task_key);
+
+-- v117 / fence-workflow-upgrade A4 (R1.6, R9.1, R9.3, R9.4): persist integration_test_agent
+-- authoring / composition-judgment session identity per fence (verifier≠fixer by session).
+CREATE TABLE IF NOT EXISTS fence_authoring_sessions (
+  id INTEGER PRIMARY KEY,
+  fence_id INTEGER NOT NULL REFERENCES fences(id) ON DELETE CASCADE,
+  run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  fence_key TEXT NOT NULL,
+  role TEXT NOT NULL,
+  model TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  purpose TEXT NOT NULL CHECK(purpose IN ('plan_time_author', 'composition_judgment')),
+  test_path TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(fence_id, purpose)
+);
+CREATE INDEX IF NOT EXISTS idx_fence_authoring_sessions_run
+  ON fence_authoring_sessions(run_id, fence_key);
+CREATE INDEX IF NOT EXISTS idx_fence_authoring_sessions_session
+  ON fence_authoring_sessions(session_id);
 `;
 
 /** B03a: slugify a model name for Helm-canonical slug backfill (not the B04 registry map). */

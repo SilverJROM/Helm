@@ -3970,6 +3970,31 @@ CREATE INDEX IF NOT EXISTS idx_fence_members_task_key ON fence_members(task_key)
 `);
         this.db.prepare('UPDATE schema_version SET version = 116').run();
       }
+
+      // v117 / fence-workflow-upgrade A4 (R1.6, R9.1, R9.3, R9.4): plan-time authoring +
+      // composition-judgment session identity for integration_test_agent (codex55).
+      if (current && current.version < 117) {
+        this.db.exec(`
+CREATE TABLE IF NOT EXISTS fence_authoring_sessions (
+  id INTEGER PRIMARY KEY,
+  fence_id INTEGER NOT NULL REFERENCES fences(id) ON DELETE CASCADE,
+  run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  fence_key TEXT NOT NULL,
+  role TEXT NOT NULL,
+  model TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  purpose TEXT NOT NULL CHECK(purpose IN ('plan_time_author', 'composition_judgment')),
+  test_path TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(fence_id, purpose)
+);
+CREATE INDEX IF NOT EXISTS idx_fence_authoring_sessions_run
+  ON fence_authoring_sessions(run_id, fence_key);
+CREATE INDEX IF NOT EXISTS idx_fence_authoring_sessions_session
+  ON fence_authoring_sessions(session_id);
+`);
+        this.db.prepare('UPDATE schema_version SET version = 117').run();
+      }
     }
   }
 
