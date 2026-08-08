@@ -27,6 +27,8 @@ import { matchSeatAuthError, authRemedyFor } from './seat-auth.js';
 import { parsePlanContradiction } from './plan-contradiction.js';
 import { classifyGateFault, authFault } from './fault-class.js';
 import { finalizeWorkerRuntimeRow } from './worker-runtime-finalize.js';
+import { openFence } from './fence-open-service.js';
+import { selectNextWork } from './fence-selector-admission.js';
 
 export type Transition = string;
 
@@ -2703,6 +2705,23 @@ export class OrchestratorLoop {
     this.runId = params.runId;
 
     while (true) {
+      if (params.artifactService) {
+        const decision = selectNextWork({
+          db: (params.artifactService as any)['db'],
+          queue: params.queue,
+          runId: params.runId,
+        });
+        if (decision.kind === 'OPEN_FENCE') {
+          openFence((params.artifactService as any)['db'], {
+            fenceId: decision.fenceId,
+            cwd: process.cwd(),
+            repoRoot: process.cwd(),
+            runDir: this.runDir,
+          });
+          continue;
+        }
+        if (decision.kind !== 'DISPATCH_TASK') break;
+      }
       // B03 C1: claim freezes TaskTerminalToken; carry through await — never mark*(taskId, runId) after settle.
       const terminalToken = params.queue.claimNextReady(params.runId);
       if (terminalToken == null) break;

@@ -58,6 +58,8 @@ import {
   recordProvenanceAfterAgreement,
   PLANNING_REQUIRED_MESSAGE,
 } from './planning-provenance-service.js';
+import { openFence } from './fence-open-service.js';
+import { selectNextWork } from './fence-selector-admission.js';
 
 // CYCLE-BUILDDIR: a cycle-plan run builds the deliverable in this subdir OF the cycle workspace (never the
 // workspace root — that holds north-star.md, which puts helm-sandbox in PROTECTED-ROOT mode and blocks
@@ -3112,6 +3114,43 @@ Use the exact JROM-clone standards: adversarial, verify against requirements con
         }
         break;
       }
+      const decision = selectNextWork({ db: this.deps.artifacts['db'], queue, runId });
+      if (decision.kind === 'OPEN_FENCE') {
+        if (!ownsCurrentGeneration()) {
+          if (genGated) {
+            console.warn(
+              `[run-orchestrator] drainDispatch stopped before OPEN fence ${decision.fenceKey} for run ${runId} generation ${expectedGeneration} — no longer current`
+            );
+          }
+          break;
+        }
+        try {
+          const opened = openFence(this.deps.artifacts['db'], {
+            fenceId: decision.fenceId,
+            cwd: project.directory,
+            repoRoot: project.directory,
+            runDir,
+          });
+          console.log(
+            `[run-orchestrator] OPEN_FENCE ${opened.fenceKey} complete for run ${runId}; ` +
+              `baseline ids=${opened.open_failed_ids.join(',')}`
+          );
+        } catch (e: any) {
+          const msg = e?.message || String(e);
+          console.error(`[run-orchestrator] OPEN_FENCE ${decision.fenceKey} failed for run ${runId}: ${msg}`);
+          this.transitionRunToBlocked(
+            runId,
+            `OPEN_FENCE ${decision.fenceKey} failed: ${msg}`,
+            project,
+            'failure',
+            expectedGeneration
+          );
+          break;
+        }
+        continue;
+      }
+      if (decision.kind !== 'DISPATCH_TASK') break;
+
       claim = queue.claimNextReady(runId);
       if (claim == null) break;
       // B03 C1: freeze token at claim; carry through await — never rebuild from taskId maps at mark*.
