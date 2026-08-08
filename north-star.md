@@ -133,6 +133,16 @@ Numbered, dated, attributed. **Not re-openable by any agent** — only JROM revi
 
 Recorded because each one *misleads* someone who doesn't know it. Not a work queue.
 
+- **The full test suite has ~106 pre-existing failures across ~35 files**, unrelated to any one
+  effort — confirmed 2026-08-08 during `fence-workflow-upgrade` (reproduces on a clean baseline
+  commit in an isolated worktree, nothing to do with that effort). Clusters: orchestrator/planning,
+  "live-oracle" (likely needs a live external service this isolated context lacks),
+  draft-not-submitted, p1-6b. **A "suite green" claim from any Tiller driver-run gate after this date
+  means green against an enumerated exclusion of these ~35 files** (`.tiller/suite-cmd.sh`,
+  `dispatch/s0-residual-failures.txt` in the fence effort's run dir), **not that Helm's suite is
+  actually fully green.** Full reasoning: `plan/fence-workflow-upgrade/decisions/D9-…md`. This is
+  real, unaddressed debt — it needs its own future cleanup effort, not a permanent exclusion nobody
+  revisits.
 - **Three DB names for one database.** Code default `helm.db`, `.env` `helm-harness.db`, pm2
   `cards2-ibrain.db`. The safety rail names the non-production file; the production file has none.
 - **`run_id` is two incompatible types.** INTEGER in `runs`/`worker_runtimes`; **TEXT with no FK** in
