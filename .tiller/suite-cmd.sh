@@ -5,10 +5,15 @@
 # Fork cap and temp DB are load-bearing, not tidiness: uncapped vitest spawns one fork per core, and on
 # this 16-core box browser/whisper tests hit ~3.5GB per fork, OOM the machine, and kill every tmux
 # session — including live Tiller runs. The temp DB keeps the suite off data/helm.db.
+#
+# Pin HELM_HOST/HELM_PORT so live .env / ecosystem bind (0.0.0.0) cannot fail smoke defaults.
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO" || exit 1
-HELM_DB_PATH="/tmp/helm-suite-$$.db" npx vitest run --poolOptions.forks.minForks=1 --poolOptions.forks.maxForks=4
+export HELM_DB_PATH="/tmp/helm-suite-$$.db"
+export HELM_HOST=127.0.0.1
+export HELM_PORT=3110
+npx vitest run --poolOptions.forks.minForks=1 --poolOptions.forks.maxForks=4
 rc=$?
 rm -f "/tmp/helm-suite-$$.db"
 exit $rc

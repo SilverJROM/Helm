@@ -7,20 +7,26 @@ import path from 'node:path';
 
 describe('Helm P1-1 scaffold', () => {
   it('config returns correct defaults (3110/127.0.0.1/data/helm.db)', () => {
-    // T1 sets HELM_DB_PATH globally for tests; to verify the DEFAULT, temporarily clear it.
+    // T1 sets HELM_DB_PATH globally; .env / ecosystem may set HELM_HOST/HELM_PORT for live bind.
+    // To verify the DEFAULTS, temporarily clear all three (same pattern as HELM_DB_PATH).
     const oldDbPath = process.env.HELM_DB_PATH;
+    const oldHost = process.env.HELM_HOST;
+    const oldPort = process.env.HELM_PORT;
     delete process.env.HELM_DB_PATH;
+    delete process.env.HELM_HOST;
+    delete process.env.HELM_PORT;
     try {
       const cfg = loadConfig();
       expect(cfg.port).toBe(3110);
       expect(cfg.host).toBe('127.0.0.1');
       expect(cfg.dbPath).toBe('data/helm.db');
     } finally {
-      if (oldDbPath !== undefined) {
-        process.env.HELM_DB_PATH = oldDbPath;
-      } else {
-        delete process.env.HELM_DB_PATH;
-      }
+      if (oldDbPath !== undefined) process.env.HELM_DB_PATH = oldDbPath;
+      else delete process.env.HELM_DB_PATH;
+      if (oldHost !== undefined) process.env.HELM_HOST = oldHost;
+      else delete process.env.HELM_HOST;
+      if (oldPort !== undefined) process.env.HELM_PORT = oldPort;
+      else delete process.env.HELM_PORT;
     }
   });
 
