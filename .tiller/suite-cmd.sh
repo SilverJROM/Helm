@@ -17,6 +17,7 @@
 # (extracted from /tmp/s0-clean-1.log, not hand-typed). NOT a blanket skip — only these exact files.
 # Any failure outside this list still fails the gate. See decisions/D9-suite-band-baseline-exclusion.md
 # and project north-star §8 known-debt. Reversible: remove the per-file excludes below.
+# S0 (fence-workflow-upgrade): fork isolation + v89/models/smoke + D9 excludes; green×2 required.
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO" || exit 1
