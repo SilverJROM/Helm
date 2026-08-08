@@ -1,6 +1,7 @@
 import { RunArtifactService } from './run-artifact-service.js';
 import { compareBatchLabels, DEFAULT_BATCH } from './execution-plan-parser.js';
 import type { TaskExpectedStatus, TaskTerminalToken } from './lifecycle-cas.js';
+import { isFenceClaimBlocked } from './fence-selector-admission.js';
 
 export type { TaskExpectedStatus, TaskTerminalToken } from './lifecycle-cas.js';
 
@@ -126,6 +127,10 @@ export class TaskQueueService {
    * B03 / AC7 C1: claim the next ready task and return an immutable terminal token bound to this
    * dispatch. Callers must carry the token through async work and pass it to mark* — never rebuild
    * from taskId maps after await.
+   *
+   * fence-workflow-upgrade B3 (R3.1): when artifacts/DB is present, a fence member whose fence
+   * lacks a complete OPEN baseline is NOT claimed (no in-flight). Returns null so the typed
+   * selector can surface OPEN_FENCE. Non-members keep the ordinary unit gate (R3.2).
    */
   claimNextReady(runId: number): TaskTerminalToken | null {
     if (this.inFlight[runId]) return null;
@@ -138,6 +143,14 @@ export class TaskQueueService {
       if (this.failedTasks.has(tid) || this.deferredTasks.has(tid)) continue;
       if (this.completedTasks.has(tid)) continue;
       if (this.isSatisfied(tid)) {
+        // R3.1 structural gate: never put a fence member in-flight without OPEN baseline.
+        // Fail closed at the real claim site — do not skip to a later task (would reorder past OPEN).
+        if (this.isFenceMemberClaimBlocked(runId, tid)) {
+          console.warn(
+            `[TaskQueueService] claimNextReady(${runId}) refused task ${tid} — fence member without OPEN baseline (R3.1)`
+          );
+          return null;
+        }
         const token = this.freezeTerminalToken(runId, tid);
         if (!token) {
           console.warn(
@@ -150,6 +163,19 @@ export class TaskQueueService {
       }
     }
     return null;
+  }
+
+  /**
+   * fence-workflow-upgrade B3: SQL admission check at claim (R3.1).
+   * No artifacts ⇒ pure in-mem path unchanged. Non-members and members with baseline pass.
+   */
+  private isFenceMemberClaimBlocked(runId: number, taskId: number): boolean {
+    if (!this.artifacts) return false;
+    try {
+      return isFenceClaimBlocked(this.artifacts['db'], runId, taskId);
+    } catch {
+      return false;
+    }
   }
 
   /**
