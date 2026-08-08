@@ -2,7 +2,7 @@ import type Database from "better-sqlite3";
 import { assertAllRoleTiersInvariants } from "./role-tier-invariants.js";
 import { PROVIDERS } from "../config/providers.js";
 
-export const SCHEMA_VERSION = 118;
+export const SCHEMA_VERSION = 119;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -1118,15 +1118,39 @@ CREATE TABLE IF NOT EXISTS fence_repair_units (
   task_key TEXT NOT NULL,
   repair_generation INTEGER NOT NULL CHECK(repair_generation >= 1),
   prior_status TEXT NOT NULL CHECK(prior_status IN ('pending','working','complete','failed','deferred')),
+  -- v119 / fence-workflow-upgrade R2 (R5.1–R5.3): validator-authored repair test
+  -- fill-once hash lock. NULL until the driver red-verifies collection + named
+  -- assert failure on HEAD, then permanently locked before reopen/dispatch.
+  repair_test_path TEXT,
+  repair_test_hash TEXT,
+  repair_assert_ids TEXT,
+  authored_by TEXT,
+  locked_at TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   UNIQUE(repair_round_id, task_key)
 );
 CREATE INDEX IF NOT EXISTS idx_fence_repair_units_task
   ON fence_repair_units(run_task_id, repair_generation);
+-- History columns are immutable; lock columns may fill NULL→value once (R2).
 CREATE TRIGGER IF NOT EXISTS fence_repair_units_no_update
 BEFORE UPDATE ON fence_repair_units
+WHEN
+  NEW.id IS NOT OLD.id
+  OR NEW.repair_round_id IS NOT OLD.repair_round_id
+  OR NEW.fence_id IS NOT OLD.fence_id
+  OR NEW.run_id IS NOT OLD.run_id
+  OR NEW.run_task_id IS NOT OLD.run_task_id
+  OR NEW.task_key IS NOT OLD.task_key
+  OR NEW.repair_generation IS NOT OLD.repair_generation
+  OR NEW.prior_status IS NOT OLD.prior_status
+  OR NEW.created_at IS NOT OLD.created_at
+  OR (OLD.repair_test_path IS NOT NULL AND (NEW.repair_test_path IS NULL OR NEW.repair_test_path IS NOT OLD.repair_test_path))
+  OR (OLD.repair_test_hash IS NOT NULL AND (NEW.repair_test_hash IS NULL OR NEW.repair_test_hash IS NOT OLD.repair_test_hash))
+  OR (OLD.repair_assert_ids IS NOT NULL AND (NEW.repair_assert_ids IS NULL OR NEW.repair_assert_ids IS NOT OLD.repair_assert_ids))
+  OR (OLD.authored_by IS NOT NULL AND (NEW.authored_by IS NULL OR NEW.authored_by IS NOT OLD.authored_by))
+  OR (OLD.locked_at IS NOT NULL AND (NEW.locked_at IS NULL OR NEW.locked_at IS NOT OLD.locked_at))
 BEGIN
-  SELECT RAISE(ABORT, 'fence repair units are append-only');
+  SELECT RAISE(ABORT, 'fence repair units are append-only (hash lock is fill-once)');
 END;
 CREATE TRIGGER IF NOT EXISTS fence_repair_units_no_delete
 BEFORE DELETE ON fence_repair_units

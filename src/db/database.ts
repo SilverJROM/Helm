@@ -4083,6 +4083,60 @@ END;
         }
         this.db.prepare('UPDATE schema_version SET version = 118').run();
       }
+
+      // v119 / fence-workflow-upgrade R2 (R5.1–R5.3): validator-authored repair test
+      // fill-once hash lock columns on fence_repair_units. History remains immutable;
+      // only NULL→value lock fill is allowed before reopen/implementer dispatch.
+      if (current && current.version < 119) {
+        const hasRepairUnits = !!this.db
+          .prepare("SELECT 1 AS o FROM sqlite_master WHERE type='table' AND name='fence_repair_units'")
+          .get();
+        if (hasRepairUnits) {
+          const unitCols = new Set(
+            (this.db.prepare('PRAGMA table_info(fence_repair_units)').all() as any[]).map((c) => c.name)
+          );
+          if (!unitCols.has('repair_test_path')) {
+            this.db.exec('ALTER TABLE fence_repair_units ADD COLUMN repair_test_path TEXT');
+          }
+          if (!unitCols.has('repair_test_hash')) {
+            this.db.exec('ALTER TABLE fence_repair_units ADD COLUMN repair_test_hash TEXT');
+          }
+          if (!unitCols.has('repair_assert_ids')) {
+            this.db.exec('ALTER TABLE fence_repair_units ADD COLUMN repair_assert_ids TEXT');
+          }
+          if (!unitCols.has('authored_by')) {
+            this.db.exec('ALTER TABLE fence_repair_units ADD COLUMN authored_by TEXT');
+          }
+          if (!unitCols.has('locked_at')) {
+            this.db.exec('ALTER TABLE fence_repair_units ADD COLUMN locked_at TEXT');
+          }
+          // Replace hard no-update with fill-once lock-aware guard.
+          this.db.exec(`
+DROP TRIGGER IF EXISTS fence_repair_units_no_update;
+CREATE TRIGGER IF NOT EXISTS fence_repair_units_no_update
+BEFORE UPDATE ON fence_repair_units
+WHEN
+  NEW.id IS NOT OLD.id
+  OR NEW.repair_round_id IS NOT OLD.repair_round_id
+  OR NEW.fence_id IS NOT OLD.fence_id
+  OR NEW.run_id IS NOT OLD.run_id
+  OR NEW.run_task_id IS NOT OLD.run_task_id
+  OR NEW.task_key IS NOT OLD.task_key
+  OR NEW.repair_generation IS NOT OLD.repair_generation
+  OR NEW.prior_status IS NOT OLD.prior_status
+  OR NEW.created_at IS NOT OLD.created_at
+  OR (OLD.repair_test_path IS NOT NULL AND (NEW.repair_test_path IS NULL OR NEW.repair_test_path IS NOT OLD.repair_test_path))
+  OR (OLD.repair_test_hash IS NOT NULL AND (NEW.repair_test_hash IS NULL OR NEW.repair_test_hash IS NOT OLD.repair_test_hash))
+  OR (OLD.repair_assert_ids IS NOT NULL AND (NEW.repair_assert_ids IS NULL OR NEW.repair_assert_ids IS NOT OLD.repair_assert_ids))
+  OR (OLD.authored_by IS NOT NULL AND (NEW.authored_by IS NULL OR NEW.authored_by IS NOT OLD.authored_by))
+  OR (OLD.locked_at IS NOT NULL AND (NEW.locked_at IS NULL OR NEW.locked_at IS NOT OLD.locked_at))
+BEGIN
+  SELECT RAISE(ABORT, 'fence repair units are append-only (hash lock is fill-once)');
+END;
+`);
+        }
+        this.db.prepare('UPDATE schema_version SET version = 119').run();
+      }
     }
   }
 

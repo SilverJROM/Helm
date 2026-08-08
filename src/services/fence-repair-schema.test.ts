@@ -38,6 +38,12 @@ const REPAIR_UNIT_COLUMNS = [
   'task_key',
   'repair_generation',
   'prior_status',
+  // v119 / R2 fill-once hash lock (NULL until lockFenceRepairUnitTest)
+  'repair_test_path',
+  'repair_test_hash',
+  'repair_assert_ids',
+  'authored_by',
+  'locked_at',
   'created_at',
 ] as const;
 
@@ -133,7 +139,7 @@ describe('R1 repair schema + staged round admission (R5.1, R5.5)', () => {
     cleanups.push(t.cleanup);
     const db = new DatabaseService(t.dbPath);
 
-    expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(118);
+    expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(119);
     expect((db.raw.prepare('SELECT version FROM schema_version').get() as { version: number }).version).toBe(
       SCHEMA_VERSION
     );
