@@ -10,6 +10,10 @@
  * coercion/normalization lives in the validator that ingest doesn't honor (ingest uses the same normalizedTasks).
  */
 import { validateMachinePlan, MACHINE_TASK_TYPES, type MachinePlanTask } from './plan-schema.js';
+import {
+  validatePlanFences,
+  type FencePlanContract,
+} from './fence-plan-contract.js';
 
 export interface ExecutionPlanTask {
   id: string;
@@ -22,6 +26,9 @@ export interface ExecutionPlanTask {
   type: string;
   [key: string]: unknown;
 }
+
+/** Re-export for plan-accept consumers (A2 fence plan-contract). */
+export type { FencePlanContract };
 
 // ---------------------------------------------------------------------------
 // Leg D (batch barrier) — batch as first-class durable ordering state.
@@ -267,7 +274,17 @@ export interface NormalizedExecutionTask {
 }
 
 export type ParseExecutionPlanResult =
-  | { ok: true; tasks: ExecutionPlanTask[] }
+  | { ok: true; tasks: ExecutionPlanTask[]; fences: FencePlanContract[] }
+  | { ok: false; errors: string[] };
+
+export type ValidateExecutionPlanResult =
+  | {
+      ok: true;
+      tasks: ExecutionPlanTask[];
+      normalizedTasks: NormalizedExecutionTask[];
+      /** Normalized fence contracts (empty when the plan is a legacy task array). */
+      fences: FencePlanContract[];
+    }
   | { ok: false; errors: string[] };
 
 function taskLabel(index: number, task: unknown): string {
@@ -411,21 +428,57 @@ function toNormalizedTask(t: ExecutionPlanTask): NormalizedExecutionTask {
 }
 
 /**
+ * Split a parsed JSON root into tasks + optional fences.
+ * Legacy plans are a bare task array (fencesRaw = undefined → no fence validation).
+ * Object form `{ tasks, fences? }` is the authored fence plan-contract shape (A2 / R1.1–R1.3).
+ * A bare object without `tasks` is rejected (fail closed).
+ */
+function extractTasksAndFences(j: unknown):
+  | { ok: true; tasks: unknown[]; fencesRaw: unknown }
+  | { ok: false; error: string } {
+  if (Array.isArray(j)) {
+    return { ok: true, tasks: j, fencesRaw: undefined };
+  }
+  if (j && typeof j === 'object') {
+    const obj = j as Record<string, unknown>;
+    if (!Array.isArray(obj.tasks)) {
+      return {
+        ok: false,
+        error:
+          'fenced JSON object must include a "tasks" array (legacy bare task arrays remain valid; optional "fences" map/array carries fence contracts)',
+      };
+    }
+    return {
+      ok: true,
+      tasks: obj.tasks,
+      fencesRaw: Object.prototype.hasOwnProperty.call(obj, 'fences') ? obj.fences : undefined,
+    };
+  }
+  return {
+    ok: false,
+    error: 'fenced JSON must be an array of task objects or an object with a "tasks" array',
+  };
+}
+
+/**
  * THE single shared validation pipeline (sol send-back #3). Pure — no DB, no queue. Runs EVERY check ingestion
  * requires and returns the fully-normalized tasks. Accepts a fenced-json markdown string OR an already-parsed
- * task array. Both the UI gate (parseExecutionPlan) and ingestion consume this, so `ok === true` ⟺ ingestible.
- * Checks: fenced-json/array shape → per-task structural (trim-aware) + coercions (batch#→str, req_refs bare→[])
+ * task array OR (A2) a plan object `{ tasks, fences? }`. Both the UI gate (parseExecutionPlan) and ingestion
+ * consume this, so `ok === true` ⟺ ingestible.
+ * Checks: fenced-json/array/object shape → per-task structural (trim-aware) + coercions (batch#→str, req_refs bare→[])
  * + per-task semantic domains (effort/type/assignee/validator_lane via shared normalizers) → cross-task ids
- * (duplicates) + deps (known string refs) → dependency cycles → canonical machine-plan schema on normalized tasks.
+ * (duplicates) + deps (known string refs) → dependency cycles → optional fence plan-contract (R1.2/R1.3:
+ * missing NC / unknown|duplicate|>5 members refused) → canonical machine-plan schema on normalized tasks.
+ * The optional `fences` list is PRESERVED on the success result (not dropped by toNormalizedTask).
  */
 export function validateExecutionPlan(
-  input: string | unknown[]
-):
-  | { ok: true; tasks: ExecutionPlanTask[]; normalizedTasks: NormalizedExecutionTask[] }
-  | { ok: false; errors: string[] } {
+  input: string | unknown[] | { tasks: unknown[]; fences?: unknown }
+): ValidateExecutionPlanResult {
   const errors: string[] = [];
 
   let parsed: unknown[];
+  let fencesRaw: unknown = undefined;
+
   if (typeof input === 'string') {
     const fenceMatch = /```json\s*([\s\S]*?)```/im.exec(String(input ?? ''));
     if (!fenceMatch || !fenceMatch[1]?.trim()) return { ok: false, errors: ['no fenced ```json block found'] };
@@ -435,12 +488,22 @@ export function validateExecutionPlan(
     } catch (e) {
       return { ok: false, errors: [`invalid JSON in fenced block: ${(e as Error).message}`] };
     }
-    if (!Array.isArray(j)) return { ok: false, errors: ['fenced JSON must be an array of task objects'] };
-    parsed = j;
+    const split = extractTasksAndFences(j);
+    if (!split.ok) return { ok: false, errors: [split.error] };
+    parsed = split.tasks;
+    fencesRaw = split.fencesRaw;
   } else if (Array.isArray(input)) {
     parsed = input;
+  } else if (input && typeof input === 'object' && Array.isArray((input as any).tasks)) {
+    parsed = (input as any).tasks;
+    fencesRaw = Object.prototype.hasOwnProperty.call(input, 'fences') ? (input as any).fences : undefined;
   } else {
-    return { ok: false, errors: ['execution plan must be a fenced ```json array or a task array'] };
+    return {
+      ok: false,
+      errors: [
+        'execution plan must be a fenced ```json array, a task array, or an object with a "tasks" array (optional "fences")',
+      ],
+    };
   }
 
   if (parsed.length === 0) return { ok: false, errors: ['task array must not be empty'] };
@@ -469,6 +532,21 @@ export function validateExecutionPlan(
     for (const e of validateBatchDependencies(parsed as any[], batchByKey)) errors.push(e);
   }
 
+  // A2 / R1.1–R1.3: optional authored fence plan-contract. Absent fences = legacy plan (still valid).
+  // Present fences are validated at accept (missing NC, unknown/duplicate member, >5 members → refuse).
+  // Collect known task ids even when some task-field errors exist so fence member refs stay precise.
+  let fences: FencePlanContract[] = [];
+  if (fencesRaw !== undefined) {
+    const knownIds = new Set<string>();
+    for (const t of parsed) {
+      const id = t && typeof t === 'object' ? (t as Record<string, unknown>).id : undefined;
+      if (typeof id === 'string' && id.trim() !== '') knownIds.add(id.trim());
+    }
+    const fenceResult = validatePlanFences(fencesRaw, knownIds);
+    if (!fenceResult.ok) errors.push(...fenceResult.errors);
+    else fences = fenceResult.fences;
+  }
+
   if (errors.length > 0) return { ok: false, errors };
 
   // All checks passed → build normalized tasks and run the canonical machine-plan schema (the thing that threw
@@ -480,16 +558,17 @@ export function validateExecutionPlan(
     return { ok: false, errors: [`canonical machine-plan schema: ${(e as Error).message}`] };
   }
 
-  return { ok: true, tasks: parsed as ExecutionPlanTask[], normalizedTasks };
+  return { ok: true, tasks: parsed as ExecutionPlanTask[], normalizedTasks, fences };
 }
 
 /**
  * The UI `execDoc.valid` gate. Thin delegate over the shared `validateExecutionPlan` so it can NEVER diverge from
- * ingestion. Returns the raw (coerced) tasks for existing `.tasks` consumers; `.ok` is the unified verdict.
+ * ingestion. Returns the raw (coerced) tasks for existing `.tasks` consumers; preserves normalized `fences`
+ * when the plan object carries them; `.ok` is the unified verdict.
  */
 export function parseExecutionPlan(markdown: string): ParseExecutionPlanResult {
   const r = validateExecutionPlan(markdown);
-  return r.ok ? { ok: true, tasks: r.tasks } : { ok: false, errors: r.errors };
+  return r.ok ? { ok: true, tasks: r.tasks, fences: r.fences } : { ok: false, errors: r.errors };
 }
 
 /**

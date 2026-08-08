@@ -403,7 +403,7 @@ Emit exactly:
   - Structured sections with \`R-XX\` requirement IDs matching north-star.md/decisions. This is the validator's contract source.
 
 **3. Plan draft** — Helm-algo machine contract (helm-algo-digestible; NOT an LLM coordinator plan) at the seat-scoped plan path only:
-  - Markdown wrapper + fenced \`\`\`json\`\`\` array of task objects. **Every field value is a JSON STRING unless noted** (\`req_refs\`/\`deps\` are string arrays). Each task MUST include:
+  - Markdown wrapper + fenced \`\`\`json\`\`\` payload. **Legacy form remains valid**: a bare **array of task objects**. **Fence form (optional)**: an object \`{"tasks":[...],"fences":{...}}\` so fence contracts survive plan accept (execution-plan-parser preserves \`fences\`; missing fences is NOT an error). **Every field value is a JSON STRING unless noted** (\`req_refs\`/\`deps\`/\`acceptance_ids\`/\`members\` are string arrays). Each task MUST include:
     - \`id\` (task key STRING, e.g. \`"B12-T02"\` or \`"T01"\`)
     - \`batch\` — batch id, a **non-empty STRING** (e.g. \`"B1"\`, \`"B2"\`), **NOT a bare number** (\`1\` is rejected — write \`"B1"\`)
     - \`title\` (atomic deliverable, STRING)
@@ -416,6 +416,7 @@ Emit exactly:
     - \`deps\` (string array of task ids)
     - \`exception_handling\` (per-task edge-case note for helm-algo escalation)
   - **COPY THIS EXACT EXAMPLE TASK** — every required field with the correct JSON type (note \`batch\` and \`id\` are STRINGS, \`req_refs\` is a string ARRAY, \`effort\`/\`type\` are enum strings): \`{"id":"T01","batch":"B1","title":"Project scaffold: TS + ws server + test runner","req_refs":["OPS-1"],"assignee":"L1","validator_lane":"L1","effort":"med","type":"feature","deps":[]}\`
+  - **Optional \`fences\` plan-contract (R1.1–R1.3)** — map keyed by fence_key (or array of objects with \`id\`/\`fence_key\`). Each fence MUST carry: \`integration_cmd\`, \`negative_control_cmd\`, \`acceptance_ids\` (string[]), \`test_path\`, \`authored_by\`, and exact \`members\` (string[] of task ids from \`tasks\`, ceiling **5**). **A fence with no \`negative_control_cmd\` is REFUSED at plan accept.** Also refused: unknown member, duplicate member within a fence, or more than 5 members. Example: \`{"tasks":[{"id":"A1","batch":"A","title":"schema","req_refs":["R1.1"],"assignee":"L2","validator_lane":"L3","effort":"med","type":"feature","deps":[]},{"id":"A2","batch":"A","title":"contract","req_refs":["R1.2"],"assignee":"L2","validator_lane":"L3","effort":"med","type":"feature","deps":["A1"]}],"fences":{"I1":{"integration_cmd":"npx vitest run src/services/fence-f1-contract.integration.test.ts --minWorkers=1 --maxWorkers=4","negative_control_cmd":"FENCE_STUB=A2 npx vitest run src/services/fence-f1-contract.integration.test.ts --minWorkers=1 --maxWorkers=4","acceptance_ids":["R1.1","R1.2","R1.3"],"test_path":"src/services/fence-f1-contract.integration.test.ts","authored_by":"integration_test_agent","members":["A1","A2"]}}}\`
 
 **4. plan.json — DO NOT author** — You write **requirements draft + plan draft ONLY**. Helm/helm-algo **derives** the compat plan.json automatically at ingest. Do NOT also hand-author plan.json — that would duplicate schema and risk drift.
 
