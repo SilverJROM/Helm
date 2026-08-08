@@ -3913,6 +3913,57 @@ ALTER TABLE role_capabilities_v114 RENAME TO role_capabilities;
         }
         this.db.prepare('UPDATE schema_version SET version = 115').run();
       }
+
+      // v116 / fence-workflow-upgrade A1 (R1.1, R1.2, R1.4): fences + fence_members with
+      // crash-legible lifecycle_state and contract/OPEN baseline columns. CREATE IF NOT EXISTS
+      // is safe on partial/hand-rolled upgrade DBs; no existing-table rebuild.
+      if (current && current.version < 116) {
+        this.db.exec(`
+CREATE TABLE IF NOT EXISTS fences (
+  id INTEGER PRIMARY KEY,
+  fence_key TEXT NOT NULL,
+  run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  cycle_id INTEGER REFERENCES cycles(id) ON DELETE SET NULL,
+  lifecycle_state TEXT NOT NULL DEFAULT 'declared' CHECK(
+    lifecycle_state IN (
+      'declared',
+      'opening',
+      'draining',
+      'closing',
+      'repairing',
+      'closed',
+      'plan_blocked'
+    )
+  ),
+  integration_cmd TEXT NOT NULL,
+  negative_control_cmd TEXT NOT NULL,
+  acceptance_ids TEXT NOT NULL DEFAULT '[]',
+  test_path TEXT,
+  authored_by TEXT,
+  label TEXT,
+  open_failed_ids TEXT,
+  open_test_hash TEXT,
+  open_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(run_id, fence_key)
+);
+CREATE INDEX IF NOT EXISTS idx_fences_run_state ON fences(run_id, lifecycle_state);
+CREATE INDEX IF NOT EXISTS idx_fences_fence_key ON fences(fence_key);
+
+CREATE TABLE IF NOT EXISTS fence_members (
+  id INTEGER PRIMARY KEY,
+  fence_id INTEGER NOT NULL REFERENCES fences(id) ON DELETE CASCADE,
+  task_key TEXT NOT NULL,
+  position INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(fence_id, task_key)
+);
+CREATE INDEX IF NOT EXISTS idx_fence_members_fence ON fence_members(fence_id);
+CREATE INDEX IF NOT EXISTS idx_fence_members_task_key ON fence_members(task_key);
+`);
+        this.db.prepare('UPDATE schema_version SET version = 116').run();
+      }
     }
   }
 
