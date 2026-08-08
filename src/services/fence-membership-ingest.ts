@@ -126,7 +126,7 @@ export function ingestFenceMembership(
       const fenceId = row.id;
       fenceIdsByKey[fence.fence_key] = fenceId;
 
-      fence.members.forEach((taskKey, position) => {
+      fence.members.forEach((taskKey: string, position: number) => {
         insertMember.run(fenceId, taskKey, position);
         memberCount += 1;
       });
