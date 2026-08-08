@@ -273,7 +273,7 @@ export function getOpenBaseline(
   if (!row) return null;
   const ids = parseOpenFailedIds(row.open_failed_ids);
   const has =
-    row.lifecycle_state === 'draining' &&
+    ['draining', 'closing', 'repairing', 'closed'].includes(row.lifecycle_state) &&
     ids.length > 0 &&
     typeof row.open_test_hash === 'string' &&
     row.open_test_hash.length > 0 &&

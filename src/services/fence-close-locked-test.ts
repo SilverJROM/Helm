@@ -156,10 +156,10 @@ function requireOpenBaseline(
   db: DatabaseService | SqliteDb,
   fence: FenceCloseLockedTestRow
 ): { openFailedIds: string[]; openTestHash: string } {
-  if (fence.lifecycle_state !== 'draining') {
+  if (fence.lifecycle_state !== 'draining' && fence.lifecycle_state !== 'closing') {
     throw new FenceCloseLockedTestError(
       'bad_state',
-      `fence '${fence.fence_key}' lifecycle_state is '${fence.lifecycle_state}' — CLOSE lock check only runs from draining`
+      `fence '${fence.fence_key}' lifecycle_state is '${fence.lifecycle_state}' — CLOSE lock check only runs from draining/closing`
     );
   }
 
