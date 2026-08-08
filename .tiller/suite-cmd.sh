@@ -7,13 +7,21 @@
 # session — including live Tiller runs. The temp DB keeps the suite off data/helm.db.
 #
 # Pin HELM_HOST/HELM_PORT so live .env / ecosystem bind (0.0.0.0) cannot fail smoke defaults.
+#
+# EXCLUDE plan-time fence journey files (*.integration.test.ts): OPEN baselines that intentionally
+# assert product absence. Running them in the suite band makes every gate red until product lands.
+# Driver still runs them via fence-contract.json integration_cmd at OPEN/CLOSE.
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO" || exit 1
-export HELM_DB_PATH="/tmp/helm-suite-$$.db"
+SUITE_DB="/tmp/helm-suite-$$-$RANDOM.db"
+export HELM_DB_PATH="$SUITE_DB"
 export HELM_HOST=127.0.0.1
 export HELM_PORT=3110
-npx vitest run --poolOptions.forks.minForks=1 --poolOptions.forks.maxForks=4
+npx vitest run \
+  --poolOptions.forks.minForks=1 \
+  --poolOptions.forks.maxForks=4 \
+  --exclude '**/*.integration.test.ts'
 rc=$?
-rm -f "/tmp/helm-suite-$$.db"
+rm -f "$SUITE_DB" "$SUITE_DB-wal" "$SUITE_DB-shm" 2>/dev/null || true
 exit $rc
