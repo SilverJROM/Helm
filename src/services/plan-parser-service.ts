@@ -4,6 +4,8 @@ import { RunArtifactService } from './run-artifact-service.js';
 import { TaskQueueService } from './task-queue-service.js';
 import { validateExecutionPlan, resolveTaskBatches, validateBatchDependencies } from './execution-plan-parser.js';
 import { MACHINE_COMPLEXITIES, validateMachinePlan, type MachinePlan, type MachinePlanTask } from './plan-schema.js';
+import type { FencePlanContract } from './fence-plan-contract.js';
+import { ingestFenceMembership } from './fence-membership-ingest.js';
 
 /**
  * B9 PLN2: Machine-readable plan (plan.json or fenced block in plan.md).
@@ -11,6 +13,7 @@ import { MACHINE_COMPLEXITIES, validateMachinePlan, type MachinePlan, type Machi
  * Records the plan as artifact for later metadata lookup (recommended_model/complexity for B8 plan-summon).
  * Round-trippable: plan(N tasks + deps) -> N run_tasks + queue order + fields preserved.
  * No schema changes to run_tasks; task_key + label + plan.json artifact hold the data.
+ * A3: optional plan fences land in fences/fence_members in the same ingest transaction.
  */
 
 export interface PlannedTask extends MachinePlanTask {
@@ -30,7 +33,11 @@ export interface PlannedTask extends MachinePlanTask {
   user_critical?: boolean;
 }
 
-export interface Plan extends MachinePlan { tasks: PlannedTask[]; }
+export interface Plan extends MachinePlan {
+  tasks: PlannedTask[];
+  /** A3: optional fence contracts from execution-plan accept (written to fences/fence_members). */
+  fences?: FencePlanContract[];
+}
 
 export class PlanParserService {
   private ingestValidator?: (runId: number, plan: Plan) => void;
@@ -174,8 +181,11 @@ export class PlanParserService {
     // in-memory queue for earlier tasks in this same loop — so the outer catch compensates by wiping
     // this run's queue state via `queue.clearRun(runId)` before rethrowing, leaving zero rows and zero
     // queue entries on any failure.
+    // A3: fence + fence_members rows join the same transaction so membership cannot partially land
+    // without tasks (or vice versa) when the plan carries fences.
     const keyToId: Record<string, number> = {};
     const created: number[] = [];
+    const fences = plan.fences ?? [];
     const runTx = this.artifacts['db'].raw.transaction(() => {
       // Create all tasks first (ids needed for dep resolution); persist the resolved batch.
       plan.tasks.forEach((t, i) => {
@@ -198,6 +208,11 @@ export class PlanParserService {
           .filter((id): id is number => typeof id === 'number');
         queue.enqueue(runId, tid, depIds, false, resolvedBatches[i]);
       });
+
+      // A3 / R1.1+R1.4: plan fences → fences/fence_members (nested SAVEPOINT-safe transaction).
+      if (fences.length > 0) {
+        ingestFenceMembership(this.artifacts['db'], { runId, fences });
+      }
     });
     try {
       runTx();
@@ -243,8 +258,12 @@ export class PlanParserService {
       throw new Error(`Invalid execution_plan.md: ${result.errors.join('; ')}`);
     }
 
-    // Consume the validator's normalized tasks verbatim (no re-map, no re-normalize, no extra check).
-    const plan = { tasks: result.normalizedTasks as unknown as PlannedTask[] } as Plan;
+    // Consume the validator's normalized tasks + fences verbatim (no re-map, no re-normalize).
+    // A3: fences ride the same ingest transaction as run_tasks → inspectable SQL membership.
+    const plan = {
+      tasks: result.normalizedTasks as unknown as PlannedTask[],
+      fences: result.fences,
+    } as Plan;
 
     // C10: ingestPlan owns the transactional plan-snapshot write (FS) + artifact row (DB) — don't
     // duplicate either here (the prior duplicate write produced two `artifacts` rows per ingest).
