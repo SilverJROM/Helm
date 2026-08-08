@@ -29,6 +29,7 @@ import { classifyGateFault, authFault } from './fault-class.js';
 import { finalizeWorkerRuntimeRow } from './worker-runtime-finalize.js';
 import { openFence } from './fence-open-service.js';
 import { selectNextWork } from './fence-selector-admission.js';
+import { assertRepairImplementerDispatchAllowed } from './fence-repair-requeue.js';
 
 export type Transition = string;
 
@@ -415,6 +416,20 @@ export class OrchestratorLoop {
     this.log(`aborted:${boundary}`);
     await this.reapLiveRunWorkers('run-aborted');
     throw new RunAbortedError(this.runId!, `${boundary}: ${detail}`);
+  }
+
+  private assertRepairImplementerDispatchBoundary(role: string): void {
+    if (role !== 'implementer' || !this.artifactService || this.taskId == null) return;
+    const db = (this.artifactService as any)?.['db']?.raw;
+    if (!db) return;
+    const task = db
+      .prepare('SELECT reopen_reason, repair_round_id FROM run_tasks WHERE id = ?')
+      .get(this.taskId) as { reopen_reason: string | null; repair_round_id: number | null } | undefined;
+    if (task?.reopen_reason !== 'repair' || task.repair_round_id == null) return;
+    assertRepairImplementerDispatchAllowed(db, {
+      runTaskId: this.taskId,
+      repoRoot: this.projectDir || process.cwd(),
+    });
   }
 
   // R5a: best-effort cleanup of any still-live run workers (sessions reaped via transport,
@@ -946,6 +961,7 @@ export class OrchestratorLoop {
     // R5a: re-check the run's DB phase/status BEFORE each dispatch — a run marked terminal in
     // the DB (run-74 zombie evidence) must never spawn another worker session.
     await this.assertRunActive(`pre-dispatch:${role}`);
+    this.assertRepairImplementerDispatchBoundary(role);
     // POCFIX22: snapshot callbacks.md byte size so any callbacks written before this dispatch
     // are excluded from waitForCallback (stale-DONE fence — prevents prior-task DONE phantom-passing later tasks).
     // Only active on the REAL path (USE_FAKE_TMUX=0): fake/test transports control the file directly

@@ -11,6 +11,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { DatabaseService } from '../db/database.js';
 import { SCHEMA_VERSION } from '../db/schema.js';
+import { FakeTransport } from './fake-transport.js';
+import { OrchestratorLoop } from './orchestrator-loop.js';
+import { RunArtifactService } from './run-artifact-service.js';
 import { TaskQueueService } from './task-queue-service.js';
 import { beginFenceRepairRound } from './fence-repair-schema.js';
 import {
@@ -416,6 +419,71 @@ describe('R3 fence-repair-requeue (R5.1, R5.2, R5.3)', () => {
       reopen_reason: 'repair',
       repair_generation: 1,
     });
+
+    db.close();
+  });
+
+  it('real implementer dispatch boundary catches alias/wrapper attempts after locked test weakening (AC-R8.1)', async () => {
+    const t = tempDir('helm-fence-r3-dispatch-boundary-');
+    cleanups.push(t.cleanup);
+    const db = new DatabaseService(path.join(t.dir, 'helm.db'));
+    const artifacts = new RunArtifactService(db);
+    const { runId, fenceId, taskIds } = insertRepairFixture(db);
+    const staged = beginFenceRepairRound(db, {
+      fenceId,
+      faultClass: 'implementation',
+      failingUnits: ['A1'],
+    });
+    const locked = lockUnit(db, {
+      repairRoundId: staged.repair_round_id,
+      taskKey: 'A1',
+      repoRoot: t.dir,
+      rel: 'repairs/A1.repair.test.ts',
+      assertId: 'unit-A1-regression',
+    });
+    const queue = makeQueue(runId, [taskIds.A1]);
+    reopenAndEnqueueRepairRound(db, {
+      repairRoundId: staged.repair_round_id,
+      queue,
+      repoRoot: t.dir,
+    });
+
+    fs.appendFileSync(path.join(t.dir, locked.repair_test_path), `// weakened after requeue\n`, 'utf8');
+
+    const prevFake = process.env.USE_FAKE_TMUX;
+    process.env.USE_FAKE_TMUX = '1';
+    try {
+      const runDir = path.join(t.dir, 'run');
+      fs.mkdirSync(runDir, { recursive: true });
+      fs.writeFileSync(path.join(runDir, 'callbacks.md'), '# R3 dispatch boundary callbacks\n', 'utf8');
+      const transport = new FakeTransport();
+      const loop = new OrchestratorLoop(transport, {
+        runDir,
+        batchId: 'R3',
+        artifactService: artifacts,
+        projectDir: t.dir,
+        runId,
+      });
+      const aliasedRunTask = loop.runTask.bind(loop);
+      const wrappedRunTask = (cfg: Parameters<typeof loop.runTask>[0]) => aliasedRunTask({ ...cfg });
+
+      await expect(
+        wrappedRunTask({
+          brief: 'repair A1 through a wrapped runTask alias',
+          preExistingTaskId: taskIds.A1,
+          taskType: 'feature',
+          taskKey: 'A1',
+        })
+      ).rejects.toThrow(/hash|weakening|R5\.3/i);
+
+      expect(transport.spawnCalls).toHaveLength(0);
+      expect(
+        (db.raw.prepare('SELECT COUNT(*) AS c FROM dispatches').get() as { c: number }).c
+      ).toBe(0);
+    } finally {
+      if (prevFake === undefined) delete process.env.USE_FAKE_TMUX;
+      else process.env.USE_FAKE_TMUX = prevFake;
+    }
 
     db.close();
   });
