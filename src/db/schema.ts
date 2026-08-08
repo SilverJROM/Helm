@@ -2,7 +2,7 @@ import type Database from "better-sqlite3";
 import { assertAllRoleTiersInvariants } from "./role-tier-invariants.js";
 import { PROVIDERS } from "../config/providers.js";
 
-export const SCHEMA_VERSION = 117;
+export const SCHEMA_VERSION = 118;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -452,6 +452,13 @@ CREATE TABLE IF NOT EXISTS run_tasks (
   status TEXT NOT NULL CHECK(status IN ('pending','working','complete','failed','deferred')) DEFAULT 'pending',
   attempts_count INTEGER NOT NULL DEFAULT 0,
   current_attempt_id INTEGER,
+  -- v118 / fence-workflow-upgrade R1 (R5.1, R5.5): current repair admission marker.
+  -- Staged repair never overloads status='deferred'; these nullable fields identify
+  -- the repair round/generation while the task keeps its ordinary status until the
+  -- later atomic reopen slice moves it back to pending.
+  reopen_reason TEXT CHECK(reopen_reason IS NULL OR reopen_reason = 'repair'),
+  repair_generation INTEGER NOT NULL DEFAULT 0 CHECK(repair_generation >= 0),
+  repair_round_id INTEGER REFERENCES fence_repair_rounds(id) ON DELETE SET NULL,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -1071,6 +1078,61 @@ CREATE INDEX IF NOT EXISTS idx_fence_authoring_sessions_run
   ON fence_authoring_sessions(run_id, fence_key);
 CREATE INDEX IF NOT EXISTS idx_fence_authoring_sessions_session
   ON fence_authoring_sessions(session_id);
+
+-- v118 / fence-workflow-upgrade R1 (R5.1, R5.5): append-only staged repair history.
+-- A repair round localizes an implementation-class fence failure to one or two named
+-- fence member units. fence_repair_units snapshots each task's status before later
+-- slices reopen/requeue it; the history itself is immutable after insert.
+CREATE TABLE IF NOT EXISTS fence_repair_rounds (
+  id INTEGER PRIMARY KEY,
+  fence_id INTEGER NOT NULL REFERENCES fences(id) ON DELETE CASCADE,
+  run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  fence_key TEXT NOT NULL,
+  round_number INTEGER NOT NULL CHECK(round_number >= 1),
+  fault_class TEXT NOT NULL CHECK(fault_class = 'implementation'),
+  status TEXT NOT NULL DEFAULT 'staged' CHECK(status IN ('staged','active','closed','plan_blocked')),
+  failing_units TEXT NOT NULL DEFAULT '[]',
+  verdict_fingerprint TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(fence_id, round_number)
+);
+CREATE INDEX IF NOT EXISTS idx_fence_repair_rounds_run
+  ON fence_repair_rounds(run_id, fence_key, round_number);
+CREATE TRIGGER IF NOT EXISTS fence_repair_rounds_no_update
+BEFORE UPDATE ON fence_repair_rounds
+BEGIN
+  SELECT RAISE(ABORT, 'fence repair rounds are append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS fence_repair_rounds_no_delete
+BEFORE DELETE ON fence_repair_rounds
+BEGIN
+  SELECT RAISE(ABORT, 'fence repair rounds are append-only');
+END;
+
+CREATE TABLE IF NOT EXISTS fence_repair_units (
+  id INTEGER PRIMARY KEY,
+  repair_round_id INTEGER NOT NULL REFERENCES fence_repair_rounds(id) ON DELETE CASCADE,
+  fence_id INTEGER NOT NULL REFERENCES fences(id) ON DELETE CASCADE,
+  run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  run_task_id INTEGER NOT NULL REFERENCES run_tasks(id) ON DELETE CASCADE,
+  task_key TEXT NOT NULL,
+  repair_generation INTEGER NOT NULL CHECK(repair_generation >= 1),
+  prior_status TEXT NOT NULL CHECK(prior_status IN ('pending','working','complete','failed','deferred')),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(repair_round_id, task_key)
+);
+CREATE INDEX IF NOT EXISTS idx_fence_repair_units_task
+  ON fence_repair_units(run_task_id, repair_generation);
+CREATE TRIGGER IF NOT EXISTS fence_repair_units_no_update
+BEFORE UPDATE ON fence_repair_units
+BEGIN
+  SELECT RAISE(ABORT, 'fence repair units are append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS fence_repair_units_no_delete
+BEFORE DELETE ON fence_repair_units
+BEGIN
+  SELECT RAISE(ABORT, 'fence repair units are append-only');
+END;
 `;
 
 /** B03a: slugify a model name for Helm-canonical slug backfill (not the B04 registry map). */

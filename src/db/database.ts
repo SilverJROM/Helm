@@ -3995,6 +3995,78 @@ CREATE INDEX IF NOT EXISTS idx_fence_authoring_sessions_session
 `);
         this.db.prepare('UPDATE schema_version SET version = 117').run();
       }
+
+      // v118 / fence-workflow-upgrade R1 (R5.1, R5.5): append-only repair rounds/units
+      // plus current run_tasks repair admission markers. Additive and guarded so old/live
+      // DBs can reopen repeatedly without clobbering staged history.
+      if (current && current.version < 118) {
+        this.db.exec(`
+CREATE TABLE IF NOT EXISTS fence_repair_rounds (
+  id INTEGER PRIMARY KEY,
+  fence_id INTEGER NOT NULL REFERENCES fences(id) ON DELETE CASCADE,
+  run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  fence_key TEXT NOT NULL,
+  round_number INTEGER NOT NULL CHECK(round_number >= 1),
+  fault_class TEXT NOT NULL CHECK(fault_class = 'implementation'),
+  status TEXT NOT NULL DEFAULT 'staged' CHECK(status IN ('staged','active','closed','plan_blocked')),
+  failing_units TEXT NOT NULL DEFAULT '[]',
+  verdict_fingerprint TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(fence_id, round_number)
+);
+CREATE INDEX IF NOT EXISTS idx_fence_repair_rounds_run
+  ON fence_repair_rounds(run_id, fence_key, round_number);
+CREATE TRIGGER IF NOT EXISTS fence_repair_rounds_no_update
+BEFORE UPDATE ON fence_repair_rounds
+BEGIN
+  SELECT RAISE(ABORT, 'fence repair rounds are append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS fence_repair_rounds_no_delete
+BEFORE DELETE ON fence_repair_rounds
+BEGIN
+  SELECT RAISE(ABORT, 'fence repair rounds are append-only');
+END;
+
+CREATE TABLE IF NOT EXISTS fence_repair_units (
+  id INTEGER PRIMARY KEY,
+  repair_round_id INTEGER NOT NULL REFERENCES fence_repair_rounds(id) ON DELETE CASCADE,
+  fence_id INTEGER NOT NULL REFERENCES fences(id) ON DELETE CASCADE,
+  run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  run_task_id INTEGER NOT NULL REFERENCES run_tasks(id) ON DELETE CASCADE,
+  task_key TEXT NOT NULL,
+  repair_generation INTEGER NOT NULL CHECK(repair_generation >= 1),
+  prior_status TEXT NOT NULL CHECK(prior_status IN ('pending','working','complete','failed','deferred')),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(repair_round_id, task_key)
+);
+CREATE INDEX IF NOT EXISTS idx_fence_repair_units_task
+  ON fence_repair_units(run_task_id, repair_generation);
+CREATE TRIGGER IF NOT EXISTS fence_repair_units_no_update
+BEFORE UPDATE ON fence_repair_units
+BEGIN
+  SELECT RAISE(ABORT, 'fence repair units are append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS fence_repair_units_no_delete
+BEFORE DELETE ON fence_repair_units
+BEGIN
+  SELECT RAISE(ABORT, 'fence repair units are append-only');
+END;
+`);
+        const rtCols = new Set(
+          (this.db.prepare('PRAGMA table_info(run_tasks)').all() as any[]).map((c) => c.name)
+        );
+        if (!rtCols.has('reopen_reason')) {
+          this.db.exec("ALTER TABLE run_tasks ADD COLUMN reopen_reason TEXT CHECK(reopen_reason IS NULL OR reopen_reason = 'repair')");
+        }
+        if (!rtCols.has('repair_generation')) {
+          this.db.exec("ALTER TABLE run_tasks ADD COLUMN repair_generation INTEGER NOT NULL DEFAULT 0 CHECK(repair_generation >= 0)");
+        }
+        if (!rtCols.has('repair_round_id')) {
+          this.db.exec("ALTER TABLE run_tasks ADD COLUMN repair_round_id INTEGER REFERENCES fence_repair_rounds(id) ON DELETE SET NULL");
+        }
+        this.db.exec('CREATE INDEX IF NOT EXISTS idx_run_tasks_repair ON run_tasks(run_id, reopen_reason, repair_generation)');
+        this.db.prepare('UPDATE schema_version SET version = 118').run();
+      }
     }
   }
 
