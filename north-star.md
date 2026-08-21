@@ -143,6 +143,16 @@ Recorded because each one *misleads* someone who doesn't know it. Not a work que
   actually fully green.** Full reasoning: `plan/fence-workflow-upgrade/decisions/D9-…md`. This is
   real, unaddressed debt — it needs its own future cleanup effort, not a permanent exclusion nobody
   revisits.
+- **Live e2e fixtures leak a scratch project directory on abort, not just on failure.** `e2e/{A5,A7,
+  A12,B1,B8,B9}.live.spec.ts` each create `PROJECT_DIR = ~/websites/<id>-validation-${RUN_TS}` and
+  clean it up in `test.afterAll` — which only runs on Playwright's own graceful completion path.
+  A genuine process abort (killed worker, hard timeout, an external reaper like a Tiller park)
+  skips it, leaving the directory behind. Confirmed 2026-08-17/18: 20+ such directories had
+  accumulated from `helm-ux-remediation` (Jul 26-27) alone, cleaned up manually by `[north]` — see
+  `plan/fence-workflow-upgrade/` session log. **Will re-accumulate** until the cleanup moves
+  somewhere that runs on abort too (an outer try/finally around the runner, or a periodic reaper
+  keyed on the `<id>-validation-*` naming convention), not just inside the spec itself. Found and
+  diagnosed by `wflow` while investigating an unrelated auth-migration issue; not yet actioned.
 - **Three DB names for one database.** Code default `helm.db`, `.env` `helm-harness.db`, pm2
   `cards2-ibrain.db`. The safety rail names the non-production file; the production file has none.
 - **`run_id` is two incompatible types.** INTEGER in `runs`/`worker_runtimes`; **TEXT with no FK** in
